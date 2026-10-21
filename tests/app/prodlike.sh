@@ -20,7 +20,8 @@ here=$(cd -P "$(dirname "$0")" && pwd -P)
 work=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-prodlike.XXXXXX") || exit 2
 tally_init "$work/tally"
 secrets=$(make_secrets) || exit 2
-project=$(project_of "$APP_REPO")-prod
+# Unique per run: concurrent runs from one checkout never share a project.
+project=$(project_of "$APP_REPO")-prod-$(sha6 "$work")
 net=${project}_front
 e2e_image=flowcrm-e2e:$(sha6 "$work")
 # The edge's port mapping is removed by compose.prodlike.yaml; the variable
@@ -30,7 +31,7 @@ export FLOWCRM_SECRETS_DIR=$secrets FLOWCRM_HTTP_PORT=0 COMPOSE_PROFILES=
 dc() { docker compose --project-name "$project" --project-directory "$APP_REPO" -f "$APP_REPO/compose.yaml" -f "$APP_REPO/compose.prodlike.yaml" "$@"; }
 docker_cleanup() {
   local id
-  case $project in flowcrm-??????-prod) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
+  case $project in flowcrm-??????-prod-??????) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
   remove_project "$project" "$APP_REPO"
   docker images -q --filter "label=com.docker.compose.project=$project" | sort -u |
     while read -r id; do docker image rm -f "$id" >/dev/null 2>&1; done
@@ -100,6 +101,35 @@ v "PL-09 /health/live and /health/ready answer 200" $?
 
 req /index.php
 [ "$CODE" = 200 ] && grep -q '<div id="root">' "$work/body"; v "PL-10 /index.php is not executed (served as the SPA)" $?
+
+# ADR-017 boundary with raw request paths (curl --path-as-is). Symfony sets
+# X-Request-Id on every response; the built SPA never does.
+layer() {
+  if [ -n "$(header X-Request-Id)" ]; then
+    case $TYPE in application/problem+json*) printf 'symfony-problem' ;; application/json*) printf 'symfony-json' ;; *) printf 'symfony-other' ;; esac
+  elif grep -q '<div id="root">' "$work/body"; then
+    printf 'spa'
+  else
+    printf 'other:%s' "$CODE"
+  fi
+}
+boundary() { # expected path
+  req "$2" --path-as-is
+  local got
+  got=$(layer)
+  [ "$got" = "$1" ]
+  v "PL-12 $2 -> $1" $? "got $CODE $TYPE via $got"
+}
+for p in //health/live /health//live //api/v1/system/status /health/live/ /API/v1/system/status /HEALTH/LIVE \
+  /health%2Flive /%68ealth/live /api%2Fv1/system/status /%61pi/v1/system/status /health/./live /index.php /_error/500; do
+  boundary spa "$p"
+done
+for p in /api//v1/system/status /api/v1/does-not-exist /api/../health/live; do
+  boundary symfony-problem "$p"
+done
+req /health/live -X POST
+[ "$(layer)" = symfony-other ] && [ "$CODE" = 405 ] && ! grep -qiE 'stack trace|vendor/symfony|/app/src' "$work/body"
+v "PL-13 POST /health/live: 405 from Symfony without debug details (production mode)" $? "got $CODE $TYPE"
 
 need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2e/Dockerfile" -t "$e2e_image" "$APP_REPO" >/dev/null && {
   docker run --rm --network "$net" -e BASE_URL=http://edge:8080 -e MODE=prod "$e2e_image" >"$work/browser.out" 2>&1

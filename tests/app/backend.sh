@@ -18,13 +18,14 @@ here=$(cd -P "$(dirname "$0")" && pwd -P)
 work=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-backend.XXXXXX") || exit 2
 tally_init "$work/tally"
 secrets=$(make_secrets) || exit 2
-project=$(project_of "$APP_REPO")-test
+# Unique per run: concurrent runs from one checkout never share a project.
+project=$(project_of "$APP_REPO")-test-$(sha6 "$work")
 export FLOWCRM_SECRETS_DIR=$secrets FLOWCRM_HTTP_PORT=0 COMPOSE_PROFILES=
 
 dc() { docker compose --project-name "$project" --project-directory "$APP_REPO" -f "$APP_REPO/compose.yaml" -f "$APP_REPO/compose.test.yaml" "$@"; }
 cleanup() {
   local id
-  case $project in flowcrm-??????-test) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
+  case $project in flowcrm-??????-test-??????) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
   remove_project "$project" "$APP_REPO"
   docker images -q --filter "label=com.docker.compose.project=$project" | sort -u |
     while read -r id; do docker image rm -f "$id" >/dev/null 2>&1; done
@@ -61,7 +62,8 @@ else
   tail -n 20 "$log" | sed 's/^/      | /'
 fi
 grep -E 'No security|Found' "$log" | sed 's/^/      /'
-check "BE-04 coding standard (PHP-CS-Fixer)" 'PHP_CS_FIXER_IGNORE_ENV=1 vendor/bin/php-cs-fixer check --diff --using-cache=no --show-progress=none'
+# No PHP_CS_FIXER_IGNORE_ENV: the fixer must refuse a PHP version it does not support.
+check "BE-04 coding standard (PHP-CS-Fixer)" 'vendor/bin/php-cs-fixer check --diff --using-cache=no --show-progress=none'
 check "BE-05 static analysis (PHPStan, level max)" 'vendor/bin/phpstan analyse --no-progress --memory-limit=1G'
 check "BE-06 migrations from an empty database" 'bin/console doctrine:migrations:migrate --no-interaction --all-or-nothing && bin/console doctrine:migrations:up-to-date'
 check "BE-07 ORM mapping matches the migrated schema" 'bin/console doctrine:schema:validate'

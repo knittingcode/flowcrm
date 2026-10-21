@@ -13,7 +13,8 @@ here=$(cd -P "$(dirname "$0")" && pwd -P)
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-frontend.XXXXXX") || exit 2
 tally_init "$work/tally"
-image=flowcrm-web-check:$(sha6 "$APP_REPO")
+# Unique per run, so a concurrent run never removes this image.
+image=flowcrm-web-check:$(sha6 "$work")
 trap 'docker image rm "$image" >/dev/null 2>&1; rm -rf "$work"' EXIT
 
 # check "label" command... (run in a throwaway container of the web image)
@@ -31,8 +32,8 @@ check() {
 }
 
 say "== frontend checks"
-need "build the web image (target dev, Node $(sed -n 's/^ARG NODE_IMAGE=node:\([0-9.]*\).*/\1/p' "$APP_REPO/docker/web/Dockerfile"))" \
-  docker build --quiet -f "$APP_REPO/docker/web/Dockerfile" --target dev -t "$image" "$APP_REPO" >/dev/null || { tally_finish; exit; }
+need "build the web image (target ci, Node $(sed -n 's/^ARG NODE_IMAGE=node:\([0-9.]*\).*/\1/p' "$APP_REPO/docker/web/Dockerfile"))" \
+  docker build --quiet -f "$APP_REPO/docker/web/Dockerfile" --target ci -t "$image" "$APP_REPO" >/dev/null || { tally_finish; exit; }
 
 check "FE-01 npm audit (high and critical)" npm audit --audit-level=high
 check "FE-02 TypeScript type check (strict)" npm run typecheck

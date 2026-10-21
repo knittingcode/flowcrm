@@ -62,6 +62,7 @@ final_cleanup() {
       while read -r id; do docker image rm -f "$id" >/dev/null 2>&1; done
   done <"$work/checkouts"
   docker image rm -f "$e2e_image" >/dev/null 2>&1
+  docker ps -aq --filter "label=devenv.test=stack-$(sha6 "$work")" | while read -r id; do docker rm -f "$id" >/dev/null 2>&1; done
 }
 trap 'final_cleanup; rm -rf "$work"' EXIT
 
@@ -98,7 +99,38 @@ get() { # port path [curl args...]
   CODE=${r%% *}
   TYPE=${r#* }
 }
+# Like get, but the path is sent exactly as given (no dot-segment cleanup).
+get_raw() { # port path [curl args...]
+  local port=$1 path=$2
+  shift 2
+  get "$port" "$path" --path-as-is "$@"
+}
 body_has() { grep -q -- "$1" "$BODY"; }
+# Symfony sets X-Request-Id on every response; the frontend never does.
+served_by() {
+  if [ -n "$(header X-Request-Id)" ]; then
+    case $TYPE in application/problem+json*) printf 'symfony-problem' ;; application/json*) printf 'symfony-json' ;; *) printf 'symfony-other' ;; esac
+  elif body_has '<div id="root">'; then
+    printf 'spa'
+  else
+    printf 'other'
+  fi
+}
+
+# Prints the missing protections of a running container (empty: hardened).
+hardening_problems() { # container
+  local uid ro capdrop secopt priv net
+  uid=$(docker exec "$1" id -u 2>/dev/null)
+  IFS='|' read -r ro capdrop secopt priv net <<EOF
+$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}|{{json .HostConfig.CapDrop}}|{{json .HostConfig.SecurityOpt}}|{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}' "$1")
+EOF
+  { [ -n "$uid" ] && [ "$uid" != 0 ]; } || printf 'runs-as-root '
+  [ "$ro" = true ] || printf 'writable-rootfs '
+  case $capdrop in *'"ALL"'*) ;; *) printf 'capabilities-kept ' ;; esac
+  case $secopt in *no-new-privileges:true*) ;; *) printf 'new-privileges-allowed ' ;; esac
+  [ "$priv" = false ] || printf 'privileged '
+  [ "$net" != host ] || printf 'host-network '
+}
 header() { tr -d '\r' <"$HEADERS" | sed -n "s/^$1: //Ip" | tail -n 1; }
 
 until_ready() { # port expected-code [seconds]: poll /health/ready
@@ -159,14 +191,34 @@ nets() { docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} 
   [ "$(docker network inspect -f '{{.Internal}}' "$(project_of "$A")_back")" = true ]
 v "ST-04 api and db only on the internal back network, web only on front" $?
 
-privileges=''
 for s in edge web api db; do
-  c=$(cid "$A" "$s")
-  privileges="$privileges $s:$(docker exec "$c" id -u):$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}}:{{.HostConfig.CapDrop}}:{{.HostConfig.Privileged}}' "$c")"
+  problems=$(hardening_problems "$(cid "$A" "$s")")
+  [ -z "$problems" ]
+  v "ST-05 $s: non-root, read-only, all capabilities dropped, no-new-privileges, unprivileged" $? "missing: $problems"
 done
-ev "uid:read-only:cap-drop:privileged ->$privileges"
-! printf '%s' "$privileges" | grep -Eq ':0:|:false:|:true$|:true ' && printf '%s' "$privileges" | grep -q 'db:70:true:\[ALL\]:false'
-v "ST-05 every container runs as non-root, read-only, without capabilities, unprivileged" $?
+ev "$(for s in edge web api db; do printf '%s:uid=%s ' "$s" "$(docker exec "$(cid "$A" "$s")" id -u)"; done)"
+
+# Negative controls: containers that each lack one protection are reported.
+control_label=devenv.test=stack-$(sha6 "$work")
+control() { # expected-problem docker-run-args...
+  local expect=$1 c problems
+  shift
+  c=$(docker run -d --label "$control_label" "$@" "$APP_FIXTURE_IMAGE" sleep 300) || return 1
+  problems=$(hardening_problems "$c")
+  docker rm -f "$c" >/dev/null 2>&1
+  if [ -z "$expect" ]; then [ -z "$problems" ]; else case " $problems" in *" $expect "*) true ;; *) false ;; esac; fi
+}
+hard=(--user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges:true)
+control '' "${hard[@]}"
+v "ST-05 control: a fully hardened container passes" $?
+control runs-as-root --read-only --cap-drop ALL --security-opt no-new-privileges:true
+v "ST-05 control: a root container is detected" $?
+control writable-rootfs --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges:true
+v "ST-05 control: a writable root filesystem is detected" $?
+control capabilities-kept --user 65534:65534 --read-only --security-opt no-new-privileges:true
+v "ST-05 control: kept capabilities are detected" $?
+control new-privileges-allowed --user 65534:65534 --read-only --cap-drop ALL
+v "ST-05 control: a missing no-new-privileges is detected" $?
 
 get "$PA" /
 [ "$CODE" = 200 ] && case $TYPE in text/html*) true ;; *) false ;; esac && body_has '<div id="root">' && body_has '/@vite/client'
@@ -192,12 +244,25 @@ get "$PA" /api
 [ "$c1" = '404 application/problem+json' ] && [ "$nohtml" = 0 ] && [ "$CODE $TYPE" = '404 application/problem+json' ]
 v "ST-09 unknown API routes are problem documents, not the SPA" $?
 
-boundary=0
-for p in /index.php /health/other /_error/500 /bundles/x; do
-  get "$PA" "$p"
-  case $TYPE in text/html*) body_has '<div id="root">' || boundary=1 ;; *) boundary=1 ;; esac
+# ADR-017 boundary with raw request paths (curl --path-as-is): only /api,
+# /api/... and exactly /health/live and /health/ready reach Symfony.
+boundary() { # expected-layer path
+  get_raw "$PA" "$2"
+  local layer
+  layer=$(served_by)
+  if body_has 'An Error Occurred' || body_has 'symfony/error-handler' || body_has 'sf-toolbar'; then layer="$layer+symfony-error-page"; fi
+  [ "$layer" = "$1" ]
+  v "ST-10 $2 -> $1" $? "got $CODE $TYPE via $layer"
+}
+for p in //health/live /health//live //api/v1/system/status /health/live/ /API/v1/system/status /HEALTH/LIVE \
+  /health%2Flive /%68ealth/live /api%2Fv1/system/status /%61pi/v1/system/status /health/./live /health/live/.. \
+  /index.php /_error/500 /bundles/x /health/other /apix /api.php; do
+  boundary spa "$p"
 done
-[ "$boundary" = 0 ]; v "ST-10 other paths (/index.php, /health/other, /_error/500) never reach Symfony" $?
+for p in /api//v1/system/status /api/v1/does-not-exist /api/v1/%2e%2e/%2e%2e/health/live /api/../health/live; do
+  boundary symfony-problem "$p"
+done
+boundary symfony-json '/health/live?probe=1'
 
 get "$PA" /accounts/some/deep/link
 [ "$CODE" = 200 ] && body_has '<div id="root">'; v "ST-11 client-side routes fall back to the SPA" $?
@@ -311,6 +376,113 @@ ev "A=$(project_of "$A"):$PA B=$(project_of "$B"):$PB"
 
 dv b-down "$B" down
 until_ready "$PA" 200 5 && [ "$(rc_of b-down)" = 0 ]; v "ST-27 stopping checkout B leaves checkout A running" $?
+
+# --- secrets lost while the database volume exists (checkout B is down) ---
+
+mv "$B/.runtime/secrets" "$work/b-secrets"
+sum_b=$(cksum <"$B/.runtime/dev.env")
+dv b-nosecret "$B" up
+[ "$(rc_of b-nosecret)" = 6 ] && err_has b-nosecret "$(project_of "$B")_db-data was initialised with it" &&
+  [ ! -e "$B/.runtime/secrets/db_password" ] && [ -z "$(docker ps -aq --filter "label=com.docker.compose.project=$(project_of "$B")")" ] &&
+  [ "$(cksum <"$B/.runtime/dev.env")" = "$sum_b" ] && docker volume inspect "$(project_of "$B")_db-data" >/dev/null 2>&1
+v "ST-28 lost secrets with an existing volume: refused (exit 6), nothing generated or started, volume and state kept" $?
+ev "$(grep -m1 ERROR "$work/out/b-nosecret.err" | cut -c1-200)"
+rm -rf "$B/.runtime/secrets"
+mv "$work/b-secrets" "$B/.runtime/secrets"
+dv b-up2 "$B" up
+PB=$(saved_port "$B")
+[ "$(rc_of b-up2)" = 0 ] && until_ready "$PB" 200 10
+v "ST-29 restoring the secrets recovers the stack" $?
+dv b-down2 "$B" down
+
+# --- changes while running: no needless rebuilds, migrations applied ---------
+
+api0=$(cid "$A" api)
+printf '\n// stack test: an ordinary source edit\n' >>"$A/backend/src/Kernel.php"
+dv a-edit "$A" up
+[ "$(rc_of a-edit)" = 0 ] && err_has a-edit 'already running; nothing to change' && [ "$(cid "$A" api)" = "$api0" ]
+v "ST-30 a PHP source edit needs no rebuild: api not recreated, nothing to change" $?
+cat >"$A/backend/migrations/Version20991231000000.php" <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace DoctrineMigrations;
+
+use Doctrine\DBAL\Schema\Schema;
+use Doctrine\Migrations\AbstractMigration;
+
+final class Version20991231000000 extends AbstractMigration
+{
+    public function up(Schema $schema): void
+    {
+        $this->addSql('CREATE TABLE st_added_migration (id INT NOT NULL, PRIMARY KEY (id))');
+    }
+
+    public function down(Schema $schema): void
+    {
+        $this->addSql('DROP TABLE st_added_migration');
+    }
+}
+PHP
+dv a-migrate "$A" up
+[ "$(rc_of a-migrate)" = 0 ] && err_has a-migrate 'applied pending database migrations' && [ "$(cid "$A" api)" = "$api0" ] &&
+  [ "$(psql_in "$A" "SELECT to_regclass('st_added_migration') IS NOT NULL")" = t ] && until_ready "$PA" 200 5
+v "ST-31 a migration added while running is applied by make up, without recreating the api" $?
+dv a-noop "$A" up
+[ "$(rc_of a-noop)" = 0 ] && err_has a-noop 'already running; nothing to change'
+v "ST-32 the next make up changes nothing" $?
+printf '\n# stack test: a file baked into the image\n' >>"$A/backend/.env"
+dv a-rebuild "$A" up
+[ "$(rc_of a-rebuild)" = 0 ] && err_has a-rebuild 'recreated: api' && [ "$(cid "$A" api)" != "$api0" ] && until_ready "$PA" 200 10
+v "ST-33 a change to a file baked into the image is rebuilt and reported (recreated: api)" $?
+
+chmod 0755 "$A/.runtime/secrets"
+dv a-perm "$A" up
+[ "$(rc_of a-perm)" = 0 ] && [ "$(perm "$A/.runtime/secrets")" = 700 ]
+v "ST-34 a too-open secrets directory is restored to 0700 by make up" $?
+if sudo -n -u nobody true 2>/dev/null; then
+  if sudo -n -u nobody cat "$A/.runtime/secrets/db_password" >/dev/null 2>&1; then r=1; else r=0; fi
+  v "ST-34 another local user cannot read the secrets" $r
+else
+  say "      INFO ST-34 cross-user read check needs passwordless sudo (runs in CI)"
+fi
+
+# --- one checkout, two stacks: the other stack's commands are refused --------
+
+app_ids=$(for s in edge web api db; do cid "$A" "$s"; done)
+refused=''
+for cmd in up down restart status url logs; do
+  FLOWCRM_STACK=fixture dv "fx-$cmd" "$A" "$cmd"
+  [ "$(rc_of "fx-$cmd")" = 6 ] && err_has "fx-$cmd" 'containers of another stack' && err_has "fx-$cmd" 'FLOWCRM_STACK=app make down' ||
+    refused="$refused $cmd:$(rc_of "fx-$cmd")"
+done
+[ -z "$refused" ] && [ "$(for s in edge web api db; do cid "$A" "$s"; done)" = "$app_ids" ] && [ -z "$(cid_all "$A" state)" ] && until_ready "$PA" 200 5
+v "ST-35 app running: fixture up/down/restart/status/url/logs refused (exit 6), app untouched" $? "not refused:$refused"
+
+FLOWCRM_STACK=fixture dv fx-concurrent "$A" up &
+fx=$!
+dv a-concurrent "$A" restart
+wait "$fx"
+[ "$(rc_of a-concurrent)" = 0 ] && [ "$(rc_of fx-concurrent)" = 6 ] && [ -z "$(cid_all "$A" state)" ] && until_ready "$PA" 200 10
+v "ST-36 concurrent app restart and fixture up: app restarts, fixture refused" $? "app $(rc_of a-concurrent), fixture $(rc_of fx-concurrent)"
+
+dv a-down2 "$A" down
+FLOWCRM_STACK=fixture dv fx-up "$A" up
+fx_ids=$(for s in edge state; do cid "$A" "$s"; done)
+[ "$(rc_of fx-up)" = 0 ] && grep -q 'FlowCRM development fixture' "$work/out/fx-up.out" && [ -z "$(cid_all "$A" api)" ]
+v "ST-37 after app down the fixture starts in the same checkout" $?
+refused=''
+for cmd in up down restart status url logs; do
+  dv "ax-$cmd" "$A" "$cmd"
+  [ "$(rc_of "ax-$cmd")" = 6 ] && err_has "ax-$cmd" 'FLOWCRM_STACK=fixture make down' || refused="$refused $cmd:$(rc_of "ax-$cmd")"
+done
+[ -z "$refused" ] && [ "$(for s in edge state; do cid "$A" "$s"; done)" = "$fx_ids" ] && [ -z "$(cid_all "$A" api)" ]
+v "ST-38 fixture running: app up/down/restart/status/url/logs refused (exit 6), fixture untouched" $? "not refused:$refused"
+FLOWCRM_STACK=fixture dv fx-down "$A" down
+dv a-up5 "$A" up
+[ "$(rc_of fx-down)" = 0 ] && [ "$(rc_of a-up5)" = 0 ] && until_ready "$PA" 200 10 && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ]
+v "ST-39 back to the app: data kept, stack ready" $?
 
 # --- cleanup verification ---------------------------------------------------
 

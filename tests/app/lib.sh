@@ -10,6 +10,9 @@
 
 APP_REPO=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
 APP_CURL_IMAGE=curlimages/curl:8.17.0@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
+# The BusyBox image of compose.fixture.yaml, for throwaway control containers.
+# shellcheck disable=SC2034 # used by stack.sh
+APP_FIXTURE_IMAGE=busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 
 say() { printf '%s\n' "$*"; }
 ok() { pass_result "$1"; }
