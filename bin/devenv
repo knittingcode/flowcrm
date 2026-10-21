@@ -149,8 +149,12 @@ select_stack() {
       INTERNAL_SERVICES='db api web'
       COMPOSE_PROFILES_VALUE=dev
       READY_PATH=/health/ready
+      READY_BODY='{"status":"ready"}'
       LOG_SERVICES='edge web api db'
       SECRETS='db_password app_secret'
+      # The database volume was initialised with this secret.
+      SECRET_VOLUMES='db_password=db-data'
+      MIGRATIONS=1
       URL_LABEL='FlowCRM'
       ;;
     fixture)
@@ -158,8 +162,11 @@ select_stack() {
       INTERNAL_SERVICES=state
       COMPOSE_PROFILES_VALUE=
       READY_PATH=/health
+      READY_BODY=ok
       LOG_SERVICES='edge state'
       SECRETS=
+      SECRET_VOLUMES=
+      MIGRATIONS=
       URL_LABEL='FlowCRM development fixture'
       ;;
     *) die $EX_CONFIG "FLOWCRM_STACK must be app or fixture (got $(show "$STACK"))" ;;
@@ -197,19 +204,32 @@ new_tmp() { # prefix -> sets TMP_FILE (removed on exit)
 # with it.
 
 ensure_secrets() {
-  local name file tmp
+  local name file tmp volume
   [ -n "$SECRETS" ] || return 0
   ensure_runtime_dir
   [ ! -L "$SECRETS_DIR" ] || die $EX_SAFETY ".runtime/secrets is a symbolic link; refusing to use it"
-  if [ ! -d "$SECRETS_DIR" ]; then
+  if [ ! -e "$SECRETS_DIR" ]; then
     (umask 077 && mkdir "$SECRETS_DIR") || die $EX_SAFETY "cannot create $SECRETS_DIR"
   fi
+  [ -d "$SECRETS_DIR" ] && [ -O "$SECRETS_DIR" ] ||
+    die $EX_SAFETY ".runtime/secrets is not a directory owned by $(id -un); refusing to use it"
+  # Only the owner may list or read the secrets (a pre-existing 0755
+  # directory would expose the 0444 files to other local users).
+  chmod 0700 "$SECRETS_DIR" || die $EX_SAFETY "cannot restrict the permissions of $SECRETS_DIR"
   for name in $SECRETS; do
     file=$SECRETS_DIR/$name
     if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
       die $EX_SAFETY ".runtime/secrets/$name is not a regular file; refusing to use it"
     fi
-    if [ -s "$file" ]; then continue; fi
+    if [ -s "$file" ]; then
+      [ -O "$file" ] || die $EX_SAFETY ".runtime/secrets/$name is not owned by $(id -un); refusing to use it"
+      chmod 0444 "$file" || die $EX_SAFETY "cannot set the permissions of .runtime/secrets/$name"
+      continue
+    fi
+    volume=$(bound_volume "$name")
+    if [ -n "$volume" ] && docker volume inspect "${PROJECT}_$volume" >/dev/null 2>&1; then
+      die $EX_SAFETY ".runtime/secrets/$name is missing, but the volume ${PROJECT}_$volume was initialised with it; a new secret would not match, so none was generated. Restore .runtime/secrets/$name from a backup, or reset the data deliberately as described in README.md (Data persistence and reset), which deletes it"
+    fi
     tmp=$(mktemp "$SECRETS_DIR/.$name.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in $SECRETS_DIR"
     TMP_FILE=$tmp
     if ! od -An -N24 -tx1 /dev/urandom | tr -d ' \n' >"$tmp" || [ ! -s "$tmp" ] ||
@@ -219,6 +239,14 @@ ensure_secrets() {
     TMP_FILE=
     log "generated the local secret .runtime/secrets/$name"
   done
+}
+
+bound_volume() { # secret name: the volume initialised with it, if any
+  local pair
+  for pair in $SECRET_VOLUMES; do
+    [ "${pair%%=*}" = "$1" ] && printf '%s' "${pair#*=}" && return 0
+  done
+  return 0
 }
 
 # --- runtime state (parsed as data; never sourced) --------------------------
@@ -583,17 +611,29 @@ require_owned_project() {
   if [ "$STATE_STATUS" = foreign ]; then
     die $EX_SAFETY ".runtime/dev.env names project $STATE_PROJECT but this checkout is $PROJECT; if it was copied from another checkout, delete .runtime/dev.env"
   fi
-  local out id wd
+  local out id wd files
   out=$(docker ps --all --filter "label=com.docker.compose.project=$PROJECT" \
-    --format '{{.ID}} {{.Label "com.docker.compose.project.working_dir"}}') ||
+    --format '{{.ID}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}') ||
     die $EX_DOCKER "could not list containers"
-  while read -r id wd; do
+  while IFS='|' read -r id wd files; do
     [ -n "$id" ] || continue
     [ "$wd" = "$ROOT" ] ||
       die $EX_SAFETY "container $id uses project name $PROJECT but belongs to $(show "$wd"); refusing to manage it"
+    # Both stacks share the project name of the checkout; the Compose file
+    # recorded on each container tells them apart.
+    [ "$files" = "$COMPOSE_FILE" ] ||
+      die $EX_SAFETY "project $PROJECT has containers of another stack (container $id from $(show "${files##*/}")); this command manages FLOWCRM_STACK=$STACK ($COMPOSE_FILE_NAME). Stop them first with: FLOWCRM_STACK=$(stack_of_file "$files") make down"
   done <<EOF
 $out
 EOF
+}
+
+stack_of_file() { # compose file path: the stack that uses it
+  case ${1##*/} in
+    compose.yaml) printf app ;;
+    compose.fixture.yaml) printf fixture ;;
+    *) printf unknown ;;
+  esac
 }
 
 # Sets EDGE_ID, EDGE_RUNNING (true|false), EDGE_HEALTH and EDGE_PORT.
@@ -620,12 +660,20 @@ port_in_use() {
   return 1
 }
 
+# The readiness path must answer 200 with the stack's own body: any other
+# 200 (for example the SPA of the other stack) is not this stack's readiness.
 http_ok() {
   (
     exec 3<>"/dev/tcp/$BIND/$1" || exit 1
     printf 'GET %s HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$READY_PATH" "$BIND" "$1" >&3
     IFS= read -r -t 5 line <&3 || exit 1
-    case $line in "HTTP/1."[01]" 200"*) exit 0 ;; esac
+    case $line in "HTTP/1."[01]" 200"*) ;; *) exit 1 ;; esac
+    while IFS= read -r -t 5 line <&3; do
+      case $line in '' | $'\r') break ;; esac
+    done
+    body=
+    IFS= read -r -t 5 body <&3 || [ -n "$body" ] || exit 1
+    case $body in *"$READY_BODY"*) exit 0 ;; esac
     exit 1
   ) 2>/dev/null
 }
@@ -669,6 +717,48 @@ start_internal() {
   fi
   rm -f "$TMP_FILE"
   TMP_FILE=
+}
+
+# Applies pending Doctrine migrations in the running api container, under
+# the lock and in a recorded process group like every other mutating call.
+# Sets MIGRATED=1 when migrations were applied.
+apply_migrations() {
+  local rc
+  MIGRATED=
+  [ -n "$MIGRATIONS" ] || return 0
+  new_tmp compose-err
+  compose_op exec -T api php bin/console doctrine:migrations:up-to-date --no-interaction >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "applying pending database migrations"
+    compose_op exec -T api php bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration --all-or-nothing >/dev/null 2>"$TMP_FILE"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      tail -n 20 "$TMP_FILE" >&2
+      die $EX_DOCKER "applying the database migrations failed: $(compose_failure "$rc"); the saved state was not changed; see make logs SERVICE=api"
+    fi
+    MIGRATED=1
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
+# "service=container-id" lines of this project, for change reports.
+service_ids() {
+  compose ps --all --format '{{.Service}}={{.ID}}' 2>/dev/null | sort
+}
+
+# Services whose container is new or was replaced since BEFORE.
+changed_services() { # before
+  local line names=''
+  for line in $(service_ids); do
+    case "
+$1
+" in *"
+$line
+"*) ;; *) names="${names:+$names }${line%%=*}" ;; esac
+  done
+  printf '%s' "$names"
 }
 
 # Returns 0 started, 1 port conflict, 2 other failure (details in
@@ -717,14 +807,16 @@ report_url() { printf '%s: http://%s:%s\n' "$URL_LABEL" "$BIND" "$1"; }
 # --- commands ---------------------------------------------------------------
 
 do_up() {
-  local c rc deadline own='' restore='' skipped=''
+  local c rc deadline own='' restore='' skipped='' before changed
   case $STATE_STATUS in
     invalid) log "ignoring invalid .runtime/dev.env (it is replaced after a verified start)" ;;
   esac
   COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
   ensure_secrets
+  before=$(service_ids)
   build_images
   start_internal
+  apply_migrations
   edge_state
 
   if [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ] && eligible "$EDGE_PORT"; then
@@ -734,7 +826,12 @@ do_up() {
           log "saved port $STATE_PORT did not match the running edge ($EDGE_PORT); saved state updated"
         write_state "$EDGE_PORT"
       fi
-      log "already running; nothing to change"
+      changed=$(changed_services "$before")
+      if [ -z "$changed$MIGRATED" ]; then
+        log "already running; nothing to change"
+      else
+        log "running; ${changed:+recreated: $changed (image or configuration changed)}${changed:+${MIGRATED:+; }}${MIGRATED:+applied pending database migrations}"
+      fi
       report_url "$EDGE_PORT"
       return 0
     fi

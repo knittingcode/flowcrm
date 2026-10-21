@@ -673,62 +673,147 @@ result "U-15 application log services are an exact allow-list" $?
 [ "$(report_url 18080)" = "FlowCRM: http://127.0.0.1:18080" ]
 result "U-15 the URL label follows the stack" $?
 
-# http_ok requests the stack's readiness path: a local server answers 200
-# only for /health/ready.
+# http_ok requests the stack's readiness path and requires the stack's own
+# body: one local server answers like the application (/health/ready) and
+# the fixture (/health); another answers every path with an SPA page.
 cat >"$work/ready_server.py" <<'PYSERVER'
 import http.server, sys
+mode = sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200 if self.path == "/health/ready" else 404)
+        if mode == "spa":
+            status, body = 200, b"<!doctype html><div id=root></div>"
+        elif self.path == "/health/ready":
+            status, body = 200, b'{"status":"ready"}'
+        elif self.path == "/health":
+            status, body = 200, b"ok\n"
+        else:
+            status, body = 404, b"not found"
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
     def log_message(self, *args):
         pass
 server = http.server.HTTPServer(("127.0.0.1", 0), H)
 open(sys.argv[1], "w").write(str(server.server_address[1]))
 server.serve_forever()
 PYSERVER
-python3 "$work/ready_server.py" "$work/ready.port" &
+python3 "$work/ready_server.py" "$work/ready.port" stacks &
 bg_pids="$bg_pids $!"
-wait_file "$work/ready.port"
+python3 "$work/ready_server.py" "$work/spa.port" spa &
+bg_pids="$bg_pids $!"
+wait_file "$work/ready.port" && wait_file "$work/spa.port"
 ready_port=$(cat "$work/ready.port")
+spa_port=$(cat "$work/spa.port")
 http_ok "$ready_port"
-result "U-15 application readiness requests /health/ready" $?
+result "U-15 application readiness: /health/ready with the application's body" $?
+if http_ok "$spa_port"; then r=1; else r=0; fi
+result "U-15 application readiness rejects a 200 with another body (SPA)" $r
 FLOWCRM_STACK=fixture select_stack
-if http_ok "$ready_port"; then r=1; else r=0; fi
-result "U-15 fixture readiness requests /health (404 here: not ready)" $r
+http_ok "$ready_port"
+result "U-15 fixture readiness: /health with the fixture's body" $?
+if http_ok "$spa_port"; then r=1; else r=0; fi
+result "U-15 fixture readiness rejects a 200 with another body (the application's SPA)" $r
 unset FLOWCRM_STACK
 select_stack
 
+# Stack identity: a fake docker lists one container of this project.
+mkdir -p "$work/fakeps"
+printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_PS"\n' >"$work/fakeps/docker"
+chmod +x "$work/fakeps/docker"
+# shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
+owned_rc() { # "id|working_dir|config_files" line
+  (
+    PATH=$work/fakeps:$PATH FAKE_PS=$1 STATE_STATUS=absent
+    export FAKE_PS
+    require_owned_project
+  ) >/dev/null 2>"$work/owned.err"
+  echo $?
+}
+expect_eq "U-15 a container of this checkout and stack is accepted" 0 "$(owned_rc "c1|$ROOT|$ROOT/compose.yaml")"
+expect_eq "U-15 a container of the fixture stack is refused for the application" "$EX_SAFETY" "$(owned_rc "c1|$ROOT|$ROOT/compose.fixture.yaml")"
+grep -q 'FLOWCRM_STACK=fixture make down' "$work/owned.err"
+result "U-15 the refusal names the stack that owns the containers" $? "($(cat "$work/owned.err"))"
+FLOWCRM_STACK=fixture select_stack
+COMPOSE_FILE=$ROOT/$COMPOSE_FILE_NAME
+expect_eq "U-15 a container of the application stack is refused for the fixture" "$EX_SAFETY" "$(owned_rc "c1|$ROOT|$ROOT/compose.yaml")"
+grep -q 'FLOWCRM_STACK=app make down' "$work/owned.err"
+result "U-15 ... and names the application stack" $?
+unset FLOWCRM_STACK
+select_stack
+COMPOSE_FILE=$ROOT/$COMPOSE_FILE_NAME
+expect_eq "U-15 a container without a recorded Compose file is refused" "$EX_SAFETY" "$(owned_rc "c1|$ROOT|")"
+expect_eq "U-15 a container of another checkout is still refused" "$EX_SAFETY" "$(owned_rc "c1|/elsewhere|$ROOT/compose.yaml")"
+
 # --- U-16 generated secrets
+# A fake docker answers `docker volume inspect` (FAKE_VOLUME=exists or not),
+# so the tests never look at this checkout's real database volume.
+mkdir -p "$work/fakevol"
+printf '#!/bin/sh\n[ "$FAKE_VOLUME" = exists ]\n' >"$work/fakevol/docker"
+chmod +x "$work/fakevol/docker"
+# shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
+secrets_rc() { # volume-state: runs ensure_secrets, prints its exit code
+  (
+    PATH=$work/fakevol:$PATH FAKE_VOLUME=$1
+    export FAKE_VOLUME
+    ensure_secrets
+  ) >/dev/null 2>"$work/secrets.err"
+  echo $?
+}
 RUNTIME_DIR=$work/rt16 SECRETS_DIR=$work/rt16/secrets
 mode_of() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
-(ensure_secrets) 2>/dev/null
-r=$?
+r=$(secrets_rc absent)
 [ "$r" = 0 ] && [ "$(mode_of "$SECRETS_DIR")" = 700 ] && [ "$(mode_of "$SECRETS_DIR/db_password")" = 444 ] &&
   [ "$(mode_of "$SECRETS_DIR/app_secret")" = 444 ]
 result "U-16 secrets created: directory 0700, files 0444" $? "(rc $r)"
 [[ $(cat "$SECRETS_DIR/db_password") =~ ^[0-9a-f]{48}$ ]] && [ "$(cat "$SECRETS_DIR/db_password")" != "$(cat "$SECRETS_DIR/app_secret")" ]
 result "U-16 each secret is 192 random bits, distinct" $?
 before=$(cat "$SECRETS_DIR/db_password")
-(ensure_secrets) 2>/dev/null
-[ "$(cat "$SECRETS_DIR/db_password")" = "$before" ] && [ -z "$(find "$SECRETS_DIR" -name '.*' -type f)" ]
-result "U-16 an existing secret is never replaced; no temporary files" $?
+r=$(secrets_rc exists)
+[ "$r" = 0 ] && [ "$(cat "$SECRETS_DIR/db_password")" = "$before" ] && [ -z "$(find "$SECRETS_DIR" -name '.*' -type f)" ]
+result "U-16 an existing secret is never replaced; no temporary files" $? "(rc $r)"
+chmod 0755 "$SECRETS_DIR"
+chmod 0644 "$SECRETS_DIR/db_password"
+r=$(secrets_rc exists)
+[ "$r" = 0 ] && [ "$(mode_of "$SECRETS_DIR")" = 700 ] && [ "$(mode_of "$SECRETS_DIR/db_password")" = 444 ]
+result "U-16 a too-open secrets directory and secret file are tightened (0700, 0444)" $? "(rc $r)"
+if sudo -n -u nobody true 2>/dev/null; then
+  if sudo -n -u nobody cat "$SECRETS_DIR/db_password" >/dev/null 2>&1; then r=1; else r=0; fi
+  result "U-16 another local user (nobody) cannot read a secret" $r
+else
+  printf 'INFO  U-16 cross-user read check needs passwordless sudo (runs in CI); permissions checked above\n'
+fi
+rm -f "$SECRETS_DIR/db_password"
+r=$(secrets_rc exists)
+[ "$r" = "$EX_SAFETY" ] && [ ! -e "$SECRETS_DIR/db_password" ] && grep -q "db-data was initialised with it" "$work/secrets.err" &&
+  grep -q 'Data persistence and reset' "$work/secrets.err"
+result "U-16 missing database secret with an existing volume: refused, nothing generated, recovery explained" $? "(rc $r)"
+r=$(secrets_rc absent)
+[ "$r" = 0 ] && [ -s "$SECRETS_DIR/db_password" ] && [ "$(cat "$SECRETS_DIR/db_password")" != "$before" ]
+result "U-16 without a volume the missing database secret is generated" $? "(rc $r)"
+rm -f "$SECRETS_DIR/app_secret"
+r=$(secrets_rc exists)
+[ "$r" = 0 ] && [ -s "$SECRETS_DIR/app_secret" ]
+result "U-16 a secret not bound to a volume is regenerated even if the volume exists" $? "(rc $r)"
 rm -f "$SECRETS_DIR/app_secret"
 ln -s "$work/target" "$SECRETS_DIR/app_secret"
-(ensure_secrets) 2>/dev/null
-expect_eq "U-16 a symlinked secret is refused" "$EX_SAFETY" "$?"
+expect_eq "U-16 a symlinked secret is refused" "$EX_SAFETY" "$(secrets_rc absent)"
 rm -rf "$work/rt16"
 mkdir -p "$work/rt16" "$work/elsewhere"
 ln -s "$work/elsewhere" "$SECRETS_DIR"
-(ensure_secrets) 2>/dev/null
-r=$?
+r=$(secrets_rc absent)
 [ "$r" = "$EX_SAFETY" ] && [ -z "$(ls -A "$work/elsewhere")" ]
 result "U-16 a symlinked secrets directory is refused" $? "(rc $r)"
+rm -f "$SECRETS_DIR"
+: >"$SECRETS_DIR"
+expect_eq "U-16 a secrets path that is not a directory is refused" "$EX_SAFETY" "$(secrets_rc absent)"
+rm -f "$SECRETS_DIR"
 FLOWCRM_STACK=fixture select_stack
 rm -rf "$work/rt16"
-(ensure_secrets) 2>/dev/null && [ ! -e "$SECRETS_DIR" ]
+[ "$(secrets_rc absent)" = 0 ] && [ ! -e "$SECRETS_DIR" ]
 result "U-16 the fixture stack needs no secrets" $?
 unset FLOWCRM_STACK
 select_stack
