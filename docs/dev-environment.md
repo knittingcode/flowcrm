@@ -168,13 +168,31 @@ Mutating commands (`up`, `down`, `restart`) take a per-checkout lock,
 to `FLOWCRM_LOCK_WAIT` seconds and then sees the result of the first (for
 `up`: "already running").
 
-The lock records host, boot id, PID, the PID's start time and a random
-token. It is removed automatically only when it provably belongs to a dead
-process on this host (or to a previous boot); a reused PID is detected
-through its start time. A lock from another host is never removed
-automatically. Ctrl-C or `SIGTERM` releases the lock; after `SIGKILL` the
-next command removes the stale lock. The saved state is never left half
-written.
+The lock records host, PID, the PID's start identity and a random token.
+The start identity does not depend on the caller's locale or time zone: on
+Linux it is the kernel boot id plus the start time in clock ticks since boot
+(`/proc/<pid>/stat`), elsewhere `ps -o lstart` rendered with `LC_ALL=C` and
+`TZ=UTC0`. A reused PID, including one after a reboot, has a different
+identity.
+
+While a command holds the lock, each `docker compose` call runs as a
+recorded child: `bin/devenv` writes the child's PID and start identity to
+`.runtime/lock/op` and then executes Docker in that same process. `SIGKILL`
+does not stop that child, so the lock counts as stale only when **both**
+the owner and its last recorded Docker command provably ended. Until then a
+second `up`, `down` or `restart` waits up to `FLOWCRM_LOCK_WAIT` seconds
+("Docker command pid … of the ended devenv pid … is still running") and
+then fails with exit 4; it never runs Compose alongside the orphan.
+
+A lock whose owner or command record is missing a field, malformed, or
+cannot be compared on this platform is never removed automatically (exit 4
+after the wait); a lock directory without an owner record is removed once it
+is older than a minute. A lock from another host is never removed
+automatically. Ctrl-C or `SIGTERM` releases the lock after the running
+Docker command returns; after `SIGKILL` the next command removes the lock
+once the orphaned Docker command has finished. The saved state is never left
+half written, and a Docker command that finished without its owner does not
+change it: the next `up` verifies and saves the actual mapping.
 
 ## Diagnostics
 
@@ -201,7 +219,7 @@ shows this project's logs (`edge` logs each HTTP request).
 | `internal services failed to start` (exit 2) | the unpublished services failed; no port was involved |
 | `Docker daemon is not reachable` (exit 5) | start Docker Desktop or the Docker service |
 | `waiting for another devenv command` | another command runs in this checkout; it is waited for |
-| `holds .runtime/lock … gave up` (exit 4) | a command is still running, or a lock from another host; remove `.runtime/lock` only if no command runs |
+| `holds .runtime/lock … gave up` (exit 4) | a command, or the Docker command of a killed one, is still running, or a lock from another host or an unreadable lock; remove `.runtime/lock` only if no devenv or `docker compose` command of this checkout runs |
 | refused with exit 6 | resources of another checkout; see the message |
 
 ## macOS and Linux
@@ -224,14 +242,24 @@ $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
 
 - `tests/devenv/unit.sh` covers configuration validation, candidate order,
   state parsing and writing, failure classification, project naming and
-  the lock (including stale, reused-PID, foreign-host and reap-guard cases).
-- `tests/devenv/integration.sh` runs scenarios PA-01 to PA-20 and the
+  the lock (stale, reused-PID, foreign-host, reap-guard and malformed
+  records; real lock holders in other locales and time zones; a recorded
+  child that survives `SIGKILL` of its owner) and checks that the result
+  tally detects failed and lost results.
+- `tests/devenv/integration.sh` runs scenarios PA-01 to PA-21 and the
   Makefile targets against real Docker in temporary checkout copies. It uses
   the 20-port block starting at `DEVENV_TEST_PORT_BASE` (default 8080) and
   skips with exit 77 if any of those ports is in use, so it never competes
   with running stacks. It removes only the containers, volumes and networks
   it created (checked by label) and verifies that pre-existing containers,
-  volumes and networks are unchanged.
+  volumes and networks are unchanged. PA-16 kills `up` with `SIGKILL` while
+  its `docker compose up --wait` blocks on a gated health check and verifies
+  that `up`, `down` and `restart` are refused until the orphan finished;
+  PA-21 holds the lock under `pl_PL.UTF-8`/`TZ=JST-9` and checks it from
+  other locales and time zones.
+- Both suites compare the printed PASS/FAIL records with their counters and
+  exit 2 on a mismatch; a scenario without results or a failed setup step
+  counts as a failure.
 
 Both suites run locally on macOS (Docker Desktop, bash 3.2) and in GitHub
 Actions on Ubuntu (Docker Engine, bash 5) in the `Dev environment` job.
