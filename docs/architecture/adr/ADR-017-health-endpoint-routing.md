@@ -30,11 +30,22 @@ The edge forwards exactly these requests to Symfony (PHP-FPM):
 | `/health/live` | liveness: the PHP process answers; no dependency is touched |
 | `/health/ready` | readiness: PostgreSQL answers `SELECT 1` and no migration is pending or unknown |
 
-The two health paths are matched **exactly**. No other path outside `/api`
-reaches Symfony: `/health/other`, `/index.php`, `/_error/*`, `/bundles/*` and
-every other path are answered by the frontend (the Vite dev server in
-development, the built SPA in production-like images). The rule is in
-`docker/edge/common.caddy` and applies to both edge configurations.
+The decision is made on the **raw request URI** as the client sent it
+(`{http.request.orig_uri}`), with two anchored, case-sensitive regular
+expressions: `^/api(/[^?]*)?([?].*)?$` and `^/health/(live|ready)([?].*)?$`.
+No other path reaches Symfony: `//api/…`, `/health//live`, `/health/live/`,
+`/HEALTH/LIVE`, `/health%2Flive`, `/%61pi/…`, `/health/./live`, `/index.php`,
+`/_error/*`, `/bundles/*` and every other path are answered by the frontend
+(the Vite dev server in development, the built SPA in production-like
+images). The rule is in `docker/edge/common.caddy` and applies to both edge
+configurations.
+
+Caddy's `path` and `path_regexp` matchers are **not** used for this rule:
+they match a cleaned path (repeated slashes merged, dot segments resolved,
+percent-encoding decoded), and `path` also ignores case. With them, the
+variants above reached Symfony and received Symfony's error pages
+(FCRM-FND-004V finding F-02). Raw paths that start with `/api/` stay inside
+the API: Symfony answers them, unknown ones as an RFC 9457 problem document.
 
 The health responses contain a single status word (`{"status":"live"}`,
 `{"status":"ready"}` or `{"status":"not-ready"}`), are sent with
@@ -52,9 +63,13 @@ API (stderr) only.
 - The exception is limited to two fixed, read-only, unauthenticated GET/HEAD
   endpoints without business data. Any further non-`/api` route needs its own
   decision.
-- The boundary is tested: `tests/app/stack.sh` (ST-09, ST-10) and
-  `tests/app/prodlike.sh` (PL-08, PL-10) check that unknown `/api` paths are
-  problem documents and that other paths never reach Symfony.
+- The boundary is tested with raw request paths (`curl --path-as-is`):
+  `tests/app/stack.sh` (ST-09, ST-10) and `tests/app/prodlike.sh` (PL-08,
+  PL-10, PL-12, PL-13) send every variant above and identify the serving layer
+  by the `X-Request-Id` response header, which only Symfony sets.
+- A non-GET request to a health path reaches Symfony and is answered with
+  405 (an HTML error page; without details when `APP_DEBUG=0`). This is
+  accepted: the method does not widen the set of reachable endpoints.
 
 ## Alternatives considered
 

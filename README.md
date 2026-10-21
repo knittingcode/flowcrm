@@ -79,7 +79,7 @@ devenv: building images (the first build can take several minutes)
 FlowCRM: http://127.0.0.1:8080
 ```
 
-`make up` builds the images, starts PostgreSQL, the API (which applies pending database migrations) and the Vite dev server, then starts Caddy on the first free port of 8080–8099. It reports success only after Docker's actual port mapping and `GET /health/ready` through the edge have been verified. Open the printed URL in a browser.
+`make up` builds the images, starts PostgreSQL, the API and the Vite dev server, applies pending database migrations, then starts Caddy on the first free port of 8080–8099. It reports success only after Docker's actual port mapping and `GET /health/ready` through the edge have been verified. Open the printed URL in a browser.
 
 The database password and the Symfony secret are generated per checkout in `.runtime/secrets/` (git-ignored); no credentials are stored in the repository.
 
@@ -115,12 +115,12 @@ All requests go through the URL printed by `make up`:
 ### Development workflow
 
 - **Frontend:** `frontend/src`, `frontend/public` and `frontend/index.html` are mounted into the Vite container; changes appear immediately through hot module replacement over the same Caddy origin.
-- **Backend:** `backend/src`, `config`, `migrations` and `public` are mounted read-only into the API container; PHP changes apply on the next request.
-- **Dependencies or Dockerfiles changed** (`composer.json`, `package.json`, `docker/`): run `make restart`, which rebuilds the images.
+- **Backend:** `backend/src`, `config`, `migrations` and `public` are mounted read-only into the API container; PHP changes apply on the next request, and `make up` neither rebuilds nor recreates anything for them.
+- **Dependencies or Dockerfiles changed** (`composer.json`, `package.json`, `docker/`, `backend/.env`, `backend/bin`): run `make up` (or `make restart`); the images are rebuilt and `make up` reports which services it recreated.
 
 ### Database migrations
 
-Migrations live in `backend/migrations` (Doctrine Migrations). The API container applies pending migrations when it starts (`doctrine:migrations:migrate --all-or-nothing`); the command is idempotent, and a failing migration stops `make up` with exit 2. `/health/ready` reports `not-ready` while a migration is pending. To run a console command:
+Migrations live in `backend/migrations` (Doctrine Migrations). Every `make up` applies pending migrations in the running API container (`doctrine:migrations:migrate --all-or-nothing`), also for a migration added while the stack runs; the command is idempotent, and a failing migration stops `make up` with exit 2. `/health/ready` reports `not-ready` while a migration is pending. To run a console command:
 
 ```console
 $ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" exec api php bin/console doctrine:migrations:status
@@ -136,7 +136,7 @@ $ docker volume rm "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)_db-
 $ make up
 ```
 
-Keep `.runtime/secrets/` as long as the volume exists: the database was initialised with that password.
+Keep `.runtime/secrets/` as long as the volume exists: the database was initialised with that password. If it is lost, `make up` refuses to start rather than generating a non-matching password.
 
 ## Tests
 
@@ -147,6 +147,7 @@ $ tests/app/backend.sh    # composer validate/audit, PHP-CS-Fixer, PHPStan, migr
 $ tests/app/frontend.sh   # npm audit, type check, ESLint, Vitest, production build
 $ tests/app/stack.sh      # real stack via bin/devenv: routing, health, persistence, isolation, browser
 $ tests/app/prodlike.sh   # production-like stack: built SPA, caching, CSP, browser
+$ tests/app/scan.sh       # Trivy scan: runtime images must have no HIGH/CRITICAL findings
 ```
 
 The application tests run in their own Compose projects (`<project>-test`, `<project>-prod`, or temporary checkout copies) and remove only what they created. The same scripts run in the `Dev environment` job of GitHub Actions.
@@ -158,7 +159,8 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 | `make up` fails with exit 2 while starting the internal services | `make logs SERVICE=api` (for example a failing migration) or `SERVICE=db` |
 | `does not answer /health/ready with 200` | the API is up but not ready: check `make logs SERVICE=api` for the logged reason |
 | A dependency or Dockerfile change has no effect | `make restart` rebuilds the images |
-| The database rejects the password after `.runtime/` was deleted | the volume was initialised with the old secret: reset the database (see above) |
+| `.runtime/secrets/db_password is missing, but the volume … was initialised with it` (exit 6) | restore `.runtime/secrets` from a backup, or reset the database (see above); `make up` never generates a password that would not match |
+| `project … has containers of another stack` (exit 6) | `FLOWCRM_STACK=fixture` and the application share a checkout's project; stop the other one with the command shown |
 | More symptoms | see [docs/dev-environment.md](docs/dev-environment.md#failure-scenarios) |
 
 ## Known limitations

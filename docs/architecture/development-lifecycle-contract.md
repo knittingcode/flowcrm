@@ -177,13 +177,19 @@ The two stacks use different paths:
   checks only that PHP-FPM serves requests; the API's Compose health check
   calls it over FastCGI and the edge's health check through the edge.
 
-**Migrations:** the API container runs
+**Migrations:** in development, `make up` applies them as its own phase,
+after the internal services are healthy and before the edge starts: it runs
+`doctrine:migrations:up-to-date` and, if migrations are pending,
 `doctrine:migrations:migrate --no-interaction --allow-no-migration --all-or-nothing`
-before PHP-FPM starts (`FLOWCRM_MIGRATE_ON_START=1`). The command is
-idempotent; a failed migration stops the container, so `make up` fails while
-starting the internal services and keeps the saved state. An existing
-database is never re-initialised. ADR-017 records why the two health paths
-are the only non-`/api` routes that reach Symfony.
+in the running `api` container, under the lock and in a recorded process
+group like every other mutating call. A migration added while the stack runs
+is therefore applied by the next `make up` without recreating a container. A
+failed migration stops `make up` with exit 2 and keeps the saved state. The
+production-like images instead migrate in the container entrypoint
+(`FLOWCRM_MIGRATE_ON_START=1`). An existing database is never
+re-initialised. ADR-017 records why the two health paths are the only
+non-`/api` routes that reach Symfony, and how the edge matches them on the
+raw request URI.
 
 ## 7. Persistent data
 
@@ -221,6 +227,10 @@ apply unchanged to FND-004. Read-only commands (`status`, `url`, `ports`,
 - All of them run as steps of the required `Dev environment` job, so a
   failing application check fails a required check; no ruleset change is
   needed. The names `Repository guard` and `Dev environment` must not change.
+- `tests/app/scan.sh` scans the built images with Trivy in the same job:
+  runtime images fail on any HIGH or CRITICAL finding (exceptions only per
+  CVE, with expiry, in `security/trivyignore.yaml`); development images are
+  reported ([container vulnerabilities](../security/container-vulnerabilities.md)).
 - Image references stay pinned by digest; actions stay pinned by commit.
 
 ## 10. Stack configuration
@@ -235,15 +245,27 @@ project prefix (ADR-009). An invalid `FLOWCRM_STACK` is rejected with exit
 | Compose file | `compose.fixture.yaml` | `compose.yaml` |
 | Internal services | `state` | `db api web` |
 | `COMPOSE_PROFILES` | (empty) | `dev` |
-| Readiness path | `/health` | `/health/ready` |
+| Readiness path and required body | `/health`, `ok` | `/health/ready`, `{"status":"ready"}` |
 | `logs` services (exact allow-list) | `edge`, `state` | `edge`, `web`, `api`, `db` |
 | Generated secrets | none | `db_password`, `app_secret` |
+| Secret bound to a volume | none | `db_password` ↔ `db-data` |
+| Migration phase | no | yes |
 | URL label | `FlowCRM development fixture` | `FlowCRM` |
 
 Secrets are created in `.runtime/secrets/` (directory `0700`, files `0444`
 so the unprivileged container users can read the mounted copy) only when
 missing; an existing secret is never replaced, because the database volume
-was initialised with it (unit tests U-16).
+was initialised with it. The directory and files must be owned by the user
+running `make`; their modes are enforced on every `make up`. A missing
+volume-bound secret is not regenerated while its volume exists (exit 6, unit
+tests U-16, ST-28).
+
+**Stack identity.** Both stacks share the project name of the checkout, so a
+checkout runs one stack at a time. Every command compares the Compose file
+recorded on the project's containers
+(`com.docker.compose.project.config_files`) with the selected stack's file
+and refuses with exit 6 on a mismatch (unit tests U-15; ST-35 to ST-38), and
+readiness requires the stack's own body.
 
 ## 11. Boundary between FND-003, FND-004 and later tasks
 
