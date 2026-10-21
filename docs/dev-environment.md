@@ -79,8 +79,10 @@ Candidates, in order, without duplicates:
 For each candidate, a TCP connect to `127.0.0.1` and `::1` skips ports on
 which something already accepts connections. That probe is only a hint:
 the candidate is accepted only when Docker actually binds it. If Docker
-reports a port conflict (`port is already allocated`, `address already in
-use`, `Ports are not available`), the next candidate is tried. **Every**
+reports a port conflict (`port is already allocated` or `address already in
+use`), the next candidate is tried; `Ports are not available` without one of
+these (Docker Desktop also uses it for permission errors) is not a conflict.
+A `docker compose` call that was terminated by a signal is never a conflict. **Every**
 candidate of the range is considered; the only other limit is the overall
 time budget `FLOWCRM_UP_TIMEOUT`. Any other Docker failure (for example the
 edge exits or never becomes healthy) stops immediately with exit 2 and no
@@ -175,22 +177,41 @@ Linux it is the kernel boot id plus the start time in clock ticks since boot
 `TZ=UTC0`. A reused PID, including one after a reboot, has a different
 identity.
 
-While a command holds the lock, each `docker compose` call runs as a
-recorded child: `bin/devenv` writes the child's PID and start identity to
-`.runtime/lock/op` and then executes Docker in that same process. `SIGKILL`
-does not stop that child, so the lock counts as stale only when **both**
-the owner and its last recorded Docker command provably ended. Until then a
-second `up`, `down` or `restart` waits up to `FLOWCRM_LOCK_WAIT` seconds
-("Docker command pid … of the ended devenv pid … is still running") and
-then fails with exit 4; it never runs Compose alongside the orphan.
+While a command holds the lock, each mutating `docker compose` call (`up`,
+`down`, `rm`) runs as a recorded process group: `bin/devenv` starts it as
+the leader of a new process group, writes its PID, start identity and
+process group to `.runtime/lock/op` and then executes Docker in that same
+process. The Docker CLI and the Compose plugin it starts (a child process)
+share that group. `SIGKILL` of `bin/devenv` or of the Docker CLI does not
+stop the plugin, so:
+
+- after such a call returns, `bin/devenv` waits until every member of the
+  group has ended before it continues or releases the lock (at most
+  `FLOWCRM_LOCK_WAIT` seconds; then it fails with exit 4 and **keeps** the
+  lock, "Docker Compose processes … are still running");
+- another command treats the lock as active while the owner, the recorded
+  leader or any member of its process group runs. A second `up`, `down` or
+  `restart` waits up to `FLOWCRM_LOCK_WAIT` seconds ("Docker command pid … is
+  still running" or "Docker Compose processes in process group … are still
+  running") and then fails with exit 4; it never runs Compose alongside
+  them.
+
+A process group ID is not reused while the group has members, so a member of
+the recorded group belongs to the recorded operation; no process names or
+command lines are matched. Read-only commands (`status`, `url`, `ports`,
+`logs`) take no lock and are not recorded.
 
 A lock whose owner or command record is missing a field, malformed, or
 cannot be compared on this platform is never removed automatically (exit 4
-after the wait); a lock directory without an owner record is removed once it
-is older than a minute. A lock from another host is never removed
-automatically. Ctrl-C or `SIGTERM` releases the lock after the running
-Docker command returns; after `SIGKILL` the next command removes the lock
-once the orphaned Docker command has finished. The saved state is never left
+after the wait). A live owner recorded by an older `bin/devenv` (no
+canonical start identity) is reported as such; once that process has ended
+the lock is removed automatically. A lock directory without an owner record
+is removed once it is older than a minute. A lock from another host is never
+removed automatically. Ctrl-C, `SIGTERM` and `SIGHUP` are forwarded to the
+running Docker Compose process group at once; the command exits (130, 143,
+129) and releases the lock after that group has ended. After `SIGKILL` the
+next command removes the lock once the orphaned Docker Compose processes have
+finished. The saved state is never left
 half written, and a Docker command that finished without its owner does not
 change it: the next `up` verifies and saves the actual mapping.
 
@@ -215,11 +236,13 @@ shows this project's logs (`edge` logs each HTTP request).
 |---|---|
 | `no free port in 8080-8099` (exit 3) | every candidate is in use; free one, or set `FLOWCRM_PORT_RANGE` or `FLOWCRM_HTTP_PORT`; see `make ports` |
 | `FLOWCRM_HTTP_PORT=… cannot be bound` (exit 3) | the explicit port is in use; no fallback by design |
-| `… other than a port conflict` (exit 2) | the edge started but failed; see `make logs`, fix, run `make up` again |
-| `internal services failed to start` (exit 2) | the unpublished services failed; no port was involved |
+| `starting the edge on port … failed for a reason other than a port conflict (…)` (exit 2) | the edge failed or `docker compose` was terminated; see `make logs`, fix, run `make up` again |
+| `starting the internal services (…) failed: …` (exit 2) | the unpublished services failed (for example an invalid Compose file or a failing health check) or `docker compose` was terminated; no port was involved |
+| `stopping project … failed: …` (exit 2) | `docker compose down` failed or was terminated |
 | `Docker daemon is not reachable` (exit 5) | start Docker Desktop or the Docker service |
 | `waiting for another devenv command` | another command runs in this checkout; it is waited for |
-| `holds .runtime/lock … gave up` (exit 4) | a command, or the Docker command of a killed one, is still running, or a lock from another host or an unreadable lock; remove `.runtime/lock` only if no devenv or `docker compose` command of this checkout runs |
+| `holds .runtime/lock … gave up` (exit 4) | a command, or Docker Compose processes of a killed one, are still running, or the lock comes from another host, an older `bin/devenv` or is unreadable; remove `.runtime/lock` only if no devenv or `docker compose` command of this checkout runs |
+| `… still running …; .runtime/lock is kept until they end` (exit 4) | Docker Compose processes outlived the Docker CLI for `FLOWCRM_LOCK_WAIT` seconds; the next command proceeds once they have ended |
 | refused with exit 6 | resources of another checkout; see the message |
 
 ## macOS and Linux
@@ -242,11 +265,13 @@ $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
 
 - `tests/devenv/unit.sh` covers configuration validation, candidate order,
   state parsing and writing, failure classification, project naming and
-  the lock (stale, reused-PID, foreign-host, reap-guard and malformed
-  records; real lock holders in other locales and time zones; a recorded
-  child that survives `SIGKILL` of its owner) and checks that the result
-  tally detects failed and lost results.
-- `tests/devenv/integration.sh` runs scenarios PA-01 to PA-21 and the
+  the lock (stale, reused-PID, foreign-host, reap-guard, legacy and
+  malformed records; real lock holders in other locales and time zones; a
+  recorded child that survives `SIGKILL` of its owner; a recorded leader
+  whose descendant outlives it; signal forwarding), the Makefile interface
+  (targets and the commands they run) and checks that the result tally
+  detects failed and lost results.
+- `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
   Makefile targets against real Docker in temporary checkout copies. It uses
   the 20-port block starting at `DEVENV_TEST_PORT_BASE` (default 8080) and
   skips with exit 77 if any of those ports is in use, so it never competes
@@ -256,10 +281,18 @@ $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
   its `docker compose up --wait` blocks on a gated health check and verifies
   that `up`, `down` and `restart` are refused until the orphan finished;
   PA-21 holds the lock under `pl_PL.UTF-8`/`TZ=JST-9` and checks it from
-  other locales and time zones.
+  other locales and time zones. PA-22 kills the recorded Docker CLI while
+  real Docker Compose processes of its group keep running (through a
+  test-only `docker` shim, since the real plugin exits within milliseconds)
+  and verifies that the lock is held until they end. PA-23 checks that an
+  invalid Compose file fails with exit 2, keeps the verified state and tries
+  no other port.
 - Both suites compare the printed PASS/FAIL records with their counters and
   exit 2 on a mismatch; a scenario without results or a failed setup step
   counts as a failure.
 
 Both suites run locally on macOS (Docker Desktop, bash 3.2) and in GitHub
 Actions on Ubuntu (Docker Engine, bash 5) in the `Dev environment` job.
+
+The interface the future application stack has to provide is described in
+[architecture/development-lifecycle-contract.md](architecture/development-lifecycle-contract.md).

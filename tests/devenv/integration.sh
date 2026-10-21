@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Real-Docker integration tests for bin/devenv (PA-01 .. PA-21) and the
+# Real-Docker integration tests for bin/devenv (PA-01 .. PA-23) and the
 # Makefile targets. Each scenario runs in its own temporary checkout copy,
 # so every checkout gets its own Compose project. Only resources created
 # here are removed afterwards, each one checked by label first; resources
@@ -616,6 +616,126 @@ pa20() {
   cleanup_checkout "$CO"
 }
 
+pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# A gated up whose Docker CLI is SIGKILLed while Docker Compose processes it
+# started keep running. The real Compose plugin exits within milliseconds of
+# its CLI ending (and SIGSTOP cannot hold it: on macOS a stopped process in
+# an orphaned process group is sent SIGHUP and SIGCONT), so a test-only
+# `docker` shim plays the CLI: it runs the real docker CLI and plugin as its
+# children and is killed itself. Sets PA22_D (devenv), PA22_CLI (shim, the
+# recorded leader) and PA22_REAL (real docker CLI). Usage: pa22_start label
+pa22_shim() {
+  mkdir -p "$work/shim"
+  cat >"$work/shim/docker" <<SHIM
+#!/bin/sh
+"$(command -v docker)" "\$@" &
+echo "\$! \$*" >>"$work/shim/children"
+wait \$!
+SHIM
+  chmod +x "$work/shim/docker"
+}
+
+pa22_start() {
+  local i=0 l
+  rm -f "$GATE/open" "$work/shim/children"
+  PATH=$work/shim:$PATH FLOWCRM_WAIT_TIMEOUT=120 start_up_bg "$CO" "$1"
+  PA22_D=$BG
+  PA22_CLI='' PA22_REAL=''
+  while [ "$i" -lt 900 ]; do
+    l=$(grep ' compose .* up ' "$work/shim/children" 2>/dev/null | tail -n 1)
+    PA22_REAL=${l%% *}
+    PA22_CLI=$(lock_field "$CO" pid op)
+    if [ -n "$PA22_REAL" ] && [ -n "$PA22_CLI" ] && kill -0 "$PA22_CLI" 2>/dev/null &&
+      [ -n "$(service_id "$CO" state)" ]; then
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -n "$PA22_REAL" ] || return 1
+  PA22_REAL_PGID=$(pgid_of "$PA22_REAL")
+  kill -KILL "$PA22_CLI"
+}
+
+pa22() {
+  new_checkout pa22
+  local co=$CO tok sum port w rc
+  need "PA-22 gated fixture" gate_checkout "$co" || return
+  pa22_shim
+  : >"$GATE/open"
+  dv pa22a "$co" up
+  need "PA-22 baseline up" [ "$(rc_of pa22a)" = 0 ] || return
+  port=$(saved_port "$co")
+  dv pa22b "$co" down
+  sum=$(cksum <"$co/.runtime/dev.env")
+
+  need "PA-22 recorded CLI killed while real Docker Compose runs" pa22_start pa22c || return
+  ev "devenv $PA22_D (pgid $(pgid_of "$PA22_D")) -> recorded CLI $PA22_CLI (killed) -> docker $PA22_REAL (pgid $PA22_REAL_PGID): $(ps -o command= -p "$PA22_REAL" | cut -c1-60)"
+  [ "$PA22_REAL_PGID" = "$PA22_CLI" ] && [ "$(lock_field "$co" pid op)" = "$PA22_CLI" ] && [ "$(lock_field "$co" pgid op)" = "$PA22_CLI" ] &&
+    kill -0 "$PA22_REAL" 2>/dev/null
+  v "PA-22 Docker Compose still runs in the recorded process group $PA22_CLI" $?
+  tok=$(lock_field "$co" token owner)
+  FLOWCRM_LOCK_WAIT=2 dv pa22d "$co" up
+  FLOWCRM_LOCK_WAIT=2 dv pa22e "$co" down
+  [ "$(rc_of pa22d)$(rc_of pa22e)" = 44 ] && [ "$(lock_field "$co" token owner)" = "$tok" ] &&
+    kill -0 "$PA22_D" 2>/dev/null && kill -0 "$PA22_REAL" 2>/dev/null
+  v "PA-22 CLI killed, Compose alive: devenv keeps the lock, up and down refused (exit 4/4)" $?
+  : >"$GATE/open"
+  wait "$PA22_D"
+  rc=$?
+  ! kill -0 "$PA22_REAL" 2>/dev/null && [ ! -e "$co/.runtime/lock" ] && [ "$rc" = 2 ] &&
+    err_has pa22c 'starting the internal services \(state\) failed: docker compose was terminated by signal 9'
+  v "PA-22 devenv ends after Docker Compose: exit 2, terminated Compose call reported, lock released" $?
+  [ "$(cksum <"$co/.runtime/dev.env")" = "$sum" ]; v "PA-22 verified state unchanged" $?
+
+  dv pa22e2 "$co" down
+  need "PA-22 second recorded CLI killed while real Docker Compose runs" pa22_start pa22f || return
+  kill -KILL "$PA22_D"
+  wait "$PA22_D" 2>/dev/null
+  FLOWCRM_LOCK_WAIT=2 dv pa22g "$co" restart
+  [ "$(rc_of pa22g)" = 4 ] && err_has pa22g "process group $PA22_CLI of the ended devenv" && kill -0 "$PA22_REAL" 2>/dev/null
+  v "PA-22 devenv and CLI killed: restart refused while Compose runs in their group (exit 4)" $?
+  (cd "$co" && exec ./bin/devenv up) >"$work/out/pa22h.out" 2>"$work/out/pa22h.err" &
+  w=$!
+  need "PA-22 next up announces that it waits" wait_err pa22h 'waiting for another' || { : >"$GATE/open"; kill "$w"; return; }
+  kill -0 "$PA22_REAL" 2>/dev/null; v "PA-22 next up waits while Compose of the killed command runs" $?
+  : >"$GATE/open"
+  wait "$w"
+  rc=$?
+  [ "$rc" = 0 ] && ! kill -0 "$PA22_REAL" 2>/dev/null && err_has pa22h 'removed a stale lock' &&
+    [ "$(saved_port "$co")" = "$port" ] && [ "$(mapped_port "$co")" = "$port" ] && http200 "$port"
+  v "PA-22 after Docker Compose ended: lock reaped, up exit 0 on the previous port $port" $?
+  cleanup_checkout "$co"
+}
+
+# A Docker failure that is not a port conflict keeps the verified state and
+# never moves to another port, with or without an explicit port.
+pa23() {
+  new_checkout pa23
+  local co=$CO sum port
+  dv pa23a "$co" up
+  need "PA-23 baseline up" [ "$(rc_of pa23a)" = 0 ] || return
+  port=$(saved_port "$co")
+  dv pa23b "$co" down
+  sum=$(cksum <"$co/.runtime/dev.env")
+  cp "$co/compose.fixture.yaml" "$co/compose.fixture.yaml.good"
+  printf 'services: [\n' >>"$co/compose.fixture.yaml"
+  dv pa23c "$co" up
+  FLOWCRM_HTTP_PORT=$OUT dv pa23d "$co" up
+  [ "$(rc_of pa23c)$(rc_of pa23d)" = 22 ]; v "PA-23 invalid Compose file: exit 2 (also with an explicit port)" $?
+  err_has pa23c 'starting the internal services \(state\) failed: docker compose exited with status' &&
+    ! err_has pa23c 'containers were left'
+  v "PA-23 the message names the failed operation" $?
+  ! err_has pa23c 'port conflict\); trying' && ! err_has pa23d 'port conflict\); trying' && [ -z "$(service_id "$co" edge)" ]
+  v "PA-23 no port retried, no edge created" $?
+  [ "$(cksum <"$co/.runtime/dev.env")" = "$sum" ] && [ ! -e "$co/.runtime/lock" ]; v "PA-23 verified state unchanged, lock released" $?
+  mv "$co/compose.fixture.yaml.good" "$co/compose.fixture.yaml"
+  dv pa23e "$co" up
+  [ "$(rc_of pa23e)" = 0 ] && [ "$(mapped_port "$co")" = "$port" ]; v "PA-23 after the fix up restarts on the saved port $port" $?
+  cleanup_checkout "$co"
+}
+
 makefile_targets() {
   new_checkout mk
   local rc
@@ -645,10 +765,19 @@ makefile_targets() {
   [ $? = 0 ] && [ "$(mapped_port "$CO")" = "$LO" ]; v "MK-09 make restart exit 0, same port" $?
   (cd "$CO" && make down) >/dev/null 2>&1
   [ $? = 0 ] && [ "$(project_containers "$CO")" = 0 ]; v "MK-10 make down exit 0, containers gone" $?
+  (cd "$CO" && make url) >"$work/out/mk-url-down.out" 2>&1
+  [ $? != 0 ] && grep -q 'edge is not running' "$work/out/mk-url-down.out"; v "MK-11 make url fails after make down" $?
+  local bad ok_all=0
+  for bad in 'FLOWCRM_HTTP_PORT=abc up' 'FLOWCRM_PORT_RANGE=1-2 up' 'TAIL=abc logs' 'FOLLOW=2 logs' 'SERVICE=db logs'; do
+    # shellcheck disable=SC2086 # bad holds a variable assignment and a target
+    (cd "$CO" && make $bad) >"$work/out/mk-bad.out" 2>&1
+    if [ $? = 0 ] || ! grep -q 'devenv: ERROR' "$work/out/mk-bad.out"; then ok_all=1; say "      accepted: make $bad"; fi
+  done
+  [ "$ok_all" = 0 ] && [ "$(project_containers "$CO")" = 0 ]; v "MK-12 invalid make inputs rejected with a devenv error, nothing started" $?
   cleanup_checkout "$CO"
 }
 
-all_scenarios='pa01 pa02 pa03 pa04 pa05 pa06 pa07 pa08 pa09 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17 pa18 pa19 pa20 pa21 makefile_targets'
+all_scenarios='pa01 pa02 pa03 pa04 pa05 pa06 pa07 pa08 pa09 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17 pa18 pa19 pa20 pa21 pa22 pa23 makefile_targets'
 scenarios=${DEVENV_TEST_SCENARIOS:-$all_scenarios}
 for t in $scenarios; do
   case " $all_scenarios " in *" $t "*) ;; *) say "unknown scenario: $t"; exit 64 ;; esac

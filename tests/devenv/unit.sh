@@ -151,8 +151,12 @@ expect_eq "U-06 engine: port is already allocated" conflict \
   "$(classify x 'Error response from daemon: driver failed programming external connectivity on endpoint p-edge-1: Bind for 127.0.0.1:8080 failed: port is already allocated')"
 expect_eq "U-06 docker-proxy: address already in use" conflict \
   "$(classify x 'Error response from daemon: failed to set up container networking: listen tcp4 127.0.0.1:8080: bind: address already in use')"
-expect_eq "U-06 Docker Desktop: Ports are not available" conflict \
+expect_eq "U-06 Docker Desktop: Ports are not available, address in use" conflict \
   "$(classify x 'Error response from daemon: Ports are not available: exposing port TCP 127.0.0.1:8080 -> 127.0.0.1:0: listen tcp 127.0.0.1:8080: bind: address already in use')"
+expect_eq "U-06 Docker Desktop: Ports are not available, access forbidden, is not a conflict" other \
+  "$(classify x 'Error response from daemon: Ports are not available: exposing port TCP 127.0.0.1:8080 -> 0.0.0.0:0: listen tcp 127.0.0.1:8080: bind: An attempt was made to access a socket in a way forbidden by its access permissions.')"
+expect_eq "U-06 terminated docker compose described" "docker compose was terminated by signal 9" "$(compose_failure 137)"
+expect_eq "U-06 failed docker compose described" "docker compose exited with status 1; its error is shown above" "$(compose_failure 1)"
 expect_eq "U-06 container exited is not a conflict" other "$(classify x 'container p-edge-1 exited (3)')"
 expect_eq "U-06 unhealthy is not a conflict" other "$(classify x 'container p-edge-1 is unhealthy')"
 expect_eq "U-06 pull failure is not a conflict" other "$(classify x 'pull access denied for busybox, repository does not exist')"
@@ -250,21 +254,49 @@ result "U-09 bin/devenv sources no files" $r
 if grep -nE 'down[^|]*(-v|--volumes)|volume rm|system prune|container prune|network prune' "$devenv_script" >/dev/null; then r=1; else r=0; fi
 result "U-09 no volume removal or global prune in bin/devenv" $r
 
-# Real processes for U-10 and U-11. lockctl.sh takes the lock of RUNTIME_DIR
-# in its own process and environment; with "hold" it then waits for GO, with
-# "child" it runs a recorded child (__run-recorded) that waits for GO.
+# Real processes for U-10, U-11 and U-13. lockctl.sh takes the lock of
+# RUNTIME_DIR in its own process and environment, with the signal handling of
+# bin/devenv, then runs MODE: "hold" waits for GO itself; the other modes
+# run a script from $work through run_op (recorded, own process group).
+# await.sh READY GO: create READY, then wait (at most 30 s) for GO.
+cat >"$work/await.sh" <<'AWAIT'
+: >"$1"
+i=0
+while [ ! -e "$2" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+AWAIT
+# tree.sh READY GO GCPID: like a Docker CLI with its Compose plugin, start a
+# descendant that waits for GO, then wait for it.
+cat >"$work/tree.sh" <<'TREE'
+sh "${0%/*}/await.sh" "$1.gc" "$2" &
+echo $! >"$3"
+i=0
+while [ ! -e "$1.gc" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+: >"$1"
+wait
+TREE
+# termchild.sh READY MARK: record a received SIGTERM in MARK, then exit.
+cat >"$work/termchild.sh" <<'TERMCHILD'
+trap ': >"$2"; exit 0' TERM
+: >"$1"
+i=0
+while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+TERMCHILD
 cat >"$work/lockctl.sh" <<'LOCKCTL'
-# lockctl.sh DEVENV RUNTIME_DIR LOCK_WAIT [hold|child READY GO]
+# lockctl.sh DEVENV RUNTIME_DIR LOCK_WAIT [hold|child|tree|term ARGS...]
 . "$1"
+SELF=$1
 RUNTIME_DIR=$2
 LOCK_DIR=$2/lock
 LOCK_WAIT=$3
+work=${0%/*}
 trap on_exit EXIT
+trap 'on_signal 143 TERM' TERM
 acquire_lock test
-await='i=0; while [ ! -e "$2" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done'
 case ${4-} in
-  hold) sh -c ": >\"\$1\"; $await" await "$5" "$6" ;;
-  child) "$BASH" "$1" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" sh -c ": >\"\$1\"; $await" child "$5" "$6" ;;
+  hold) sh "$work/await.sh" "$5" "$6" ;;
+  child) run_op sh "$work/await.sh" "$5" "$6" ;;
+  tree) run_op sh "$work/tree.sh" "$5" "$6" "$7" ;;
+  term) run_op sh "$work/termchild.sh" "$5" "$6" ;;
 esac
 LOCKCTL
 # An array, not a function: env and & must start the lock owner itself.
@@ -275,6 +307,14 @@ wait_file() { # file: bounded wait (10 s) for a readiness signal
   [ -e "$1" ]
 }
 lock_token() { sed -n 's/^token=//p' "$LOCK_DIR/owner" 2>/dev/null; }
+# Start a command as the leader of its own process group, as run_op does.
+as_leader() {
+  set -m
+  "$@" &
+  local j=$!
+  set +m
+  wait "$j"
+}
 
 # --- U-10 start identity independent of locale and time zone (H-1)
 bg_sleep
@@ -334,20 +374,27 @@ result "U-10 lock of a SIGKILLed holder is reaped from another locale and time z
 rm -rf "$LOCK_DIR" "$work/ran"
 mkdir -p "$LOCK_DIR"
 printf 'token=tok\nhost=%s\npid=%s\npstart=%s\n' "$(host_id)" "$$" "$(proc_start $$)" >"$LOCK_DIR/owner"
-out=$("$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok sh -c 'echo "self=$$"; cat "$1/op"' rec "$LOCK_DIR" 2>&1)
+out=$(as_leader "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok sh -c 'echo "self=$$"; cat "$1/op"' rec "$LOCK_DIR" 2>&1)
 self=$(printf '%s\n' "$out" | sed -n 's/^self=//p')
 [ -n "$self" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^pid=//p')" = "$self" ]
 result "U-11 record names the process that runs the command (same PID after exec)" $? "($out)"
+[ -n "$self" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^pgid=//p')" = "$self" ]
+result "U-11 record names the command's own process group" $? "($out)"
+rm -f "$work/ran"
+"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+r=$?
+[ "$r" = "$EX_SAFETY" ] && [ ! -e "$work/ran" ]
+result "U-11 command refused when it does not lead its own process group" $? "(rc $r)"
 case $(printf '%s\n' "$out" | sed -n 's/^pstart=//p') in linux:* | lstart:*) r=0 ;; *) r=1 ;; esac
 result "U-11 record carries a canonical start identity" $r
 [ -z "$(find "$LOCK_DIR" -name '.op.*')" ] && [ ! -e "$RUNTIME_DIR/lock.reap" ]
 result "U-11 no temporary record or reap guard left" $?
-"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" other-token touch "$work/ran" 2>/dev/null
+as_leader "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" other-token touch "$work/ran" 2>/dev/null
 r=$?
 [ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ]
 result "U-11 command refused for a lock with another token" $? "(rc $r)"
 rm -rf "$LOCK_DIR"
-"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+as_leader "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
 r=$?
 [ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ] && [ ! -e "$LOCK_DIR" ]
 result "U-11 command refused when the lock is gone" $? "(rc $r)"
@@ -356,40 +403,73 @@ printf 'token=tok\nhost=%s\npid=%s\npstart=%s\n' "$(host_id)" "$$" "$(proc_start
 mkdir "$RUNTIME_DIR/lock.reap"
 (sleep 0.5 && rmdir "$RUNTIME_DIR/lock.reap") &
 releaser=$!
-"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+as_leader "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
 r=$?
 wait "$releaser"
 [ "$r" = 0 ] && [ -e "$work/ran" ]
 result "U-11 waits for a briefly held reap guard, then runs" $? "(rc $r)"
 rm -f "$work/ran"
 mkdir "$RUNTIME_DIR/lock.reap"
-"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+as_leader "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
 r=$?
 rmdir "$RUNTIME_DIR/lock.reap"
 [ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ]
 result "U-11 busy reap guard: bounded wait, command not run" $? "(rc $r)"
 
-# compose() with a fake docker on PATH that reports its PID and the record.
+# compose_op() and compose() with a fake docker on PATH that reports its PID,
+# its process group and the record.
 mkdir -p "$work/fakebin"
-printf '#!/bin/sh\necho "docker-pid=$$"\ncat "$FAKE_LOCK/op" 2>/dev/null\n' >"$work/fakebin/docker"
+printf '#!/bin/sh\necho "docker-pid=$$ docker-pgid=$(ps -o pgid= -p $$ | tr -d " ")"\ncat "$FAKE_LOCK/op" 2>/dev/null\n' >"$work/fakebin/docker"
 chmod +x "$work/fakebin/docker"
-fake_compose() { # held(0|1)
+# shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
+fake_compose() { # held(0|1) function
   (
     PATH=$work/fakebin:$PATH FAKE_LOCK=$LOCK_DIR LOCK_HELD=$1 LOCK_TOKEN=tok COMPOSE_PORT=8080
     export FAKE_LOCK
-    compose version
+    "$2" version
   ) 2>&1
 }
-out=$(fake_compose 1)
-self=$(printf '%s\n' "$out" | sed -n 's/^docker-pid=//p')
-[ -n "$self" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^pid=//p')" = "$self" ]
-result "U-11 compose() runs docker as the recorded child while the lock is held" $? "($out)"
+out=$(fake_compose 1 compose_op)
+self=$(printf '%s\n' "$out" | sed -n 's/^docker-pid=\([0-9]*\) .*/\1/p')
+[ -n "$self" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^pid=//p')" = "$self" ] &&
+  [ "$(printf '%s\n' "$out" | sed -n 's/.*docker-pgid=//p')" = "$self" ]
+result "U-11 compose_op() runs docker as the recorded leader of its own process group" $? "($out)"
 rm -f "$LOCK_DIR/op"
-out=$(fake_compose 0)
+out=$(fake_compose 1 compose)
 [ -n "$(printf '%s\n' "$out" | sed -n 's/^docker-pid=//p')" ] && [ ! -e "$LOCK_DIR/op" ]
-result "U-11 compose() without the lock runs docker directly, unrecorded" $? "($out)"
+result "U-11 read-only compose() runs docker directly, unrecorded" $? "($out)"
+out=$(fake_compose 0 compose_op)
+r=$?
+[ "$r" = "$EX_SAFETY" ] && ! printf '%s\n' "$out" | grep -q docker-pid=
+result "U-11 compose_op() refuses to run without the lock" $? "(rc $r: $out)"
 
-op() { printf 'pid=%s\npstart=%s\n' "$1" "$2" >"$LOCK_DIR/op"; }
+# try_edge() with a fake docker whose `compose up` prints a bind conflict and
+# then exits 1 or is killed by SIGKILL; `compose ps` reports no edge.
+mkdir -p "$work/fakeedge"
+cat >"$work/fakeedge/docker" <<'FAKE'
+#!/bin/sh
+case " $* " in
+  *" up "*)
+    echo 'Error response from daemon: Bind for 127.0.0.1:8080 failed: port is already allocated' >&2
+    [ "$FAKE_MODE" = killed ] && kill -KILL $$
+    exit 1 ;;
+esac
+exit 0
+FAKE
+chmod +x "$work/fakeedge/docker"
+# shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
+edge_rc() { # mode: try_edge result with the fake docker
+  (
+    PATH=$work/fakeedge:$PATH FAKE_MODE=$1 LOCK_HELD=1 LOCK_TOKEN=tok WAIT_TIMEOUT=5
+    export FAKE_MODE
+    try_edge 8080 >/dev/null 2>&1
+    echo "$?:$LAST_FAILURE"
+  )
+}
+expect_eq "U-11 failed edge start with conflict text is a port conflict" "1:docker compose exited with status 1; its error is shown above" "$(edge_rc exit)"
+expect_eq "U-11 terminated edge start is never a port conflict" "2:docker compose was terminated by signal 9" "$(edge_rc killed)"
+
+op() { printf 'pid=%s\npstart=%s\npgid=%s\n' "$1" "$2" "${3-}" >"$LOCK_DIR/op"; }
 bg_sleep
 child=$BG_PID
 dead_pid
@@ -409,6 +489,31 @@ op "abc" "x"
 expect_eq "U-11 malformed command record keeps the lock" "$EX_LOCK" "$(lock_rc)"
 op "$child" ""
 expect_eq "U-11 command record without start identity keeps the lock" "$EX_LOCK" "$(lock_rc)"
+# A process group whose recorded leader ended while a member still runs.
+rm -f "$work/member"
+as_leader sh -c 'sleep 60 & echo $! >"$1"' leader "$work/member"
+member=$(cat "$work/member")
+bg_pids="$bg_pids $member"
+leader=$(ps -o pgid= -p "$member" | tr -d ' ')
+owner "$(host_id)" "$DEAD_PID" "x"
+op "$leader" "lstart:Thu Jan  1 00:00:00 1970" "$leader"
+lock_status
+[ "$LOCK_STATE" = active ] && ! ps -p "$leader" >/dev/null 2>&1 && case $LOCK_INFO in *"process group $leader"*) true ;; *) false ;; esac
+result "U-11 ended leader with a running group member: lock active" $? "($LOCK_STATE: $LOCK_INFO)"
+expect_eq "U-11 that lock is not taken" "$EX_LOCK" "$(lock_rc)"
+op "$leader" "x" ""
+expect_eq "U-11 legacy command record without process group: member not considered" 0 "$(lock_rc)"
+owner "$(host_id)" "$DEAD_PID" "x"
+kill "$member"
+wait_gone() { local i=0; while kill -0 -- "-$1" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done; }
+wait_gone "$leader"
+op "$leader" "x" "$leader"
+expect_eq "U-11 group without members does not block" 0 "$(lock_rc)"
+owner "$(host_id)" "$sleeper" "Wed Oct 21 14:26:30 2026"
+lock_status
+case $LOCK_INFO in *"older version"*) r=0 ;; *) r=1 ;; esac
+[ "$LOCK_STATE" = active ]
+result "U-11 legacy owner record: kept and explained" $(($? + r)) "($LOCK_INFO)"
 rm -rf "$LOCK_DIR"
 
 rm -f "$work"/c.*
@@ -435,6 +540,91 @@ while [ -n "$child" ] && ps -p "$child" >/dev/null 2>&1 && [ "$i" -lt 100 ]; do 
 r=$?
 [ "$r" = 0 ] && grep -q 'removed a stale lock' "$work/b.err" && [ ! -e "$LOCK_DIR" ]
 result "U-11 lock reaped once the orphaned child ended" $? "(rc $r)"
+
+# --- U-13 Docker CLI killed while its Compose plugin runs (process group)
+rm -rf "$LOCK_DIR" "$work"/t.*
+"${lockctl[@]}" 5 tree "$work/t.ready" "$work/t.go" "$work/t.gc" 2>"$work/t.err" &
+parent=$!
+bg_pids="$bg_pids $parent"
+wait_file "$work/t.ready"
+result "U-13 recorded leader started a descendant" $?
+leader=$(sed -n 's/^pid=//p' "$LOCK_DIR/op" 2>/dev/null)
+gc=$(cat "$work/t.gc" 2>/dev/null)
+[ -n "$leader" ] && [ "$(ps -o pgid= -p "$leader" | tr -d ' ')" = "$leader" ] && [ "$(ps -o pgid= -p "$gc" | tr -d ' ')" = "$leader" ]
+result "U-13 leader and descendant share the recorded process group $leader" $?
+kill -KILL "$leader"
+env LC_ALL=C TZ=UTC0 "${lockctl[@]}" 1 2>"$work/b.err"
+r=$?
+[ "$r" = "$EX_LOCK" ] && kill -0 "$parent" 2>/dev/null && kill -0 "$gc" 2>/dev/null && ! grep -q 'removed a stale lock' "$work/b.err"
+result "U-13 leader SIGKILLed: owner keeps the lock while the descendant runs" $? "(rc $r)"
+: >"$work/t.go"
+wait "$parent"
+r=$?
+! kill -0 "$gc" 2>/dev/null && [ ! -e "$LOCK_DIR" ] && [ "$r" = 137 ]
+result "U-13 lock released only after the descendant ended (status of the killed leader: 137)" $? "(rc $r)"
+
+rm -f "$work"/t.*
+"${lockctl[@]}" 5 tree "$work/t.ready" "$work/t.go" "$work/t.gc" 2>/dev/null &
+parent=$!
+bg_pids="$bg_pids $parent"
+wait_file "$work/t.ready"
+leader=$(sed -n 's/^pid=//p' "$LOCK_DIR/op" 2>/dev/null)
+gc=$(cat "$work/t.gc" 2>/dev/null)
+kill -KILL "$leader" "$parent"
+wait "$parent" 2>/dev/null
+env LC_ALL=C TZ=UTC0 "${lockctl[@]}" 1 2>"$work/b.err"
+r=$?
+[ "$r" = "$EX_LOCK" ] && grep -q "process group $leader" "$work/b.err" && kill -0 "$gc" 2>/dev/null
+result "U-13 owner and leader SIGKILLed: lock kept while the descendant runs" $? "(rc $r: $(tail -n 1 "$work/b.err"))"
+: >"$work/t.go"
+wait_gone "$leader"
+"${lockctl[@]}" 5 2>"$work/b.err"
+r=$?
+[ "$r" = 0 ] && grep -q 'removed a stale lock' "$work/b.err"
+result "U-13 lock reaped once the whole group ended" $? "(rc $r)"
+
+rm -f "$work"/t.*
+"${lockctl[@]}" 1 tree "$work/t.ready" "$work/t.go" "$work/t.gc" 2>"$work/t.err" &
+parent=$!
+bg_pids="$bg_pids $parent"
+wait_file "$work/t.ready"
+leader=$(sed -n 's/^pid=//p' "$LOCK_DIR/op" 2>/dev/null)
+kill -KILL "$leader"
+wait "$parent"
+r=$?
+[ "$r" = "$EX_LOCK" ] && [ -f "$LOCK_DIR/owner" ] && grep -q 'kept .runtime/lock' "$work/t.err"
+result "U-13 descendant outlives FLOWCRM_LOCK_WAIT: owner fails with exit 4 and keeps the lock" $? "(rc $r: $(tail -n 1 "$work/t.err"))"
+: >"$work/t.go"
+wait_gone "$leader"
+"${lockctl[@]}" 5 2>/dev/null
+expect_eq "U-13 that lock is reaped after the group ended" 0 "$?"
+
+rm -f "$work"/t.*
+"${lockctl[@]}" 5 term "$work/t.ready" "$work/t.mark" 2>/dev/null &
+parent=$!
+bg_pids="$bg_pids $parent"
+wait_file "$work/t.ready"
+SECONDS=0
+kill -TERM "$parent"
+wait "$parent"
+r=$?
+[ "$r" = 143 ] && [ -e "$work/t.mark" ] && [ ! -e "$LOCK_DIR" ] && [ "$SECONDS" -lt 5 ]
+result "U-13 SIGTERM is forwarded to the Docker process group; exit 143 after it ended" $? "(rc $r, ${SECONDS}s)"
+
+# --- U-14 Makefile interface (kept stable for the application stack)
+mk_root=$(cd -P "$here/../.." && pwd -P)
+mk() { (cd "$mk_root" && make "$@") 2>&1; }
+expect_eq "U-14 make help lists the public targets" "help up down restart status url ports logs doctor test-devenv" \
+  "$(mk -s help | awk '/^  [a-z-]+ / { printf "%s%s", sep, $1; sep = " " }')"
+for t in up down restart status url ports logs doctor; do
+  expect_eq "U-14 make $t runs bin/devenv $t" "./bin/devenv $t" "$(mk -n "$t")"
+done
+expect_eq "U-14 make test-devenv runs both suites" "tests/devenv/unit.sh tests/devenv/integration.sh" "$(mk -n test-devenv | tr '\n' ' ' | sed 's/ $//')"
+expect_eq "U-14 make without a target shows help" "$(mk -s help)" "$(mk -s)"
+mk -s no-such-target >/dev/null
+r=$?
+[ "$r" -ne 0 ]
+result "U-14 unknown make target fails" $? "(rc $r)"
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
