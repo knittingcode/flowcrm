@@ -2,7 +2,9 @@
 #
 # Unit tests for bin/devenv logic that needs no Docker: configuration
 # validation, candidate order, runtime-state parsing and writing, failure
-# classification, project naming and the per-checkout lock.
+# classification, project naming, the per-checkout lock (including real
+# processes in other locales and time zones and an orphaned recorded child)
+# and a self-check of the result tally.
 #
 # Usage: tests/devenv/unit.sh
 
@@ -22,26 +24,18 @@ devenv_script=${DEVENV:-"$here/../../bin/devenv"}
 # shellcheck source=../../bin/devenv
 . "$devenv_script"
 init_paths
+# shellcheck source=tally.sh
+. "$here/tally.sh"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/devenv-unit.XXXXXX") || exit 2
 work=$(cd -P "$work" && pwd -P)
-: >"$work/tally"
-sleeper=''
-trap 'rm -rf "$work"; [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null' EXIT
+tally_init "$work/tally"
+# Background processes started here; killed on exit.
+bg_pids=''
+trap 'for p in $bg_pids; do kill -KILL "$p" 2>/dev/null; done; wait 2>/dev/null; rm -rf "$work"' EXIT
 
-pass=0
-fail=0
-
-# Every result is also appended to $work/tally, so a result recorded in a
-# subshell (lost counter) is detected by the final cross-check.
 result() { # name ok(0|1) [detail]
-  if [ "$2" -eq 0 ]; then
-    pass=$((pass + 1))
-    printf 'PASS  %s\n' "$1" | tee -a "$work/tally"
-  else
-    fail=$((fail + 1))
-    printf 'FAIL  %s %s\n' "$1" "${3-}" | tee -a "$work/tally"
-  fi
+  if [ "$2" -eq 0 ]; then pass_result "$1"; else fail_result "$1${3:+ $3}"; fi
 }
 
 expect_eq() { # name expected actual
@@ -175,43 +169,63 @@ result "U-07 deterministic and path-dependent" $?
 # --- U-08 lock (PA-11, PA-16)
 LOCK_WAIT=1
 lock_rc() { (acquire_lock test && release_lock) >/dev/null 2>&1; echo $?; }
-owner() { # host boot pid pstart
+owner() { # host pid pstart
   mkdir -p "$LOCK_DIR"
-  printf 'token=tok\nhost=%s\nboot=%s\npid=%s\npstart=%s\ncommand=test\n' "$1" "$2" "$3" "$4" >"$LOCK_DIR/owner"
+  printf 'token=tok\nhost=%s\npid=%s\npstart=%s\ncommand=test\n' "$1" "$2" "$3" >"$LOCK_DIR/owner"
+}
+# A start identity of the same kind but of another process instance: a
+# reused PID (on Linux: the same PID and ticks in another boot).
+other_start() {
+  case $1 in
+    linux:*) printf 'linux:00000000-0000-0000-0000-000000000000:%s\n' "${1##*:}" ;;
+    *) printf 'lstart:Thu Jan  1 00:00:00 1970\n' ;;
+  esac
+}
+bg_sleep() { # -> sets BG_PID (a live process for 60 seconds)
+  sleep 60 &
+  BG_PID=$!
+  bg_pids="$bg_pids $BG_PID"
+}
+dead_pid() { # -> sets DEAD_PID (a process that has exited and been reaped)
+  sh -c 'exit 0' &
+  DEAD_PID=$!
+  wait "$DEAD_PID"
 }
 rm -rf "$LOCK_DIR"
 expect_eq "U-08 free lock acquired" 0 "$(lock_rc)"
 [ ! -e "$LOCK_DIR" ]
 result "U-08 released lock removed" $?
 
-sleep 30 &
-sleeper=$!
-owner "$(host_id)" "$(boot_id)" "$sleeper" "$(proc_start "$sleeper")"
+bg_sleep
+sleeper=$BG_PID
+owner "$(host_id)" "$sleeper" "$(proc_start "$sleeper")"
 expect_eq "U-08 lock of a live process is not taken" "$EX_LOCK" "$(lock_rc)"
 [ -f "$LOCK_DIR/owner" ]
 result "U-08 live lock left in place" $?
-owner "$(host_id)" "$(boot_id)" "$sleeper" "Thu Jan  1 00:00:00 1970"
-expect_eq "U-08 reused PID (start time differs) is stale" 0 "$(lock_rc)"
-kill "$sleeper" 2>/dev/null
-wait "$sleeper" 2>/dev/null
-dead=$sleeper
-sleeper=''
-owner "$(host_id)" "$(boot_id)" "$dead" "x"
+owner "$(host_id)" "$sleeper" "$(other_start "$(proc_start "$sleeper")")"
+expect_eq "U-08 reused PID (other start identity) is stale" 0 "$(lock_rc)"
+owner "$(host_id)" "$sleeper" ""
+expect_eq "U-08 live PID without a start identity is not taken" "$EX_LOCK" "$(lock_rc)"
+owner "$(host_id)" "$sleeper" "Wed Oct 21 14:26:30 2026"
+expect_eq "U-08 live PID with an unrecognised (legacy) start record is not taken" "$EX_LOCK" "$(lock_rc)"
+owner "$(host_id)" "12x" "x"
+expect_eq "U-08 malformed owner PID is not taken" "$EX_LOCK" "$(lock_rc)"
+dead_pid
+dead=$DEAD_PID
+owner "$(host_id)" "$dead" "x"
 expect_eq "U-08 dead owner is reaped" 0 "$(lock_rc)"
-owner "another-host.example" "$(boot_id)" "$$" "$(proc_start $$)"
+owner "another-host.example" "$$" "$(proc_start $$)"
 expect_eq "U-08 lock from another host is never reaped" "$EX_LOCK" "$(lock_rc)"
 [ -f "$LOCK_DIR/owner" ]
 result "U-08 foreign lock left in place" $?
-if [ -n "$(boot_id)" ]; then
-  owner "$(host_id)" "other-boot" "$$" "$(proc_start $$)"
-  expect_eq "U-08 lock from an earlier boot is reaped" 0 "$(lock_rc)"
-fi
+if is_pid 4194303 && is_pid 1 && ! is_pid 0 && ! is_pid 12345678901 && ! is_pid ' 1'; then r=0; else r=1; fi
+result "U-08 PID syntax (up to Linux pid_max 4194304, no garbage)" $r
 rm -rf "$LOCK_DIR"
 mkdir "$LOCK_DIR"
 expect_eq "U-08 young lock without owner is not taken" "$EX_LOCK" "$(lock_rc)"
 touch -t 202001010000 "$LOCK_DIR"
 expect_eq "U-08 old lock without owner is reaped" 0 "$(lock_rc)"
-owner "$(host_id)" "$(boot_id)" "$dead" "x"
+owner "$(host_id)" "$dead" "x"
 mkdir "$RUNTIME_DIR/lock.reap"
 expect_eq "U-08 active reap guard blocks reaping" "$EX_LOCK" "$(lock_rc)"
 touch -t 202001010000 "$RUNTIME_DIR/lock.reap"
@@ -236,11 +250,202 @@ result "U-09 bin/devenv sources no files" $r
 if grep -nE 'down[^|]*(-v|--volumes)|volume rm|system prune|container prune|network prune' "$devenv_script" >/dev/null; then r=1; else r=0; fi
 result "U-09 no volume removal or global prune in bin/devenv" $r
 
-tallied=$(wc -l <"$work/tally" | tr -d ' ')
-echo
-echo "TOTAL $((pass + fail)) passed=$pass failed=$fail"
-if [ "$tallied" -ne $((pass + fail)) ]; then
-  echo "HARNESS ERROR: $tallied results printed but $((pass + fail)) counted (a result ran in a subshell)"
-  exit 2
-fi
-[ "$fail" -eq 0 ]
+# Real processes for U-10 and U-11. lockctl.sh takes the lock of RUNTIME_DIR
+# in its own process and environment; with "hold" it then waits for GO, with
+# "child" it runs a recorded child (__run-recorded) that waits for GO.
+cat >"$work/lockctl.sh" <<'LOCKCTL'
+# lockctl.sh DEVENV RUNTIME_DIR LOCK_WAIT [hold|child READY GO]
+. "$1"
+RUNTIME_DIR=$2
+LOCK_DIR=$2/lock
+LOCK_WAIT=$3
+trap on_exit EXIT
+acquire_lock test
+await='i=0; while [ ! -e "$2" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done'
+case ${4-} in
+  hold) sh -c ": >\"\$1\"; $await" await "$5" "$6" ;;
+  child) "$BASH" "$1" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" sh -c ": >\"\$1\"; $await" child "$5" "$6" ;;
+esac
+LOCKCTL
+# An array, not a function: env and & must start the lock owner itself.
+lockctl=("$BASH" "$work/lockctl.sh" "$devenv_script" "$RUNTIME_DIR")
+wait_file() { # file: bounded wait (10 s) for a readiness signal
+  local i=0
+  while [ ! -e "$1" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$1" ]
+}
+lock_token() { sed -n 's/^token=//p' "$LOCK_DIR/owner" 2>/dev/null; }
+
+# --- U-10 start identity independent of locale and time zone (H-1)
+bg_sleep
+probe_pid=$BG_PID
+ref=$(proc_start "$probe_pid")
+[[ $ref =~ ^(linux:[0-9a-f-]+:[0-9]+|lstart:[A-Z][a-z]{2}\ [A-Z][a-z]{2}\ +[0-9]{1,2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}\ [0-9]{4})$ ]]
+result "U-10 canonical start identity ($ref)" $?
+start_in() { # assignments... : proc_start of probe_pid in a new process with that environment
+  env "$@" "$BASH" -c '. "$1"; proc_start "$2"' start_in "$devenv_script" "$probe_pid" 2>/dev/null
+}
+for e in LANG=pl_PL.UTF-8 LANG=de_DE.UTF-8 LC_ALL=pl_PL.UTF-8 LC_ALL=de_DE.UTF-8 LC_ALL=C \
+  LC_TIME=pl_PL.UTF-8 TZ=UTC0 TZ=JST-9 TZ=EST5EDT TZ=NZST-12NZDT 'LC_ALL=pl_PL.UTF-8 TZ=JST-9' 'LANG= LC_ALL= TZ='; do
+  # shellcheck disable=SC2086 # e holds one or more assignments
+  expect_eq "U-10 same identity with $e" "$ref" "$(start_in $e)"
+done
+raw_lstart() { env "$@" ps -o lstart= -p "$probe_pid" 2>/dev/null; }
+[ "$(raw_lstart TZ=UTC0)" != "$(raw_lstart TZ=JST-9)" ]
+result "U-10 control: raw ps lstart differs between time zones on this platform" $?
+printf 'INFO  raw lstart: LC_ALL=C TZ=UTC0 [%s], LC_ALL=pl_PL.UTF-8 TZ=JST-9 [%s]\n' \
+  "$(raw_lstart LC_ALL=C TZ=UTC0)" "$(raw_lstart LC_ALL=pl_PL.UTF-8 TZ=JST-9)"
+dead_pid
+expect_eq "U-10 no identity for an ended process" "" "$(proc_start "$DEAD_PID")"
+
+rm -rf "$LOCK_DIR" "$work"/a.*
+env LANG=pl_PL.UTF-8 LC_ALL=pl_PL.UTF-8 TZ=JST-9 "${lockctl[@]}" 5 hold "$work/a.ready" "$work/a.go" 2>"$work/a.err" &
+holder=$!
+bg_pids="$bg_pids $holder"
+wait_file "$work/a.ready"
+result "U-10 holder process under pl_PL.UTF-8 and TZ=JST-9 took the lock" $?
+tok=$(lock_token)
+for e in 'LC_ALL=C TZ=UTC0' 'LANG=de_DE.UTF-8 TZ=EST5EDT' 'LANG= LC_ALL= TZ='; do
+  # shellcheck disable=SC2086 # e holds assignments
+  env $e "${lockctl[@]}" 1 2>"$work/b.err"
+  r=$?
+  [ "$r" = "$EX_LOCK" ] && [ -n "$tok" ] && [ "$(lock_token)" = "$tok" ] && ! grep -q 'removed a stale lock' "$work/b.err"
+  result "U-10 live lock not taken by a process with $e" $? "(rc $r: $(tail -n 1 "$work/b.err"))"
+done
+: >"$work/a.go"
+wait "$holder"
+expect_eq "U-10 holder finished normally" 0 "$?"
+[ ! -e "$LOCK_DIR" ]
+result "U-10 holder released its lock" $?
+
+env LANG=pl_PL.UTF-8 LC_ALL=pl_PL.UTF-8 TZ=JST-9 "${lockctl[@]}" 5 hold "$work/a.ready2" "$work/a.go2" 2>/dev/null &
+holder=$!
+bg_pids="$bg_pids $holder"
+wait_file "$work/a.ready2"
+kill -KILL "$holder"
+wait "$holder" 2>/dev/null
+env LC_ALL=C TZ=UTC0 "${lockctl[@]}" 5 2>"$work/b.err"
+r=$?
+[ "$r" = 0 ] && grep -q 'removed a stale lock' "$work/b.err" && [ ! -e "$LOCK_DIR" ]
+result "U-10 lock of a SIGKILLed holder is reaped from another locale and time zone" $? "(rc $r)"
+: >"$work/a.go2" # ends the orphaned waiter of the killed holder
+
+# --- U-11 Docker command recorded in the lock (M-1)
+rm -rf "$LOCK_DIR" "$work/ran"
+mkdir -p "$LOCK_DIR"
+printf 'token=tok\nhost=%s\npid=%s\npstart=%s\n' "$(host_id)" "$$" "$(proc_start $$)" >"$LOCK_DIR/owner"
+out=$("$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok sh -c 'echo "self=$$"; cat "$1/op"' rec "$LOCK_DIR" 2>&1)
+self=$(printf '%s\n' "$out" | sed -n 's/^self=//p')
+[ -n "$self" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^pid=//p')" = "$self" ]
+result "U-11 record names the process that runs the command (same PID after exec)" $? "($out)"
+case $(printf '%s\n' "$out" | sed -n 's/^pstart=//p') in linux:* | lstart:*) r=0 ;; *) r=1 ;; esac
+result "U-11 record carries a canonical start identity" $r
+[ -z "$(find "$LOCK_DIR" -name '.op.*')" ] && [ ! -e "$RUNTIME_DIR/lock.reap" ]
+result "U-11 no temporary record or reap guard left" $?
+"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" other-token touch "$work/ran" 2>/dev/null
+r=$?
+[ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ]
+result "U-11 command refused for a lock with another token" $? "(rc $r)"
+rm -rf "$LOCK_DIR"
+"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+r=$?
+[ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ] && [ ! -e "$LOCK_DIR" ]
+result "U-11 command refused when the lock is gone" $? "(rc $r)"
+mkdir -p "$LOCK_DIR"
+printf 'token=tok\nhost=%s\npid=%s\npstart=%s\n' "$(host_id)" "$$" "$(proc_start $$)" >"$LOCK_DIR/owner"
+mkdir "$RUNTIME_DIR/lock.reap"
+(sleep 0.5 && rmdir "$RUNTIME_DIR/lock.reap") &
+releaser=$!
+"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+r=$?
+wait "$releaser"
+[ "$r" = 0 ] && [ -e "$work/ran" ]
+result "U-11 waits for a briefly held reap guard, then runs" $? "(rc $r)"
+rm -f "$work/ran"
+mkdir "$RUNTIME_DIR/lock.reap"
+"$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+r=$?
+rmdir "$RUNTIME_DIR/lock.reap"
+[ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ]
+result "U-11 busy reap guard: bounded wait, command not run" $? "(rc $r)"
+
+# compose() with a fake docker on PATH that reports its PID and the record.
+mkdir -p "$work/fakebin"
+printf '#!/bin/sh\necho "docker-pid=$$"\ncat "$FAKE_LOCK/op" 2>/dev/null\n' >"$work/fakebin/docker"
+chmod +x "$work/fakebin/docker"
+fake_compose() { # held(0|1)
+  (
+    PATH=$work/fakebin:$PATH FAKE_LOCK=$LOCK_DIR LOCK_HELD=$1 LOCK_TOKEN=tok COMPOSE_PORT=8080
+    export FAKE_LOCK
+    compose version
+  ) 2>&1
+}
+out=$(fake_compose 1)
+self=$(printf '%s\n' "$out" | sed -n 's/^docker-pid=//p')
+[ -n "$self" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^pid=//p')" = "$self" ]
+result "U-11 compose() runs docker as the recorded child while the lock is held" $? "($out)"
+rm -f "$LOCK_DIR/op"
+out=$(fake_compose 0)
+[ -n "$(printf '%s\n' "$out" | sed -n 's/^docker-pid=//p')" ] && [ ! -e "$LOCK_DIR/op" ]
+result "U-11 compose() without the lock runs docker directly, unrecorded" $? "($out)"
+
+op() { printf 'pid=%s\npstart=%s\n' "$1" "$2" >"$LOCK_DIR/op"; }
+bg_sleep
+child=$BG_PID
+dead_pid
+owner "$(host_id)" "$DEAD_PID" "x"
+op "$child" "$(proc_start "$child")"
+lock_status
+[ "$LOCK_STATE" = active ] && case $LOCK_INFO in *"Docker command pid $child"*) true ;; *) false ;; esac
+result "U-11 ended owner with a running recorded command: lock active" $? "($LOCK_STATE: $LOCK_INFO)"
+expect_eq "U-11 that lock is not taken" "$EX_LOCK" "$(lock_rc)"
+op "$child" "$(other_start "$(proc_start "$child")")"
+expect_eq "U-11 recorded command whose PID was reused does not block" 0 "$(lock_rc)"
+owner "$(host_id)" "$DEAD_PID" "x"
+op "$DEAD_PID" "x"
+expect_eq "U-11 ended recorded command does not block" 0 "$(lock_rc)"
+owner "$(host_id)" "$DEAD_PID" "x"
+op "abc" "x"
+expect_eq "U-11 malformed command record keeps the lock" "$EX_LOCK" "$(lock_rc)"
+op "$child" ""
+expect_eq "U-11 command record without start identity keeps the lock" "$EX_LOCK" "$(lock_rc)"
+rm -rf "$LOCK_DIR"
+
+rm -f "$work"/c.*
+"${lockctl[@]}" 5 child "$work/c.ready" "$work/c.go" 2>/dev/null &
+parent=$!
+bg_pids="$bg_pids $parent"
+wait_file "$work/c.ready"
+result "U-11 devenv process runs a recorded child" $?
+child=$(sed -n 's/^pid=//p' "$LOCK_DIR/op" 2>/dev/null)
+tok=$(lock_token)
+kill -KILL "$parent"
+wait "$parent" 2>/dev/null
+[ -n "$child" ] && ps -p "$child" >/dev/null 2>&1 && [ -f "$LOCK_DIR/owner" ]
+result "U-11 recorded child survives SIGKILL of its devenv process" $? "(child $child)"
+env LC_ALL=C TZ=UTC0 "${lockctl[@]}" 1 2>"$work/b.err"
+r=$?
+[ "$r" = "$EX_LOCK" ] && [ "$(lock_token)" = "$tok" ] && ! grep -q 'removed a stale lock' "$work/b.err" &&
+  grep -q 'Docker command pid' "$work/b.err"
+result "U-11 lock kept while the orphaned child runs (exit 4)" $? "(rc $r: $(tail -n 1 "$work/b.err"))"
+: >"$work/c.go"
+i=0
+while [ -n "$child" ] && ps -p "$child" >/dev/null 2>&1 && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+"${lockctl[@]}" 5 2>"$work/b.err"
+r=$?
+[ "$r" = 0 ] && grep -q 'removed a stale lock' "$work/b.err" && [ ! -e "$LOCK_DIR" ]
+result "U-11 lock reaped once the orphaned child ended" $? "(rc $r)"
+
+# --- U-12 tally self-check (negative controls for the result bookkeeping)
+tally_rc() { # snippet: exit status of a minimal suite running it
+  "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1
+  echo $?
+}
+expect_eq "U-12 all results passed: exit 0" 0 "$(tally_rc 'pass_result a; pass_result b')"
+expect_eq "U-12 a failed result: exit 1" 1 "$(tally_rc 'pass_result a; fail_result b')"
+expect_eq "U-12 no results: exit 1" 1 "$(tally_rc ':')"
+expect_eq "U-12 failure recorded in a subshell: harness error" 2 "$(tally_rc 'pass_result a; (fail_result b)')"
+expect_eq "U-12 result recorded in a pipeline: harness error" 2 "$(tally_rc 'pass_result a; echo | pass_result b')"
+expect_eq "U-12 result captured by command substitution: harness error" 2 "$(tally_rc 'x=$(fail_result b); pass_result a')"
+
+tally_finish ""

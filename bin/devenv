@@ -138,6 +138,7 @@ init_paths() {
   RUNTIME_DIR=$ROOT/.runtime
   STATE_FILE=$RUNTIME_DIR/dev.env
   LOCK_DIR=$RUNTIME_DIR/lock
+  SELF=$here/${BASH_SOURCE[0]##*/}
   PROJECT=flowcrm-$(sha256_prefix "$ROOT")
   [[ $PROJECT =~ $PROJECT_RE ]] || die $EX_PREREQ "could not derive a project name"
 }
@@ -215,22 +216,46 @@ write_state() {
 }
 
 # --- per-checkout lock --------------------------------------------------------
-# A directory created with mkdir (atomic). The owner record names host, boot
-# id, PID and the PID's start time; a lock is only reaped when it provably
-# belongs to a dead process on this host (or this host rebooted since).
-# Locks from another host are never reaped automatically.
+# A directory created with mkdir (atomic). The owner record names host, PID
+# and the PID's start identity. While the lock is held, every Docker command
+# runs as a recorded child (lock/op, see run_recorded): SIGKILL of devenv
+# does not stop that child, so the lock is only reaped when both the owner
+# and its last Docker command provably ended. Unverifiable records keep the
+# lock (exit 4 after FLOWCRM_LOCK_WAIT). Locks from another host are never
+# reaped automatically.
 
 host_id() { hostname 2>/dev/null || uname -n; }
 
-boot_id() {
-  if [ -r /proc/sys/kernel/random/boot_id ]; then
-    cat /proc/sys/kernel/random/boot_id
-  else
-    sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p'
+is_pid() { [[ $1 =~ ^[1-9][0-9]{0,9}$ ]]; }
+
+# Start identity of a process, independent of the caller's locale and time
+# zone: on Linux the boot id and the start time in clock ticks since boot
+# (unaffected by changes of the wall clock), elsewhere ps lstart rendered in
+# the C locale and UTC. Empty if the process does not exist.
+proc_start() {
+  local stat boot f
+  if [ -r /proc/sys/kernel/random/boot_id ] && stat=$(cat "/proc/$1/stat" 2>/dev/null); then
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+    read -r -a f <<<"${stat##*) }"
+    if [ -n "$boot" ] && [[ ${f[19]-} =~ ^[0-9]+$ ]]; then printf 'linux:%s:%s\n' "$boot" "${f[19]}"; fi
+    return 0
   fi
+  stat=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//')
+  [ -z "$stat" ] || printf 'lstart:%s\n' "$stat"
 }
 
-proc_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+# Returns 1 only when the recorded process provably ended: its PID is gone
+# or now belongs to a process with another start identity of the same kind.
+# A missing, malformed or incomparable record counts as running.
+recorded_alive() { # pid pstart
+  local now
+  is_pid "$1" && command -v ps >/dev/null 2>&1 || return 0
+  ps -p "$1" >/dev/null 2>&1 || return 1
+  case $2 in linux:* | lstart:*) ;; *) return 0 ;; esac
+  now=$(proc_start "$1")
+  [ -n "$now" ] && [ "${now%%:*}" = "${2%%:*}" ] || return 0
+  [ "$now" = "$2" ]
+}
 
 older_than_a_minute() { [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }
 
@@ -238,7 +263,7 @@ new_token() { od -An -N8 -tx1 /dev/urandom | tr -d ' \n'; }
 
 write_lock_owner() {
   new_tmp lock-owner
-  printf '%s\n' "token=$LOCK_TOKEN" "host=$(host_id)" "boot=$(boot_id)" \
+  printf '%s\n' "token=$LOCK_TOKEN" "host=$(host_id)" \
     "pid=$$" "pstart=$(proc_start $$)" "command=$1" >"$TMP_FILE" &&
     mv -f "$TMP_FILE" "$LOCK_DIR/owner"
   local rc=$?
@@ -246,45 +271,48 @@ write_lock_owner() {
   return $rc
 }
 
+# Sets REC_TOKEN, REC_HOST, REC_PID and REC_PSTART from a lock record.
+read_record() {
+  local line
+  REC_TOKEN='' REC_HOST='' REC_PID='' REC_PSTART=''
+  while IFS= read -r line; do
+    case $line in
+      token=*) REC_TOKEN=${line#token=} ;;
+      host=*) REC_HOST=${line#host=} ;;
+      pid=*) REC_PID=${line#pid=} ;;
+      pstart=*) REC_PSTART=${line#pstart=} ;;
+    esac
+  done <"$1"
+}
+
 # Sets LOCK_STATE (active|stale|foreign), LOCK_INFO and OBSERVED_TOKEN.
 lock_status() {
-  local f=$LOCK_DIR/owner line now_boot token='' host='' boot='' pid='' pstart=''
+  local pid
   LOCK_INFO='owner not recorded yet'
   OBSERVED_TOKEN=
-  if [ ! -f "$f" ]; then
+  if [ ! -f "$LOCK_DIR/owner" ]; then
     if [ -d "$LOCK_DIR" ] && older_than_a_minute "$LOCK_DIR"; then LOCK_STATE=stale; else LOCK_STATE=active; fi
     return 0
   fi
-  while IFS= read -r line; do
-    case $line in
-      token=*) token=${line#token=} ;;
-      host=*) host=${line#host=} ;;
-      boot=*) boot=${line#boot=} ;;
-      pid=*) pid=${line#pid=} ;;
-      pstart=*) pstart=${line#pstart=} ;;
-    esac
-  done <"$f"
-  OBSERVED_TOKEN=$token
-  LOCK_INFO="pid $pid on host $host"
-  if [ "$host" != "$(host_id)" ]; then
+  read_record "$LOCK_DIR/owner" 2>/dev/null
+  OBSERVED_TOKEN=$REC_TOKEN
+  pid=$REC_PID
+  LOCK_INFO="pid $(show "$pid") on host $(show "$REC_HOST")"
+  if [ "$REC_HOST" != "$(host_id)" ]; then
     LOCK_STATE=foreign
     return 0
   fi
-  now_boot=$(boot_id)
-  if [ -n "$boot" ] && [ -n "$now_boot" ] && [ "$boot" != "$now_boot" ]; then
-    LOCK_STATE=stale
-    return 0
+  LOCK_STATE=active
+  recorded_alive "$REC_PID" "$REC_PSTART" && return 0
+  # The owner ended; a Docker command it started may still be running.
+  if [ -e "$LOCK_DIR/op" ]; then
+    read_record "$LOCK_DIR/op" 2>/dev/null
+    if recorded_alive "$REC_PID" "$REC_PSTART"; then
+      LOCK_INFO="Docker command pid $(show "$REC_PID") of the ended devenv pid $(show "$pid") is still running"
+      return 0
+    fi
   fi
-  if ! is_uint "$pid" || ! command -v ps >/dev/null 2>&1; then
-    # Unverifiable owner: never treat as stale.
-    LOCK_STATE=active
-    return 0
-  fi
-  if ps -p "$pid" >/dev/null 2>&1; then
-    if [ -n "$pstart" ] && [ "$(proc_start "$pid")" != "$pstart" ]; then LOCK_STATE=stale; else LOCK_STATE=active; fi
-  else
-    LOCK_STATE=stale
-  fi
+  LOCK_STATE=stale
 }
 
 # Remove a stale lock under a second mkdir guard, re-checking that it is
@@ -330,6 +358,29 @@ acquire_lock() {
   done
 }
 
+# Internal command, run by compose() while the lock is held: record this
+# process (PID and start identity) in lock/op, then exec the Docker command
+# in the same process. The record is written under the reap guard and only
+# while the lock still belongs to the caller's token, so a concurrent reaper
+# either sees the record or the command never starts.
+run_recorded() { # lock-dir token command...
+  local dir=$1 token=$2 guard i=0 tmp ok=''
+  shift 2
+  guard=${dir%/*}/lock.reap
+  until mkdir "$guard" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || die $EX_LOCK "the reap guard of .runtime/lock is busy; the Docker command was not run"
+    sleep 0.1
+  done
+  if [ "$(sed -n 's/^token=//p' "$dir/owner" 2>/dev/null)" = "$token" ] &&
+    tmp=$(mktemp "$dir/.op.XXXXXX" 2>/dev/null); then
+    if printf '%s\n' "pid=$$" "pstart=$(proc_start $$)" >"$tmp" && mv -f "$tmp" "$dir/op"; then ok=1; else rm -f "$tmp"; fi
+  fi
+  rmdir "$guard"
+  [ -n "$ok" ] || die $EX_LOCK "this command no longer holds .runtime/lock; the Docker command was not run"
+  exec "$@"
+}
+
 release_lock() {
   [ "$LOCK_HELD" = 1 ] || return 0
   local t
@@ -346,7 +397,9 @@ on_exit() {
 # --- Docker -----------------------------------------------------------------
 
 compose() {
-  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND docker compose \
+  local run=(docker)
+  if [ "$LOCK_HELD" = 1 ]; then run=("$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" docker); fi
+  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND "${run[@]}" compose \
     --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
 }
 
@@ -718,6 +771,10 @@ main() {
   [ $# -eq 0 ] || shift
   case $cmd in
     up | down | restart | status | url | ports | logs | doctor) ;;
+    __run-recorded)
+      [ $# -ge 3 ] || die $EX_CONFIG "usage: bin/devenv __run-recorded LOCK_DIR TOKEN COMMAND..."
+      run_recorded "$@"
+      ;;
     help | -h | --help)
       usage
       return 0
