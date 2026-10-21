@@ -326,8 +326,10 @@ Application suites (`tests/app/`), each in its own Compose projects:
 
 - `scan.sh` (SC-xx): Trivy scans of the runtime images (production-like api
   and edge, db), which fail on any HIGH or CRITICAL finding, and of the
-  development images, which are reported; a control scan proves the gate
-  fails on a vulnerable image (see
+  development images, which are reported; each scan must inventory the
+  expected package sources (Alpine packages, Composer, the Caddy binary,
+  Node packages), and control scans prove the gate fails on a vulnerable
+  image and on an image without inventoried packages (see
   [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
 - `backend.sh` (BE-01 to BE-10): PHP 8.5 runtime, `composer validate` and
   `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
