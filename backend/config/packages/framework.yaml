@@ -1,0 +1,13 @@
+# see https://symfony.com/doc/current/reference/configuration/framework.html
+framework:
+    secret: '%env(trim:file:APP_SECRET_FILE)%'
+
+    # The API is stateless until sessions are introduced (ADR-005).
+    session: false
+
+    # Never trust client-supplied forwarding headers beyond the edge.
+    trusted_proxies: '%env(default::TRUSTED_PROXIES)%'
+
+when@test:
+    framework:
+        test: true
