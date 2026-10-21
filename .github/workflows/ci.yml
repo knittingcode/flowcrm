@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs are cancelled; every push to main is checked.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  guard:
+    name: Repository guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reject tracked local-only files
+        run: scripts/ci/guard-tracked-files.sh
+
+      - name: Run guard regression tests
+        run: scripts/ci/tests/guard-tracked-files.test.sh
+
+      - name: ShellCheck
+        run: >-
+          docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
+          koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+          scripts/ci/guard-tracked-files.sh scripts/ci/tests/guard-tracked-files.test.sh
+
+      - name: actionlint
+        run: >-
+          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
