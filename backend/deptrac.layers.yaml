@@ -1,0 +1,37 @@
+# Layers inside every module (FCRM-003 section E): Http -> Application ->
+# Domain; Infrastructure implements interfaces of Domain and Application.
+# A module's public Api may use Domain types (identifiers, value objects).
+# Domain uses no framework HTTP and no persistence code except the Doctrine
+# mapping attributes (an accepted trade-off) and Doctrine collections;
+# Application and Api use no framework HTTP. Module boundaries:
+# deptrac.modules.yaml.
+deptrac:
+  paths:
+    - ./src
+  exclude_files:
+    - '#/src/Kernel\.php$#'
+  layers:
+    - { name: Api, collectors: [{ type: classLike, value: '^App\\[A-Za-z]+\\Api\\' }] }
+    - { name: Domain, collectors: [{ type: classLike, value: '^App\\[A-Za-z]+\\Domain\\' }] }
+    - { name: Application, collectors: [{ type: classLike, value: '^App\\[A-Za-z]+\\Application\\' }] }
+    - { name: Infrastructure, collectors: [{ type: classLike, value: '^App\\[A-Za-z]+\\Infrastructure\\' }] }
+    - { name: Http, collectors: [{ type: classLike, value: '^App\\[A-Za-z]+\\Http\\' }] }
+    - name: HttpFramework
+      collectors:
+        - { type: classLike, value: '^Symfony\\Component\\(HttpFoundation|HttpKernel|Routing|Form|Security)\\' }
+        - { type: classLike, value: '^Symfony\\Bundle\\' }
+    - name: Persistence
+      collectors:
+        - type: bool
+          must:
+            - { type: classLike, value: '^Doctrine\\' }
+          must_not:
+            - { type: classLike, value: '^Doctrine\\ORM\\Mapping\\' }
+            - { type: classLike, value: '^Doctrine\\DBAL\\Types\\Types$' }
+            - { type: classLike, value: '^Doctrine\\Common\\Collections\\' }
+  ruleset:
+    Api: [Domain]
+    Domain: []
+    Application: [Domain, Api]
+    Infrastructure: [Domain, Application, Api, HttpFramework, Persistence]
+    Http: [Domain, Application, Api, HttpFramework]

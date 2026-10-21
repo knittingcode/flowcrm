@@ -1,4 +1,7 @@
 {
+    "deptrac/deptrac": {
+        "version": "4.7.2"
+    },
     "doctrine/deprecations": {
         "version": "1.1",
         "recipe": {
