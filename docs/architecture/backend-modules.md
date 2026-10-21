@@ -7,18 +7,19 @@ lists the rules and how they are enforced.
 
 | Module | Responsibility | Status |
 |---|---|---|
-| `Identity` | users, password hashing, login, sessions, `/me` | planned |
-| `Organizations` | organizations, memberships, roles, tenant resolution | planned |
+| `Identity` | users, password hashing, login, sessions, `/me` | `User` entity (FND-007) |
+| `Organizations` | organizations, memberships, roles, tenant resolution | `Organization`, `Membership` entities (FND-007) |
 | `CRM` | accounts, contacts | planned |
-| `Sales` | pipelines, stages, opportunities | planned |
+| `Sales` | pipelines, stages, opportunities | `Pipeline`, `PipelineStage` entities (FND-007) |
 | `Activities` | tasks | planned |
 | `Reporting` | dashboard queries; no tables of its own | planned |
-| `Audit` | audit writer and queries | planned |
+| `Audit` | audit writer and queries | `AuditEvent` entity (FND-007) |
 | `Shared` | small cross-cutting code: health checks, API status, problem details, request IDs; later `Clock`, UUIDv7 and `Money` | implemented |
 
-The planned modules exist only as rules in `backend/deptrac.modules.yaml`;
+Modules without code exist only as rules in `backend/deptrac.modules.yaml`;
 their namespaces are created by the tasks that implement them. No
-placeholder classes are added.
+placeholder classes are added. The core schema is described in
+[data-model.md](data-model.md).
 
 Rules (`backend/deptrac.modules.yaml`):
 
