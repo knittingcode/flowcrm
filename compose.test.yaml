@@ -1,0 +1,26 @@
+# Test override for tests/app/backend.sh, used only with a separate
+# "<project>-test" Compose project: no published ports, no edge or web, and
+# a throwaway database on tmpfs. Never used by make up.
+services:
+  edge:
+    ports: !reset []
+
+  db:
+    volumes: !reset []
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql:uid=70,gid=70
+      - /var/lib/postgresql:uid=70,gid=70
+
+  api:
+    build:
+      target: test
+    environment:
+      APP_ENV: test
+      FLOWCRM_MIGRATE_ON_START: "0"
+    volumes: !reset []
+    # Runs the checks given as the command, then exits.
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["echo 'pass the checks to run' >&2; exit 64"]
+    healthcheck:
+      disable: true

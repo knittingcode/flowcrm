@@ -1,0 +1,149 @@
+# FlowCRM development stack (FCRM-003, ADR-009, ADR-017).
+#
+# edge - Caddy 2, the only service with a published host port, always bound
+#        to 127.0.0.1. Routes /api and /health/{live,ready} to the api service
+#        and everything else to the Vite dev server.
+# web  - React + TypeScript with the Vite dev server (profile "dev").
+# api  - Symfony 7.4 under PHP-FPM 8.5. bin/devenv applies pending
+#        migrations after the internal services are healthy.
+# db   - PostgreSQL 18 with the persistent volume db-data.
+#
+# The project name, project directory, host port and profile are supplied by
+# bin/devenv: run `make up`. A plain `docker compose up` fails on the
+# required FLOWCRM_HTTP_PORT instead of creating an unmanaged project.
+# Secrets are generated per checkout by bin/devenv in .runtime/secrets.
+
+x-hardening: &hardening
+  init: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  edge:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/edge/Dockerfile
+      target: dev
+    read_only: true
+    tmpfs:
+      - /tmp
+    ports:
+      - "${FLOWCRM_HTTP_BIND:-127.0.0.1}:${FLOWCRM_HTTP_PORT:?is set by bin/devenv; run make up}:8080"
+    networks: [front, back]
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+
+  web:
+    <<: *hardening
+    profiles: [dev]
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+      target: dev
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/node_modules/.vite:uid=1000,gid=1000
+      - /app/node_modules/.vite-temp:uid=1000,gid=1000
+    # Only the files that change during development; configuration and
+    # dependency changes need a rebuild (make restart).
+    volumes:
+      - ./frontend/src:/app/src:ro
+      - ./frontend/public:/app/public:ro
+      - ./frontend/index.html:/app/index.html:ro
+    networks: [front]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5173/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+
+  api:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+      target: dev
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/var:uid=82,gid=82
+    environment:
+      APP_ENV: dev
+      # Migrations are a phase of make up (bin/devenv), not of the container
+      # start, so a migration added while the stack runs is applied too.
+      FLOWCRM_MIGRATE_ON_START: "0"
+    secrets: [db_password, app_secret]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./backend/config:/app/config:ro
+      - ./backend/migrations:/app/migrations:ro
+      - ./backend/public:/app/public:ro
+    networks: [back]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "flowcrm-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 1s
+
+  db:
+    <<: *hardening
+    build:
+      context: .
+      dockerfile: docker/db/Dockerfile
+    # Runs as the image's postgres user from the start, so the entrypoint
+    # needs no capabilities to change ownership or switch users.
+    user: postgres
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql:uid=70,gid=70
+    environment:
+      POSTGRES_DB: flowcrm
+      POSTGRES_USER: flowcrm
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - db-data:/var/lib/postgresql
+    networks: [back]
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=flowcrm", "--dbname=flowcrm", "--host=127.0.0.1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+networks:
+  front: {}
+  # api and db are reachable only from inside the project.
+  back:
+    internal: true
+
+volumes:
+  db-data: {}
+
+secrets:
+  db_password:
+    file: ${FLOWCRM_SECRETS_DIR:-./.runtime/secrets}/db_password
+  app_secret:
+    file: ${FLOWCRM_SECRETS_DIR:-./.runtime/secrets}/app_secret

@@ -1,0 +1,33 @@
+# Production-like edge: /api and /health/{live,ready} go to PHP-FPM; every
+# other request is answered from the built SPA, with index.html as the
+# fallback for client-side routes.
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+import /etc/caddy/common.caddy
+
+:8080 {
+	import baseline
+
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+
+	handle {
+		root * /srv/www
+		# Vite fingerprints everything under /assets/.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@app not path /assets/*
+		header @app Cache-Control "no-cache"
+		# Client-side routes fall back to index.html; a missing fingerprinted
+		# asset stays a 404.
+		@spa {
+			not path /assets/*
+			not file
+		}
+		rewrite @spa /index.html
+		file_server
+	}
+}

@@ -43,10 +43,13 @@ jobs:
           rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
           -color
 
+  # The application checks run in this required job on purpose: a separate
+  # job that is not a required check could fail (or be skipped) without
+  # blocking a merge.
   devenv:
     name: Dev environment
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,12 +60,24 @@ jobs:
         run: >-
           docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
           koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
-          -x bin/devenv tests/devenv/unit.sh tests/devenv/integration.sh
+          -x bin/devenv tests/devenv/unit.sh tests/devenv/integration.sh tests/devenv/tally.sh
+          tests/app/lib.sh tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh tests/app/scan.sh
+          docker/api/entrypoint.sh docker/api/healthcheck.sh
 
       - name: Validate Compose configuration
-        run: >-
-          FLOWCRM_HTTP_PORT=8080 docker compose --project-name flowcrm-config-check
-          --file compose.fixture.yaml config --quiet
+        run: |
+          secrets=$(mktemp -d)
+          printf 'ci\n' >"$secrets/db_password"
+          printf 'ci\n' >"$secrets/app_secret"
+          export FLOWCRM_SECRETS_DIR=$secrets
+          FLOWCRM_HTTP_PORT=8080 docker compose --project-name flowcrm-config-check --file compose.fixture.yaml config --quiet
+          FLOWCRM_HTTP_PORT=8080 COMPOSE_PROFILES=dev docker compose --project-name flowcrm-config-check --file compose.yaml config --quiet
+          FLOWCRM_HTTP_PORT=0 docker compose --project-name flowcrm-config-check --file compose.yaml --file compose.test.yaml config --quiet
+          FLOWCRM_HTTP_PORT=0 docker compose --project-name flowcrm-config-check --file compose.yaml --file compose.prodlike.yaml config --quiet
+          # Exactly one published port, on 127.0.0.1, owned by the edge.
+          FLOWCRM_HTTP_PORT=8080 COMPOSE_PROFILES=dev docker compose --project-name flowcrm-config-check --file compose.yaml config --format json |
+            python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]; p = {n: s.get("ports", []) for n, s in c.items()}; assert [n for n, v in p.items() if v] == ["edge"], p; assert [x["host_ip"] for x in p["edge"]] == ["127.0.0.1"], p'
+          rm -rf "$secrets"
 
       - name: make help and make doctor
         run: make help && make doctor
@@ -72,3 +87,20 @@ jobs:
 
       - name: Allocator integration tests (real Docker)
         run: tests/devenv/integration.sh
+
+      - name: Backend checks (Composer, PHP-CS-Fixer, PHPStan, migrations, PHPUnit)
+        run: tests/app/backend.sh
+
+      - name: Frontend checks (npm audit, type check, ESLint, Vitest, build)
+        run: tests/app/frontend.sh
+
+      - name: Application stack (real Docker, bin/devenv, browser)
+        run: tests/app/stack.sh
+
+      - name: Production-like stack (built SPA, browser)
+        run: tests/app/prodlike.sh
+
+      # Fails on HIGH/CRITICAL findings in runtime images (policy in
+      # docs/security/container-vulnerabilities.md).
+      - name: Container vulnerability scan (Trivy)
+        run: tests/app/scan.sh

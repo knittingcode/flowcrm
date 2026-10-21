@@ -3,12 +3,29 @@
 `make` commands start this checkout's Docker Compose project and publish its
 HTTP edge on `127.0.0.1` without manual port configuration.
 
-> **Current stage:** the stack is a development fixture
-> (`compose.fixture.yaml`): a minimal BusyBox HTTP server (`edge`) and an
-> unpublished helper with a named volume (`state`). It exists to exercise the
-> port allocator and the lifecycle commands. The Symfony backend, the React
-> frontend and PostgreSQL are not part of it yet, and a healthy fixture says
-> nothing about their readiness.
+## Stacks
+
+`FLOWCRM_STACK` selects the Compose stack that the commands manage:
+
+| `FLOWCRM_STACK` | Compose file | Services | Readiness path |
+|---|---|---|---|
+| `app` (default) | `compose.yaml` | `edge` (Caddy 2), `web` (Vite, profile `dev`), `api` (Symfony on PHP-FPM), `db` (PostgreSQL 18) | `/health/ready` |
+| `fixture` | `compose.fixture.yaml` | `edge` (BusyBox HTTP server), `state` (helper with a named volume) | `/health` |
+
+The application stack is the normal development environment (see the
+[README](../README.md) and the
+[lifecycle contract](architecture/development-lifecycle-contract.md)). The
+fixture exists only for the allocator's regression tests
+(`tests/devenv/integration.sh` sets `FLOWCRM_STACK=fixture`); it is not a CRM
+application, and a healthy fixture says nothing about the application.
+Both stacks use the same allocator, lock and runtime state, and the same
+Compose project name. One checkout runs one stack at a time: every command
+checks the Compose file recorded on the project's containers (label
+`com.docker.compose.project.config_files`) and refuses with exit 6 if they
+belong to the other stack, naming the command that stops them
+(`FLOWCRM_STACK=<stack> make down`). Readiness also requires the stack's own
+response body (`{"status":"ready"}` or `ok`), so another stack's page never
+counts as ready.
 
 ## Prerequisites
 
@@ -18,11 +35,11 @@ HTTP edge on `127.0.0.1` without manual port configuration.
 | Docker Compose v2 | the `docker compose` plugin |
 | GNU Make ≥ 3.81 | the macOS default works |
 | bash ≥ 3.2 | `bin/devenv` runs under bash (macOS `/bin/bash` works) |
-| `mktemp`, `hostname`, `ps`, `find`, `od`, `sha256sum` or `shasum` | present on macOS and common Linux distributions |
+| `mktemp`, `hostname`, `ps`, `find`, `od`, `tr`, `sha256sum` or `shasum` | present on macOS and common Linux distributions |
 | `lsof` | optional, improves `make ports` |
 
-PHP, Composer, Node.js and Python are **not** needed on the host. Python 3 and
-`curl` are used only by the test suite.
+PHP, Composer, Node.js, PostgreSQL and Python are **not** needed on the host.
+Python 3, `curl`, `git` and `tar` are used only by the test suites.
 
 Run `make doctor` to check all of this. It changes nothing.
 
@@ -30,14 +47,37 @@ Run `make doctor` to check all of this. It changes nothing.
 
 ```console
 $ make up
-FlowCRM development fixture: http://127.0.0.1:8080
+devenv: generated the local secret .runtime/secrets/db_password
+devenv: generated the local secret .runtime/secrets/app_secret
+devenv: building images (the first build can take several minutes)
+FlowCRM: http://127.0.0.1:8080
 $ make url
 http://127.0.0.1:8080
 ```
 
-`make up` validates the configuration and prerequisites, starts the internal
-services, binds the edge, checks the actual Docker mapping and `GET /health`,
-saves the verified port and prints the URL.
+`make up` runs these phases; any failure stops it with a non-zero exit code
+and leaves `.runtime/dev.env` unchanged:
+
+1. validate the configuration, the prerequisites (Docker, Compose v2) and
+   the Compose file (`docker compose config`);
+2. take the per-checkout lock;
+3. create missing secrets in `.runtime/secrets` (never replacing one; see
+   below);
+4. build this project's images (`docker compose build`; source code is
+   mounted, so editing it does not rebuild anything);
+5. start the internal services with `up --wait`: `db`, then `api` and `web`;
+   they publish no port, so a failure here is never retried on another port;
+6. apply pending database migrations in the running `api` container
+   (`doctrine:migrations:migrate --all-or-nothing`; application stack only);
+7. start the edge on the first usable port (`up --no-deps --wait edge`);
+8. verify Docker's actual mapping and `GET` of the stack's readiness path
+   (`/health/ready`, which must answer 200 with the stack's own body) through
+   the published edge;
+9. save the verified port and print the URL.
+
+When the stack already runs, `make up` reports what it changed: `already
+running; nothing to change`, or `running; recreated: api (image or
+configuration changed)` and/or `applied pending database migrations`.
 
 ## Commands
 
@@ -47,12 +87,13 @@ saves the verified port and prints the URL.
 | `make down` | Stop and remove this checkout's containers and network. **Volumes and the saved port are kept.** |
 | `make restart` | `down`, then `up`; the saved port is tried first. |
 | `make status` | Show the project name, saved port, each service's state and health and the actual mapping. Exit 1 unless the edge is running, healthy and matches the saved port. |
-| `make url` | Print the verified URL. Fails when the edge is not running, does not answer `/health` or its mapping differs from the saved port. |
+| `make url` | Print the verified URL. Fails when the edge is not running, the readiness path does not answer 200 or the mapping differs from the saved port. |
 | `make ports` | Read-only: the candidate ports in order, whether something accepts connections on them, and the container or process using them (best effort). |
-| `make logs` | Recent logs of this project only. `SERVICE=edge\|state`, `TAIL=200`, `FOLLOW=1`. |
+| `make logs` | Recent logs of this project only. `SERVICE` is one of the stack's services (`edge`, `web`, `api`, `db`; fixture: `edge`, `state`), `TAIL=200`, `FOLLOW=1`. |
 | `make doctor` | Read-only prerequisite and configuration check. |
 | `make help` | List the targets. |
-| `make test-devenv` | Run the allocator tests (see below). |
+| `make test-devenv` | Run the allocator tests on the fixture (see below). |
+| `make test-app` | Run the backend, frontend and application-stack tests (see below). |
 
 When `bin/devenv` fails, `make` reports its own exit code 2; run
 `bin/devenv <command>` directly to see the codes below.
@@ -130,7 +171,8 @@ FLOWCRM_HTTP_PORT=8080
 ```
 
 - It is written atomically (temporary file, then rename) and only after the
-  Docker mapping and `/health` were checked. A failed start never replaces it.
+  Docker mapping and the readiness path were checked. A failed start never
+  replaces it.
 - It is read as data with a fixed set of keys; it is never executed. A
   corrupt, unknown-schema, symlinked or oversized file is ignored and
   replaced on the next successful start.
@@ -139,7 +181,16 @@ FLOWCRM_HTTP_PORT=8080
 - If the running edge uses a different port than the saved one (for example
   the file was edited), `make url` and `make status` report the mismatch and
   `make up` reconciles the file with the actual mapping.
-- The file contains no secrets.
+- The file contains no secrets. The application's secrets are separate
+  files in `.runtime/secrets/`:
+  - The directory must be owned by you; `make up` sets it to `0700` and the
+    files to `0444` (readable by the unprivileged container users, not by
+    other local users). Symlinks and other file types are refused.
+  - A secret is generated once and never replaced.
+  - If `db_password` is missing while the volume `<project>_db-data` exists,
+    `make up` refuses with exit 6 and generates nothing: the database was
+    initialised with the old password. Restore the file from a backup, or
+    reset the database deliberately (README, "Data persistence and reset").
 
 ## Several checkouts and projects
 
@@ -239,6 +290,13 @@ shows this project's logs (`edge` logs each HTTP request).
 | `starting the edge on port … failed for a reason other than a port conflict (…)` (exit 2) | the edge failed or `docker compose` was terminated; see `make logs`, fix, run `make up` again |
 | `starting the internal services (…) failed: …` (exit 2) | the unpublished services failed (for example an invalid Compose file or a failing health check) or `docker compose` was terminated; no port was involved |
 | `stopping project … failed: …` (exit 2) | `docker compose down` failed or was terminated |
+| `project … has containers of another stack` (exit 6) | the other `FLOWCRM_STACK` runs in this checkout; stop it with the command shown |
+| `.runtime/secrets/db_password is missing, but the volume … was initialised with it` (exit 6) | restore the secret, or reset the database (README) |
+| `applying the database migrations failed` (exit 2) | a migration failed; nothing was saved; see `make logs SERVICE=api` |
+| `the Compose configuration (…) is invalid` (exit 2) | the Compose file does not parse or validate; nothing was started |
+| `building the images failed: …` (exit 2) | a Dockerfile or dependency install failed; running containers were not changed |
+| `does not answer /health/ready with 200` (exit 2) | the stack runs but is not ready (database unreachable or a migration pending); `make logs SERVICE=api` shows the logged reason |
+| `could not create the secret …` / `… is not a regular file` (exit 6) | `.runtime/secrets` is not writable or contains a symlink; fix it, never edit an existing secret |
 | `Docker daemon is not reachable` (exit 5) | start Docker Desktop or the Docker service |
 | `waiting for another devenv command` | another command runs in this checkout; it is waited for |
 | `holds .runtime/lock … gave up` (exit 4) | a command, or Docker Compose processes of a killed one, are still running, or the lock comes from another host, an older `bin/devenv` or is unreadable; remove `.runtime/lock` only if no devenv or `docker compose` command of this checkout runs |
@@ -258,10 +316,44 @@ shows this project's logs (`edge` logs each HTTP request).
 ## Tests
 
 ```console
-$ make test-devenv                               # unit + integration
+$ make test-devenv                               # allocator: unit + integration (fixture)
 $ tests/devenv/unit.sh                           # no Docker needed
 $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
+$ make test-app                                  # application: the four suites below
 ```
+
+Application suites (`tests/app/`), each in its own Compose projects:
+
+- `scan.sh` (SC-xx): Trivy scans of the runtime images (production-like api
+  and edge, db), which fail on any HIGH or CRITICAL finding, and of the
+  development images, which are reported; each scan must inventory the
+  expected package sources (Alpine packages, Composer, the Caddy binary,
+  Node packages), and control scans prove the gate fails on a vulnerable
+  image and on an image without inventoried packages (see
+  [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
+- `backend.sh` (BE-01 to BE-10): PHP 8.5 runtime, `composer validate` and
+  `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
+  empty database, `doctrine:schema:validate`, a full down/up migration round
+  trip, and PHPUnit unit and integration suites against a real PostgreSQL
+  (project `<project>-test`, database on tmpfs, no published ports).
+- `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
+  without warnings, Vitest component tests and the production build.
+- `stack.sh` (ST-01 to ST-39): the real stack through `bin/devenv` in fresh
+  copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
+  (default 18300): exposure, networks, non-root and read-only containers,
+  routing through Caddy, API and health responses, readiness with a pending
+  migration and with a stopped database, persistence across down/up and
+  restart, a port conflict, checkout isolation, a Playwright browser
+  journey including the HMR connection, the raw-path routing boundary,
+  per-service hardening with negative controls, lost secrets, source edits
+  and migrations added while running, and both stacks in one checkout.
+- `prodlike.sh` (PL-01 to PL-13): the production images (`<project>-prod`,
+  no published ports): built SPA, CSP, cache headers, SPA fallback, API
+  errors, health, the raw-path routing boundary and a Playwright journey
+  under the CSP.
+
+Each application suite uses Compose project and image names unique to the
+run, so several runs from one checkout do not interfere.
 
 - `tests/devenv/unit.sh` covers configuration validation, candidate order,
   state parsing and writing, failure classification, project naming and

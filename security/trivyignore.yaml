@@ -1,0 +1,17 @@
+# Exceptions for the container vulnerability gate (tests/app/scan.sh).
+#
+# The gate fails on every HIGH or CRITICAL finding in a runtime image. An
+# entry here is allowed only for one specific CVE that cannot be fixed yet,
+# with the evidence for the risk decision in `statement`, the affected
+# package or path, and an `expired_at` date no more than 90 days ahead, so
+# the decision is reviewed again. Each entry is also listed in
+# docs/security/container-vulnerabilities.md. No broad or permanent rules.
+#
+# Example:
+#   vulnerabilities:
+#     - id: CVE-0000-00000
+#       paths: ["usr/bin/example"]
+#       statement: "Why it is not exploitable here, with evidence."
+#       expired_at: 2026-12-31
+
+vulnerabilities: []

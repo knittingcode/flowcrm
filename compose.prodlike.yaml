@@ -1,0 +1,24 @@
+# Production-like override for tests/app/prodlike.sh, used only with a
+# separate "<project>-prod" Compose project: the edge serves the built SPA,
+# the api runs without dev dependencies, there is no Vite dev server and no
+# port is published (the tests run inside the project network).
+services:
+  edge:
+    build:
+      target: prod
+    ports: !reset []
+
+  api:
+    build:
+      target: prod
+    environment:
+      APP_ENV: prod
+      FLOWCRM_MIGRATE_ON_START: "1"
+    volumes: !reset []
+
+  db:
+    volumes: !reset []
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql:uid=70,gid=70
+      - /var/lib/postgresql:uid=70,gid=70

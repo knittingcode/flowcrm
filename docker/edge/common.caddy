@@ -1,0 +1,37 @@
+# Shared by Caddyfile.dev and Caddyfile.prod.
+
+(php) {
+	# Every PHP request runs Symfony's front controller on the api service.
+	rewrite * /index.php
+	reverse_proxy api:9000 {
+		transport fastcgi {
+			root /app/public
+			split .php
+		}
+	}
+}
+
+(baseline) {
+	# The request ID is always generated here; a client-supplied one is replaced.
+	request_header X-Request-Id {http.request.uuid}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+		-Server
+	}
+	log {
+		output stdout
+		format json
+	}
+
+	# ADR-017: Symfony is reached only for /api, /api/... and exactly
+	# /health/live and /health/ready. The check uses the raw request URI,
+	# not Caddy's path matchers: those match case-insensitively on a
+	# decoded path with merged slashes, so //api/..., /health//live,
+	# /HEALTH/LIVE or /health%2Flive would also reach Symfony.
+	@php expression `{http.request.orig_uri}.matches("^/api(/[^?]*)?([?].*)?$") || {http.request.orig_uri}.matches("^/health/(live|ready)([?].*)?$")`
+	handle @php {
+		import php
+	}
+}

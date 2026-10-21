@@ -6,7 +6,7 @@
 DEVENV := ./bin/devenv
 
 .DEFAULT_GOAL := help
-.PHONY: help up down restart status url ports logs doctor test-devenv
+.PHONY: help up down restart status url ports logs doctor test-devenv test-app
 
 help: ## Show this help
 	@echo 'Usage: make <target>'
@@ -34,7 +34,7 @@ url: ## Print the verified URL (fails when not running)
 ports: ## Show candidate ports and who uses them (read-only)
 	@$(DEVENV) ports
 
-logs: ## Show recent logs (SERVICE=edge|state TAIL=200 FOLLOW=1)
+logs: ## Show recent logs (SERVICE=edge|web|api|db TAIL=200 FOLLOW=1)
 	@$(DEVENV) logs
 
 doctor: ## Check prerequisites (read-only)
@@ -43,3 +43,9 @@ doctor: ## Check prerequisites (read-only)
 test-devenv: ## Run the allocator unit and real-Docker integration tests
 	@tests/devenv/unit.sh
 	@tests/devenv/integration.sh
+
+test-app: ## Run the backend, frontend and real application-stack tests
+	@tests/app/backend.sh
+	@tests/app/frontend.sh
+	@tests/app/stack.sh
+	@tests/app/prodlike.sh

@@ -13,7 +13,11 @@
 # bind decides. Internal services start first and never publish ports, so
 # retrying a port only recreates the stateless edge container. Volumes are
 # never removed. The verified port is written to .runtime/dev.env only
-# after the mapping and /health have been checked.
+# after the mapping and the stack's readiness path have been checked.
+#
+# FLOWCRM_STACK selects the Compose stack: "app" (default, compose.yaml, the
+# Symfony, React, PostgreSQL and Caddy stack) or "fixture"
+# (compose.fixture.yaml, the BusyBox fixture of the allocator tests).
 #
 # Exit codes:
 #   0 success          1 not running (status, url)   2 Docker error
@@ -29,7 +33,6 @@ readonly RUNTIME_SCHEMA=1
 readonly BIND=127.0.0.1
 readonly EDGE=edge
 readonly EDGE_CONTAINER_PORT=8080
-readonly INTERNAL_SERVICES=state
 readonly PROJECT_RE='^flowcrm-[0-9a-f]{6}$'
 # Bind conflicts as reported by Docker Engine and Docker Desktop. "Ports are
 # not available" alone is not enough: Docker Desktop also uses it for
@@ -68,12 +71,13 @@ Usage: bin/devenv <command>
   status   Show container state and the saved port (exit 1 if not running)
   url      Print the verified URL (exit 1 if not running)
   ports    Show candidate ports and who uses them (read-only)
-  logs     Show recent logs (SERVICE=edge|state, TAIL=200, FOLLOW=1)
+  logs     Show recent logs (SERVICE=<service>, TAIL=200, FOLLOW=1)
   doctor   Check prerequisites (read-only)
 
-Configuration: FLOWCRM_PORT_DEFAULT (8080), FLOWCRM_PORT_RANGE (8080-8099),
-FLOWCRM_HTTP_PORT (explicit port, no fallback), FLOWCRM_UP_TIMEOUT (600),
-FLOWCRM_WAIT_TIMEOUT (60), FLOWCRM_LOCK_WAIT (120). See docs/dev-environment.md.
+Configuration: FLOWCRM_STACK (app or fixture), FLOWCRM_PORT_DEFAULT (8080),
+FLOWCRM_PORT_RANGE (8080-8099), FLOWCRM_HTTP_PORT (explicit port, no
+fallback), FLOWCRM_UP_TIMEOUT (600), FLOWCRM_WAIT_TIMEOUT (60),
+FLOWCRM_LOCK_WAIT (120). See docs/dev-environment.md.
 EOF
 }
 
@@ -135,12 +139,48 @@ sha256_prefix() {
   fi | cut -c1-6
 }
 
+# Stack definitions (docs/architecture/development-lifecycle-contract.md,
+# section 10). Both publish the service "edge" on container port 8080.
+select_stack() {
+  STACK=${FLOWCRM_STACK:-app}
+  case $STACK in
+    app)
+      COMPOSE_FILE_NAME=compose.yaml
+      INTERNAL_SERVICES='db api web'
+      COMPOSE_PROFILES_VALUE=dev
+      READY_PATH=/health/ready
+      READY_BODY='{"status":"ready"}'
+      LOG_SERVICES='edge web api db'
+      SECRETS='db_password app_secret'
+      # The database volume was initialised with this secret.
+      SECRET_VOLUMES='db_password=db-data'
+      MIGRATIONS=1
+      URL_LABEL='FlowCRM'
+      ;;
+    fixture)
+      COMPOSE_FILE_NAME=compose.fixture.yaml
+      INTERNAL_SERVICES=state
+      COMPOSE_PROFILES_VALUE=
+      READY_PATH=/health
+      READY_BODY=ok
+      LOG_SERVICES='edge state'
+      SECRETS=
+      SECRET_VOLUMES=
+      MIGRATIONS=
+      URL_LABEL='FlowCRM development fixture'
+      ;;
+    *) die $EX_CONFIG "FLOWCRM_STACK must be app or fixture (got $(show "$STACK"))" ;;
+  esac
+}
+
 init_paths() {
   local here
   here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || die $EX_PREREQ "cannot resolve the script directory"
   ROOT=$(cd -P "$here/.." && pwd -P) || die $EX_PREREQ "cannot resolve the checkout directory"
-  COMPOSE_FILE=$ROOT/compose.fixture.yaml
+  select_stack
+  COMPOSE_FILE=$ROOT/$COMPOSE_FILE_NAME
   RUNTIME_DIR=$ROOT/.runtime
+  SECRETS_DIR=$RUNTIME_DIR/secrets
   STATE_FILE=$RUNTIME_DIR/dev.env
   LOCK_DIR=$RUNTIME_DIR/lock
   SELF=$here/${BASH_SOURCE[0]##*/}
@@ -155,6 +195,58 @@ ensure_runtime_dir() {
 
 new_tmp() { # prefix -> sets TMP_FILE (removed on exit)
   TMP_FILE=$(mktemp "$RUNTIME_DIR/.$1.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in .runtime"
+}
+
+# --- generated secrets --------------------------------------------------------
+# Random per-checkout secrets in .runtime/secrets (directory 0700, files
+# 0444 so the unprivileged container users can read the bind-mounted copy).
+# An existing secret is never replaced: the database volume was initialised
+# with it.
+
+ensure_secrets() {
+  local name file tmp volume
+  [ -n "$SECRETS" ] || return 0
+  ensure_runtime_dir
+  [ ! -L "$SECRETS_DIR" ] || die $EX_SAFETY ".runtime/secrets is a symbolic link; refusing to use it"
+  if [ ! -e "$SECRETS_DIR" ]; then
+    (umask 077 && mkdir "$SECRETS_DIR") || die $EX_SAFETY "cannot create $SECRETS_DIR"
+  fi
+  [ -d "$SECRETS_DIR" ] && [ -O "$SECRETS_DIR" ] ||
+    die $EX_SAFETY ".runtime/secrets is not a directory owned by $(id -un); refusing to use it"
+  # Only the owner may list or read the secrets (a pre-existing 0755
+  # directory would expose the 0444 files to other local users).
+  chmod 0700 "$SECRETS_DIR" || die $EX_SAFETY "cannot restrict the permissions of $SECRETS_DIR"
+  for name in $SECRETS; do
+    file=$SECRETS_DIR/$name
+    if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then
+      die $EX_SAFETY ".runtime/secrets/$name is not a regular file; refusing to use it"
+    fi
+    if [ -s "$file" ]; then
+      [ -O "$file" ] || die $EX_SAFETY ".runtime/secrets/$name is not owned by $(id -un); refusing to use it"
+      chmod 0444 "$file" || die $EX_SAFETY "cannot set the permissions of .runtime/secrets/$name"
+      continue
+    fi
+    volume=$(bound_volume "$name")
+    if [ -n "$volume" ] && docker volume inspect "${PROJECT}_$volume" >/dev/null 2>&1; then
+      die $EX_SAFETY ".runtime/secrets/$name is missing, but the volume ${PROJECT}_$volume was initialised with it; a new secret would not match, so none was generated. Restore .runtime/secrets/$name from a backup, or reset the data deliberately as described in README.md (Data persistence and reset), which deletes it"
+    fi
+    tmp=$(mktemp "$SECRETS_DIR/.$name.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in $SECRETS_DIR"
+    TMP_FILE=$tmp
+    if ! od -An -N24 -tx1 /dev/urandom | tr -d ' \n' >"$tmp" || [ ! -s "$tmp" ] ||
+      ! chmod 0444 "$tmp" || ! mv -f "$tmp" "$file"; then
+      die $EX_SAFETY "could not create the secret .runtime/secrets/$name"
+    fi
+    TMP_FILE=
+    log "generated the local secret .runtime/secrets/$name"
+  done
+}
+
+bound_volume() { # secret name: the volume initialised with it, if any
+  local pair
+  for pair in $SECRET_VOLUMES; do
+    [ "${pair%%=*}" = "$1" ] && printf '%s' "${pair#*=}" && return 0
+  done
+  return 0
 }
 
 # --- runtime state (parsed as data; never sourced) --------------------------
@@ -389,22 +481,36 @@ acquire_lock() {
 # caller's token, so a concurrent reaper either sees the record or the
 # command never starts.
 run_recorded() { # lock-dir token command...
-  local dir=$1 token=$2 guard i=0 tmp ok='' pgid
+  local dir=$1 token=$2 guard i=0 tmp='' ok='' pgid held=''
   shift 2
   pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
   [ "$pgid" = "$$" ] ||
     die $EX_SAFETY "the Docker command must lead its own process group (pid $$, group $(show "$pgid")); it was not run"
   guard=${dir%/*}/lock.reap
+  # A signal (forwarded to this group by devenv) must not leave the guard
+  # or a partial record behind; only a guard held by this process is removed.
+  trap 'leave_recording 130' INT
+  trap 'leave_recording 143' TERM
+  trap 'leave_recording 129' HUP
+  leave_recording() {
+    [ -z "$tmp" ] || rm -f "$tmp"
+    [ -z "$held" ] || rmdir "$guard" 2>/dev/null
+    exit "$1"
+  }
   until mkdir "$guard" 2>/dev/null; do
     i=$((i + 1))
     [ "$i" -lt 50 ] || die $EX_LOCK "the reap guard of .runtime/lock is busy; the Docker command was not run"
     sleep 0.1
   done
+  held=1
   if [ "$(sed -n 's/^token=//p' "$dir/owner" 2>/dev/null)" = "$token" ] &&
     tmp=$(mktemp "$dir/.op.XXXXXX" 2>/dev/null); then
     if printf '%s\n' "pid=$$" "pstart=$(proc_start $$)" "pgid=$pgid" >"$tmp" && mv -f "$tmp" "$dir/op"; then ok=1; else rm -f "$tmp"; fi
   fi
+  tmp=''
   rmdir "$guard"
+  held=''
+  trap - INT TERM HUP
   [ -n "$ok" ] || die $EX_LOCK "this command no longer holds .runtime/lock; the Docker command was not run"
   exec "$@"
 }
@@ -473,14 +579,14 @@ on_exit() {
 
 # Read-only Docker Compose call (ps, port, logs).
 compose() {
-  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND docker compose \
+  COMPOSE_PROFILES=$COMPOSE_PROFILES_VALUE FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND docker compose \
     --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
 }
 
 # Mutating Docker Compose call (up, down, rm); only while the lock is held.
 compose_op() {
   [ "$LOCK_HELD" = 1 ] || die $EX_SAFETY "internal error: mutating Docker Compose call without the lock"
-  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND run_op docker compose \
+  COMPOSE_PROFILES=$COMPOSE_PROFILES_VALUE FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND run_op docker compose \
     --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
 }
 
@@ -505,17 +611,29 @@ require_owned_project() {
   if [ "$STATE_STATUS" = foreign ]; then
     die $EX_SAFETY ".runtime/dev.env names project $STATE_PROJECT but this checkout is $PROJECT; if it was copied from another checkout, delete .runtime/dev.env"
   fi
-  local out id wd
+  local out id wd files
   out=$(docker ps --all --filter "label=com.docker.compose.project=$PROJECT" \
-    --format '{{.ID}} {{.Label "com.docker.compose.project.working_dir"}}') ||
+    --format '{{.ID}}|{{.Label "com.docker.compose.project.working_dir"}}|{{.Label "com.docker.compose.project.config_files"}}') ||
     die $EX_DOCKER "could not list containers"
-  while read -r id wd; do
+  while IFS='|' read -r id wd files; do
     [ -n "$id" ] || continue
     [ "$wd" = "$ROOT" ] ||
       die $EX_SAFETY "container $id uses project name $PROJECT but belongs to $(show "$wd"); refusing to manage it"
+    # Both stacks share the project name of the checkout; the Compose file
+    # recorded on each container tells them apart.
+    [ "$files" = "$COMPOSE_FILE" ] ||
+      die $EX_SAFETY "project $PROJECT has containers of another stack (container $id from $(show "${files##*/}")); this command manages FLOWCRM_STACK=$STACK ($COMPOSE_FILE_NAME). Stop them first with: FLOWCRM_STACK=$(stack_of_file "$files") make down"
   done <<EOF
 $out
 EOF
+}
+
+stack_of_file() { # compose file path: the stack that uses it
+  case ${1##*/} in
+    compose.yaml) printf app ;;
+    compose.fixture.yaml) printf fixture ;;
+    *) printf unknown ;;
+  esac
 }
 
 # Sets EDGE_ID, EDGE_RUNNING (true|false), EDGE_HEALTH and EDGE_PORT.
@@ -542,12 +660,20 @@ port_in_use() {
   return 1
 }
 
+# The readiness path must answer 200 with the stack's own body: any other
+# 200 (for example the SPA of the other stack) is not this stack's readiness.
 http_ok() {
   (
     exec 3<>"/dev/tcp/$BIND/$1" || exit 1
-    printf 'GET /health HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$BIND" "$1" >&3
+    printf 'GET %s HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$READY_PATH" "$BIND" "$1" >&3
     IFS= read -r -t 5 line <&3 || exit 1
-    case $line in "HTTP/1."[01]" 200"*) exit 0 ;; esac
+    case $line in "HTTP/1."[01]" 200"*) ;; *) exit 1 ;; esac
+    while IFS= read -r -t 5 line <&3; do
+      case $line in '' | $'\r') break ;; esac
+    done
+    body=
+    IFS= read -r -t 5 body <&3 || [ -n "$body" ] || exit 1
+    case $body in *"$READY_BODY"*) exit 0 ;; esac
     exit 1
   ) 2>/dev/null
 }
@@ -564,6 +690,21 @@ wait_http() {
 
 is_port_conflict() { grep -Eiq "$CONFLICT_RE" "$1"; }
 
+# P2: build this project's images (a no-op for services without a build).
+build_images() {
+  local rc
+  new_tmp compose-err
+  log "building images (the first build can take several minutes)"
+  compose_op build >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    tail -n 30 "$TMP_FILE" >&2
+    die $EX_DOCKER "building the images failed: $(compose_failure "$rc"); running containers were not changed"
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
 start_internal() {
   local rc
   new_tmp compose-err
@@ -576,6 +717,48 @@ start_internal() {
   fi
   rm -f "$TMP_FILE"
   TMP_FILE=
+}
+
+# Applies pending Doctrine migrations in the running api container, under
+# the lock and in a recorded process group like every other mutating call.
+# Sets MIGRATED=1 when migrations were applied.
+apply_migrations() {
+  local rc
+  MIGRATED=
+  [ -n "$MIGRATIONS" ] || return 0
+  new_tmp compose-err
+  compose_op exec -T api php bin/console doctrine:migrations:up-to-date --no-interaction >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "applying pending database migrations"
+    compose_op exec -T api php bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration --all-or-nothing >/dev/null 2>"$TMP_FILE"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      tail -n 20 "$TMP_FILE" >&2
+      die $EX_DOCKER "applying the database migrations failed: $(compose_failure "$rc"); the saved state was not changed; see make logs SERVICE=api"
+    fi
+    MIGRATED=1
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
+# "service=container-id" lines of this project, for change reports.
+service_ids() {
+  compose ps --all --format '{{.Service}}={{.ID}}' 2>/dev/null | sort
+}
+
+# Services whose container is new or was replaced since BEFORE.
+changed_services() { # before
+  local line names=''
+  for line in $(service_ids); do
+    case "
+$1
+" in *"
+$line
+"*) ;; *) names="${names:+$names }${line%%=*}" ;; esac
+  done
+  printf '%s' "$names"
 }
 
 # Returns 0 started, 1 port conflict, 2 other failure (details in
@@ -619,17 +802,21 @@ build_candidates() { # [port to try first]
   done
 }
 
-report_url() { printf 'FlowCRM development fixture: http://%s:%s\n' "$BIND" "$1"; }
+report_url() { printf '%s: http://%s:%s\n' "$URL_LABEL" "$BIND" "$1"; }
 
 # --- commands ---------------------------------------------------------------
 
 do_up() {
-  local c rc deadline own='' restore='' skipped=''
+  local c rc deadline own='' restore='' skipped='' before changed
   case $STATE_STATUS in
     invalid) log "ignoring invalid .runtime/dev.env (it is replaced after a verified start)" ;;
   esac
   COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  ensure_secrets
+  before=$(service_ids)
+  build_images
   start_internal
+  apply_migrations
   edge_state
 
   if [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ] && eligible "$EDGE_PORT"; then
@@ -639,7 +826,12 @@ do_up() {
           log "saved port $STATE_PORT did not match the running edge ($EDGE_PORT); saved state updated"
         write_state "$EDGE_PORT"
       fi
-      log "already running; nothing to change"
+      changed=$(changed_services "$before")
+      if [ -z "$changed$MIGRATED" ]; then
+        log "already running; nothing to change"
+      else
+        log "running; ${changed:+recreated: $changed (image or configuration changed)}${changed:+${MIGRATED:+; }}${MIGRATED:+applied pending database migrations}"
+      fi
       report_url "$EDGE_PORT"
       return 0
     fi
@@ -672,7 +864,7 @@ do_up() {
     edge_state
     [ "$EDGE_PORT" = "$c" ] ||
       die $EX_DOCKER "Docker reports the edge on $(show "$EDGE_PORT"), expected $BIND:$c; saved state not changed"
-    wait_http "$c" || die $EX_DOCKER "the edge on port $c does not answer /health; saved state not changed"
+    wait_http "$c" || die $EX_DOCKER "the edge on port $c does not answer $READY_PATH with 200; saved state not changed; see make status and make logs"
     write_state "$c"
     [ -z "$skipped" ] || log "ports in use, skipped:$skipped"
     report_url "$c"
@@ -719,8 +911,18 @@ do_down() {
   log "stopped project $PROJECT; volumes and .runtime/dev.env were kept"
 }
 
+# Rejects an invalid Compose file before anything is locked or started.
+validate_compose() {
+  local out
+  if ! out=$(COMPOSE_PORT=$PORT_DEFAULT compose config --quiet 2>&1); then
+    printf '%s\n' "$out" | tail -n 10 >&2
+    die $EX_DOCKER "the Compose configuration ($COMPOSE_FILE_NAME) is invalid; nothing was started or changed"
+  fi
+}
+
 locked() { # command
   preflight
+  validate_compose
   ensure_runtime_dir
   acquire_lock "$1"
   read_state
@@ -789,7 +991,7 @@ cmd_url() {
   [ "$EDGE_RUNNING" = true ] || die $EX_NOT_RUNNING "the edge is not running; run make up"
   [ "$EDGE_PORT" = "$STATE_PORT" ] ||
     die $EX_NOT_RUNNING "the running edge uses $(show "$EDGE_PORT") but the saved port is $STATE_PORT; run make up to reconcile"
-  http_ok "$STATE_PORT" || die $EX_NOT_RUNNING "the edge on port $STATE_PORT does not answer /health"
+  http_ok "$STATE_PORT" || die $EX_NOT_RUNNING "the edge on port $STATE_PORT does not answer $READY_PATH with 200 (not ready)"
   printf 'http://%s:%s\n' "$BIND" "$STATE_PORT"
 }
 
@@ -817,9 +1019,17 @@ cmd_ports() {
   done
 }
 
+is_log_service() { # name: exact match against the stack's services
+  local s
+  for s in $LOG_SERVICES; do [ "$1" = "$s" ] && return 0; done
+  return 1
+}
+
 cmd_logs() {
   local svc=${SERVICE-} follow=${FOLLOW-0} tail=${TAIL-200} args
-  case $svc in '' | edge | state) ;; *) die $EX_CONFIG "SERVICE must be edge or state (got $(show "$svc"))" ;; esac
+  if [ -n "$svc" ] && ! is_log_service "$svc"; then
+    die $EX_CONFIG "SERVICE must be one of: ${LOG_SERVICES// /, } (got $(show "$svc"))"
+  fi
   case $follow in 0 | 1) ;; *) die $EX_CONFIG "FOLLOW must be 0 or 1" ;; esac
   bounded_uint TAIL "$tail" 100000
   preflight
@@ -850,11 +1060,11 @@ cmd_doctor() {
   check required "docker CLI" docker version --format '{{.Client.Version}}'
   check required "Docker daemon" docker version --format '{{.Server.Version}}'
   check required "Docker Compose v2" docker compose version --short
-  for t in mktemp hostname ps find od; do check required "$t" command -v "$t"; done
+  for t in mktemp hostname ps find od tr; do check required "$t" command -v "$t"; done
   if command -v sha256sum >/dev/null 2>&1; then check required "sha256" command -v sha256sum; else check required "sha256" command -v shasum; fi
   check optional "make" sh -c 'make --version | head -n 1'
   check optional "lsof (diagnostics)" command -v lsof
-  check required "compose.fixture.yaml" test -f "$COMPOSE_FILE"
+  check required "$COMPOSE_FILE_NAME ($STACK)" test -f "$COMPOSE_FILE"
   if (load_config) 2>/dev/null; then
     printf 'ok    %-22s %s\n' "configuration" "valid"
   else
