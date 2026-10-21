@@ -20,9 +20,19 @@
 		X-Frame-Options DENY
 		-Server
 	}
+	# JSON access log with the request ID. Caddy already redacts the
+	# Cookie, Set-Cookie, Authorization and Proxy-Authorization headers;
+	# query strings (which can carry tokens) and CSRF tokens are removed too.
 	log {
 		output stdout
-		format json
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp "\?.*$" "?[redacted]"
+				request>headers>Referer regexp "\?.*$" "?[redacted]"
+				request>headers>X-Csrf-Token delete
+			}
+		}
 	}
 
 	# ADR-017: Symfony is reached only for /api, /api/... and exactly
