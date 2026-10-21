@@ -421,6 +421,7 @@ result "U-11 busy reap guard: bounded wait, command not run" $? "(rc $r)"
 mkdir -p "$work/fakebin"
 printf '#!/bin/sh\necho "docker-pid=$$ docker-pgid=$(ps -o pgid= -p $$ | tr -d " ")"\ncat "$FAKE_LOCK/op" 2>/dev/null\n' >"$work/fakebin/docker"
 chmod +x "$work/fakebin/docker"
+# shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
 fake_compose() { # held(0|1) function
   (
     PATH=$work/fakebin:$PATH FAKE_LOCK=$LOCK_DIR LOCK_HELD=$1 LOCK_TOKEN=tok COMPOSE_PORT=8080
@@ -456,6 +457,7 @@ esac
 exit 0
 FAKE
 chmod +x "$work/fakeedge/docker"
+# shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
 edge_rc() { # mode: try_edge result with the fake docker
   (
     PATH=$work/fakeedge:$PATH FAKE_MODE=$1 LOCK_HELD=1 LOCK_TOKEN=tok WAIT_TIMEOUT=5
