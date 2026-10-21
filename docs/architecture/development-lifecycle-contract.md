@@ -4,11 +4,37 @@ This document defines the interface between the development lifecycle
 (`Makefile`, `bin/devenv`) and the Docker Compose stack it starts. Today the
 stack is a development fixture (`compose.fixture.yaml`: a BusyBox HTTP server
 and a helper with a named volume). It is **not** a CRM application. The
-contract states what the real Symfony, React and PostgreSQL stack (FND-004)
-must provide so that it can replace the fixture without changing the
-developer commands or weakening the allocator's guarantees.
+contract states what the application stack approved in the FCRM-003
+architecture must provide when FND-004 implements it, so that it can replace
+the fixture without changing the developer commands or weakening the
+allocator's guarantees.
 
 Day-to-day usage is described in [dev-environment.md](../dev-environment.md).
+
+## Approved application stack (FCRM-003)
+
+These decisions are fixed; FND-004 implements them and does not revisit
+them:
+
+| Service | Role |
+|---|---|
+| `edge` | Caddy 2, the same-origin HTTP entry point and the only service with a published host port (on `127.0.0.1`). Serves the SPA, sends `/api` to the `api` service with `php_fastcgi`, and in development sends `/` to the Vite dev server `web:5173`. |
+| `web` | Vite development server for the React + TypeScript SPA; exists only under the Compose `dev` profile. |
+| `api` | Symfony modular monolith under PHP-FPM, running as a non-root user. |
+| `db` | PostgreSQL with the named volume `db-data`, on the internal network only. |
+
+- Networks: `edge` and `web` on `front`; `api` and `db` on `back`, which is
+  `internal: true`.
+- Production-like images serve the built SPA from the `edge` image; PHP
+  requests still go to PHP-FPM.
+- Health endpoints: `/health/live` (process only; for the edge and the API)
+  and `/health/ready` (`SELECT 1` and migrations current). Neither returns
+  details in its body. They are used by the Compose health checks and by the
+  `make up` verification.
+- Redis and RabbitMQ are not adopted (ADR-007).
+- Project isolation follows ADR-009 (section 4).
+
+Exact versions and image digests are pinned in FND-004.
 
 ## 1. Stable developer interface
 
@@ -41,10 +67,9 @@ targets and the commands they run.
 
 `bin/devenv` uses exactly one Compose file, `$ROOT/compose.fixture.yaml`,
 passed with `--file`, and always sets `--project-name` and
-`--project-directory`. FND-004 replaces this path with the application's
-Compose file (for example `compose.yaml`); the file name is one of the
-constants in section 10. The fixture file stays in the repository for the
-allocator tests (section 9).
+`--project-directory`. FND-004 points this setting at the application's
+Compose file; the file name is one of the constants in section 10. The
+fixture file stays in the repository for the allocator tests (section 9).
 
 Requirements for the application's Compose file:
 
@@ -62,20 +87,29 @@ Requirements for the application's Compose file:
 
 Services are split into two groups:
 
-- **Internal services** (fixture: `state`; application: for example the PHP
-  runtime, PostgreSQL, Redis, RabbitMQ, the frontend dev server) publish no
-  host port. They are started first with
+- **Internal services** (fixture: `state`; application: `db` and `api`, plus
+  `web` under the `dev` profile) publish no host port. They are started
+  first with
   `docker compose up --detach --wait --wait-timeout $FLOWCRM_WAIT_TIMEOUT <services>`.
   Any failure here is never a port conflict: `up` stops with exit 2 and no
   port is retried.
-- **The edge** (fixture: `edge`) is the only service with a published port,
-  always on `127.0.0.1`. It is started with `--no-deps`, so trying another
-  port recreates only the edge and never an internal service.
+- **The edge** (fixture: BusyBox `edge`; application: the Caddy 2 `edge`) is
+  the only service with a published port, always on `127.0.0.1`. It is
+  started with `--no-deps`, so trying another port recreates only the
+  stateless edge and never `db`, `api` or `web`.
 
-The edge owns the published HTTP port. Which server implements it (for
-example a reverse proxy in front of PHP and the frontend) is an FND-004
-decision that needs the owner's approval; the allocator only requires one
-HTTP service that serves the whole application on one container port.
+The edge owns the published HTTP port and serves the whole application on
+one container port (8080 in FCRM-003), with the routing listed in the
+approved stack above:
+
+| Mode | `/api` | Other requests (`/`) |
+|---|---|---|
+| Development | `php_fastcgi` to `api` (PHP-FPM) | Vite dev server `web:5173` |
+| Production-like | `php_fastcgi` to `api` (PHP-FPM) | built SPA assets served by the `edge` image |
+
+FND-004 implements this Caddy configuration; it does not choose another edge
+server or routing scheme. Using the `dev` profile for `web` in development is
+part of the allocator configuration FND-004 adds (section 10).
 
 ## 4. Project names and isolation
 
@@ -105,13 +139,23 @@ Readiness has two levels:
 
 1. Docker health: `up --wait` returns only when every started service is
    healthy.
-2. HTTP: `GET /health` on `127.0.0.1:<port>` through the published edge must
-   answer `HTTP/1.x 200` (20 attempts, 0.5 s apart).
+2. HTTP: a `GET` of the readiness path on `127.0.0.1:<port>` through the
+   published edge must answer `HTTP/1.x 200` (20 attempts, 0.5 s apart).
 
-For FND-004 `/health` must be served through the edge and should only answer
-200 when the application behind it can serve requests (for example routed
-to a Symfony health endpoint that checks the database connection). The path
-is one of the constants in section 10.
+The two stacks use different paths:
+
+- **Fixture (today):** `/health`, a static file served by the BusyBox edge.
+  It only shows that the fixture's HTTP server answers; it does not
+  implement the application health contract.
+- **Application (FND-004):** the approved `/health/ready` (database reachable
+  with `SELECT 1`, migrations current), requested through the Caddy edge,
+  is the readiness path of the `make up` verification. `/health/live`
+  (process only) serves the Compose health checks of the edge and the API.
+
+The readiness path is one of the constants in section 10. FCRM-003 also
+states that only `/api/*` reaches PHP at the edge; FND-004 has to make the
+Caddy routing of `/health/*` consistent with that rule without changing the
+approved endpoints (see section 11).
 
 ## 7. Persistent data
 
@@ -119,9 +163,9 @@ is one of the constants in section 10.
   `bin/devenv` (statically checked by U-09). `make down` keeps volumes.
 - Edge retries never touch internal services (`--no-deps`), so PostgreSQL
   data and connections survive port changes.
-- PostgreSQL must be an internal service with a named volume (for example
-  `postgres-data`), published on no host port by default. Volume names are
-  scoped by the project name, so checkouts never share a database.
+- PostgreSQL (`db`) is an internal service on the internal `back` network
+  with the named volume `db-data`, published on no host port. Volume names
+  are scoped by the project name, so checkouts never share a database.
 - Deleting data is always an explicit developer action
   (`docker volume rm <project>_<volume>`).
 
@@ -147,12 +191,11 @@ apply unchanged to FND-004. Read-only commands (`status`, `url`, `ports`,
 - The integration suite selects the stack through the Compose file copied
   into its temporary checkouts; once the file name is configurable, the same
   scenarios can run against the application file without code changes.
-- The application stack gets its own smoke test (`make up`, `make url`,
-  `GET /health`, `make down`, volume kept). Whether it runs in the existing
-  `Dev environment` job or in a new job is an FND-004 decision; a new job
-  only becomes mandatory after the owner adds it to the
-  `Portfolio Main Protection` ruleset. The names `Repository guard` and
-  `Dev environment` must not change.
+- FCRM-003 plans a startup CI job for the application stack: fresh clone,
+  `make up`, `/health/ready` returning 200 through the edge, URL printed,
+  plus a health-check test. A new job only becomes a required check after
+  the owner adds it to the `Portfolio Main Protection` ruleset. The names
+  `Repository guard` and `Dev environment` must not change.
 - Image references stay pinned by digest; actions stay pinned by commit.
 
 ## 10. Fixture-specific constants
@@ -160,16 +203,16 @@ apply unchanged to FND-004. Read-only commands (`status`, `url`, `ports`,
 These values in `bin/devenv` describe the fixture and must become explicit
 configuration for FND-004:
 
-| Constant | Fixture value | Use |
-|---|---|---|
-| `COMPOSE_FILE` | `$ROOT/compose.fixture.yaml` | the Compose file |
-| `EDGE` | `edge` | service with the published port |
-| `EDGE_CONTAINER_PORT` | `8080` | container port of the edge |
-| `INTERNAL_SERVICES` | `state` | services started before the edge |
-| readiness path | `/health` | HTTP readiness check |
-| `PROJECT_RE` / prefix | `flowcrm-` | project naming |
-| `logs` services | `edge`, `state` | `SERVICE` allow-list |
-| URL label | `FlowCRM development fixture` | `make up` output |
+| Constant | Fixture value | Application value (FCRM-003) | Use |
+|---|---|---|---|
+| `COMPOSE_FILE` | `$ROOT/compose.fixture.yaml` | the application Compose file | the Compose file |
+| `EDGE` | `edge` | `edge` (Caddy 2) | service with the published port |
+| `EDGE_CONTAINER_PORT` | `8080` | `8080` | container port of the edge |
+| `INTERNAL_SERVICES` | `state` | `db api`, plus `web` under the `dev` profile | services started before the edge |
+| readiness path | `/health` | `/health/ready` | HTTP readiness check |
+| `PROJECT_RE` / prefix | `flowcrm-` | `flowcrm-` (ADR-009) | project naming |
+| `logs` services | `edge`, `state` | `edge`, `web`, `api`, `db` | `SERVICE` allow-list |
+| URL label | `FlowCRM development fixture` | the application name | `make up` output |
 
 The proposed form is a small, documented block of constants at the top of
 `bin/devenv` (no new file format and no new runtime dependency); values stay
@@ -180,14 +223,20 @@ not planned.
 ## 11. Boundary between FND-003 and FND-004
 
 FND-003 (this document) hardens the lifecycle and fixes the contract above,
-using the fixture only. FND-004:
+using the fixture only. FND-004 implements the approved FCRM-003 stack; it
+does not select an alternative edge, runtime or routing. FND-004:
 
-1. adds the application's Compose file following sections 2, 3, 6 and 7;
-2. turns the constants of section 10 into configuration and points them at
-   the application;
-3. adds the application smoke test and decides its CI placement (section 9);
-4. keeps the fixture tests green throughout.
+1. adds the application's Compose file with the `edge` (Caddy 2), `web`
+   (Vite, `dev` profile), `api` (Symfony on PHP-FPM) and `db` (PostgreSQL,
+   `db-data`) services, following sections 2, 3, 6 and 7;
+2. adds the Caddy configuration for the development and production-like
+   routing of section 3 and the `/health/live` and `/health/ready`
+   endpoints;
+3. turns the constants of section 10 into configuration and sets the
+   application values;
+4. adds the planned startup CI job (section 9);
+5. keeps the fixture tests green throughout.
 
-Prerequisites from the owner before FND-004: the edge server, the
-health-check semantics of `/health` and the CI placement of the application
-test.
+Open points for FND-004, within the approved architecture: how the Caddy
+routing of `/health/*` coexists with the rule that only `/api/*` reaches PHP
+(section 6), and whether the owner makes the startup job a required check.
