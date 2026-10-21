@@ -331,11 +331,14 @@ Application suites (`tests/app/`), each in its own Compose projects:
   Node packages), and control scans prove the gate fails on a vulnerable
   image and on an image without inventoried packages (see
   [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
-- `backend.sh` (BE-01 to BE-10): PHP 8.5 runtime, `composer validate` and
+- `backend.sh` (BE-01 to BE-13): PHP 8.5 runtime, `composer validate` and
   `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
   empty database, `doctrine:schema:validate`, a full down/up migration round
-  trip, and PHPUnit unit and integration suites against a real PostgreSQL
-  (project `<project>-test`, database on tmpfs, no published ports).
+  trip, PHPUnit unit and integration suites against a real PostgreSQL
+  (project `<project>-test`, database on tmpfs, no published ports), and the
+  architecture rules: Deptrac with `deptrac.modules.yaml` and
+  `deptrac.layers.yaml`, and the architecture test suite (see
+  [architecture/backend-modules.md](architecture/backend-modules.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
 - `stack.sh` (ST-01 to ST-39): the real stack through `bin/devenv` in fresh
