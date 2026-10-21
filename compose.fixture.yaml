@@ -1,0 +1,60 @@
+# Development fixture for bin/devenv, used until the application exists.
+#
+# edge  - a minimal HTTP server; the only service that publishes a host
+#         port, always on 127.0.0.1. Serves / and /health.
+# state - an unpublished service with a named volume, so lifecycle tests
+#         can prove that data survives port changes and `make down`.
+#
+# The project name, project directory and host port are supplied by
+# bin/devenv; running `docker compose` directly fails on the required
+# FLOWCRM_HTTP_PORT variable instead of creating an unmanaged project.
+
+x-fixture: &fixture
+  image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  edge:
+    <<: *fixture
+    user: "65534:65534"
+    tmpfs:
+      - /tmp
+    command:
+      - sh
+      - -c
+      - >-
+        mkdir -p /tmp/www &&
+        echo ok > /tmp/www/health &&
+        echo 'FlowCRM development fixture' > /tmp/www/index.html &&
+        exec httpd -f -v -p 8080 -h /tmp/www
+    ports:
+      - "${FLOWCRM_HTTP_BIND:-127.0.0.1}:${FLOWCRM_HTTP_PORT:?is set by bin/devenv; run make up}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+
+  state:
+    <<: *fixture
+    command:
+      - sh
+      - -c
+      - date -u +%Y-%m-%dT%H:%M:%SZ >> /data/boot.log && exec sleep 2147483647
+    volumes:
+      - state-data:/data
+    healthcheck:
+      test: ["CMD", "test", "-s", "/data/boot.log"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+
+volumes:
+  state-data: {}
