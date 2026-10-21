@@ -28,6 +28,8 @@ LO=$BASE
 HI=$((BASE + 19))
 OUT=$((BASE + 100))
 
+# The allocator scenarios run against the BusyBox fixture stack.
+export FLOWCRM_STACK=fixture
 export FLOWCRM_PORT_RANGE="$LO-$HI" FLOWCRM_PORT_DEFAULT=$LO
 export FLOWCRM_WAIT_TIMEOUT=60 FLOWCRM_LOCK_WAIT=120 FLOWCRM_UP_TIMEOUT=600
 unset FLOWCRM_HTTP_PORT SERVICE TAIL FOLLOW
@@ -724,9 +726,9 @@ pa23() {
   dv pa23c "$co" up
   FLOWCRM_HTTP_PORT=$OUT dv pa23d "$co" up
   [ "$(rc_of pa23c)$(rc_of pa23d)" = 22 ]; v "PA-23 invalid Compose file: exit 2 (also with an explicit port)" $?
-  err_has pa23c 'starting the internal services \(state\) failed: docker compose exited with status' &&
+  err_has pa23c 'the Compose configuration \(compose.fixture.yaml\) is invalid; nothing was started or changed' &&
     ! err_has pa23c 'containers were left'
-  v "PA-23 the message names the failed operation" $?
+  v "PA-23 the message names the failed operation (configuration check)" $?
   ! err_has pa23c 'port conflict\); trying' && ! err_has pa23d 'port conflict\); trying' && [ -z "$(service_id "$co" edge)" ]
   v "PA-23 no port retried, no edge created" $?
   [ "$(cksum <"$co/.runtime/dev.env")" = "$sum" ] && [ ! -e "$co/.runtime/lock" ]; v "PA-23 verified state unchanged, lock released" $?

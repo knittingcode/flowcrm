@@ -416,6 +416,28 @@ rmdir "$RUNTIME_DIR/lock.reap"
 [ "$r" = "$EX_LOCK" ] && [ ! -e "$work/ran" ]
 result "U-11 busy reap guard: bounded wait, command not run" $? "(rc $r)"
 
+# A signal while the reap guard is held (here: a mktemp that blocks inside
+# the critical section) releases the guard and does not run the command.
+mkdir -p "$work/slowbin"
+printf '#!/bin/sh\n: >"$SLOW_READY"\nexec sleep 30\n' >"$work/slowbin/mktemp"
+chmod +x "$work/slowbin/mktemp"
+rm -f "$work/ran" "$work/slow.ready"
+set -m
+PATH=$work/slowbin:$PATH SLOW_READY=$work/slow.ready "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null &
+slow=$!
+set +m
+wait_file "$work/slow.ready"
+held_guard=$([ -d "$RUNTIME_DIR/lock.reap" ] && echo yes)
+kill -TERM -- "-$slow"
+wait "$slow"
+r=$?
+[ "$held_guard" = yes ] && [ "$r" = 143 ] && [ ! -e "$RUNTIME_DIR/lock.reap" ] && [ ! -e "$work/ran" ]
+result "U-11 SIGTERM inside the critical section releases the reap guard; command not run" $? "(held $held_guard, rc $r)"
+as_leader "$BASH" "$devenv_script" __run-recorded "$LOCK_DIR" tok touch "$work/ran" 2>/dev/null
+[ -e "$work/ran" ]
+result "U-11 the next recorded command runs at once" $?
+rm -f "$work/ran"
+
 # compose_op() and compose() with a fake docker on PATH that reports its PID,
 # its process group and the record.
 mkdir -p "$work/fakebin"
@@ -614,17 +636,102 @@ result "U-13 SIGTERM is forwarded to the Docker process group; exit 143 after it
 # --- U-14 Makefile interface (kept stable for the application stack)
 mk_root=$(cd -P "$here/../.." && pwd -P)
 mk() { (cd "$mk_root" && make "$@") 2>&1; }
-expect_eq "U-14 make help lists the public targets" "help up down restart status url ports logs doctor test-devenv" \
+expect_eq "U-14 make help lists the public targets" "help up down restart status url ports logs doctor test-devenv test-app" \
   "$(mk -s help | awk '/^  [a-z-]+ / { printf "%s%s", sep, $1; sep = " " }')"
 for t in up down restart status url ports logs doctor; do
   expect_eq "U-14 make $t runs bin/devenv $t" "./bin/devenv $t" "$(mk -n "$t")"
 done
 expect_eq "U-14 make test-devenv runs both suites" "tests/devenv/unit.sh tests/devenv/integration.sh" "$(mk -n test-devenv | tr '\n' ' ' | sed 's/ $//')"
+expect_eq "U-14 make test-app runs the application suites" "tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh" "$(mk -n test-app | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "U-14 make without a target shows help" "$(mk -s help)" "$(mk -s)"
 mk -s no-such-target >/dev/null
 r=$?
 [ "$r" -ne 0 ]
 result "U-14 unknown make target fails" $? "(rc $r)"
+
+# --- U-15 stack selection (app by default, fixture for the allocator tests)
+stack_of() { # FLOWCRM_STACK value: prints the selected settings or the exit code
+  (
+    if [ "$1" = unset ]; then unset FLOWCRM_STACK; else FLOWCRM_STACK=$1; fi
+    select_stack
+    printf '%s|%s|%s|%s|%s|%s' "$COMPOSE_FILE_NAME" "$INTERNAL_SERVICES" "$COMPOSE_PROFILES_VALUE" "$READY_PATH" "$SECRETS" "$URL_LABEL"
+  ) 2>/dev/null || echo "exit $?"
+}
+expect_eq "U-15 default stack is the application" "compose.yaml|db api web|dev|/health/ready|db_password app_secret|FlowCRM" "$(stack_of unset)"
+expect_eq "U-15 FLOWCRM_STACK=app" "$(stack_of unset)" "$(stack_of app)"
+expect_eq "U-15 FLOWCRM_STACK=fixture" "compose.fixture.yaml|state||/health||FlowCRM development fixture" "$(stack_of fixture)"
+for bad in APP Fixture 'app;id' '$(id)' ' app'; do
+  expect_eq "U-15 reject FLOWCRM_STACK=$(show "$bad")" "exit $EX_CONFIG" "$(stack_of "$bad")"
+done
+FLOWCRM_STACK=fixture select_stack
+is_log_service state && ! is_log_service web && ! is_log_service 'edge state' && ! is_log_service ''
+result "U-15 fixture log services are an exact allow-list" $?
+unset FLOWCRM_STACK
+select_stack
+is_log_service api && is_log_service db && ! is_log_service state && ! is_log_service 'api db'
+result "U-15 application log services are an exact allow-list" $?
+[ "$(report_url 18080)" = "FlowCRM: http://127.0.0.1:18080" ]
+result "U-15 the URL label follows the stack" $?
+
+# http_ok requests the stack's readiness path: a local server answers 200
+# only for /health/ready.
+cat >"$work/ready_server.py" <<'PYSERVER'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == "/health/ready" else 404)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(server.server_address[1]))
+server.serve_forever()
+PYSERVER
+python3 "$work/ready_server.py" "$work/ready.port" &
+bg_pids="$bg_pids $!"
+wait_file "$work/ready.port"
+ready_port=$(cat "$work/ready.port")
+http_ok "$ready_port"
+result "U-15 application readiness requests /health/ready" $?
+FLOWCRM_STACK=fixture select_stack
+if http_ok "$ready_port"; then r=1; else r=0; fi
+result "U-15 fixture readiness requests /health (404 here: not ready)" $r
+unset FLOWCRM_STACK
+select_stack
+
+# --- U-16 generated secrets
+RUNTIME_DIR=$work/rt16 SECRETS_DIR=$work/rt16/secrets
+mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+(ensure_secrets) 2>/dev/null
+r=$?
+[ "$r" = 0 ] && [ "$(mode_of "$SECRETS_DIR")" = 700 ] && [ "$(mode_of "$SECRETS_DIR/db_password")" = 444 ] &&
+  [ "$(mode_of "$SECRETS_DIR/app_secret")" = 444 ]
+result "U-16 secrets created: directory 0700, files 0444" $? "(rc $r)"
+[[ $(cat "$SECRETS_DIR/db_password") =~ ^[0-9a-f]{48}$ ]] && [ "$(cat "$SECRETS_DIR/db_password")" != "$(cat "$SECRETS_DIR/app_secret")" ]
+result "U-16 each secret is 192 random bits, distinct" $?
+before=$(cat "$SECRETS_DIR/db_password")
+(ensure_secrets) 2>/dev/null
+[ "$(cat "$SECRETS_DIR/db_password")" = "$before" ] && [ -z "$(find "$SECRETS_DIR" -name '.*' -type f)" ]
+result "U-16 an existing secret is never replaced; no temporary files" $?
+rm -f "$SECRETS_DIR/app_secret"
+ln -s "$work/target" "$SECRETS_DIR/app_secret"
+(ensure_secrets) 2>/dev/null
+expect_eq "U-16 a symlinked secret is refused" "$EX_SAFETY" "$?"
+rm -rf "$work/rt16"
+mkdir -p "$work/rt16" "$work/elsewhere"
+ln -s "$work/elsewhere" "$SECRETS_DIR"
+(ensure_secrets) 2>/dev/null
+r=$?
+[ "$r" = "$EX_SAFETY" ] && [ -z "$(ls -A "$work/elsewhere")" ]
+result "U-16 a symlinked secrets directory is refused" $? "(rc $r)"
+FLOWCRM_STACK=fixture select_stack
+rm -rf "$work/rt16"
+(ensure_secrets) 2>/dev/null && [ ! -e "$SECRETS_DIR" ]
+result "U-16 the fixture stack needs no secrets" $?
+unset FLOWCRM_STACK
+select_stack
+RUNTIME_DIR=$work/rt
+SECRETS_DIR=$RUNTIME_DIR/secrets
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
