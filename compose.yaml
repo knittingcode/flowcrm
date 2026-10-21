@@ -4,7 +4,8 @@
 #        to 127.0.0.1. Routes /api and /health/{live,ready} to the api service
 #        and everything else to the Vite dev server.
 # web  - React + TypeScript with the Vite dev server (profile "dev").
-# api  - Symfony 7.4 under PHP-FPM 8.5. Applies pending migrations on start.
+# api  - Symfony 7.4 under PHP-FPM 8.5. bin/devenv applies pending
+#        migrations after the internal services are healthy.
 # db   - PostgreSQL 18 with the persistent volume db-data.
 #
 # The project name, project directory, host port and profile are supplied by
@@ -83,7 +84,9 @@ services:
       - /app/var:uid=82,gid=82
     environment:
       APP_ENV: dev
-      FLOWCRM_MIGRATE_ON_START: "1"
+      # Migrations are a phase of make up (bin/devenv), not of the container
+      # start, so a migration added while the stack runs is applied too.
+      FLOWCRM_MIGRATE_ON_START: "0"
     secrets: [db_password, app_secret]
     volumes:
       - ./backend/src:/app/src:ro
@@ -104,7 +107,9 @@ services:
 
   db:
     <<: *hardening
-    image: postgres:18.6-alpine3.23@sha256:885cf05d376c7cf27afef02073e6bdac3841252537f16e244fd1c1e6a7c99fb1
+    build:
+      context: .
+      dockerfile: docker/db/Dockerfile
     # Runs as the image's postgres user from the start, so the entrypoint
     # needs no capabilities to change ownership or switch users.
     user: postgres

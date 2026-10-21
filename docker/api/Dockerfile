@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 # FlowCRM API: Symfony 7.4 on PHP-FPM 8.5, running as www-data (uid 82).
-# Build context: the repository root. Targets: dev (with dev dependencies,
-# source mounted by compose.yaml) and prod (no dev dependencies, code baked in).
+# Build context: the repository root. Targets: dev (dev dependencies; the
+# source comes from the read-only mounts of compose.yaml, so editing PHP code
+# does not rebuild the image), test (dev plus the full source, for
+# tests/app/backend.sh) and prod (no dev dependencies, code baked in).
 
 ARG PHP_IMAGE=php:8.5.12-fpm-alpine3.24@sha256:c15690bd932bd6d33f43ccae6ddd8d60acb93cee50c16afc6e699265d5d86583
 ARG COMPOSER_IMAGE=composer:2.9.7@sha256:02062f7719ec9433a9d4256cfba1c792db96dc9db60a4a92e48264c9e166b877
@@ -29,6 +31,11 @@ COPY --from=composer /usr/bin/composer /usr/local/bin/composer
 ENV APP_ENV=dev COMPOSER_NO_INTERACTION=1
 COPY --chown=www-data:www-data backend/composer.json backend/composer.lock backend/symfony.lock ./
 RUN composer install --no-progress --no-scripts --prefer-dist
+COPY --chown=www-data:www-data backend/bin ./bin
+COPY --chown=www-data:www-data backend/.env ./
+RUN composer dump-autoload --no-scripts
+
+FROM dev AS test
 COPY --chown=www-data:www-data backend/ ./
 RUN composer dump-autoload --no-scripts
 
