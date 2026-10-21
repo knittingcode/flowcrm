@@ -61,7 +61,7 @@ jobs:
           docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
           koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
           -x bin/devenv tests/devenv/unit.sh tests/devenv/integration.sh tests/devenv/tally.sh
-          tests/app/lib.sh tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh
+          tests/app/lib.sh tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh tests/app/scan.sh
           docker/api/entrypoint.sh docker/api/healthcheck.sh
 
       - name: Validate Compose configuration
@@ -99,3 +99,8 @@ jobs:
 
       - name: Production-like stack (built SPA, browser)
         run: tests/app/prodlike.sh
+
+      # Fails on HIGH/CRITICAL findings in runtime images (policy in
+      # docs/security/container-vulnerabilities.md).
+      - name: Container vulnerability scan (Trivy)
+        run: tests/app/scan.sh
