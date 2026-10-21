@@ -25,8 +25,12 @@
 		format json
 	}
 
-	# ADR-017: Symfony is reached only for /api and these two health paths.
-	@php path /api /api/* /health/live /health/ready
+	# ADR-017: Symfony is reached only for /api, /api/... and exactly
+	# /health/live and /health/ready. The check uses the raw request URI,
+	# not Caddy's path matchers: those match case-insensitively on a
+	# decoded path with merged slashes, so //api/..., /health//live,
+	# /HEALTH/LIVE or /health%2Flive would also reach Symfony.
+	@php expression `{http.request.orig_uri}.matches("^/api(/[^?]*)?([?].*)?$") || {http.request.orig_uri}.matches("^/health/(live|ready)([?].*)?$")`
 	handle @php {
 		import php
 	}
