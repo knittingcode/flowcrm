@@ -2,8 +2,11 @@
 
 declare(strict_types=1);
 
-namespace App\Shared\Infrastructure\Database;
+namespace App\Shared\Application\Health;
 
+/**
+ * Whether the application can serve requests that need its dependencies.
+ */
 interface ReadinessCheck
 {
     /**

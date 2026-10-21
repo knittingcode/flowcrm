@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Shared\Infrastructure\Database;
 
+use App\Shared\Application\Health\ReadinessCheck;
+use App\Shared\Application\Health\ReadinessResult;
+use App\Shared\Application\SystemStatus\DatabaseTime;
 use Doctrine\DBAL\Connection;
 use Doctrine\Migrations\DependencyFactory;
 
@@ -11,7 +14,7 @@ use Doctrine\Migrations\DependencyFactory;
  * Read-only checks of the PostgreSQL connection and the migration state.
  * Failures surface as exceptions; callers decide what to expose.
  */
-final readonly class DatabaseProbe implements ReadinessCheck
+final readonly class DatabaseProbe implements ReadinessCheck, DatabaseTime
 {
     public function __construct(
         private Connection $connection,

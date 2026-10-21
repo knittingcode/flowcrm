@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Shared;
 
+use App\Shared\Application\Health\ReadinessCheck;
+use App\Shared\Application\SystemStatus\DatabaseTime;
 use App\Shared\Infrastructure\Database\DatabaseProbe;
 use Doctrine\DBAL\Connection;
 use Symfony\Bundle\FrameworkBundle\Test\KernelTestCase;
@@ -39,6 +41,13 @@ final class DatabaseProbeTest extends KernelTestCase
         }
 
         self::assertTrue($this->probe()->check()->ready, 'restored after the rollback');
+    }
+
+    public function testTheApplicationContractsAreServedByTheProbe(): void
+    {
+        foreach ([ReadinessCheck::class, DatabaseTime::class] as $contract) {
+            self::assertInstanceOf(DatabaseProbe::class, self::getContainer()->get($contract), $contract);
+        }
     }
 
     public function testTheBaselineRowExists(): void

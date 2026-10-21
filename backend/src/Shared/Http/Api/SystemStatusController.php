@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace App\Shared\Http\Api;
 
-use App\Shared\Infrastructure\Database\DatabaseProbe;
+use App\Shared\Application\SystemStatus\DatabaseTime;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
@@ -17,7 +17,7 @@ use Symfony\Component\Routing\Attribute\Route;
 final readonly class SystemStatusController
 {
     public function __construct(
-        private DatabaseProbe $database,
+        private DatabaseTime $database,
         private LoggerInterface $logger,
     ) {
     }
