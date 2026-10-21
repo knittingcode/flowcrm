@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Real-Docker integration tests for bin/devenv (PA-01 .. PA-20) and the
+# Real-Docker integration tests for bin/devenv (PA-01 .. PA-21) and the
 # Makefile targets. Each scenario runs in its own temporary checkout copy,
 # so every checkout gets its own Compose project. Only resources created
 # here are removed afterwards, each one checked by label first; resources
@@ -8,12 +8,16 @@
 #
 # Usage: tests/devenv/integration.sh
 #   DEVENV_TEST_PORT_BASE  first port of the 20-port test range (default 8080)
+#   DEVENV                 bin/devenv copy to test (default: this checkout's)
+#   DEVENV_TEST_SCENARIOS  space-separated subset, e.g. "pa16 pa21" (default:
+#                          all); the summary names the scenarios that ran
 # Needs: docker with Compose v2, python3 and curl (test tools only).
 
 # shellcheck disable=SC2319,SC2181
 # "<condition>; v NAME $?" records the status of that condition on purpose.
 # shellcheck disable=SC2016
 # Single-quoted $(...) and backticks are injection attempts that must stay literal.
+# shellcheck source-path=SCRIPTDIR
 
 set -u
 
@@ -33,13 +37,14 @@ work=$(cd -P "$work" && pwd -P)
 mkdir -p "$work/out"
 for f in checkouts holders containers volumes networks; do : >"$work/$f"; done
 
-pass=0
-fail=0
+# shellcheck source=tally.sh
+. "$here/tally.sh"
+tally_init "$work/tally"
 n=0
 
 say() { printf '%s\n' "$*"; }
-ok() { pass=$((pass + 1)); say "PASS  $1"; }
-bad() { fail=$((fail + 1)); say "FAIL  $1"; [ -z "${2-}" ] || say "      $2"; }
+ok() { pass_result "$1"; }
+bad() { fail_result "$1"; [ -z "${2-}" ] || say "      $2"; }
 # Usage: <condition>; v "ID description" $?
 # The whole (possibly compound) condition runs before v records its status.
 v() {
@@ -51,6 +56,15 @@ v() {
   fi
 }
 ev() { say "      evidence: $*"; }
+# A setup step that must succeed; otherwise a FAIL is recorded and the
+# scenario ends. Usage: need "ID what" command... || return
+need() {
+  local what=$1
+  shift
+  "$@" && return 0
+  bad "$what (setup failed)"
+  return 1
+}
 
 # --- environment checks -----------------------------------------------------
 
@@ -81,7 +95,7 @@ new_checkout() { # name -> sets CO
   CO=$work/$1
   mkdir -p "$CO/bin"
   cp "$repo/Makefile" "$repo/compose.fixture.yaml" "$CO/"
-  cp "$repo/bin/devenv" "$CO/bin/"
+  cp "${DEVENV:-$repo/bin/devenv}" "$CO/bin/devenv"
   printf '%s\n' "$CO" >>"$work/checkouts"
 }
 
@@ -402,29 +416,132 @@ start_up_bg() { # dir label -> sets BG
   while [ ! -d "$1/.runtime/lock" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 }
 
+# Gate the state service of a checkout copy: it becomes healthy only once
+# $GATE/open exists, so `up` stays inside `docker compose up --wait` until
+# the test opens the gate (start period raised so it cannot turn unhealthy
+# first). Sets GATE.
+gate_checkout() { # dir
+  local f=$1/compose.fixture.yaml
+  GATE=$1.gate
+  mkdir -p "$GATE" || return 1
+  awk -v gate="$GATE" '
+    /^  [a-z]+:$/ { svc = $1 }
+    svc == "state:" && /"-s", "\/data\/boot.log"/ { sub(/"-s", "\/data\/boot.log"/, "\"-e\", \"/gate/open\"") }
+    svc == "state:" && /start_period: 20s/ { sub(/20s/, "300s") }
+    { print }
+    svc == "state:" && /^      - state-data:\/data$/ { print "      - " gate ":/gate:ro" }
+  ' "$f" >"$f.gated" && mv "$f.gated" "$f" || return 1
+  grep -q '"/gate/open"' "$f" && grep -q ":/gate:ro" "$f" && grep -q 'start_period: 300s' "$f"
+}
+
+# Bounded wait (90 s) until the devenv process runs a docker child and the
+# state container of the checkout exists; sets OP_PID to that child.
+wait_compose_child() { # dir devenv-pid
+  local i=0
+  while [ "$i" -lt 900 ]; do
+    OP_PID=$(pgrep -P "$2" -x docker | head -n 1)
+    if [ -n "$OP_PID" ] && [ -n "$(service_id "$1" state)" ]; then return 0; fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_err() { # label pattern: bounded wait (30 s) for a line in label.err
+  local i=0
+  while ! err_has "$1" "$2" && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
+  err_has "$1" "$2"
+}
+
+lock_field() { sed -n "s/^$2=//p" "$1/.runtime/lock/$3" 2>/dev/null; }
+
 pa16() {
   new_checkout pa16
-  local rc
-  start_up_bg "$CO" pa16a
+  local co=$CO rc op tok port boots sum other w
+  need "PA-16 gated fixture" gate_checkout "$co" || return
+  : >"$GATE/open"
+  start_up_bg "$co" pa16a
   kill -TERM "$BG"
   wait "$BG"
   rc=$?
   [ "$rc" = 143 ]; v "PA-16 SIGTERM during up: exit 143" $?
-  [ ! -e "$CO/.runtime/lock" ]; v "PA-16 lock released after SIGTERM" $?
-  [ ! -e "$CO/.runtime/dev.env" ] && [ -z "$(find "$CO/.runtime" -name '.*' -type f)" ]; v "PA-16 no partial state or temporary files" $?
-  dv pa16b "$CO" up
+  [ ! -e "$co/.runtime/lock" ]; v "PA-16 lock released after SIGTERM" $?
+  [ ! -e "$co/.runtime/dev.env" ] && [ -z "$(find "$co/.runtime" -name '.*' -type f)" ]; v "PA-16 no partial state or temporary files" $?
+  dv pa16b "$co" up
   [ "$(rc_of pa16b)" = 0 ]; v "PA-16 next up succeeds" $?
-  dv pa16c "$CO" down
-  start_up_bg "$CO" pa16d
+  port=$(saved_port "$co")
+  boots=$(boot_lines "$co")
+  dv pa16c "$co" down
+  sum=$(cksum <"$co/.runtime/dev.env")
+
+  # SIGKILL while `docker compose up --wait` runs: its child keeps running.
+  rm -f "$GATE/open"
+  FLOWCRM_WAIT_TIMEOUT=120 start_up_bg "$co" pa16d
+  need "PA-16 up runs docker compose" wait_compose_child "$co" "$BG" || return
+  op=$OP_PID
+  tok=$(lock_field "$co" token owner)
+  ev "Docker command pid $op: $(ps -o command= -p "$op" | cut -c1-110)"
+  [ "$(lock_field "$co" pid op)" = "$op" ]; v "PA-16 the lock records that Docker command (lock/op pid $op)" $?
   kill -KILL "$BG"
   wait "$BG" 2>/dev/null
-  [ -f "$CO/.runtime/lock/owner" ]; v "PA-16 SIGKILL leaves the lock behind" $?
-  # Let the orphaned docker compose child of the killed process finish.
-  sleep 10
-  dv pa16e "$CO" up
-  [ "$(rc_of pa16e)" = 0 ] && err_has pa16e "removed a stale lock"; v "PA-16 stale lock of the killed process reaped; up exit 0" $?
-  [ "$(saved_port "$CO")" = "$(mapped_port "$CO")" ]; v "PA-16 state consistent with mapping" $?
-  cleanup_checkout "$CO"
+  [ -f "$co/.runtime/lock/owner" ]; v "PA-16 SIGKILL leaves the lock behind" $?
+  kill -0 "$op" 2>/dev/null; v "PA-16 its Docker Compose child is still running (orphan pid $op)" $?
+  FLOWCRM_LOCK_WAIT=2 dv pa16e "$co" up
+  FLOWCRM_LOCK_WAIT=2 dv pa16f "$co" down
+  FLOWCRM_LOCK_WAIT=2 dv pa16g "$co" restart
+  [ "$(rc_of pa16e)$(rc_of pa16f)$(rc_of pa16g)" = 444 ]; v "PA-16 up, down and restart refused while the orphan runs (exit 4/4/4)" $?
+  err_has pa16e "Docker command pid $op of the ended devenv"; v "PA-16 the refusal names the running Docker command" $?
+  ! err_has pa16e 'removed a stale lock' && ! err_has pa16f 'removed a stale lock' && ! err_has pa16g 'removed a stale lock' &&
+    [ "$(lock_field "$co" token owner)" = "$tok" ] && [ "$(lock_field "$co" pid op)" = "$op" ] && kill -0 "$op" 2>/dev/null
+  v "PA-16 lock and command record untouched: no overlapping Compose command started" $?
+  [ "$(cksum <"$co/.runtime/dev.env")" = "$sum" ]; v "PA-16 verified state unchanged while the orphan runs" $?
+  ev "$(head -n 1 "$work/out/pa16e.err")"
+
+  new_checkout pa16x
+  other=$CO
+  dv pa16x "$other" up
+  [ "$(rc_of pa16x)" = 0 ] && [ -n "$(mapped_port "$other")" ] && [ "$(saved_port "$other")" = "$(mapped_port "$other")" ]
+  v "PA-16 a separate checkout starts and stops normally meanwhile" $?
+  cleanup_checkout "$other"
+
+  (cd "$co" && exec ./bin/devenv up) >"$work/out/pa16h.out" 2>"$work/out/pa16h.err" &
+  w=$!
+  need "PA-16 next up announces that it waits" wait_err pa16h 'waiting for another' || { kill "$w"; return; }
+  kill -0 "$op" 2>/dev/null && [ "$(lock_field "$co" token owner)" = "$tok" ]; v "PA-16 next up waits for the orphan instead of reaping" $?
+  : >"$GATE/open"
+  wait "$w"
+  rc=$?
+  ! kill -0 "$op" 2>/dev/null; v "PA-16 the orphan finished after the gate opened" $?
+  [ "$rc" = 0 ] && err_has pa16h 'removed a stale lock'; v "PA-16 then the lock is reaped and up exits 0" $?
+  [ "$(saved_port "$co")" = "$(mapped_port "$co")" ] && [ "$(saved_port "$co")" = "$port" ]; v "PA-16 state matches the mapping on the previous verified port $port" $?
+  [ "$(boot_lines "$co")" -gt "$boots" ]; v "PA-16 volume data kept (boot log grew from $boots lines)" $?
+  cleanup_checkout "$co"
+}
+
+# H-1: a live lock taken in one locale and time zone is not stolen from another.
+pa21() {
+  new_checkout pa21
+  local co=$CO a tok rc
+  need "PA-21 gated fixture" gate_checkout "$co" || return
+  (cd "$co" && LANG=pl_PL.UTF-8 LC_ALL=pl_PL.UTF-8 TZ=JST-9 FLOWCRM_WAIT_TIMEOUT=120 exec ./bin/devenv up) \
+    >"$work/out/pa21a.out" 2>"$work/out/pa21a.err" &
+  a=$!
+  need "PA-21 up under pl_PL.UTF-8 and TZ=JST-9 runs docker compose" wait_compose_child "$co" "$a" || { kill "$a"; return; }
+  tok=$(lock_field "$co" token owner)
+  ev "owner pstart=$(lock_field "$co" pstart owner)"
+  LANG='' LC_ALL=C TZ=UTC0 FLOWCRM_LOCK_WAIT=2 dv pa21b "$co" up
+  LANG=de_DE.UTF-8 LC_ALL='' TZ=EST5EDT FLOWCRM_LOCK_WAIT=2 dv pa21c "$co" down
+  [ "$(rc_of pa21b)$(rc_of pa21c)" = 44 ]; v "PA-21 up (C, UTC) and down (de_DE, EST5EDT) refused while the owner runs (exit 4/4)" $?
+  ! err_has pa21b 'removed a stale lock' && ! err_has pa21c 'removed a stale lock' &&
+    [ "$(lock_field "$co" token owner)" = "$tok" ] && kill -0 "$a" 2>/dev/null
+  v "PA-21 live lock untouched, owner still running" $?
+  : >"$GATE/open"
+  wait "$a"
+  rc=$?
+  [ "$rc" = 0 ] && [ -n "$(saved_port "$co")" ] && [ "$(saved_port "$co")" = "$(mapped_port "$co")" ]; v "PA-21 owner completes its up (exit 0, state matches mapping)" $?
+  LANG='' LC_ALL=C TZ=UTC0 dv pa21d "$co" up
+  [ "$(rc_of pa21d)" = 0 ] && err_has pa21d 'already running'; v "PA-21 next up in another locale sees it running" $?
+  cleanup_checkout "$co"
 }
 
 pa17() {
@@ -531,9 +648,17 @@ makefile_targets() {
   cleanup_checkout "$CO"
 }
 
-for t in pa01 pa02 pa03 pa04 pa05 pa06 pa07 pa08 pa09 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17 pa18 pa19 pa20 makefile_targets; do
+all_scenarios='pa01 pa02 pa03 pa04 pa05 pa06 pa07 pa08 pa09 pa10 pa11 pa12 pa13 pa14 pa15 pa16 pa17 pa18 pa19 pa20 pa21 makefile_targets'
+scenarios=${DEVENV_TEST_SCENARIOS:-$all_scenarios}
+for t in $scenarios; do
+  case " $all_scenarios " in *" $t "*) ;; *) say "unknown scenario: $t"; exit 64 ;; esac
+done
+[ "$scenarios" = "$all_scenarios" ] || say "== subset: $scenarios"
+for t in $scenarios; do
   n=$((n + 1))
+  before=$((pass + fail))
   "$t"
+  [ $((pass + fail)) -gt "$before" ] || bad "harness: scenario $t recorded no results"
 done
 
 # --- cleanup verification -----------------------------------------------------
@@ -561,6 +686,4 @@ missing=$(comm -23 "$work/before.containers" "$work/after.containers")
 [ -z "$(comm -23 "$work/before.networks" <(docker network ls -q --no-trunc | sort))" ]; v "CLEAN pre-existing networks kept" $?
 say "      pre-existing: $(wc -l <"$work/before.containers" | tr -d ' ') containers, $(wc -l <"$work/before.volumes" | tr -d ' ') volumes, $(wc -l <"$work/before.networks" | tr -d ' ') networks"
 
-echo
-echo "TOTAL $((pass + fail)) passed=$pass failed=$fail (scenarios run: $n)"
-[ "$fail" -eq 0 ]
+tally_finish "(scenarios run: $n)"
