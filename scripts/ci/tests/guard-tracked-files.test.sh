@@ -113,6 +113,20 @@ new_repo
 track "$repo" README.md backend/composer.json frontend/package.json
 expect "clean repository with ordinary files" 0 "$repo"
 
+# The whole index is checked even when started below the top level.
+new_repo
+track "$repo" CLAUDE.md src/App.php
+expect "subdirectory argument still checks the whole index" 1 "$repo/src"
+if (cd "$repo/src" && "$guard" >"$work/out" 2>&1); then got=0; else got=$?; fi
+if [ "$got" -eq 1 ]; then
+  pass=$((pass + 1))
+  printf 'PASS  %-58s exit=%s\n' "run from a subdirectory still checks the whole index" "$got"
+else
+  fail=$((fail + 1))
+  printf 'FAIL  %-58s exit=%s want=1\n' "run from a subdirectory still checks the whole index" "$got"
+  sed 's/^/      | /' "$work/out"
+fi
+
 # Error handling: not a Git repository
 mkdir -p "$work/not-a-repo"
 expect "not a Git repository (inspection error)" 2 "$work/not-a-repo"

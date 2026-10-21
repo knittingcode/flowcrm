@@ -28,8 +28,15 @@ tmp=$(mktemp "${TMPDIR:-/tmp}/guard-tracked-files.XXXXXX") || {
 }
 trap 'rm -f "$tmp"' EXIT
 
-if ! git -C "$repo" ls-files -z >"$tmp"; then
-  echo "ERROR: could not list tracked files in '$repo'." >&2
+# ls-files only lists the current directory's subtree, so always list
+# from the top level; a subdirectory argument must not narrow the check.
+if ! top=$(git -C "$repo" rev-parse --show-toplevel) || [ -z "$top" ]; then
+  echo "ERROR: '$repo' is not inside a Git work tree." >&2
+  exit 2
+fi
+
+if ! git -C "$top" ls-files -z >"$tmp"; then
+  echo "ERROR: could not list tracked files in '$top'." >&2
   exit 2
 fi
 
