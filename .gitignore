@@ -1,0 +1,33 @@
+# Local environment overrides (committed .env files hold non-secret defaults)
+.env.local
+.env.local.php
+.env.*.local
+
+# Local runtime state written by the development tooling
+/.runtime/
+
+# Backend (Symfony)
+/backend/vendor/
+/backend/var/
+/backend/coverage/
+/backend/.phpunit.cache/
+/backend/.php-cs-fixer.cache
+
+# Frontend (Vite, React)
+node_modules/
+/frontend/dist/
+/frontend/coverage/
+/frontend/playwright-report/
+/frontend/test-results/
+/frontend/blob-report/
+*.tsbuildinfo
+.eslintcache
+
+# Editors
+/.idea/
+*.swp
+
+# Operating system metadata
+.DS_Store
+._*
+Thumbs.db
