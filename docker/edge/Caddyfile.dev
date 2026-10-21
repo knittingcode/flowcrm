@@ -1,0 +1,17 @@
+# Development edge: /api and /health/{live,ready} go to PHP-FPM; everything
+# else, including the Vite HMR WebSocket, goes to the Vite dev server.
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+import /etc/caddy/common.caddy
+
+:8080 {
+	import baseline
+
+	handle {
+		reverse_proxy web:5173
+	}
+}

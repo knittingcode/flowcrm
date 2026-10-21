@@ -1,0 +1,19 @@
+# Build contexts receive only what the images need (allow-list).
+*
+!backend/
+!frontend/
+!docker/
+
+# Generated or local files inside those directories.
+backend/vendor/
+backend/var/
+backend/.phpunit.cache/
+backend/.php-cs-fixer.cache
+backend/.env.local
+backend/.env.*.local
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/
+**/.DS_Store
