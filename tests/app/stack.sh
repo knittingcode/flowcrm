@@ -209,7 +209,9 @@ rid=$(header X-Request-Id)
 v "ST-12 the edge replaces client request IDs and hides server details" $?
 
 sd=$A/.runtime/secrets
-perm() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+perm() { # GNU stat first: its -f means file system status
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 leak=0
 for f in db_password app_secret; do
   s=$(cat "$sd/$f")

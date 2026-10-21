@@ -701,7 +701,9 @@ select_stack
 
 # --- U-16 generated secrets
 RUNTIME_DIR=$work/rt16 SECRETS_DIR=$work/rt16/secrets
-mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+mode_of() { # GNU stat first: its -f means file system status
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 (ensure_secrets) 2>/dev/null
 r=$?
 [ "$r" = 0 ] && [ "$(mode_of "$SECRETS_DIR")" = 700 ] && [ "$(mode_of "$SECRETS_DIR/db_password")" = 444 ] &&
