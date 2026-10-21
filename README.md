@@ -56,7 +56,7 @@ flowchart LR
 
 - The browser talks to one origin, the Caddy edge; the API and the frontend are same-origin, so no CORS configuration exists.
 - Only the edge publishes a port, on `127.0.0.1`. PostgreSQL, PHP-FPM and Vite are not reachable from the host.
-- Backend modules follow the FCRM-003 module plan; the foundation contains only the small `Shared` module (health checks, the API status endpoint, problem details and request IDs).
+- Backend modules follow the FCRM-003 module plan; the foundation contains only the small `Shared` module (health checks, the API status endpoint, problem details and request IDs). Module boundaries and layers are enforced with Deptrac ([backend modules](docs/architecture/backend-modules.md)).
 
 Details: [development lifecycle contract](docs/architecture/development-lifecycle-contract.md), [ADR-017 health endpoint routing](docs/architecture/adr/ADR-017-health-endpoint-routing.md).
 
@@ -143,7 +143,7 @@ Keep `.runtime/secrets/` as long as the volume exists: the database was initiali
 ```console
 $ make test-devenv    # port allocator: unit tests and real-Docker scenarios on the BusyBox fixture
 $ make test-app       # all of the following
-$ tests/app/backend.sh    # composer validate/audit, PHP-CS-Fixer, PHPStan, migrations, PHPUnit (real PostgreSQL)
+$ tests/app/backend.sh    # composer validate/audit, PHP-CS-Fixer, PHPStan, migrations, PHPUnit (real PostgreSQL), Deptrac
 $ tests/app/frontend.sh   # npm audit, type check, ESLint, Vitest, production build
 $ tests/app/stack.sh      # real stack via bin/devenv: routing, health, persistence, isolation, browser
 $ tests/app/prodlike.sh   # production-like stack: built SPA, caching, CSP, browser

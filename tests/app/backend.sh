@@ -2,9 +2,10 @@
 #
 # Backend checks in a throwaway "<project>-test" Compose project: no
 # published ports and a database on tmpfs (compose.test.yaml). Runs
-# composer validate and audit, the coding standard, PHPStan, migrations
-# from an empty database (with a full down/up round trip and a schema
-# check) and PHPUnit (unit + integration against the real PostgreSQL).
+# composer validate and audit, the coding standard, PHPStan, the Deptrac
+# architecture rules and their tests, migrations from an empty database
+# (with a full down/up round trip and a schema check) and PHPUnit (unit +
+# integration against the real PostgreSQL).
 # Removes only its own test project afterwards.
 #
 # Usage: tests/app/backend.sh
@@ -43,7 +44,7 @@ check() {
     bad "$label" "exit $?"
     sed 's/^/      | /' "$log" | tail -n 30
   fi
-  grep -E '^(OK|Tests:|PHPStan|\[OK\]|No security|Found|Loaded config)' "$log" | sed 's/^/      /' | head -n 6
+  grep -E '^(OK|Tests:|PHPStan|\[OK\]|No security|Found|Loaded config| +Violations )' "$log" | sed 's/^/      /' | head -n 6
 }
 
 say "== backend checks in project $project"
@@ -70,5 +71,8 @@ check "BE-07 ORM mapping matches the migrated schema" 'bin/console doctrine:sche
 check "BE-08 migrations down to empty and up again" 'bin/console doctrine:migrations:migrate first --no-interaction && if bin/console dbal:run-sql "SELECT 1 FROM schema_baseline" >/dev/null 2>&1; then echo "schema_baseline still exists after migrating down" >&2; exit 1; fi && bin/console doctrine:migrations:migrate --no-interaction && bin/console doctrine:migrations:up-to-date'
 check "BE-09 PHPUnit unit suite" 'vendor/bin/phpunit --colors=never --testsuite unit'
 check "BE-10 PHPUnit integration suite (real PostgreSQL)" 'vendor/bin/phpunit --colors=never --testsuite integration'
+check "BE-11 module boundaries (Deptrac, deptrac.modules.yaml)" 'vendor/bin/deptrac analyse --config-file=deptrac.modules.yaml --no-cache --no-progress'
+check "BE-12 layer rules (Deptrac, deptrac.layers.yaml)" 'vendor/bin/deptrac analyse --config-file=deptrac.layers.yaml --no-cache --no-progress'
+check "BE-13 architecture tests (rules on fixtures, source layout)" 'vendor/bin/phpunit --colors=never --testsuite architecture'
 
 tally_finish "(backend)"

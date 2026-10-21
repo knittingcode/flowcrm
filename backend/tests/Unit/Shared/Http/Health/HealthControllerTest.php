@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace App\Tests\Unit\Shared\Http\Health;
 
+use App\Shared\Application\Health\ReadinessCheck;
+use App\Shared\Application\Health\ReadinessResult;
 use App\Shared\Http\Health\HealthController;
-use App\Shared\Infrastructure\Database\ReadinessCheck;
-use App\Shared\Infrastructure\Database\ReadinessResult;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 

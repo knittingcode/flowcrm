@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace App\Shared\Infrastructure\Database;
+namespace App\Shared\Application\Health;
 
 final readonly class ReadinessResult
 {

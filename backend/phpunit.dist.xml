@@ -24,6 +24,10 @@
         <testsuite name="unit">
             <directory>tests/Unit</directory>
         </testsuite>
+        <!-- Runs Deptrac (deptrac.modules.yaml, deptrac.layers.yaml). -->
+        <testsuite name="architecture">
+            <directory>tests/Architecture</directory>
+        </testsuite>
         <!-- Needs the real PostgreSQL of the test project (tests/app/backend.sh). -->
         <testsuite name="integration">
             <directory>tests/Integration</directory>
