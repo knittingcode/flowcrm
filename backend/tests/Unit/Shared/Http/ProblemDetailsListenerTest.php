@@ -6,7 +6,6 @@ namespace App\Tests\Unit\Shared\Http;
 
 use App\Shared\Http\Problem\ProblemDetailsListener;
 use App\Shared\Http\RequestId;
-use App\Tests\Unit\Shared\Http\Health\RecordingLogger;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpFoundation\Request;
@@ -44,16 +43,14 @@ final class ProblemDetailsListenerTest extends TestCase
         self::assertSame('GET', $response->headers->get('Allow'));
     }
 
-    public function testUnexpectedErrorsRevealNothingAndAreLogged(): void
+    public function testUnexpectedErrorsRevealNothing(): void
     {
-        $logger = new RecordingLogger();
-        $response = $this->dispatch('/api/v1/system/status', new \RuntimeException('connection to db:5432 failed, password=secret'), $logger)->getResponse();
+        $response = $this->dispatch('/api/v1/system/status', new \RuntimeException('connection to db:5432 failed, password=secret'))->getResponse();
 
         self::assertNotNull($response);
         self::assertSame(500, $response->getStatusCode());
         self::assertStringNotContainsString('db:5432', (string) $response->getContent());
         self::assertStringNotContainsString('secret', (string) $response->getContent());
-        self::assertStringContainsString('db:5432', $logger->lines());
     }
 
     /** @return iterable<string, array{string}> */
@@ -70,12 +67,12 @@ final class ProblemDetailsListenerTest extends TestCase
         self::assertNull($this->dispatch($path, new NotFoundHttpException())->getResponse());
     }
 
-    private function dispatch(string $path, \Throwable $exception, ?RecordingLogger $logger = null): ExceptionEvent
+    private function dispatch(string $path, \Throwable $exception): ExceptionEvent
     {
         $request = Request::create($path);
         $request->headers->set(RequestId::HEADER, '0192F0C4-7D1E-7B8A-9F3C-2B4D6E8F0A1C');
         $event = new ExceptionEvent($this->createStub(HttpKernelInterface::class), $request, HttpKernelInterface::MAIN_REQUEST, $exception);
-        new ProblemDetailsListener($logger ?? new RecordingLogger())($event);
+        new ProblemDetailsListener()($event);
 
         return $event;
     }

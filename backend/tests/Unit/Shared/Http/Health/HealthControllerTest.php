@@ -77,8 +77,12 @@ final class RecordingLogger extends AbstractLogger
     /** @var list<string> */
     private array $lines = [];
 
+    /** @var list<array{string, string, array<array-key, mixed>}> level, message, context */
+    public array $records = [];
+
     public function log($level, \Stringable|string $message, array $context = []): void
     {
+        $this->records[] = [\is_string($level) ? $level : get_debug_type($level), (string) $message, $context];
         $replace = [];
         foreach ($context as $key => $value) {
             $replace['{'.$key.'}'] = \is_scalar($value) ? (string) $value : '';

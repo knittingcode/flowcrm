@@ -8,6 +8,11 @@ framework:
     # Never trust client-supplied forwarding headers beyond the edge.
     trusted_proxies: '%env(default::TRUSTED_PROXIES)%'
 
+    # Client errors that need no attention are logged at info, not error.
+    exceptions:
+        Symfony\Component\HttpKernel\Exception\NotFoundHttpException: { log_level: info }
+        Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException: { log_level: info }
+
 when@test:
     framework:
         test: true

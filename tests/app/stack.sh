@@ -273,6 +273,35 @@ rid=$(header X-Request-Id)
   [ "$(header X-Content-Type-Options)" = nosniff ]
 v "ST-12 the edge replaces client request IDs and hides server details" $?
 
+# Structured logs (FCRM-003 section Q): the request ID of a response is in
+# the api's JSON record of that request and in the edge access log; tokens
+# sent in the query, headers or cookies are in neither.
+get "$PA" '/api/v1/system/status?token=st40-query-secret' -H 'Authorization: Bearer st40-header-secret' \
+  -H 'Cookie: sid=st40-cookie-secret' -H 'X-CSRF-Token: st40-csrf-secret'
+rid=$(header X-Request-Id)
+i=0
+until docker logs "$(cid "$A" api)" 2>&1 | grep -qF "\"request_id\":\"$rid\"" || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
+api_log=$work/api.log edge_log=$work/edge.log
+docker logs "$(cid "$A" api)" >"$api_log" 2>&1
+docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
+[ "$CODE" = 200 ] && grep -F "\"request_id\":\"$rid\"" "$api_log" | grep -F '"channel":"http"' | grep -F '"route":"api_v1_system_status"' |
+  grep -F '"status":200' | grep -qF '"message":"request completed"'
+v "ST-40 the api logs the request as one JSON record with the response's request ID" $? "$(grep -F "$rid" "$api_log" | head -n 2)"
+grep -F "$rid" "$edge_log" | grep -qF '"uri":"/api/v1/system/status?[redacted]"'
+v "ST-41 the edge access log has the same request ID and no query string" $? "$(grep -F "$rid" "$edge_log" | head -c 600)"
+# Every JSON line of the api is a complete record with the baseline fields.
+json_check=$(grep '^{' "$api_log" | docker exec -i "$(cid "$A" api)" php -r '
+  $n = 0; $bad = 0;
+  while (false !== ($l = fgets(STDIN))) {
+    $n++; $d = json_decode($l, true);
+    if (!is_array($d) || array_slice(array_keys($d), 0, 5) !== ["ts", "level", "channel", "message", "request_id"]) { $bad++; }
+  }
+  echo "$n $bad";')
+[ "${json_check%% *}" -gt 0 ] && [ "${json_check#* }" = 0 ]
+v "ST-42 api log lines are complete JSON records (lines, invalid: $json_check)" $?
+! grep -qE 'st40-(query|header|cookie|csrf)-secret' "$api_log" "$edge_log"
+v "ST-43 query, Authorization, Cookie and CSRF values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3)"
+
 sd=$A/.runtime/secrets
 perm() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"

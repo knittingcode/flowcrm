@@ -57,6 +57,7 @@ flowchart LR
 - The browser talks to one origin, the Caddy edge; the API and the frontend are same-origin, so no CORS configuration exists.
 - Only the edge publishes a port, on `127.0.0.1`. PostgreSQL, PHP-FPM and Vite are not reachable from the host.
 - Backend modules follow the FCRM-003 module plan; the foundation contains only the small `Shared` module (health checks, the API status endpoint, problem details and request IDs). Module boundaries and layers are enforced with Deptrac ([backend modules](docs/architecture/backend-modules.md)).
+- The API writes structured JSON logs to stderr; the edge, the API's log records and problem documents share one request ID per request ([observability](docs/architecture/observability.md)).
 
 Details: [development lifecycle contract](docs/architecture/development-lifecycle-contract.md), [ADR-017 health endpoint routing](docs/architecture/adr/ADR-017-health-endpoint-routing.md).
 
@@ -93,7 +94,7 @@ The database password and the Symfony secret are generated per checkout in `.run
 | `make status` | Services, health and the port mapping |
 | `make url` | Print the verified URL (fails when the stack is not ready) |
 | `make ports` | Diagnose port use in the range |
-| `make logs` | Logs; `SERVICE=edge\|web\|api\|db`, `TAIL=200`, `FOLLOW=1` |
+| `make logs` | Logs (JSON for `api` and `edge`); `SERVICE=edge\|web\|api\|db`, `TAIL=200`, `FOLLOW=1` |
 | `make doctor` | Check the prerequisites |
 | `make test-devenv` | Port allocator unit and real-Docker tests (fixture stack) |
 | `make test-app` | Backend, frontend and application-stack tests |
