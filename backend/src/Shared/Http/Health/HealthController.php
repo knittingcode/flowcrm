@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Shared\Http\Health;
 
 use App\Shared\Application\Health\ReadinessCheck;
+use Monolog\Attribute\WithMonologChannel;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
@@ -12,8 +13,9 @@ use Symfony\Component\Routing\Attribute\Route;
 
 /**
  * Infrastructure health endpoints (ADR-017). Responses carry only a status
- * word; reasons are logged, never returned.
+ * word; reasons are logged on the health channel, never returned.
  */
+#[WithMonologChannel('health')]
 final readonly class HealthController
 {
     public function __construct(

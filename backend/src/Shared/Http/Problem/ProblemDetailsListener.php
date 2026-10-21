@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Shared\Http\Problem;
 
 use App\Shared\Http\RequestId;
-use Psr\Log\LoggerInterface;
 use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
@@ -15,8 +14,9 @@ use Symfony\Component\HttpKernel\KernelEvents;
 
 /**
  * Renders every exception under /api as RFC 9457 application/problem+json.
- * Exception messages and traces never reach the client; unexpected errors
- * are logged with the request ID.
+ * Exception messages and traces never reach the client. The framework's
+ * error listener logs the exception; the log record and the problem
+ * document carry the same request ID.
  */
 final readonly class ProblemDetailsListener
 {
@@ -29,10 +29,6 @@ final readonly class ProblemDetailsListener
         500 => 'internal-error',
         503 => 'service-unavailable',
     ];
-
-    public function __construct(private LoggerInterface $logger)
-    {
-    }
 
     #[AsEventListener(event: KernelEvents::EXCEPTION, priority: -64)]
     public function __invoke(ExceptionEvent $event): void
@@ -52,14 +48,6 @@ final readonly class ProblemDetailsListener
         }
 
         $requestId = RequestId::of($request);
-        if ($status >= 500) {
-            $this->logger->error('Unhandled API error {class} (request {requestId}): {message}', [
-                'class' => $exception::class,
-                'requestId' => $requestId,
-                'message' => $exception->getMessage(),
-            ]);
-        }
-
         $type = self::TYPES[$status] ?? null;
         $body = [
             'type' => null === $type ? 'about:blank' : '/problems/'.$type,
