@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+#
+# bin/devenv - FlowCRM development environment lifecycle (Makefile backend).
+#
+# Starts the Compose project of this checkout and publishes its HTTP edge
+# on 127.0.0.1 using the first port that Docker can actually bind:
+#   1. the saved, previously verified port (if inside the range)
+#   2. FLOWCRM_PORT_DEFAULT (8080)
+#   3. every other port of FLOWCRM_PORT_RANGE (8080-8099), ascending
+# FLOWCRM_HTTP_PORT replaces that list with exactly one port (no fallback).
+#
+# A TCP connect probe only skips ports that are visibly in use; Docker's
+# bind decides. Internal services start first and never publish ports, so
+# retrying a port only recreates the stateless edge container. Volumes are
+# never removed. The verified port is written to .runtime/dev.env only
+# after the mapping and /health have been checked.
+#
+# Exit codes:
+#   0 success          1 not running (status, url)   2 Docker error
+#   3 no usable port   4 lock timeout                5 missing prerequisite
+#   6 safety refusal   64 invalid configuration or usage
+
+set -u
+
+readonly EX_OK=0 EX_NOT_RUNNING=1 EX_DOCKER=2 EX_NO_PORT=3 EX_LOCK=4
+readonly EX_PREREQ=5 EX_SAFETY=6 EX_CONFIG=64
+
+readonly RUNTIME_SCHEMA=1
+readonly BIND=127.0.0.1
+readonly EDGE=edge
+readonly EDGE_CONTAINER_PORT=8080
+readonly INTERNAL_SERVICES=state
+readonly PROJECT_RE='^flowcrm-[0-9a-f]{6}$'
+readonly CONFLICT_RE='port is already allocated|address already in use|ports are not available'
+
+LOCK_HELD=0
+LOCK_TOKEN=
+TMP_FILE=
+
+log() { printf 'devenv: %s\n' "$*" >&2; }
+
+die() {
+  local code=$1
+  shift
+  printf 'devenv: ERROR: %s\n' "$*" >&2
+  exit "$code"
+}
+
+# Print a user-supplied value safely in messages (escaped, truncated).
+show() {
+  local v
+  printf -v v '%q' "$1"
+  printf '%s' "${v:0:40}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: bin/devenv <command>
+
+  up       Start the stack and print its URL (port chosen automatically)
+  down     Stop and remove this checkout's containers (volumes are kept)
+  restart  down + up, preferring the saved port
+  status   Show container state and the saved port (exit 1 if not running)
+  url      Print the verified URL (exit 1 if not running)
+  ports    Show candidate ports and who uses them (read-only)
+  logs     Show recent logs (SERVICE=edge|state, TAIL=200, FOLLOW=1)
+  doctor   Check prerequisites (read-only)
+
+Configuration: FLOWCRM_PORT_DEFAULT (8080), FLOWCRM_PORT_RANGE (8080-8099),
+FLOWCRM_HTTP_PORT (explicit port, no fallback), FLOWCRM_UP_TIMEOUT (600),
+FLOWCRM_WAIT_TIMEOUT (60), FLOWCRM_LOCK_WAIT (120). See docs/dev-environment.md.
+EOF
+}
+
+# --- validation -------------------------------------------------------------
+
+is_uint() { [[ $1 =~ ^[1-9][0-9]{0,5}$ ]]; }
+
+valid_port() { is_uint "$1" && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]; }
+
+in_range() { valid_port "$1" && [ "$1" -ge "$PORT_LO" ] && [ "$1" -le "$PORT_HI" ]; }
+
+# A running edge port may be kept only if automatic selection could pick it.
+eligible() {
+  if [ -n "$OVERRIDE" ]; then [ "$1" = "$OVERRIDE" ]; else in_range "$1"; fi
+}
+
+bounded_uint() { # name value max
+  is_uint "$2" && [ "$2" -le "$3" ] ||
+    die $EX_CONFIG "$1 must be an integer from 1 to $3 (got $(show "$2"))"
+}
+
+load_config() {
+  local range=${FLOWCRM_PORT_RANGE-8080-8099}
+  if [[ ! $range =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    die $EX_CONFIG "FLOWCRM_PORT_RANGE must look like 8080-8099 (got $(show "$range"))"
+  fi
+  PORT_LO=${BASH_REMATCH[1]}
+  PORT_HI=${BASH_REMATCH[2]}
+  if ! valid_port "$PORT_LO" || ! valid_port "$PORT_HI" || [ "$PORT_LO" -gt "$PORT_HI" ]; then
+    die $EX_CONFIG "FLOWCRM_PORT_RANGE needs two ports from 1024 to 65535, low-high, without leading zeros (got $(show "$range"))"
+  fi
+  [ $((PORT_HI - PORT_LO)) -lt 1000 ] ||
+    die $EX_CONFIG "FLOWCRM_PORT_RANGE may span at most 1000 ports"
+
+  PORT_DEFAULT=${FLOWCRM_PORT_DEFAULT-8080}
+  in_range "$PORT_DEFAULT" ||
+    die $EX_CONFIG "FLOWCRM_PORT_DEFAULT must be a port inside $PORT_LO-$PORT_HI (got $(show "$PORT_DEFAULT"))"
+
+  OVERRIDE=${FLOWCRM_HTTP_PORT-}
+  if [ -n "$OVERRIDE" ] && ! valid_port "$OVERRIDE"; then
+    die $EX_CONFIG "FLOWCRM_HTTP_PORT must be a port from 1024 to 65535 (got $(show "$OVERRIDE"))"
+  fi
+
+  UP_TIMEOUT=${FLOWCRM_UP_TIMEOUT-600}
+  WAIT_TIMEOUT=${FLOWCRM_WAIT_TIMEOUT-60}
+  LOCK_WAIT=${FLOWCRM_LOCK_WAIT-120}
+  bounded_uint FLOWCRM_UP_TIMEOUT "$UP_TIMEOUT" 3600
+  bounded_uint FLOWCRM_WAIT_TIMEOUT "$WAIT_TIMEOUT" 600
+  bounded_uint FLOWCRM_LOCK_WAIT "$LOCK_WAIT" 3600
+}
+
+# --- paths and project identity ---------------------------------------------
+
+sha256_prefix() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum
+  else
+    printf '%s' "$1" | shasum -a 256
+  fi | cut -c1-6
+}
+
+init_paths() {
+  local here
+  here=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) || die $EX_PREREQ "cannot resolve the script directory"
+  ROOT=$(cd -P "$here/.." && pwd -P) || die $EX_PREREQ "cannot resolve the checkout directory"
+  COMPOSE_FILE=$ROOT/compose.fixture.yaml
+  RUNTIME_DIR=$ROOT/.runtime
+  STATE_FILE=$RUNTIME_DIR/dev.env
+  LOCK_DIR=$RUNTIME_DIR/lock
+  SELF=$here/${BASH_SOURCE[0]##*/}
+  PROJECT=flowcrm-$(sha256_prefix "$ROOT")
+  [[ $PROJECT =~ $PROJECT_RE ]] || die $EX_PREREQ "could not derive a project name"
+}
+
+ensure_runtime_dir() {
+  [ ! -L "$RUNTIME_DIR" ] || die $EX_SAFETY ".runtime is a symbolic link; refusing to write through it"
+  mkdir -p "$RUNTIME_DIR" || die $EX_SAFETY "cannot create $RUNTIME_DIR"
+}
+
+new_tmp() { # prefix -> sets TMP_FILE (removed on exit)
+  TMP_FILE=$(mktemp "$RUNTIME_DIR/.$1.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in .runtime"
+}
+
+# --- runtime state (parsed as data; never sourced) --------------------------
+
+read_state() {
+  STATE_STATUS=absent
+  STATE_PORT=
+  STATE_PROJECT=
+  local line key val size bad='' schema='' project='' bind='' port=''
+  [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ] || return 0
+  if [ -L "$STATE_FILE" ] || [ ! -f "$STATE_FILE" ]; then
+    STATE_STATUS=invalid
+    return 0
+  fi
+  size=$(wc -c <"$STATE_FILE" | tr -d ' ')
+  if [ "$size" -gt 4096 ]; then
+    STATE_STATUS=invalid
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in '' | '#'*) continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    if [ "$key" = "$line" ]; then
+      bad=1
+      continue
+    fi
+    case $key in
+      RUNTIME_SCHEMA) schema=$val ;;
+      COMPOSE_PROJECT_NAME) project=$val ;;
+      FLOWCRM_HTTP_BIND) bind=$val ;;
+      FLOWCRM_HTTP_PORT) port=$val ;;
+      *) bad=1 ;;
+    esac
+  done <"$STATE_FILE"
+  if [ -n "$bad" ] || [ "$schema" != "$RUNTIME_SCHEMA" ] || [[ ! $project =~ $PROJECT_RE ]] ||
+    [ "$bind" != "$BIND" ] || ! valid_port "$port"; then
+    STATE_STATUS=invalid
+    return 0
+  fi
+  if [ "$project" != "$PROJECT" ]; then
+    STATE_STATUS=foreign
+    STATE_PROJECT=$project
+    return 0
+  fi
+  STATE_STATUS=valid
+  STATE_PORT=$port
+}
+
+write_state() {
+  ensure_runtime_dir
+  new_tmp dev.env
+  if ! printf '%s\n' \
+    '# Written by bin/devenv after a verified start. Local only; do not commit.' \
+    "RUNTIME_SCHEMA=$RUNTIME_SCHEMA" \
+    "COMPOSE_PROJECT_NAME=$PROJECT" \
+    "FLOWCRM_HTTP_BIND=$BIND" \
+    "FLOWCRM_HTTP_PORT=$1" >"$TMP_FILE" || ! mv -f "$TMP_FILE" "$STATE_FILE"; then
+    die $EX_SAFETY "could not write $STATE_FILE"
+  fi
+  TMP_FILE=
+  STATE_STATUS=valid
+  STATE_PORT=$1
+}
+
+# --- per-checkout lock --------------------------------------------------------
+# A directory created with mkdir (atomic). The owner record names host, PID
+# and the PID's start identity. While the lock is held, every Docker command
+# runs as a recorded child (lock/op, see run_recorded): SIGKILL of devenv
+# does not stop that child, so the lock is only reaped when both the owner
+# and its last Docker command provably ended. Unverifiable records keep the
+# lock (exit 4 after FLOWCRM_LOCK_WAIT). Locks from another host are never
+# reaped automatically.
+
+host_id() { hostname 2>/dev/null || uname -n; }
+
+is_pid() { [[ $1 =~ ^[1-9][0-9]{0,9}$ ]]; }
+
+# Start identity of a process, independent of the caller's locale and time
+# zone: on Linux the boot id and the start time in clock ticks since boot
+# (unaffected by changes of the wall clock), elsewhere ps lstart rendered in
+# the C locale and UTC. Empty if the process does not exist.
+proc_start() {
+  local stat boot f
+  if [ -r /proc/sys/kernel/random/boot_id ] && stat=$(cat "/proc/$1/stat" 2>/dev/null); then
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+    read -r -a f <<<"${stat##*) }"
+    if [ -n "$boot" ] && [[ ${f[19]-} =~ ^[0-9]+$ ]]; then printf 'linux:%s:%s\n' "$boot" "${f[19]}"; fi
+    return 0
+  fi
+  stat=$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//')
+  [ -z "$stat" ] || printf 'lstart:%s\n' "$stat"
+}
+
+# Returns 1 only when the recorded process provably ended: its PID is gone
+# or now belongs to a process with another start identity of the same kind.
+# A missing, malformed or incomparable record counts as running.
+recorded_alive() { # pid pstart
+  local now
+  is_pid "$1" && command -v ps >/dev/null 2>&1 || return 0
+  ps -p "$1" >/dev/null 2>&1 || return 1
+  case $2 in linux:* | lstart:*) ;; *) return 0 ;; esac
+  now=$(proc_start "$1")
+  [ -n "$now" ] && [ "${now%%:*}" = "${2%%:*}" ] || return 0
+  [ "$now" = "$2" ]
+}
+
+older_than_a_minute() { [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }
+
+new_token() { od -An -N8 -tx1 /dev/urandom | tr -d ' \n'; }
+
+write_lock_owner() {
+  new_tmp lock-owner
+  printf '%s\n' "token=$LOCK_TOKEN" "host=$(host_id)" \
+    "pid=$$" "pstart=$(proc_start $$)" "command=$1" >"$TMP_FILE" &&
+    mv -f "$TMP_FILE" "$LOCK_DIR/owner"
+  local rc=$?
+  TMP_FILE=
+  return $rc
+}
+
+# Sets REC_TOKEN, REC_HOST, REC_PID and REC_PSTART from a lock record.
+read_record() {
+  local line
+  REC_TOKEN='' REC_HOST='' REC_PID='' REC_PSTART=''
+  while IFS= read -r line; do
+    case $line in
+      token=*) REC_TOKEN=${line#token=} ;;
+      host=*) REC_HOST=${line#host=} ;;
+      pid=*) REC_PID=${line#pid=} ;;
+      pstart=*) REC_PSTART=${line#pstart=} ;;
+    esac
+  done <"$1"
+}
+
+# Sets LOCK_STATE (active|stale|foreign), LOCK_INFO and OBSERVED_TOKEN.
+lock_status() {
+  local pid
+  LOCK_INFO='owner not recorded yet'
+  OBSERVED_TOKEN=
+  if [ ! -f "$LOCK_DIR/owner" ]; then
+    if [ -d "$LOCK_DIR" ] && older_than_a_minute "$LOCK_DIR"; then LOCK_STATE=stale; else LOCK_STATE=active; fi
+    return 0
+  fi
+  read_record "$LOCK_DIR/owner" 2>/dev/null
+  OBSERVED_TOKEN=$REC_TOKEN
+  pid=$REC_PID
+  LOCK_INFO="pid $(show "$pid") on host $(show "$REC_HOST")"
+  if [ "$REC_HOST" != "$(host_id)" ]; then
+    LOCK_STATE=foreign
+    return 0
+  fi
+  LOCK_STATE=active
+  recorded_alive "$REC_PID" "$REC_PSTART" && return 0
+  # The owner ended; a Docker command it started may still be running.
+  if [ -e "$LOCK_DIR/op" ]; then
+    read_record "$LOCK_DIR/op" 2>/dev/null
+    if recorded_alive "$REC_PID" "$REC_PSTART"; then
+      LOCK_INFO="Docker command pid $(show "$REC_PID") of the ended devenv pid $(show "$pid") is still running"
+      return 0
+    fi
+  fi
+  LOCK_STATE=stale
+}
+
+# Remove a stale lock under a second mkdir guard, re-checking that it is
+# still the same stale owner, so concurrent reapers cannot remove a lock
+# that another process acquired in the meantime.
+reap_lock() {
+  local guard=$RUNTIME_DIR/lock.reap observed=$OBSERVED_TOKEN
+  if ! mkdir "$guard" 2>/dev/null; then
+    if older_than_a_minute "$guard"; then rm -rf "$guard"; fi
+    return 1
+  fi
+  lock_status
+  if [ "$LOCK_STATE" = stale ] && [ "$OBSERVED_TOKEN" = "$observed" ]; then
+    rm -rf "$LOCK_DIR" && log "removed a stale lock ($LOCK_INFO)"
+  fi
+  rmdir "$guard"
+}
+
+acquire_lock() {
+  local deadline=$((SECONDS + LOCK_WAIT)) announced='' reaps=0
+  LOCK_TOKEN=$(new_token)
+  while :; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      LOCK_HELD=1
+      write_lock_owner "$1" || die $EX_SAFETY "could not record the lock owner"
+      return 0
+    fi
+    lock_status
+    if [ "$LOCK_STATE" = stale ] && [ "$reaps" -lt 3 ]; then
+      reaps=$((reaps + 1))
+      reap_lock && continue
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      [ "$LOCK_STATE" != foreign ] ||
+        log "the lock belongs to another host; remove .runtime/lock manually only if no devenv command runs there"
+      die $EX_LOCK "another devenv command holds .runtime/lock ($LOCK_INFO); gave up after ${LOCK_WAIT}s"
+    fi
+    if [ -z "$announced" ]; then
+      log "waiting for another devenv command in this checkout ($LOCK_INFO)"
+      announced=1
+    fi
+    sleep 1
+  done
+}
+
+# Internal command, run by compose() while the lock is held: record this
+# process (PID and start identity) in lock/op, then exec the Docker command
+# in the same process. The record is written under the reap guard and only
+# while the lock still belongs to the caller's token, so a concurrent reaper
+# either sees the record or the command never starts.
+run_recorded() { # lock-dir token command...
+  local dir=$1 token=$2 guard i=0 tmp ok=''
+  shift 2
+  guard=${dir%/*}/lock.reap
+  until mkdir "$guard" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || die $EX_LOCK "the reap guard of .runtime/lock is busy; the Docker command was not run"
+    sleep 0.1
+  done
+  if [ "$(sed -n 's/^token=//p' "$dir/owner" 2>/dev/null)" = "$token" ] &&
+    tmp=$(mktemp "$dir/.op.XXXXXX" 2>/dev/null); then
+    if printf '%s\n' "pid=$$" "pstart=$(proc_start $$)" >"$tmp" && mv -f "$tmp" "$dir/op"; then ok=1; else rm -f "$tmp"; fi
+  fi
+  rmdir "$guard"
+  [ -n "$ok" ] || die $EX_LOCK "this command no longer holds .runtime/lock; the Docker command was not run"
+  exec "$@"
+}
+
+release_lock() {
+  [ "$LOCK_HELD" = 1 ] || return 0
+  local t
+  t=$(sed -n 's/^token=//p' "$LOCK_DIR/owner" 2>/dev/null)
+  if [ -z "$t" ] || [ "$t" = "$LOCK_TOKEN" ]; then rm -rf "$LOCK_DIR"; fi
+  LOCK_HELD=0
+}
+
+on_exit() {
+  release_lock
+  if [ -n "$TMP_FILE" ]; then rm -f "$TMP_FILE"; fi
+}
+
+# --- Docker -----------------------------------------------------------------
+
+compose() {
+  local run=(docker)
+  if [ "$LOCK_HELD" = 1 ]; then run=("$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" docker); fi
+  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND "${run[@]}" compose \
+    --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
+}
+
+preflight() {
+  command -v docker >/dev/null 2>&1 || die $EX_PREREQ "docker CLI not found (see make doctor)"
+  docker compose version >/dev/null 2>&1 || die $EX_PREREQ "Docker Compose v2 plugin not found (see make doctor)"
+  docker info >/dev/null 2>&1 || die $EX_PREREQ "Docker daemon is not reachable (see make doctor)"
+  [ -f "$COMPOSE_FILE" ] || die $EX_PREREQ "missing $COMPOSE_FILE"
+}
+
+# Refuse to manage resources that do not belong to this checkout.
+require_owned_project() {
+  if [ "$STATE_STATUS" = foreign ]; then
+    die $EX_SAFETY ".runtime/dev.env names project $STATE_PROJECT but this checkout is $PROJECT; if it was copied from another checkout, delete .runtime/dev.env"
+  fi
+  local out id wd
+  out=$(docker ps --all --filter "label=com.docker.compose.project=$PROJECT" \
+    --format '{{.ID}} {{.Label "com.docker.compose.project.working_dir"}}') ||
+    die $EX_DOCKER "could not list containers"
+  while read -r id wd; do
+    [ -n "$id" ] || continue
+    [ "$wd" = "$ROOT" ] ||
+      die $EX_SAFETY "container $id uses project name $PROJECT but belongs to $(show "$wd"); refusing to manage it"
+  done <<EOF
+$out
+EOF
+}
+
+# Sets EDGE_ID, EDGE_RUNNING (true|false), EDGE_HEALTH and EDGE_PORT.
+edge_state() {
+  local s m
+  EDGE_RUNNING=false
+  EDGE_HEALTH=none
+  EDGE_PORT=
+  EDGE_ID=$(compose ps --all --quiet "$EDGE" 2>/dev/null | head -n 1)
+  [ -n "$EDGE_ID" ] || return 0
+  s=$(docker inspect -f '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$EDGE_ID" 2>/dev/null) || return 0
+  EDGE_RUNNING=${s%% *}
+  EDGE_HEALTH=${s#* }
+  [ "$EDGE_RUNNING" = true ] || return 0
+  m=$(compose port "$EDGE" "$EDGE_CONTAINER_PORT" 2>/dev/null | head -n 1)
+  case $m in "$BIND:"*) EDGE_PORT=${m#"$BIND:"} ;; esac
+  valid_port "$EDGE_PORT" || EDGE_PORT=
+}
+
+# A hint only: something accepts connections on the port.
+port_in_use() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0
+  (exec 3<>"/dev/tcp/::1/$1") 2>/dev/null && return 0
+  return 1
+}
+
+http_ok() {
+  (
+    exec 3<>"/dev/tcp/$BIND/$1" || exit 1
+    printf 'GET /health HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$BIND" "$1" >&3
+    IFS= read -r -t 5 line <&3 || exit 1
+    case $line in "HTTP/1."[01]" 200"*) exit 0 ;; esac
+    exit 1
+  ) 2>/dev/null
+}
+
+wait_http() {
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    http_ok "$1" && return 0
+    i=$((i + 1))
+    sleep 0.5
+  done
+  return 1
+}
+
+is_port_conflict() { grep -Eiq "$CONFLICT_RE" "$1"; }
+
+start_internal() {
+  new_tmp compose-err
+  # shellcheck disable=SC2086 # INTERNAL_SERVICES is a fixed word list
+  if ! compose up --detach --wait --wait-timeout "$WAIT_TIMEOUT" $INTERNAL_SERVICES >/dev/null 2>"$TMP_FILE"; then
+    tail -n 20 "$TMP_FILE" >&2
+    die $EX_DOCKER "internal services failed to start (no host ports involved); containers were left for diagnosis: make status, make logs"
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
+# Returns 0 started, 1 port conflict, 2 other failure (details in LAST_ERROR).
+try_edge() {
+  local rc
+  COMPOSE_PORT=$1
+  new_tmp compose-err
+  compose up --detach --no-deps --wait --wait-timeout "$WAIT_TIMEOUT" "$EDGE" >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  LAST_ERROR=$(tail -n 20 "$TMP_FILE")
+  if [ "$rc" -ne 0 ]; then
+    edge_state
+    if [ "$EDGE_RUNNING" != true ] && is_port_conflict "$TMP_FILE"; then rc=1; else rc=2; fi
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+  return "$rc"
+}
+
+add_candidate() {
+  case " $CANDIDATES " in *" $1 "*) ;; *) CANDIDATES="${CANDIDATES:+$CANDIDATES }$1" ;; esac
+}
+
+build_candidates() { # [port to try first]
+  local p
+  CANDIDATES=
+  if [ -n "$OVERRIDE" ]; then
+    CANDIDATES=$OVERRIDE
+    return 0
+  fi
+  if [ -n "${1-}" ] && in_range "$1"; then add_candidate "$1"; fi
+  if [ "$STATE_STATUS" = valid ] && in_range "$STATE_PORT"; then add_candidate "$STATE_PORT"; fi
+  add_candidate "$PORT_DEFAULT"
+  p=$PORT_LO
+  while [ "$p" -le "$PORT_HI" ]; do
+    add_candidate "$p"
+    p=$((p + 1))
+  done
+}
+
+report_url() { printf 'FlowCRM development fixture: http://%s:%s\n' "$BIND" "$1"; }
+
+# --- commands ---------------------------------------------------------------
+
+do_up() {
+  local c rc deadline own='' restore='' skipped=''
+  case $STATE_STATUS in
+    invalid) log "ignoring invalid .runtime/dev.env (it is replaced after a verified start)" ;;
+  esac
+  COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  start_internal
+  edge_state
+
+  if [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ] && eligible "$EDGE_PORT"; then
+    if [ "$EDGE_HEALTH" = healthy ] && wait_http "$EDGE_PORT"; then
+      if [ "$STATE_STATUS" != valid ] || [ "$STATE_PORT" != "$EDGE_PORT" ]; then
+        [ "$STATE_STATUS" != valid ] ||
+          log "saved port $STATE_PORT did not match the running edge ($EDGE_PORT); saved state updated"
+        write_state "$EDGE_PORT"
+      fi
+      log "already running; nothing to change"
+      report_url "$EDGE_PORT"
+      return 0
+    fi
+    own=$EDGE_PORT
+  elif [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ]; then
+    restore=$EDGE_PORT
+  fi
+
+  build_candidates "$own"
+  deadline=$((SECONDS + UP_TIMEOUT))
+  for c in $CANDIDATES; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      die $EX_NO_PORT "time budget of ${UP_TIMEOUT}s used up before a port could be bound (FLOWCRM_UP_TIMEOUT)"
+    fi
+    if [ "$c" != "$own" ] && port_in_use "$c"; then
+      skipped="$skipped $c"
+      continue
+    fi
+    try_edge "$c"
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+      log "Docker could not bind $BIND:$c (port conflict); trying the next candidate"
+      skipped="$skipped $c"
+      continue
+    fi
+    if [ "$rc" -ne 0 ]; then
+      printf '%s\n' "$LAST_ERROR" >&2
+      die $EX_DOCKER "the edge failed on port $c for a reason other than a port conflict; no other port was tried; containers were left for diagnosis: make status, make logs"
+    fi
+    edge_state
+    [ "$EDGE_PORT" = "$c" ] ||
+      die $EX_DOCKER "Docker reports the edge on $(show "$EDGE_PORT"), expected $BIND:$c; saved state not changed"
+    wait_http "$c" || die $EX_DOCKER "the edge on port $c does not answer /health; saved state not changed"
+    write_state "$c"
+    [ -z "$skipped" ] || log "ports in use, skipped:$skipped"
+    report_url "$c"
+    return 0
+  done
+
+  if [ -n "$restore" ]; then
+    COMPOSE_PORT=$restore
+    edge_state
+    if [ "$EDGE_RUNNING" != true ] || [ "$EDGE_PORT" != "$restore" ]; then
+      if try_edge "$restore"; then
+        log "the previous edge on port $restore was restored"
+      else
+        log "WARNING: could not restore the previous edge on port $restore"
+      fi
+    else
+      log "the running edge on port $restore was left unchanged"
+    fi
+  else
+    COMPOSE_PORT=$PORT_DEFAULT
+    edge_state
+    if [ -n "$EDGE_ID" ] && [ "$EDGE_RUNNING" != true ]; then
+      compose rm --force --stop "$EDGE" >/dev/null 2>&1
+    fi
+  fi
+  if [ -n "$OVERRIDE" ]; then
+    die $EX_NO_PORT "FLOWCRM_HTTP_PORT=$OVERRIDE cannot be bound (in use); no other port is tried for an explicit override"
+  fi
+  die $EX_NO_PORT "no free port in $PORT_LO-$PORT_HI (in use:$skipped); free one, or set FLOWCRM_PORT_RANGE or FLOWCRM_HTTP_PORT; see make ports"
+}
+
+do_down() {
+  COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  new_tmp compose-err
+  if ! compose down --remove-orphans >/dev/null 2>"$TMP_FILE"; then
+    tail -n 20 "$TMP_FILE" >&2
+    die $EX_DOCKER "docker compose down failed"
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+  log "stopped project $PROJECT; volumes and .runtime/dev.env were kept"
+}
+
+locked() { # command
+  preflight
+  ensure_runtime_dir
+  acquire_lock "$1"
+  read_state
+  require_owned_project
+}
+
+cmd_up() {
+  locked up
+  do_up
+}
+
+cmd_down() {
+  locked down
+  do_down
+}
+
+cmd_restart() {
+  locked restart
+  do_down
+  do_up
+}
+
+cmd_status() {
+  local svc id s rc=$EX_NOT_RUNNING
+  preflight
+  read_state
+  require_owned_project
+  COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  printf 'project:    %s\ncheckout:   %s\n' "$PROJECT" "$ROOT"
+  case $STATE_STATUS in
+    valid) printf 'saved port: %s\n' "$STATE_PORT" ;;
+    *) printf 'saved port: none (%s)\n' "$STATE_STATUS" ;;
+  esac
+  for svc in $INTERNAL_SERVICES $EDGE; do
+    id=$(compose ps --all --quiet "$svc" 2>/dev/null | head -n 1)
+    if [ -z "$id" ]; then
+      printf '%-6s      absent\n' "$svc"
+      continue
+    fi
+    s=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$id" 2>/dev/null)
+    printf '%-6s      %s (%s) %s\n' "$svc" "${s%% *}" "${s#* }" "$(printf '%s' "$id" | cut -c1-12)"
+  done
+  edge_state
+  if [ "$EDGE_RUNNING" = true ]; then
+    printf 'mapping:    %s:%s -> %s\n' "$BIND" "${EDGE_PORT:-unknown}" "$EDGE_CONTAINER_PORT"
+  fi
+  if [ "$EDGE_RUNNING" = true ] && [ "$EDGE_HEALTH" = healthy ] && [ "$STATE_STATUS" = valid ] &&
+    [ "$EDGE_PORT" = "$STATE_PORT" ]; then
+    printf 'result:     running\n'
+    rc=$EX_OK
+  elif [ "$EDGE_RUNNING" = true ] && [ "$STATE_STATUS" = valid ] && [ "$EDGE_PORT" != "$STATE_PORT" ]; then
+    printf 'result:     mapping does not match the saved port; run make up to reconcile\n'
+  else
+    printf 'result:     not running\n'
+  fi
+  return "$rc"
+}
+
+cmd_url() {
+  preflight
+  read_state
+  require_owned_project
+  [ "$STATE_STATUS" = valid ] || die $EX_NOT_RUNNING "not started in this checkout (no verified port saved); run make up"
+  COMPOSE_PORT=$STATE_PORT
+  edge_state
+  [ "$EDGE_RUNNING" = true ] || die $EX_NOT_RUNNING "the edge is not running; run make up"
+  [ "$EDGE_PORT" = "$STATE_PORT" ] ||
+    die $EX_NOT_RUNNING "the running edge uses $(show "$EDGE_PORT") but the saved port is $STATE_PORT; run make up to reconcile"
+  http_ok "$STATE_PORT" || die $EX_NOT_RUNNING "the edge on port $STATE_PORT does not answer /health"
+  printf 'http://%s:%s\n' "$BIND" "$STATE_PORT"
+}
+
+cmd_ports() {
+  local p use who lsof_out='' docker_ok=''
+  read_state
+  build_candidates
+  printf 'range %s-%s, default %s, override %s, saved %s\n' "$PORT_LO" "$PORT_HI" "$PORT_DEFAULT" \
+    "${OVERRIDE:-none}" "${STATE_PORT:-none}"
+  docker info >/dev/null 2>&1 && docker_ok=1
+  if command -v lsof >/dev/null 2>&1; then
+    lsof_out=$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null)
+  fi
+  printf '%-6s %-10s %s\n' PORT PROBE 'PUBLISHED BY / LISTENER (best effort)'
+  for p in $CANDIDATES; do
+    if port_in_use "$p"; then use=in-use; else use=free; fi
+    who=
+    if [ -n "$docker_ok" ]; then
+      who=$(docker ps --filter "publish=$p" --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')
+    fi
+    if [ -z "$who" ] && [ -n "$lsof_out" ]; then
+      who=$(printf '%s\n' "$lsof_out" | awk -v p=":$p" 'index($9, p) && substr($9, length($9) - length(p) + 1) == p { print $1 }' | sort -u | tr '\n' ' ')
+    fi
+    printf '%-6s %-10s %s\n' "$p" "$use" "$who"
+  done
+}
+
+cmd_logs() {
+  local svc=${SERVICE-} follow=${FOLLOW-0} tail=${TAIL-200} args
+  case $svc in '' | edge | state) ;; *) die $EX_CONFIG "SERVICE must be edge or state (got $(show "$svc"))" ;; esac
+  case $follow in 0 | 1) ;; *) die $EX_CONFIG "FOLLOW must be 0 or 1" ;; esac
+  bounded_uint TAIL "$tail" 100000
+  preflight
+  read_state
+  require_owned_project
+  COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  args=(logs --no-color --tail "$tail")
+  if [ "$follow" = 1 ]; then args+=(--follow); fi
+  if [ -n "$svc" ]; then args+=("$svc"); fi
+  compose "${args[@]}"
+}
+
+cmd_doctor() {
+  local fail=0 v t
+  check() { # level label command...
+    local level=$1 label=$2
+    shift 2
+    if v=$("$@" 2>/dev/null); then
+      printf 'ok    %-22s %s\n' "$label" "$(printf '%s' "$v" | head -n 1)"
+    elif [ "$level" = required ]; then
+      printf 'FAIL  %-22s required\n' "$label"
+      fail=1
+    else
+      printf 'warn  %-22s optional, not available\n' "$label"
+    fi
+  }
+  check required "bash" printf '%s' "$BASH_VERSION"
+  check required "docker CLI" docker version --format '{{.Client.Version}}'
+  check required "Docker daemon" docker version --format '{{.Server.Version}}'
+  check required "Docker Compose v2" docker compose version --short
+  for t in mktemp hostname ps find od; do check required "$t" command -v "$t"; done
+  if command -v sha256sum >/dev/null 2>&1; then check required "sha256" command -v sha256sum; else check required "sha256" command -v shasum; fi
+  check optional "make" sh -c 'make --version | head -n 1'
+  check optional "lsof (diagnostics)" command -v lsof
+  check required "compose.fixture.yaml" test -f "$COMPOSE_FILE"
+  if (load_config) 2>/dev/null; then
+    printf 'ok    %-22s %s\n' "configuration" "valid"
+  else
+    printf 'FAIL  %-22s %s\n' "configuration" "$( (load_config) 2>&1 | sed 's/^devenv: ERROR: //')"
+    fail=1
+  fi
+  printf 'project %s for %s\n' "$PROJECT" "$ROOT"
+  [ "$fail" -eq 0 ] || return $EX_PREREQ
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# -eq 0 ] || shift
+  case $cmd in
+    up | down | restart | status | url | ports | logs | doctor) ;;
+    __run-recorded)
+      [ $# -ge 3 ] || die $EX_CONFIG "usage: bin/devenv __run-recorded LOCK_DIR TOKEN COMMAND..."
+      run_recorded "$@"
+      ;;
+    help | -h | --help)
+      usage
+      return 0
+      ;;
+    *)
+      usage >&2
+      return $EX_CONFIG
+      ;;
+  esac
+  [ $# -eq 0 ] || die $EX_CONFIG "unexpected arguments: $(show "$*")"
+  init_paths
+  if [ "$cmd" = doctor ]; then
+    cmd_doctor
+    return
+  fi
+  load_config
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  "cmd_$cmd"
+}
+
+# Tests source this file to reach the functions without running main.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
