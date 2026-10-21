@@ -9,12 +9,17 @@ doctrine:
         server_version: '18'
         charset: utf8
         profiling_collect_backtrace: '%kernel.debug%'
+        types:
+            inet: App\Shared\Infrastructure\Persistence\InetType
+        mapping_types:
+            inet: inet
     orm:
         validate_xml_mapping: true
         naming_strategy: doctrine.orm.naming_strategy.underscore
         identity_generation_preferences:
             Doctrine\DBAL\Platforms\PostgreSQLPlatform: identity
         auto_mapping: false
+        # One mapping per module: entities live in <Module>/Domain (FCRM-003 section E).
         mappings:
             Shared:
                 type: attribute
@@ -22,6 +27,30 @@ doctrine:
                 dir: '%kernel.project_dir%/src/Shared/Infrastructure/Persistence'
                 prefix: 'App\Shared\Infrastructure\Persistence'
                 alias: Shared
+            Identity:
+                type: attribute
+                is_bundle: false
+                dir: '%kernel.project_dir%/src/Identity/Domain'
+                prefix: 'App\Identity\Domain'
+                alias: Identity
+            Organizations:
+                type: attribute
+                is_bundle: false
+                dir: '%kernel.project_dir%/src/Organizations/Domain'
+                prefix: 'App\Organizations\Domain'
+                alias: Organizations
+            Sales:
+                type: attribute
+                is_bundle: false
+                dir: '%kernel.project_dir%/src/Sales/Domain'
+                prefix: 'App\Sales\Domain'
+                alias: Sales
+            Audit:
+                type: attribute
+                is_bundle: false
+                dir: '%kernel.project_dir%/src/Audit/Domain'
+                prefix: 'App\Audit\Domain'
+                alias: Audit
 
 when@prod:
     doctrine:

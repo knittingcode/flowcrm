@@ -9,7 +9,8 @@ use Doctrine\ORM\Mapping as ORM;
 
 /**
  * Records which schema baseline the database was created from. It holds a
- * single row and no business data; the core schema follows in FND-007.
+ * single row and no business data; the core schema is created by later
+ * migrations (docs/architecture/data-model.md).
  */
 #[ORM\Entity(readOnly: true)]
 #[ORM\Table(name: 'schema_baseline')]
