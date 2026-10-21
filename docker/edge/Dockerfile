@@ -3,14 +3,14 @@
 # Targets: dev (proxies the Vite dev server) and prod (serves the built SPA).
 # Build context: the repository root.
 
-ARG CADDY_IMAGE=caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+ARG CADDY_IMAGE=caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
 ARG GO_IMAGE=golang:1.26.10-alpine3.24@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca
-ARG NODE_IMAGE=node:24.20.0-alpine3.24@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
+ARG NODE_IMAGE=node:24.22.1-alpine3.24@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d
 
-# Caddy 2.11.4 rebuilt from the upstream module with a patched Go toolchain
+# Caddy 2.11.7 rebuilt from the upstream module with a patched Go toolchain
 # and patched dependencies (docker/edge/caddy/go.mod, verified by go.sum);
-# the released binary contains vulnerable versions that no Caddy release
-# fixes yet. See docs/security/container-vulnerabilities.md.
+# the released binary (Go 1.26.8, x/net 0.59.0) contains vulnerable versions
+# that no Caddy release fixes yet. See docs/security/container-vulnerabilities.md.
 FROM ${GO_IMAGE} AS caddy-build
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local GOFLAGS=-mod=readonly
 WORKDIR /src
@@ -33,7 +33,6 @@ FROM caddy-base AS dev
 COPY docker/edge/Caddyfile.dev /etc/caddy/Caddyfile
 
 FROM ${NODE_IMAGE} AS spa-build
-RUN apk upgrade --no-cache libssl3 libcrypto3
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund

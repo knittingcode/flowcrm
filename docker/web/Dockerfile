@@ -5,11 +5,19 @@
 # ci (the full source, for tests/app/frontend.sh).
 # Build context: the repository root.
 
-ARG NODE_IMAGE=node:24.20.0-alpine3.24@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf
+ARG NODE_IMAGE=node:24.22.1-alpine3.24@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d
 
 FROM ${NODE_IMAGE} AS deps
-# OpenSSL fixes published after the base image (CVE-2026-14456).
-RUN apk upgrade --no-cache libssl3 libcrypto3
+# The npm bundled with Node 24.22.1 (11.19.1) ships modules with known HIGH
+# vulnerabilities (docs/security/container-vulnerabilities.md); replace it
+# with a pinned release whose tarball is verified against its checksum.
+ARG NPM_VERSION=11.21.1
+ARG NPM_SHA256=dd77c48eb845f4856c2cdba347cfb52bd877a2655a1ea48ff0c4796e3df9dd7b
+RUN wget -q -O /tmp/npm.tgz "https://registry.npmjs.org/npm/-/npm-${NPM_VERSION}.tgz" \
+ && echo "${NPM_SHA256}  /tmp/npm.tgz" | sha256sum -c - \
+ && npm install -g --no-audit --no-fund /tmp/npm.tgz \
+ && rm /tmp/npm.tgz \
+ && test "$(npm -v)" = "${NPM_VERSION}"
 WORKDIR /app
 RUN chown node:node /app
 USER node
