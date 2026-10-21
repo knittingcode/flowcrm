@@ -31,10 +31,15 @@ readonly EDGE=edge
 readonly EDGE_CONTAINER_PORT=8080
 readonly INTERNAL_SERVICES=state
 readonly PROJECT_RE='^flowcrm-[0-9a-f]{6}$'
-readonly CONFLICT_RE='port is already allocated|address already in use|ports are not available'
+# Bind conflicts as reported by Docker Engine and Docker Desktop. "Ports are
+# not available" alone is not enough: Docker Desktop also uses it for
+# permission errors, which must not be retried on another port.
+readonly CONFLICT_RE='port is already allocated|address already in use'
 
 LOCK_HELD=0
+LOCK_KEEP=0
 LOCK_TOKEN=
+OP_GROUP=
 TMP_FILE=
 
 log() { printf 'devenv: %s\n' "$*" >&2; }
@@ -217,12 +222,14 @@ write_state() {
 
 # --- per-checkout lock --------------------------------------------------------
 # A directory created with mkdir (atomic). The owner record names host, PID
-# and the PID's start identity. While the lock is held, every Docker command
-# runs as a recorded child (lock/op, see run_recorded): SIGKILL of devenv
-# does not stop that child, so the lock is only reaped when both the owner
-# and its last Docker command provably ended. Unverifiable records keep the
-# lock (exit 4 after FLOWCRM_LOCK_WAIT). Locks from another host are never
-# reaped automatically.
+# and the PID's start identity. While the lock is held, every mutating
+# Docker Compose call runs in its own process group, whose leader is
+# recorded in lock/op (see compose_op and run_recorded): neither SIGKILL of
+# devenv nor of the Docker CLI stops the Compose plugin, so the lock is only
+# reaped when the owner, the recorded leader and every member of its process
+# group provably ended. Unverifiable records keep the lock (exit 4 after
+# FLOWCRM_LOCK_WAIT). Locks from another host are never reaped
+# automatically.
 
 host_id() { hostname 2>/dev/null || uname -n; }
 
@@ -257,6 +264,14 @@ recorded_alive() { # pid pstart
   [ "$now" = "$2" ]
 }
 
+# True while a process group whose leader was recorded has members although
+# the leader itself ended. A process group ID is not reused while the group
+# has members, so such members belong to the recorded operation; if a
+# process with that PID exists again, the recorded group already ended.
+group_outlives_leader() { # pgid
+  is_pid "$1" && ! ps -p "$1" >/dev/null 2>&1 && kill -0 -- "-$1" 2>/dev/null
+}
+
 older_than_a_minute() { [ -n "$(find "$1" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }
 
 new_token() { od -An -N8 -tx1 /dev/urandom | tr -d ' \n'; }
@@ -271,16 +286,17 @@ write_lock_owner() {
   return $rc
 }
 
-# Sets REC_TOKEN, REC_HOST, REC_PID and REC_PSTART from a lock record.
+# Sets REC_TOKEN, REC_HOST, REC_PID, REC_PSTART and REC_PGID from a lock record.
 read_record() {
   local line
-  REC_TOKEN='' REC_HOST='' REC_PID='' REC_PSTART=''
+  REC_TOKEN='' REC_HOST='' REC_PID='' REC_PSTART='' REC_PGID=''
   while IFS= read -r line; do
     case $line in
       token=*) REC_TOKEN=${line#token=} ;;
       host=*) REC_HOST=${line#host=} ;;
       pid=*) REC_PID=${line#pid=} ;;
       pstart=*) REC_PSTART=${line#pstart=} ;;
+      pgid=*) REC_PGID=${line#pgid=} ;;
     esac
   done <"$1"
 }
@@ -303,12 +319,20 @@ lock_status() {
     return 0
   fi
   LOCK_STATE=active
+  case $REC_PSTART in
+    linux:* | lstart:*) ;;
+    *) LOCK_INFO="$LOCK_INFO; the record has no start identity this bin/devenv can verify (for example from an older version)" ;;
+  esac
   recorded_alive "$REC_PID" "$REC_PSTART" && return 0
   # The owner ended; a Docker command it started may still be running.
   if [ -e "$LOCK_DIR/op" ]; then
     read_record "$LOCK_DIR/op" 2>/dev/null
     if recorded_alive "$REC_PID" "$REC_PSTART"; then
       LOCK_INFO="Docker command pid $(show "$REC_PID") of the ended devenv pid $(show "$pid") is still running"
+      return 0
+    fi
+    if [ "$REC_PGID" = "$REC_PID" ] && group_outlives_leader "$REC_PGID"; then
+      LOCK_INFO="Docker Compose processes in process group $(show "$REC_PGID") of the ended devenv pid $(show "$pid") are still running"
       return 0
     fi
   fi
@@ -358,14 +382,18 @@ acquire_lock() {
   done
 }
 
-# Internal command, run by compose() while the lock is held: record this
-# process (PID and start identity) in lock/op, then exec the Docker command
-# in the same process. The record is written under the reap guard and only
-# while the lock still belongs to the caller's token, so a concurrent reaper
-# either sees the record or the command never starts.
+# Internal command, started by compose_op as the leader of a new process
+# group: record this process (PID, start identity, process group) in
+# lock/op, then exec the Docker command in the same process. The record is
+# written under the reap guard and only while the lock still belongs to the
+# caller's token, so a concurrent reaper either sees the record or the
+# command never starts.
 run_recorded() { # lock-dir token command...
-  local dir=$1 token=$2 guard i=0 tmp ok=''
+  local dir=$1 token=$2 guard i=0 tmp ok='' pgid
   shift 2
+  pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  [ "$pgid" = "$$" ] ||
+    die $EX_SAFETY "the Docker command must lead its own process group (pid $$, group $(show "$pgid")); it was not run"
   guard=${dir%/*}/lock.reap
   until mkdir "$guard" 2>/dev/null; do
     i=$((i + 1))
@@ -374,15 +402,62 @@ run_recorded() { # lock-dir token command...
   done
   if [ "$(sed -n 's/^token=//p' "$dir/owner" 2>/dev/null)" = "$token" ] &&
     tmp=$(mktemp "$dir/.op.XXXXXX" 2>/dev/null); then
-    if printf '%s\n' "pid=$$" "pstart=$(proc_start $$)" >"$tmp" && mv -f "$tmp" "$dir/op"; then ok=1; else rm -f "$tmp"; fi
+    if printf '%s\n' "pid=$$" "pstart=$(proc_start $$)" "pgid=$pgid" >"$tmp" && mv -f "$tmp" "$dir/op"; then ok=1; else rm -f "$tmp"; fi
   fi
   rmdir "$guard"
   [ -n "$ok" ] || die $EX_LOCK "this command no longer holds .runtime/lock; the Docker command was not run"
   exec "$@"
 }
 
+# Run a command as a background job with job control, i.e. as the leader
+# of its own process group, recorded in lock/op through run_recorded. Wait
+# for the job, then for every remaining member of its group (a Compose
+# plugin outlives a killed Docker CLI). If members remain after
+# FLOWCRM_LOCK_WAIT seconds, fail and keep the lock, so no other command can
+# start while they run.
+run_op() { # command...
+  local rc
+  set -m
+  "$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" "$@" </dev/null &
+  OP_GROUP=$!
+  set +m
+  wait "$OP_GROUP"
+  rc=$?
+  finish_op
+  return "$rc"
+}
+
+finish_op() {
+  local g=$OP_GROUP deadline=$((SECONDS + LOCK_WAIT))
+  [ -n "$g" ] || return 0
+  while kill -0 -- "-$g" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      LOCK_KEEP=1
+      die $EX_LOCK "processes of this command's Docker Compose call (process group $g) are still running after ${LOCK_WAIT}s; .runtime/lock is kept until they end"
+    fi
+    sleep 0.1
+  done
+  OP_GROUP=
+}
+
+# Signals reach devenv but not the Docker process group: forward them, wait
+# for the group to end, then exit (the lock is released by on_exit).
+on_signal() { # exit-code signal
+  trap '' INT TERM HUP
+  if [ -n "$OP_GROUP" ]; then
+    kill -"$2" -- "-$OP_GROUP" 2>/dev/null
+    finish_op
+  fi
+  exit "$1"
+}
+
 release_lock() {
   [ "$LOCK_HELD" = 1 ] || return 0
+  if [ "$LOCK_KEEP" = 1 ]; then
+    log "kept .runtime/lock: Docker Compose processes of this command are still running"
+    LOCK_HELD=0
+    return 0
+  fi
   local t
   t=$(sed -n 's/^token=//p' "$LOCK_DIR/owner" 2>/dev/null)
   if [ -z "$t" ] || [ "$t" = "$LOCK_TOKEN" ]; then rm -rf "$LOCK_DIR"; fi
@@ -396,11 +471,26 @@ on_exit() {
 
 # --- Docker -----------------------------------------------------------------
 
+# Read-only Docker Compose call (ps, port, logs).
 compose() {
-  local run=(docker)
-  if [ "$LOCK_HELD" = 1 ]; then run=("$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" docker); fi
-  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND "${run[@]}" compose \
+  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND docker compose \
     --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
+}
+
+# Mutating Docker Compose call (up, down, rm); only while the lock is held.
+compose_op() {
+  [ "$LOCK_HELD" = 1 ] || die $EX_SAFETY "internal error: mutating Docker Compose call without the lock"
+  FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND run_op docker compose \
+    --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
+}
+
+# Describes a failed docker compose exit status for messages.
+compose_failure() { # status
+  if [ "$1" -gt 128 ]; then
+    printf 'docker compose was terminated by signal %s' $(($1 - 128))
+  else
+    printf 'docker compose exited with status %s; its error is shown above' "$1"
+  fi
 }
 
 preflight() {
@@ -475,27 +565,33 @@ wait_http() {
 is_port_conflict() { grep -Eiq "$CONFLICT_RE" "$1"; }
 
 start_internal() {
+  local rc
   new_tmp compose-err
   # shellcheck disable=SC2086 # INTERNAL_SERVICES is a fixed word list
-  if ! compose up --detach --wait --wait-timeout "$WAIT_TIMEOUT" $INTERNAL_SERVICES >/dev/null 2>"$TMP_FILE"; then
+  compose_op up --detach --wait --wait-timeout "$WAIT_TIMEOUT" $INTERNAL_SERVICES >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
     tail -n 20 "$TMP_FILE" >&2
-    die $EX_DOCKER "internal services failed to start (no host ports involved); containers were left for diagnosis: make status, make logs"
+    die $EX_DOCKER "starting the internal services ($INTERNAL_SERVICES) failed: $(compose_failure "$rc"); they publish no host port, so no other port was tried; containers that were created are kept for make status and make logs"
   fi
   rm -f "$TMP_FILE"
   TMP_FILE=
 }
 
-# Returns 0 started, 1 port conflict, 2 other failure (details in LAST_ERROR).
+# Returns 0 started, 1 port conflict, 2 other failure (details in
+# LAST_ERROR and LAST_FAILURE). A terminated Compose call is never a conflict.
 try_edge() {
   local rc
   COMPOSE_PORT=$1
   new_tmp compose-err
-  compose up --detach --no-deps --wait --wait-timeout "$WAIT_TIMEOUT" "$EDGE" >/dev/null 2>"$TMP_FILE"
+  compose_op up --detach --no-deps --wait --wait-timeout "$WAIT_TIMEOUT" "$EDGE" >/dev/null 2>"$TMP_FILE"
   rc=$?
   LAST_ERROR=$(tail -n 20 "$TMP_FILE")
+  LAST_FAILURE=
   if [ "$rc" -ne 0 ]; then
+    LAST_FAILURE=$(compose_failure "$rc")
     edge_state
-    if [ "$EDGE_RUNNING" != true ] && is_port_conflict "$TMP_FILE"; then rc=1; else rc=2; fi
+    if [ "$rc" -le 128 ] && [ "$EDGE_RUNNING" != true ] && is_port_conflict "$TMP_FILE"; then rc=1; else rc=2; fi
   fi
   rm -f "$TMP_FILE"
   TMP_FILE=
@@ -571,7 +667,7 @@ do_up() {
     fi
     if [ "$rc" -ne 0 ]; then
       printf '%s\n' "$LAST_ERROR" >&2
-      die $EX_DOCKER "the edge failed on port $c for a reason other than a port conflict; no other port was tried; containers were left for diagnosis: make status, make logs"
+      die $EX_DOCKER "starting the edge on port $c failed for a reason other than a port conflict ($LAST_FAILURE); no other port was tried; containers were left for diagnosis: make status, make logs"
     fi
     edge_state
     [ "$EDGE_PORT" = "$c" ] ||
@@ -599,7 +695,7 @@ do_up() {
     COMPOSE_PORT=$PORT_DEFAULT
     edge_state
     if [ -n "$EDGE_ID" ] && [ "$EDGE_RUNNING" != true ]; then
-      compose rm --force --stop "$EDGE" >/dev/null 2>&1
+      compose_op rm --force --stop "$EDGE" >/dev/null 2>&1
     fi
   fi
   if [ -n "$OVERRIDE" ]; then
@@ -609,11 +705,14 @@ do_up() {
 }
 
 do_down() {
+  local rc
   COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
   new_tmp compose-err
-  if ! compose down --remove-orphans >/dev/null 2>"$TMP_FILE"; then
+  compose_op down --remove-orphans >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
     tail -n 20 "$TMP_FILE" >&2
-    die $EX_DOCKER "docker compose down failed"
+    die $EX_DOCKER "stopping project $PROJECT failed: $(compose_failure "$rc")"
   fi
   rm -f "$TMP_FILE"
   TMP_FILE=
@@ -792,9 +891,9 @@ main() {
   fi
   load_config
   trap on_exit EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  trap 'exit 129' HUP
+  trap 'on_signal 130 INT' INT
+  trap 'on_signal 143 TERM' TERM
+  trap 'on_signal 129 HUP' HUP
   "cmd_$cmd"
 }
 
