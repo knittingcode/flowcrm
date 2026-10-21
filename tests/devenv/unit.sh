@@ -25,19 +25,22 @@ init_paths
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/devenv-unit.XXXXXX") || exit 2
 work=$(cd -P "$work" && pwd -P)
+: >"$work/tally"
 sleeper=''
 trap 'rm -rf "$work"; [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null' EXIT
 
 pass=0
 fail=0
 
+# Every result is also appended to $work/tally, so a result recorded in a
+# subshell (lost counter) is detected by the final cross-check.
 result() { # name ok(0|1) [detail]
   if [ "$2" -eq 0 ]; then
     pass=$((pass + 1))
-    printf 'PASS  %s\n' "$1"
+    printf 'PASS  %s\n' "$1" | tee -a "$work/tally"
   else
     fail=$((fail + 1))
-    printf 'FAIL  %s %s\n' "$1" "${3-}"
+    printf 'FAIL  %s %s\n' "$1" "${3-}" | tee -a "$work/tally"
   fi
 }
 
@@ -113,22 +116,24 @@ RUNTIME_DIR=$work/rt
 STATE_FILE=$RUNTIME_DIR/dev.env
 LOCK_DIR=$RUNTIME_DIR/lock
 mkdir -p "$RUNTIME_DIR"
-state_case() { # name expected-status [expected-port] -- content via stdin
-  cat >"$STATE_FILE"
+# Fixtures are written to $work/st first: piping into state_case would run it
+# in a subshell and lose its pass/fail counts.
+state_case() { # name expected-status [expected-port]
+  cp "$work/st" "$STATE_FILE"
   read_state
   expect_eq "U-04 $1" "$2${3:+:$3}" "$STATE_STATUS${3:+:$STATE_PORT}"
 }
-printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\n' "$PROJECT" | state_case "valid state" valid 8084
-printf '# comment\n\nRUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084' "$PROJECT" | state_case "comments, no final newline" valid 8084
-printf 'RUNTIME_SCHEMA=2\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\n' "$PROJECT" | state_case "unknown schema" invalid
-printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=0.0.0.0\nFLOWCRM_HTTP_PORT=8084\n' "$PROJECT" | state_case "non-loopback bind" invalid
-printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=$(id)\n' "$PROJECT" | state_case "command text as port" invalid
-printf 'RUNTIME_SCHEMA=1\r\nCOMPOSE_PROJECT_NAME=%s\r\nFLOWCRM_HTTP_BIND=127.0.0.1\r\nFLOWCRM_HTTP_PORT=8084\r\n' "$PROJECT" | state_case "CRLF line endings" invalid
-printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\nPATH=/tmp\n' "$PROJECT" | state_case "unknown key" invalid
-printf 'garbage\n\001\002\n' | state_case "garbage" invalid
-printf '' | state_case "empty file" invalid
-printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=flowcrm-000000\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\n' | state_case "other project is foreign" foreign
-head -c 5000 /dev/zero | tr '\0' 'x' | state_case "oversized file" invalid
+printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\n' "$PROJECT" >"$work/st"; state_case "valid state" valid 8084
+printf '# comment\n\nRUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084' "$PROJECT" >"$work/st"; state_case "comments, no final newline" valid 8084
+printf 'RUNTIME_SCHEMA=2\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\n' "$PROJECT" >"$work/st"; state_case "unknown schema" invalid
+printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=0.0.0.0\nFLOWCRM_HTTP_PORT=8084\n' "$PROJECT" >"$work/st"; state_case "non-loopback bind" invalid
+printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=$(id)\n' "$PROJECT" >"$work/st"; state_case "command text as port" invalid
+printf 'RUNTIME_SCHEMA=1\r\nCOMPOSE_PROJECT_NAME=%s\r\nFLOWCRM_HTTP_BIND=127.0.0.1\r\nFLOWCRM_HTTP_PORT=8084\r\n' "$PROJECT" >"$work/st"; state_case "CRLF line endings" invalid
+printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=%s\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\nPATH=/tmp\n' "$PROJECT" >"$work/st"; state_case "unknown key" invalid
+printf 'garbage\n\001\002\n' >"$work/st"; state_case "garbage" invalid
+printf '' >"$work/st"; state_case "empty file" invalid
+printf 'RUNTIME_SCHEMA=1\nCOMPOSE_PROJECT_NAME=flowcrm-000000\nFLOWCRM_HTTP_BIND=127.0.0.1\nFLOWCRM_HTTP_PORT=8084\n' >"$work/st"; state_case "other project is foreign" foreign
+head -c 5000 /dev/zero | tr '\0' 'x' >"$work/st"; state_case "oversized file" invalid
 rm -f "$STATE_FILE"
 read_state
 expect_eq "U-04 missing file is absent" absent "$STATE_STATUS"
@@ -231,6 +236,11 @@ result "U-09 bin/devenv sources no files" $r
 if grep -nE 'down[^|]*(-v|--volumes)|volume rm|system prune|container prune|network prune' "$devenv_script" >/dev/null; then r=1; else r=0; fi
 result "U-09 no volume removal or global prune in bin/devenv" $r
 
+tallied=$(wc -l <"$work/tally" | tr -d ' ')
 echo
 echo "TOTAL $((pass + fail)) passed=$pass failed=$fail"
+if [ "$tallied" -ne $((pass + fail)) ]; then
+  echo "HARNESS ERROR: $tallied results printed but $((pass + fail)) counted (a result ran in a subshell)"
+  exit 2
+fi
 [ "$fail" -eq 0 ]
