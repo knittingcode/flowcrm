@@ -341,7 +341,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   [architecture/backend-modules.md](architecture/backend-modules.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-39): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-43): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -349,7 +349,9 @@ Application suites (`tests/app/`), each in its own Compose projects:
   restart, a port conflict, checkout isolation, a Playwright browser
   journey including the HMR connection, the raw-path routing boundary,
   per-service hardening with negative controls, lost secrets, source edits
-  and migrations added while running, and both stacks in one checkout.
+  and migrations added while running, both stacks in one checkout, and the
+  structured logs (request ID in the api and edge logs, complete JSON
+  records, no tokens in any log).
 - `prodlike.sh` (PL-01 to PL-13): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary and a Playwright journey
