@@ -23,8 +23,11 @@ export FLOWCRM_SECRETS_DIR=$secrets FLOWCRM_HTTP_PORT=0 COMPOSE_PROFILES=
 
 dc() { docker compose --project-name "$project" --project-directory "$APP_REPO" -f "$APP_REPO/compose.yaml" -f "$APP_REPO/compose.test.yaml" "$@"; }
 cleanup() {
+  local id
   case $project in flowcrm-??????-test) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
   remove_project "$project" "$APP_REPO"
+  docker images -q --filter "label=com.docker.compose.project=$project" | sort -u |
+    while read -r id; do docker image rm -f "$id" >/dev/null 2>&1; done
   rm -rf "$work" "$secrets"
 }
 trap cleanup EXIT
