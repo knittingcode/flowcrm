@@ -102,7 +102,8 @@ The database passwords (superuser `db_password`, schema owner `db_owner_password
 | `make logs` | Logs (JSON for `api` and `edge`); `SERVICE=edge\|web\|api\|db`, `TAIL=200`, `FOLLOW=1` |
 | `make doctor` | Check the prerequisites |
 | `make db-upgrade-roles` | Convert a database volume created before the role separation (verified backup first, see below) |
-| `make db-rotate-password ROLE=app\|owner` | Rotate the runtime or schema owner password (development only) |
+| `make db-rotate-password ROLE=app\|owner` | Rotate the runtime or schema owner password (development only); run it again to finish an interrupted rotation |
+| `make db-rotate-password-abort ROLE=app\|owner` | Undo an unfinished rotation: the database gets the current password back |
 | `make test-devenv` | Port allocator unit and real-Docker tests (fixture stack) |
 | `make test-app` | Backend, frontend and application-stack tests |
 
@@ -118,7 +119,7 @@ All requests go through the URL printed by `make up`:
 | `GET /api/v1/system/status` | Symfony | `{"service":"flowcrm-api","apiVersion":"v1","databaseTime":"…Z"}`, read from PostgreSQL |
 | other `/api/…` paths | Symfony | RFC 9457 `application/problem+json` errors |
 | `GET /health/live` | Symfony | `200 {"status":"live"}` while PHP-FPM serves requests |
-| `GET /health/ready` | Symfony | `200 {"status":"ready"}`, or `503 {"status":"not-ready"}` when PostgreSQL is unreachable or a migration is pending |
+| `GET /health/ready` | Symfony | `200 {"status":"ready"}`, or `503 {"status":"not-ready"}` when PostgreSQL is unreachable, its credential cannot be read or a migration is pending |
 
 ### Development workflow
 
@@ -135,7 +136,7 @@ $ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" e
 $ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" run --rm --no-deps migrate php bin/console doctrine:migrations:status
 ```
 
-New tables are invisible to the API by default: the migration that creates an object must grant its runtime privileges explicitly, and `backend/config/database/runtime-privileges.yaml` must list it. `make up` runs `bin/console app:database:verify-privileges --runtime` after the migrations and stops with exit 6 on any difference ([ADR-018](docs/architecture/adr/ADR-018-database-roles.md)).
+New tables are invisible to the API by default: the migration that creates an object must grant its runtime privileges explicitly, and `backend/config/database/runtime-privileges.yaml` must list it. `make up` runs `bin/console app:database:verify-privileges --runtime` after the migrations and stops with exit 6 on any difference; a stack that was already running is then no longer served (its edge is stopped, `make status` reports `blocked`) until a `make up` passes ([ADR-018](docs/architecture/adr/ADR-018-database-roles.md)).
 
 ### Upgrading a database created before the role separation
 
@@ -183,8 +184,9 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 | `.runtime/secrets/db_password is missing, but the volume … was initialised with it` (exit 6) | restore `.runtime/secrets` from a backup, or reset the database (see above); `make up` never generates a password that would not match |
 | `.runtime/secrets/db_owner_password is missing, but the volume … exists` or `… was created before role separation` (exit 6) | the volume predates the role separation: `make db-upgrade-roles`; for an already upgraded volume restore the file from a backup or run `make db-rotate-password ROLE=owner\|app` |
 | `… is malformed (expected 48 lowercase hex characters)` (exit 6) | restore the file from a backup, or `make db-rotate-password ROLE=owner\|app` |
-| `the api's database role or privileges do not match …; the stack was not published` (exit 6) | the violations are listed above the message: grant the privileges in a migration and list the object in `backend/config/database/runtime-privileges.yaml`; a failed login means a stale `db_app_password` (`make db-rotate-password ROLE=app`) |
+| `the api's database role or privileges do not match …; the stack is not served` (exit 6), `make status` shows `blocked:` | the violations are listed above the message: grant the privileges in a migration and list the object in `backend/config/database/runtime-privileges.yaml`; a failed login means a stale `db_app_password` (`make db-rotate-password ROLE=app`) |
 | `the database roles of … are inconsistent` (exit 6) | see the recovery table of [ADR-018](docs/architecture/adr/ADR-018-database-roles.md#recovery) |
+| a password rotation was interrupted or failed | `make db-rotate-password ROLE=…` again finishes it, `make db-rotate-password-abort ROLE=…` undoes it; if the file was already replaced, `make up` recreates the containers |
 | `project … has containers of another stack` (exit 6) | `FLOWCRM_STACK=fixture` and the application share a checkout's project; stop the other one with the command shown |
 | More symptoms | see [docs/dev-environment.md](docs/dev-environment.md#failure-scenarios) |
 

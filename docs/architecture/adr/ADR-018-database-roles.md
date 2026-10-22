@@ -25,7 +25,10 @@ for both.
 | `flowcrm_app` | LOGIN, NOSUPERUSER, NOCREATEDB, NOCREATEROLE, NOREPLICATION, NOBYPASSRLS, **NOINHERIT**, no memberships | `CONNECT` on the database, `USAGE` on schema `public`, and the table privileges of the manifest | the API: Doctrine, sessions, cache |
 
 Nobody gets privileges through PUBLIC: the database, schema `public`, its
-objects and functions grant PUBLIC nothing.
+objects and functions grant PUBLIC nothing. The maintenance databases
+`postgres` and `template1` keep their contents but grant PUBLIC no CONNECT
+or TEMPORARY, so the two application roles can log in to `flowcrm` only
+(`template0` accepts no connections at all).
 
 ### Explicit privileges, default-deny
 
@@ -52,8 +55,19 @@ manifest lists it. `bin/console app:database:verify-privileges --runtime`
 compares the live catalog with the manifest (owners, role attributes,
 memberships, database and schema privileges, every object's privileges,
 default privileges) and fails on any difference, including an object the
-manifest does not list. `make up` runs it after the migrations and publishes
-nothing if it fails.
+manifest does not list. Beyond schema `public` it also fails when
+`flowcrm_app` could connect to another database, use or create in another
+non-system schema, reach an object there, own anything, or hold parameter,
+tablespace or foreign-server privileges, and when any role's default
+privileges give it or PUBLIC anything. The system schemas (`pg_*`,
+`information_schema`) keep PostgreSQL's built-in defaults and are not
+inspected.
+
+`make up` runs the check after the migrations. If it, or the role check
+before it, fails, the stack is not served: an edge that was already running
+is stopped (the database, its volume, the other containers and the saved
+port are kept), `make status` reports `blocked` with the reason and `make
+url` fails, until a `make up` passes every check.
 
 ### Bootstrap
 
@@ -65,6 +79,21 @@ characters, checked), reach psql through its environment (`\getenv`), never
 a command line, and the session sets `log_statement = none` and
 `log_min_error_statement = panic` and echoes no failing statement. Each
 command runs in one transaction.
+
+**Operation lifetime.** Ending `docker compose exec` on the host does not
+end the process inside the container, so every changing command runs as a
+named operation: `bin/devenv` passes an operation ID, the script records
+its process and names its sessions `flowcrm-db-roles:<id>`
+(`application_name`), and every transaction first takes one PostgreSQL
+advisory lock, so changes never interleave. On SIGINT or SIGTERM, `bin/devenv`
+cancels its operation (`flowcrm-db-roles cancel <id>`: the script is ended,
+its sessions are terminated, an open transaction rolls back) and waits, at
+most 30 s, until both are gone, before it releases the checkout lock; it
+reports whether that was confirmed. Every changing command first ends the
+leftovers of earlier operations the same way (it holds the checkout lock,
+so they belong to an interrupted command, for example one ended with
+SIGKILL) and removes an interrupted backup's dump and scratch database. No
+other session is touched.
 
 - **New volume:** the image's initdb hook (`10-flowcrm-roles.sh`) runs
   `flowcrm-db-roles init`: the two roles with their passwords, schema
@@ -88,11 +117,17 @@ $ make db-upgrade-roles
 1. Creates the two role secrets (only this command may do so for an
    existing volume) and stops a running api, web and edge.
 2. Dumps the database (`pg_dump -Fc`), restores the dump into a scratch
-   database, compares every table's row count, the migration history and
-   the triggers, and drops the scratch database. The dump is copied to
-   `.runtime/backups/roles_upgrade_<UTC time>.dump` (directory `0700`, file
-   `0600`) and its SHA-256 checked against the verified one. Any failure
-   stops here with nothing changed.
+   database and compares, original against copy: the schema (relations,
+   columns, defaults, constraints, indexes, triggers with their enabled
+   state, functions, ACLs), the contents of every table (row count and a
+   hash over all rows), the migration history and the audit triggers. Any
+   difference, or a comparison that cannot be computed, fails. The scratch
+   database is dropped. The verified dump is copied to
+   `.runtime/backups/roles_upgrade_<UTC time>_<pid>.dump` (directory `0700`,
+   file `0600`) and its SHA-256 checked against the verified one. Any
+   failure stops here with nothing changed; an unverified dump is removed
+   (from the container's tmpfs and, for a failed or damaged copy, from the
+   host), a verified backup never.
 3. `flowcrm-db-roles upgrade`, one transaction: creates the roles, moves
    schema `public` and its tables, views, sequences, functions and types to
    `flowcrm_owner` (explicitly per object type, never `REASSIGN OWNED`),
@@ -125,20 +160,54 @@ generated; for an existing one a missing or malformed role secret stops
 `make up` and is never regenerated by it. The superuser password is not
 rotated by this decision.
 
+### Secret files and running containers
+
+Compose secrets are bind mounts of the host files. A container keeps the
+file it was started with: when a file is replaced on the host (rotation,
+restore from a backup), a running container sees it as **missing** on
+Docker Desktop (observed on macOS, 29.x) and keeps the **old** file on
+Linux (the bind mount pins the replaced inode; stack test ST-50 prints the
+observed behaviour of each run). `make up`, the upgrade and the rotation
+therefore compare the SHA-256 of every secret the running `db` and `api`
+mount with the host file and recreate a container whose mount differs (no
+value is printed). Restoring a secret from a backup is followed by `make up`.
+
 ### Rotation (development only)
 
 ```console
-$ make db-rotate-password ROLE=app     # or ROLE=owner
+$ make db-rotate-password ROLE=app           # or ROLE=owner; run again to finish an interrupted one
+$ make db-rotate-password-abort ROLE=app     # undo an unfinished rotation
 ```
 
-Writes a new secret atomically (the previous one is kept until the new
-password is set), recreates the db container so it reads the new file (a
-Compose secret is a bind mount, which keeps showing the old file after an
-atomic replace), sets the password, and recreates the api (`app`) or runs
-the migrate job (`owner`) to prove the login. If setting the password
-fails, the previous file is restored and nothing changed. If a later step
-fails, the password has changed and `make up` completes the restart.
-Clients fail for a few seconds while the database restarts: there is no
+A state machine whose state is the files in `.runtime/secrets`:
+
+| State | Files | Database |
+|---|---|---|
+| start | current `db_<role>_password` | current password |
+| 1 pending | plus `.db_<role>_password.pending` (`0600`, never mounted) | either password |
+| 2 database | pending | the pending password (set by the superuser from standard input) |
+| 3 login | pending | a SCRAM login with it succeeded (over TCP; a wrong password is refused first) |
+| 4 promoted | pending replaced the current file (atomic `mv`, `0444`) | pending = current |
+| 5 refreshed | `db` and `api` recreated because they mount the replaced file | |
+| 6 verified | the api's own connection (app) or the migrate job (owner) logged in; privileges match | |
+
+- Interrupted (SIGINT, SIGTERM) or failed in states 1-3: the pending file
+  is kept. `make db-rotate-password ROLE=…` finishes the rotation with it;
+  `make db-rotate-password-abort ROLE=…` sets the database back to the
+  current password, checks the login and removes the pending file. Both
+  work whatever the database has at that moment, because the superuser sets
+  the password; neither needs the old one, and nothing is left read-only.
+  While the database has the pending password and the files the current
+  one, the api cannot log in (readiness 503) until one of the two runs.
+- Interrupted or failed after state 4 (for example the api does not get
+  healthy again): the password and the file agree; `make up` recreates the
+  containers that still mount the old file, after the cause is fixed.
+- A password change waiting inside PostgreSQL when the command is
+  interrupted is cancelled and rolled back (operation lifetime, above).
+- Passwords are never printed or passed on a command line; nothing falls
+  back to another role; the superuser password is not rotated.
+
+Clients fail while the database and the api are recreated: there is no
 zero-downtime rotation.
 
 ## Recovery
@@ -146,11 +215,13 @@ zero-downtime rotation.
 | Situation | `make up` | What to do |
 |---|---|---|
 | legacy volume | exit 6, nothing started | `make db-upgrade-roles` |
-| role secret missing or malformed | exit 6, nothing generated | restore the file from a backup, or `make db-rotate-password ROLE=…` (needs a complete database) |
-| runtime password does not match (stale file, or the role changed its own password) | exit 6 after the migrations (login fails in the privilege check) | `make db-rotate-password ROLE=app` |
-| privileges differ from the manifest | exit 6, violations listed | fix the migration or the manifest; correct grants as `flowcrm_owner` |
+| role secret missing or malformed | exit 6, nothing generated | restore the file from a backup and run `make up` (it recreates containers that mount the replaced file), or `make db-rotate-password ROLE=…` (needs a complete database) |
+| runtime password does not match (stale file, or the role changed its own password) | exit 6 after the migrations (login fails in the privilege check), edge stopped | `make db-rotate-password ROLE=app` |
+| privileges differ from the manifest | exit 6, violations listed, edge stopped, `make status` reports `blocked` | fix the migration or the manifest; correct grants as `flowcrm_owner`; `make up` |
+| rotation interrupted or failed | depends on the state (see Rotation) | `make db-rotate-password ROLE=…` again, or `make db-rotate-password-abort ROLE=…`; after the file was replaced: `make up` |
+| interrupted database operation could not be confirmed as ended | warning from the interrupted command | the next `make up`, `make db-upgrade-roles` or `make db-rotate-password` ends it before it changes anything |
 | `inconsistent` roles (for example an object in `public` owned by another role) | exit 6, nothing changed | inspect with `docker compose exec db flowcrm-db-roles state` and `psql`; move the object to `flowcrm_owner` or out of `public` by hand |
-| failed or interrupted upgrade | legacy: exit 6; converted: migrates | run `make db-upgrade-roles` again; the backup in `.runtime/backups/` restores the previous state (`pg_restore` into a new database) |
+| failed or interrupted upgrade | legacy: exit 6; converted: migrates | run `make db-upgrade-roles` again (an interrupted conversion was rolled back before the command exited); the backup in `.runtime/backups/` restores the previous state (`pg_restore` into a new database) |
 
 **Rollback** without data loss: restore the pre-upgrade backup into a new
 volume, or, on the converted database, give the objects back to `flowcrm`
@@ -199,16 +270,29 @@ example, hash-chained or off-host records).
   role.
 - `OwnerRoleTest.php`: DDL works, new objects give the runtime nothing, no
   superuser powers, and the documented trigger limit.
-- `RuntimePrivilegesVerifierTest.php`: 21 weakenings (extra, missing,
+- `RuntimePrivilegesTest.php` also: no login to `postgres` or `template1`.
+- `RuntimePrivilegesVerifierTest.php`: 31 weakenings (extra, missing,
   PUBLIC, grant-option and column privileges, unclassified objects, default
-  privileges, schema and database privileges, foreign owners, role
-  attributes, memberships) are each reported.
+  privileges of any role, schema and database privileges, foreign owners,
+  role attributes, memberships including predefined roles, grants in other
+  schemas, objects owned by the runtime role, maintenance databases,
+  parameter privileges) are each reported.
+- `HttpEndpointsTest.php`: an unreadable database credential makes
+  `/health/ready` answer 503, not 500.
 - `CoreSchemaTest.php`: the runtime role is refused audit changes by
   privilege, the owner by the trigger.
 - `tests/app/backend.sh` BE-06 to BE-08 (migrations as the owner), BE-16
   (manifest as the runtime role), BE-17 (who gets which secret).
-- `tests/app/stack.sh` ST-47 to ST-53: the api's role and secrets; privilege
-  drift, missing and malformed secrets fail closed; rotation of both
-  passwords; a volume created exactly as before FND-009 is refused, upgraded
-  with a verified backup and keeps every row, triggers and its history.
+- `tests/app/stack.sh` ST-47 to ST-58: the api's role and secrets;
+  privilege drift on a running stack stops the edge; missing and malformed
+  secrets fail closed, also with the former environment switch set;
+  rotation interrupted (SIGTERM) after each state and while its transaction
+  waits on a lock, then finished or aborted, for both roles, a failed api
+  recreation, repeated rotations; a volume created exactly as before
+  FND-009 is refused; an upgrade interrupted after the backup and while an
+  `ALTER TABLE` waits on a real lock leaves it unchanged (no later commit);
+  a backup that does not restore, differs in its contents or is damaged on
+  the host stops the upgrade without leaving a dump; the upgrade keeps every
+  row, the triggers and the history; an unreadable credential gives 503
+  through the edge.
 - `tests/app/prodlike.sh` PL-15: migrations as the owner before the api.

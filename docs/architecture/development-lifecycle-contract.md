@@ -193,7 +193,12 @@ failed migration stops `make up` with exit 2 and keeps the saved state.
 Before the migrations, `make up` checks the database roles in the `db`
 container (`flowcrm-db-roles ensure`); after them it verifies the runtime
 privileges (`app:database:verify-privileges --runtime` in the `api`); both
-refuse with exit 6 and publish nothing on failure. A database created before
+refuse with exit 6 on failure, and a stack that was already running is then
+no longer served: its edge is stopped (the database, its volume and the
+saved port are kept), `make status` reports `blocked` and `make url` fails
+until a `make up` passes. Before the migrations, a running `db` or `api`
+whose mounted secret files differ from `.runtime/secrets` is recreated,
+because a file replaced on the host is not seen by a running container. A database created before
 the role separation is converted only by the explicit `make
 db-upgrade-roles` (ADR-018). The production-like stack runs the same
 `migrate` job (prod image) to completion before the `api` starts

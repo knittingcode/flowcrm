@@ -74,13 +74,20 @@ and leaves `.runtime/dev.env` unchanged:
    [ADR-018](architecture/adr/ADR-018-database-roles.md)), then `api` and
    `web`; they publish no port, so a failure here is never retried on another
    port;
-6. apply pending database migrations in a one-off `migrate` container
+6. recreate a running `db` or `api` whose mounted secret files differ from
+   the files in `.runtime/secrets` (a file replaced on the host is not seen
+   by a running container; application stack only), then apply pending
+   database migrations in a one-off `migrate` container
    (`docker compose run --rm`) that connects as the schema owner
    `flowcrm_owner` (`doctrine:migrations:migrate --all-or-nothing`;
    application stack only);
 7. verify the runtime role and privileges in the `api` container
    (`app:database:verify-privileges --runtime`; exit 6 on any difference from
-   `backend/config/database/runtime-privileges.yaml`; application stack only);
+   `backend/config/database/runtime-privileges.yaml`; application stack only).
+   When this check or the role check of phase 5 fails, a running edge is
+   stopped, so the stack is not served; the database and the saved port are
+   kept, `make status` reports `blocked` and `make url` fails until a
+   `make up` passes;
 8. start the edge on the first usable port (`up --no-deps --wait edge`);
 9. verify Docker's actual mapping and `GET` of the stack's readiness path
    (`/health/ready`, which must answer 200 with the stack's own body) through
@@ -104,7 +111,8 @@ configuration changed)` and/or `applied pending database migrations`.
 | `make logs` | Recent logs of this project only. `SERVICE` is one of the stack's services (`edge`, `web`, `api`, `db`; fixture: `edge`, `state`), `TAIL=200`, `FOLLOW=1`. |
 | `make doctor` | Read-only prerequisite and configuration check. |
 | `make db-upgrade-roles` | Application stack only, explicit: convert a database created before the role separation. Creates the two role secrets, stops `api`, `web` and `edge`, takes a backup verified by a restore into a scratch database (`.runtime/backups/`), moves the schema to `flowcrm_owner` in one transaction, migrates and verifies. On a converted database it only re-checks. |
-| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: set a new password for `flowcrm_app` or `flowcrm_owner`, recreate `db` (and `api` for `app`) and prove the login. The previous secret is kept as `.runtime/secrets/.db_<role>_password.previous` until the new password is set. |
+| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: a new password for `flowcrm_app` or `flowcrm_owner`. The pending password (`.runtime/secrets/.db_<role>_password.pending`, `0600`) is set in the database, a SCRAM login is checked, then it replaces the current file, the containers that mount it are recreated and the role's own client logs in. After an interruption or failure, running it again finishes the rotation (ADR-018, Rotation). |
+| `make db-rotate-password-abort ROLE=app\|owner` | Undo an unfinished rotation: the database gets the current password back (SCRAM login checked) and the pending file is removed. |
 | `make help` | List the targets. |
 | `make test-devenv` | Run the allocator tests on the fixture (see below). |
 | `make test-app` | Run the backend, frontend and application-stack tests (see below). |
@@ -323,7 +331,7 @@ shows this project's logs (`edge` logs each HTTP request).
 | `… was created before role separation` / `.runtime/secrets/db_owner_password is missing, but the volume … exists` (exit 6) | the volume predates the role separation: `make db-upgrade-roles` |
 | `… is malformed (expected 48 lowercase hex characters)` (exit 6) | restore the role secret, or `make db-rotate-password ROLE=…` |
 | `the database roles of … are inconsistent` (exit 6) | nothing was changed; see the recovery table in [ADR-018](architecture/adr/ADR-018-database-roles.md#recovery) |
-| `the api's database role or privileges do not match …` (exit 6) | the violations are listed; grant the privileges in the migration and list the object in `backend/config/database/runtime-privileges.yaml`; a failed login means a stale `db_app_password` (`make db-rotate-password ROLE=app`) |
+| `the api's database role or privileges do not match …` (exit 6, edge stopped, `make status` shows `blocked:`) | the violations are listed; grant the privileges in the migration and list the object in `backend/config/database/runtime-privileges.yaml`; a failed login means a stale `db_app_password` (`make db-rotate-password ROLE=app`) |
 | `the Compose configuration (…) is invalid` (exit 2) | the Compose file does not parse or validate; nothing was started |
 | `building the images failed: …` (exit 2) | a Dockerfile or dependency install failed; running containers were not changed |
 | `does not answer /health/ready with 200` (exit 2) | the stack runs but is not ready (database unreachable or a migration pending); `make logs SERVICE=api` shows the logged reason |
@@ -406,7 +414,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   [architecture/adr/ADR-018-database-roles.md](architecture/adr/ADR-018-database-roles.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-53): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-58): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -419,11 +427,15 @@ Application suites (`tests/app/`), each in its own Compose projects:
   records, no tokens in any log), lazy sessions (no cookie and no stored
   session for stateless requests) and the session and cache migration
   through `make up` with an incompatible and a compatible existing table,
-  and the database roles: the api's role and secrets, privilege drift and
-  missing or malformed role secrets failing closed, rotation of both role
-  passwords, and a volume created as before the role separation being
-  refused, upgraded with a verified backup (rows, triggers and migration
-  history kept) and upgraded again without changes.
+  and the database roles: the api's role and secrets, privilege drift on a
+  running stack stopping the edge, missing or malformed role secrets failing
+  closed, rotations interrupted at each step and while waiting on a lock
+  (finished or aborted, for both roles, with a failed api recreation), a
+  volume created as before the role separation being refused, upgrades
+  interrupted after the backup and while waiting on a lock, backups that do
+  not restore, differ or are damaged, the upgrade itself (rows, triggers and
+  migration history kept) and a second upgrade without changes, and an
+  unreadable credential answering 503 through the edge.
 - `prodlike.sh` (PL-01 to PL-15): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey
