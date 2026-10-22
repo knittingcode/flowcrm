@@ -356,17 +356,21 @@ Application suites (`tests/app/`), each in its own Compose projects:
   Node packages), and control scans prove the gate fails on a vulnerable
   image and on an image without inventoried packages (see
   [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
-- `backend.sh` (BE-01 to BE-13): PHP 8.5 runtime, `composer validate` and
+- `backend.sh` (BE-01 to BE-15): PHP 8.5 runtime, `composer validate` and
   `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
   empty database, `doctrine:schema:validate`, a full down/up migration round
   trip, PHPUnit unit and integration suites against a real PostgreSQL
   (project `<project>-test`, database on tmpfs, no published ports), and the
   architecture rules: Deptrac with `deptrac.modules.yaml` and
   `deptrac.layers.yaml`, and the architecture test suite (see
-  [architecture/backend-modules.md](architecture/backend-modules.md)).
+  [architecture/backend-modules.md](architecture/backend-modules.md)). The
+  integration suite also runs sessions through a real PHP-FPM; BE-14 checks
+  the session and cache configuration of dev and prod, BE-15 the PHP-FPM
+  request time limit (see
+  [architecture/sessions-and-cache.md](architecture/sessions-and-cache.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-43): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-46): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -376,11 +380,13 @@ Application suites (`tests/app/`), each in its own Compose projects:
   per-service hardening with negative controls, lost secrets, source edits
   and migrations added while running, both stacks in one checkout, and the
   structured logs (request ID in the api and edge logs, complete JSON
-  records, no tokens in any log).
-- `prodlike.sh` (PL-01 to PL-13): the production images (`<project>-prod`,
+  records, no tokens in any log), lazy sessions (no cookie and no stored
+  session for stateless requests) and the session and cache migration
+  through `make up` with an incompatible and a compatible existing table.
+- `prodlike.sh` (PL-01 to PL-14): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
-  errors, health, the raw-path routing boundary and a Playwright journey
-  under the CSP.
+  errors, health, the raw-path routing boundary, a Playwright journey
+  under the CSP and lazy sessions in production mode.
 
 Each application suite uses Compose project and image names unique to the
 run, so several runs from one checkout do not interfere.

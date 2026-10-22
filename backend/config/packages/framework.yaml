@@ -2,8 +2,7 @@
 framework:
     secret: '%env(trim:file:APP_SECRET_FILE)%'
 
-    # The API is stateless until sessions are introduced (ADR-005).
-    session: false
+    # Sessions: config/packages/session.yaml.
 
     # Never trust client-supplied forwarding headers beyond the edge.
     trusted_proxies: '%env(default::TRUSTED_PROXIES)%'

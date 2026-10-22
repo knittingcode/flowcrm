@@ -91,7 +91,7 @@ to every record:
 
 | Data | Treatment |
 |---|---|
-| Values under the keys `password`, `passwd`, `pwd`, `secret`, `token`, `csrf`, `authorization`, `cookie`, `set-cookie`, `session`, `api_key`, `apikey`, `email`, `phone`, `first_name`, `last_name`, `display_name` (any case), and keys containing `password`, `secret`, `token`, `csrf`, `cookie`, `session` or `authorization` | replaced by `[redacted]`, at any depth |
+| Values under the keys `password`, `passwd`, `pwd`, `secret`, `token`, `csrf`, `authorization`, `cookie`, `set-cookie`, `session`, `sid`, `sess_id`, `sess_data`, `api_key`, `apikey`, `email`, `phone`, `first_name`, `last_name`, `display_name` (any case), keys containing `password`, `secret`, `token`, `csrf`, `cookie`, `session`, `sessid` or `authorization`, and keys ending in `_sid` or `-sid` (the session cookie names `flowcrm_sid`, `__Host-flowcrm_sid`) | replaced by `[redacted]`, at any depth |
 | `key=value` or `key: value` text with such a key, `Bearer`/`Basic` credentials, passwords in URLs (`scheme://user:password@`) | value replaced by `[redacted]` in messages and strings |
 | Messages of database errors (DBAL exceptions, driver exceptions, `PDOException`) | replaced by `database error (SQLSTATE …)`: PostgreSQL error details can quote row values |
 | Objects other than exceptions | logged as their type only |

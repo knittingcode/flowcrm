@@ -54,15 +54,15 @@ by themselves:
   FND-016).
 - Rules across rows, such as the last-admin rule (BR-03) and the stage
   reorder and archive rules (BR-15), belong to the use cases.
-- Authentication, sessions and passwords are not implemented
-  (`users.password_hash` is written by FND-008).
+- Authentication and passwords are not implemented (`users.password_hash`
+  is written by the authentication work). Session storage exists
+  ([sessions and cache](sessions-and-cache.md)) but is not authentication.
 
 ## Not included yet
 
 | Item (FCRM-003 FND-007) | Status |
 |---|---|
 | Separate owner (migrations) and application database roles, with the application role limited to `INSERT, SELECT` on `audit_events` | open: needs a decision on how the second database credential is created and rotated, including existing development volumes; the trigger already blocks changes for every role |
-| `sessions` (Symfony `PdoSessionHandler`) and `cache_items` (Doctrine DBAL cache adapter) | with FND-008, where the components that define these tables are configured |
 
 ## Tests
 

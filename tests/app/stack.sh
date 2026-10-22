@@ -302,6 +302,18 @@ v "ST-42 api log lines are complete JSON records (lines, invalid: $json_check)" 
 ! grep -qE 'st40-(query|header|cookie|csrf)-secret' "$api_log" "$edge_log"
 v "ST-43 query, Authorization, Cookie and CSRF values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3)"
 
+# Sessions are lazy (FND-008): stateless routes neither start a session nor
+# set a cookie, even when a session cookie is sent; the migration that runs
+# during make up created the session and cache tables.
+cookies=''
+for route in /api/v1/system/status /health/live /health/ready /api/v1/does-not-exist; do
+  get "$PA" "$route" -H 'Cookie: flowcrm_sid=st44unknownsessionid0000000000000'
+  cookies="$cookies$(header Set-Cookie)"
+done
+[ -z "$cookies" ] && [ "$(psql_in "$A" 'SELECT count(*) FROM sessions')" = 0 ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('sessions', 'cache_items')")" = 2 ]
+v "ST-44 stateless requests set no cookie and store no session (sessions and cache_items exist)" $? "Set-Cookie: $cookies"
+
 sd=$A/.runtime/secrets
 perm() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
@@ -352,6 +364,31 @@ dv a-url-pending "$A" url
 v "ST-17 a pending migration makes /health/ready 503 (live stays 200, make url fails)" $?
 console_in "$A" doctrine:migrations:migrate
 until_ready "$PA" 200 30; v "ST-18 applying the migration makes it ready again" $?
+
+# The session and cache migration only creates its tables (FND-008). With
+# any cache_items relation in the way, even one identical to its own
+# definition, make up fails, changes nothing and keeps the verified state;
+# after the documented recovery (rename it by hand), make up migrates and
+# the renamed table keeps its rows.
+fnd008='DoctrineMigrations\Version20261022000000'
+state0=$(cat "$A/.runtime/dev.env")
+console_in "$A" doctrine:migrations:migrate "$fnd008"
+psql_in "$A" "CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id)); INSERT INTO cache_items VALUES ('st45:kept', 'v', NULL, 1)" >/dev/null
+dv a-up-existing "$A" up
+[ "$(rc_of a-up-existing)" = 2 ] && err_has a-up-existing 'applying the database migrations failed' &&
+  err_has a-up-existing 'Not migrating: cache_items already exist' && [ "$(cat "$A/.runtime/dev.env")" = "$state0" ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE tablename = 'sessions'")" = 0 ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM cache_items WHERE item_id = 'st45:kept'")" = 1 ] &&
+  until_ready "$PA" 503 5
+v "ST-45 an existing cache_items table stops make up without changes; the saved state is kept" $? "$(tail -n 3 "$work/out/a-up-existing.err")"
+psql_in "$A" "ALTER TABLE cache_items RENAME TO cache_items_preexisting; ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey" >/dev/null
+dv a-up-renamed "$A" up
+[ "$(rc_of a-up-renamed)" = 0 ] && err_has a-up-renamed 'applied pending database migrations' &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM cache_items_preexisting WHERE item_id = 'st45:kept'")" = 1 ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE tablename IN ('sessions', 'cache_items')")" = 2 ] &&
+  until_ready "$PA" 200 10 && ! console_in "$A" doctrine:schema:validate &&
+  psql_in "$A" "DROP TABLE cache_items_preexisting" >/dev/null && console_in "$A" doctrine:schema:validate
+v "ST-46 after renaming the existing table by hand, make up migrates; the renamed table keeps its rows until dropped" $? "$(tail -n 3 "$work/out/a-up-renamed.err")"
 
 docker stop "$(cid "$A" db)" >/dev/null
 until_ready "$PA" 503 60

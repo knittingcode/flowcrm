@@ -7,7 +7,7 @@ lists the rules and how they are enforced.
 
 | Module | Responsibility | Status |
 |---|---|---|
-| `Identity` | users, password hashing, login, sessions, `/me` | `User` entity (FND-007) |
+| `Identity` | users, password hashing, login, sessions, `/me` | `User` entity (FND-007); session storage is framework configuration ([sessions and cache](sessions-and-cache.md)) |
 | `Organizations` | organizations, memberships, roles, tenant resolution | `Organization`, `Membership` entities (FND-007) |
 | `CRM` | accounts, contacts | planned |
 | `Sales` | pipelines, stages, opportunities | `Pipeline`, `PipelineStage` entities (FND-007) |

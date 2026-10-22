@@ -131,6 +131,17 @@ req /health/live -X POST
 [ "$(layer)" = symfony-other ] && [ "$CODE" = 405 ] && ! grep -qiE 'stack trace|vendor/symfony|/app/src' "$work/body"
 v "PL-13 POST /health/live: 405 from Symfony without debug details (production mode)" $? "got $CODE $TYPE"
 
+# Sessions are lazy in production too (FND-008): no cookie and no stored
+# session for stateless routes, even with a session cookie in the request.
+cookies=''
+for route in /api/v1/system/status /health/live /health/ready /api/v1/does-not-exist; do
+  req "$route" -H 'Cookie: __Host-flowcrm_sid=pl14unknownsessionid000000000000'
+  cookies="$cookies$(header Set-Cookie)"
+done
+sessions=$(dc exec -T db psql -U flowcrm -d flowcrm -tAq -c 'SELECT count(*) FROM sessions' 2>&1)
+[ -z "$cookies" ] && [ "$sessions" = 0 ]
+v "PL-14 stateless requests set no cookie and store no session (production mode)" $? "Set-Cookie: $cookies, sessions: $sessions"
+
 need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2e/Dockerfile" -t "$e2e_image" "$APP_REPO" >/dev/null && {
   docker run --rm --network "$net" -e BASE_URL=http://edge:8080 -e MODE=prod "$e2e_image" >"$work/browser.out" 2>&1
   r=$?

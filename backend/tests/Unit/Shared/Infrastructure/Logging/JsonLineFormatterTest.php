@@ -52,6 +52,12 @@ final class JsonLineFormatterTest extends TestCase
         yield 'contact e-mail' => ['contact created', ['email' => 'anna@example.com'], 'anna@example.com'];
         yield 'phone' => ['contact created', ['contact' => ['phone' => '+48 600 100 200']], '600 100 200'];
         yield 'session id' => ['session', ['session_id' => 'session-value'], 'session-value'];
+        yield 'session table columns' => ['session', ['sess_id' => 'session-row-id', 'sess_data' => 'session-row-data'], 'session-row-'];
+        yield 'sid' => ['session', ['sid' => 'sid-value'], 'sid-value'];
+        yield 'session cookie name' => ['session', ['flowcrm_sid' => 'synthetic-sid-1'], 'synthetic-sid-1'];
+        yield 'prod session cookie name, any case' => ['session', ['__HOST-FlowCRM_SID' => 'synthetic-sid-2'], 'synthetic-sid-2'];
+        yield 'session cookie in a nested cookie jar' => ['session', ['request' => ['jar' => ['__Host-flowcrm_sid' => 'synthetic-sid-3']]], 'synthetic-sid-3'];
+        yield 'PHPSESSID' => ['session', ['PHPSESSID' => 'synthetic-sid-4'], 'synthetic-sid-4'];
         yield 'credential in the message' => ['connect failed: password=hunter2-value host=db', [], 'hunter2-value'];
         yield 'quoted credential in a context string' => ['failed', ['detail' => 'config "secret": "s3cr3t-value"'], 's3cr3t-value'];
         yield 'bearer token in the message' => ['upstream said Authorization: Bearer abc.def-ghi', [], 'abc.def-ghi'];
@@ -70,6 +76,15 @@ final class JsonLineFormatterTest extends TestCase
         self::assertStringNotContainsString($secret, $line);
         self::assertStringContainsString('[redacted]', $line);
         json_decode($line, flags: \JSON_THROW_ON_ERROR);
+    }
+
+    public function testOrdinaryKeysThatLookLikeSessionNamesAreKept(): void
+    {
+        $line = $this->format('x', ['request_id' => 'kept-1', 'side' => 'kept-2', 'inside' => 'kept-3', 'consid' => 'kept-4', 'status' => 'kept-5']);
+
+        foreach (['kept-1', 'kept-2', 'kept-3', 'kept-4', 'kept-5'] as $value) {
+            self::assertStringContainsString($value, $line);
+        }
     }
 
     public function testPlaceholdersAreFilledFromTheRedactedContext(): void

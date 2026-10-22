@@ -19,12 +19,18 @@ final class LogRedactor
     /** Keys whose values are never logged, compared case-insensitively. */
     private const KEYS = [
         'password', 'passwd', 'pwd', 'secret', 'token', 'csrf', 'authorization',
-        'cookie', 'set-cookie', 'session', 'api_key', 'apikey',
+        'cookie', 'set-cookie', 'session', 'sid', 'sess_id', 'sess_data', 'api_key', 'apikey',
         'email', 'phone', 'first_name', 'last_name', 'display_name',
     ];
 
     /** Key fragments that mark a key as sensitive (for example access_token, x-csrf-token). */
-    private const FRAGMENTS = ['password', 'secret', 'token', 'csrf', 'cookie', 'session', 'authorization'];
+    private const FRAGMENTS = ['password', 'secret', 'token', 'csrf', 'cookie', 'session', 'authorization', 'sessid'];
+
+    /**
+     * Session-ID cookie names: flowcrm_sid, __Host-flowcrm_sid and other
+     * keys ending in _sid or -sid.
+     */
+    private const SESSION_ID_NAME = '/[_-]sid$/';
 
     private const MAX_DEPTH = 8;
 
@@ -40,7 +46,7 @@ final class LogRedactor
             }
         }
 
-        return false;
+        return 1 === preg_match(self::SESSION_ID_NAME, $key);
     }
 
     /**

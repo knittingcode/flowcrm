@@ -1,0 +1,45 @@
+# Server-side sessions in PostgreSQL (FCRM-003 ADR-005, ADR-007), see
+# docs/architecture/sessions-and-cache.md. Sessions are lazy: nothing starts
+# one until code reads or writes it, so stateless routes never set a cookie
+# or touch the sessions table.
+framework:
+    session:
+        handler_id: Symfony\Component\HttpFoundation\Session\Storage\Handler\PdoSessionHandler
+        name: flowcrm_sid
+        # Browser-session cookie; the server-side idle lifetime below decides
+        # how long the session stays valid.
+        cookie_lifetime: 0
+        cookie_path: /
+        cookie_httponly: true
+        cookie_samesite: lax
+        # Secure whenever the request is HTTPS; always Secure in prod.
+        cookie_secure: auto
+        # Idle timeout: a session not used for 30 minutes is expired on read
+        # and deleted by garbage collection (probability 1/100 per request
+        # that uses a session).
+        gc_maxlifetime: 1800
+        gc_probability: 1
+        gc_divisor: 100
+
+services:
+    # Its own lazily opened connection (only when a session starts), so the
+    # session lock transaction never mixes with Doctrine's transactions.
+    # LOCK_TRANSACTIONAL: SELECT ... FOR UPDATE on the session row until the
+    # request ends, so concurrent requests of one session are serialised.
+    # lock_timeout (this connection only): a request waits at most 5 seconds
+    # for the session lock, then fails with a 500 problem document instead
+    # of blocking a PHP-FPM worker; PHP's time limit does not count waits.
+    Symfony\Component\HttpFoundation\Session\Storage\Handler\PdoSessionHandler:
+        arguments:
+            - "pgsql:host=%env(DATABASE_HOST)%;port=%env(DATABASE_PORT)%;dbname=%env(DATABASE_NAME)%;connect_timeout=5;application_name=flowcrm_sessions;options='-c lock_timeout=5s'"
+            - db_username: '%env(DATABASE_USER)%'
+              db_password: '%env(trim:file:DATABASE_PASSWORD_FILE)%'
+              lock_mode: !php/const Symfony\Component\HttpFoundation\Session\Storage\Handler\PdoSessionHandler::LOCK_TRANSACTIONAL
+
+when@prod:
+    framework:
+        session:
+            # The __Host- prefix makes browsers reject the cookie unless it
+            # is Secure, has Path=/ and no Domain (FCRM-003 C-07).
+            name: __Host-flowcrm_sid
+            cookie_secure: true
