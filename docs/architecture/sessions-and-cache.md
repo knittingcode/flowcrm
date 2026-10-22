@@ -29,9 +29,11 @@ listener adds it to the expected schema, so `doctrine:schema:validate`
 
 The handler uses its own connection, built from the same `DATABASE_*`
 settings and password file as Doctrine (no new credential). It is opened
-only when a session starts, gives up after 5 seconds (`connect_timeout`) and
-shows up as `flowcrm_sessions` in `pg_stat_activity`. Its lock transaction
-(below) therefore never mixes with Doctrine's transactions.
+only when a session starts, gives up connecting after 5 seconds
+(`connect_timeout`), waits at most 5 seconds for a lock (`lock_timeout`,
+set on this connection only) and shows up as `flowcrm_sessions` in
+`pg_stat_activity`. Its lock transaction (below) therefore never mixes with
+Doctrine's transactions.
 
 ### Lazy sessions
 
@@ -95,18 +97,47 @@ neither overwrites the other's changes. The cost: such requests run one
 after another, so request handlers that use the session should stay short.
 Requests of different sessions do not wait for each other.
 
+Both sides of the wait are bounded:
+
+- **The waiting request** gives up after 5 seconds (`lock_timeout` of the
+  session connection). It gets a 500 problem document without details and
+  no `Set-Cookie` header: PHP's session module queues a cookie with a new ID
+  when the ID cannot be validated, and `FailedSessionStartListener` removes
+  it, so the browser keeps its valid session cookie. The connection closes
+  with the request, which rolls its transaction back. The next request of
+  the session works normally. PHP's own time limit does not help here: it
+  counts CPU time, not time spent waiting for PostgreSQL.
+- **The lock holder:** PHP-FPM kills a worker that is still busy after 60
+  seconds (`request_terminate_timeout` in `docker/api/php-fpm.conf`). Its
+  connections close, PostgreSQL rolls back its transaction and the lock is
+  released; the killed request's session changes are not saved.
+
+Neither bound lets an update be lost: a request that cannot get the lock
+fails instead of writing.
+
 ### Database outages
 
 Requests that do not use the session are unaffected. An `/api` request that
 uses the session fails with a 500 problem document without details; the
 connection attempt is abandoned after 5 seconds.
 
+### Connections
+
+A PHP-FPM worker opens at most three connections, each only when needed:
+Doctrine's default connection, the session connection and the cache
+connection. With `pm.max_children = 8`, the API uses at most 24 of
+PostgreSQL's default 100 connections (plus console commands).
+
 ### Logs
 
 The log redactor masks values under the keys `session`, `sid`, `sess_id`,
-`sess_data`, `cookie` and `set-cookie` (and keys containing `session` or
-`cookie`); the edge masks `Cookie` request headers (ST-43). The PHP-FPM tests
-check that no session ID appears in PHP-FPM or PHP error output.
+`sess_data`, `cookie` and `set-cookie`, keys containing `session`, `cookie`
+or `sessid` (such as `PHPSESSID`), and keys ending in `_sid` or `-sid`, such
+as the cookie names `flowcrm_sid` and `__Host-flowcrm_sid`, in any letter
+case and at any depth. The edge masks `Cookie` request headers (ST-43). The
+PHP-FPM tests check that no session ID appears in PHP-FPM or PHP error
+output. Values written into free text (messages, exception texts) are not
+covered by key-based redaction; code must not put session IDs there.
 
 ## Cache
 
@@ -114,10 +145,27 @@ check that no session ID appears in PHP-FPM or PHP error output.
 
 FCRM-003 section F names `cache_items`, managed by Symfony's Doctrine DBAL
 cache adapter, and ADR-007 rules out Redis. `cache.app` and every pool based
-on it therefore use `DoctrineDbalAdapter` on Doctrine's default connection.
-`cache.system` (compiled container, routing and validation metadata) stays
-on the local filesystem of the container: it is rebuilt from the code and
-must not depend on the database.
+on it therefore use `DoctrineDbalAdapter`. `cache.system` (compiled
+container, routing and validation metadata) stays on the local filesystem
+of the container: it is rebuilt from the code and must not depend on the
+database.
+
+The adapter runs on its own DBAL connection, `cache` in
+`config/packages/doctrine.yaml`: the same database and credentials as the
+default connection, `application_name` `flowcrm_cache`, opened only when the
+cache is used. Two reasons:
+
+- **Transactions:** a cache query that fails (for example on a missing
+  table) would abort an open transaction of the connection it runs on, and
+  every later query of that business transaction would fail with SQLSTATE
+  25P02. On its own connection, a cache failure is a logged miss and the
+  business transaction goes on.
+- **Schema ownership:** the adapter creates `cache_items` itself when the
+  table is missing. The `RejectSchemaChanges` middleware, registered for
+  the `cache` connection only, rejects `CREATE`, `ALTER`, `DROP` and
+  `TRUNCATE` there, so the attempt fails (a logged miss) and the table
+  exists only once its migration has run. The middleware guards against the
+  adapter's own statements; it is not a defence against hostile SQL.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -153,8 +201,9 @@ own prefix. Environments use separate databases. Pools today:
 - `bin/console cache:pool:prune` deletes the expired items of every pool.
   Nothing runs it on a schedule yet, so items that expire without being
   read again stay in the table until it runs.
-- The cache shares Doctrine's connection. A write inside an open Doctrine
-  transaction is committed or rolled back with that transaction.
+- Cache writes are not part of Doctrine transactions: they are committed
+  on the cache connection at once, even if the business transaction rolls
+  back later.
 
 ### Keys and cached data
 
@@ -168,11 +217,11 @@ own prefix. Environments use separate databases. Pools today:
 
 ### Database outages
 
-Because the connection has a configured `server_version`, the adapter does
-not need the database to detect the platform. When PostgreSQL is
+Because the cache connection has a configured `server_version`, the adapter
+does not need the database to detect the platform. When PostgreSQL is
 unreachable, every read is a miss and every write is skipped, with a warning
-on the `cache` log channel. The rest of the application needs the database
-anyway.
+on the `cache` log channel; no stale value is returned. The rest of the
+application needs the database anyway.
 
 ### Locks
 
@@ -185,16 +234,44 @@ the authentication work stores its counters in a cache pool).
 
 ## Migration
 
-`Version20261022100000` only adds `sessions` (with its index) and
-`cache_items`; `down()` drops them. No existing table, constraint or row is
+`Version20261022100000` owns `sessions` (with `sess_lifetime_idx`) and
+`cache_items`; `down()` drops them. No other table, constraint or row is
 changed, and no credential changes. `make up` applies it to existing
-development databases. Tests:
+development databases (in development after the containers start, as every
+migration; in the production-like stack before PHP-FPM starts). Because the
+cache cannot create its table (see above), the order does not matter: a
+cache write before the migration is a logged miss.
+
+If one of the tables already exists, the migration compares it with its
+own definition: every column (name, order, type, length, nullability, no
+default), the primary key and, for `sessions`, the index.
+
+- **Identical:** the table is adopted with its rows ("Adopting the existing
+  ... table"), and a missing `sess_lifetime_idx` is created.
+- **Different:** the migration aborts. Migrations run all-or-nothing in one
+  transaction, so nothing is created, dropped or altered, and the version is
+  not recorded. `make up` fails with exit 2 and keeps its saved state;
+  `/health/ready` stays 503.
+
+Reconciling a different table is a manual decision: inspect it (and back it
+up if it might hold something of value), then rename or drop it yourself
+and run `make up` again. Nothing does that automatically.
+
+An interrupted migration (process killed, connection lost) is rolled back
+by PostgreSQL and can simply be run again.
+
+Tests:
 
 - from an empty database (BE-06), in sync with the schema (BE-07), and a
   full down/up round trip (BE-08);
-- `SessionCacheMigrationTest`: in a throwaway database, up to the core
-  schema, core rows inserted, then this migration up, down and up again,
-  with the core rows unchanged each time.
+- `SessionCacheMigrationTest`, each case in a throwaway database: core rows,
+  including an audit event and the audit triggers, unchanged by up, down and
+  up; a cache write before the migration creates no table (and, as a
+  control, does without the middleware); a compatible table adopted with its
+  rows; six incompatible definitions rejected with nothing changed; a
+  migration killed while waiting inside its transaction leaves nothing and
+  runs again;
+- ST-45 and ST-46: the same through `make up` on the running stack.
 
 ## Security boundaries
 
@@ -211,24 +288,65 @@ development databases. Tests:
 
 | Test | Proves |
 |---|---|
-| `backend/tests/Integration/Session/FpmSessionTest.php` | through a real PHP-FPM and the real database: stateless routes set no cookie and store nothing; the session ID has 128 bits and never appears in a body; cookie attributes over HTTP and HTTPS; idle expiry stored; data survives a PHP-FPM restart; unknown, malformed and expired IDs are replaced, never adopted; `migrate` deletes the old row; `invalidate` deletes the row and expires the cookie; two concurrent requests of one session do not lose an update; without the database only session routes fail, as problem documents without details; no session ID in PHP-FPM output |
-| `backend/tests/Integration/Session/PdoSessionHandlerTest.php` | the configured handler: transactional lock mode on its own connection; write, read and destroy, including binary data; unknown and expired IDs invalid; garbage collection deletes only expired rows; a second request waits for the lock; **negative control:** without the lock an update is lost |
+| `backend/tests/Integration/Session/FpmSessionTest.php` | through a real PHP-FPM and the real database: stateless routes, with and without a session cookie, answer at once while the sessions table is exclusively locked, set no cookie and store nothing; the session ID has 128 bits and never appears in a body; cookie attributes over HTTP and HTTPS; idle expiry stored; data survives a PHP-FPM restart; unknown, malformed and expired IDs are replaced, never adopted; `migrate` deletes the old row; `invalidate` deletes the row and expires the cookie; two concurrent requests of one session do not lose an update; a request waiting for a locked session fails after 5 s with a problem document and no cookie, closes its connection, and the session works afterwards; a worker past `request_terminate_timeout` is killed and releases the lock; without the database only session routes fail, as problem documents without details; no session ID in PHP-FPM output |
+| `backend/tests/Integration/Session/PdoSessionHandlerTest.php` | the configured handler: transactional lock mode on its own connection; `lock_timeout` 5 s on the session connection only; write, read and destroy, including binary data; unknown and expired IDs invalid; garbage collection deletes only expired rows; a second request waits for the lock; **negative control:** without the lock an update is lost |
+| `backend/tests/Integration/Session/FpmServerTest.php` | the harness: a request without an answer fails at its deadline with diagnostics and its client process is killed; stopping ends the master and every worker |
 | `backend/tests/Integration/Cache/DatabaseCacheTest.php` | `cache.app` is `DoctrineDbalAdapter`; items in `cache_items` with their TTL; hit, expiry, deletion; namespaces of two pools isolated; clearing touches no other table; prune removes only expired items; reserved key characters rejected; an unreachable database gives logged misses |
+| `backend/tests/Integration/Cache/CacheConnectionTest.php` | the cache's own lazy connection; it refuses `CREATE`, `ALTER`, `DROP` and `TRUNCATE`, the default connection does not; a cache failure leaves a business transaction intact; **negative control:** on the default connection it aborts it (25P02) |
 | `backend/tests/Integration/Configuration/SessionAndCacheConfigurationTest.php` | the session options of dev, test and prod |
 | `backend/tests/Integration/Database/SessionCacheMigrationTest.php` | the migration keeps existing data, up and down |
 | `tests/app/backend.sh` BE-14 | dev and prod use `PdoSessionHandler`, `DoctrineDbalAdapter` and the seed `flowcrm`; the test-only session routes exist in the test environment only |
+| `tests/app/backend.sh` BE-15 | the PHP-FPM configuration of the image ends requests after 60 s |
 | `tests/app/stack.sh` ST-44, `tests/app/prodlike.sh` PL-14 | through the edge, in development and production mode: stateless requests set no cookie and store no session; the tables exist after `make up` |
+| `tests/app/stack.sh` ST-45, ST-46 | `make up` with an incompatible `cache_items` fails, changes nothing and keeps its saved state; with a compatible one it adopts the table and its rows |
 
 The session tests use `SessionProbeController`
 (`backend/tests/Support/Session`), test-only routes under `/api/_test/session`
 that are registered only in the test environment. `tests/` is not mounted in
 the development stack and is removed from the production image.
 
-These configuration changes each fail the tests named: lock mode
-`LOCK_NONE`; `HttpOnly` off; `SameSite=None`; the native file handler
-instead of PostgreSQL; a 24-hour idle timeout; the prod cookie without the
-`__Host-` prefix; a filesystem `cache.app`; `Secure` never set; the
-migration removed (BE-07 and the session and cache tests).
+Each of these changes fails the tests named (run on copies of the code):
+
+| Change | Fails |
+|---|---|
+| lock mode `LOCK_NONE` | the concurrency and lock tests |
+| `HttpOnly` off, `SameSite=None`, `Secure` never set | the cookie tests and the configuration test |
+| the native file handler instead of PostgreSQL | the handler tests |
+| a 24-hour idle timeout; the prod cookie without `__Host-` | the configuration test (and the lifetime test) |
+| a filesystem `cache.app` | the cache tests |
+| the migration removed | BE-07 and the session and cache tests |
+| no `lock_timeout` on the session connection | the lock-wait test (fails at the harness deadline instead of hanging) and the lock-timeout scope test |
+| no removal of the cookie of a failed session start | the lock-wait test (a new session cookie is sent) |
+| no `request_terminate_timeout` | BE-15 |
+| the schema guard disabled | the guard and transaction-isolation tests |
+| the guard without its connection scope | the test that the default connection is not restricted |
+| the migration creating tables without checking existing ones, or adopting any existing table | the adoption and incompatible-table tests |
+| `cache.app` on the default connection | the dedicated-connection test |
+| no redaction of `*_sid` keys | the redaction tests for the cookie names |
+| a listener that starts the session on every request | the stateless-route test |
+| no deadline in the FastCGI harness | the harness deadline test |
+
+## Prerequisites for the authentication work
+
+Login, logout, CSRF and throttling are not part of this infrastructure. When
+they are built:
+
+- Start the session before migrating or invalidating it. `migrate()` and
+  `invalidate()` silently do nothing on a session that has not started;
+  Symfony's firewall starts it when a session cookie is present, code that
+  migrates on its own must call `start()` first. Login must migrate (new ID,
+  old row deleted); logout must invalidate.
+- Store the login time in the session and enforce the absolute timeout of 8
+  hours (FCRM-003); the idle timeout is already enforced.
+- Keep request handlers that use the session short: requests of one session
+  run one after another and wait at most 5 seconds for each other.
+- Login throttling stores counters in a cache pool on the `cache`
+  connection; the pool must be based on `cache.app` (or another
+  `DoctrineDbalAdapter` on that connection).
+- Never cache authorization or membership decisions across requests
+  (FCRM-003: the tenant resolver checks the membership on every request).
+- Verify `Secure` and the `__Host-` prefix in a real browser over HTTPS (see
+  below); no environment here terminates TLS.
 
 ## Known limitations
 
@@ -240,3 +358,10 @@ migration removed (BE-07 and the session and cache tests).
   with the authentication work.
 - Sessions and cache use the application's database role. Separate roles
   are an open decision (see [data model](data-model.md#not-included-yet)).
+- `sess_lifetime`, `sess_time`, `item_lifetime` and `item_time` are 32-bit
+  `INT` columns, as Symfony's components define them; Unix times exceed them
+  in January 2038. This follows the framework's schema and is tracked
+  upstream.
+- How browsers treat the `Secure` `__Host-flowcrm_sid` cookie over HTTPS is
+  not verified end to end: the stacks here run over plain HTTP, and the
+  production-like stack does not use sessions.
