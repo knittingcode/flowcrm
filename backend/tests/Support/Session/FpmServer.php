@@ -13,9 +13,14 @@ namespace App\Tests\Support\Session;
  *
  * Every request has a deadline: a request still running then is killed
  * (only its own cgi-fcgi process) and reported with diagnostics, so a
- * locking regression fails the test instead of hanging the suite. stop()
- * ends the master and, if needed, its own workers by PID; nothing else is
- * signalled. A shutdown function stops the server even after a fatal error.
+ * locking regression fails the test instead of hanging the suite.
+ *
+ * The master runs in a process group of its own (setsid), with a pool name
+ * unique to this server. A process counts as this server's only if it is
+ * in that group and its command line names this server's configuration or
+ * pool, so workers are still found after the master died and was replaced
+ * as their parent. stop() ends them by PID; nothing else is signalled. A
+ * shutdown function stops the server even after a fatal error.
  */
 final class FpmServer
 {
@@ -29,6 +34,7 @@ final class FpmServer
     private $process;
     private ?int $masterPid = null;
     private readonly string $dir;
+    private readonly string $poolName;
     private int $port = 0;
     private bool $removed = false;
 
@@ -45,6 +51,7 @@ final class FpmServer
             throw new \RuntimeException('cannot create '.$dir);
         }
         $this->dir = $dir;
+        $this->poolName = 'probe_'.bin2hex(random_bytes(4));
         register_shutdown_function(function (): void {
             if (!$this->removed) {
                 $this->remove();
@@ -65,7 +72,7 @@ final class FpmServer
             log_limit = 16384
             daemonize = no
 
-            [probe]
+            [{$this->poolName}]
             listen = 127.0.0.1:{$this->port}
             pm = static
             pm.max_children = 4
@@ -76,7 +83,8 @@ final class FpmServer
 
         $env = array_merge(getenv(), ['APP_ENV' => 'test', 'APP_DEBUG' => '0'], $this->env);
         $process = proc_open(
-            ['php-fpm', '--nodaemonize', '--fpm-config', $this->dir.'/fpm.conf'],
+            // setsid execs php-fpm in place: the master keeps this PID and leads a new group.
+            ['setsid', 'php-fpm', '--nodaemonize', '--fpm-config', $this->dir.'/fpm.conf'],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', $this->dir.'/fpm.out', 'a'], 2 => ['file', $this->dir.'/fpm.out', 'a']],
             $pipes,
             '/app',
@@ -117,8 +125,14 @@ final class FpmServer
         for ($i = 0; $i < 100 && [] !== $this->processes(); ++$i) {
             usleep(50_000);
         }
-        foreach ($this->processes() as $pid) {
+        $killed = $this->processes();
+        foreach ($killed as $pid) {
             posix_kill($pid, self::SIGKILL);
+        }
+        // Wait for these PIDs, not for processes(): an exiting process loses
+        // its command line before it is gone.
+        for ($i = 0; $i < 100 && [] !== array_filter($killed, self::isAlive(...)); ++$i) {
+            usleep(20_000);
         }
         proc_close($this->process);
         $this->process = null;
@@ -134,8 +148,16 @@ final class FpmServer
         $this->start();
     }
 
+    /** The PID of the PHP-FPM master (it also identifies the process group), while started. */
+    public function master(): ?int
+    {
+        return $this->masterPid;
+    }
+
     /**
-     * The PIDs of this server's master and workers that are still running.
+     * The PIDs of this server's master and workers that are still running:
+     * members of its process group whose command line names this server's
+     * configuration (master) or pool (workers).
      *
      * @return list<int>
      */
@@ -144,18 +166,24 @@ final class FpmServer
         if (null === $this->masterPid) {
             return [];
         }
-        $pids = self::isAlive($this->masterPid) ? [$this->masterPid] : [];
+        $pids = [];
         foreach (glob('/proc/[0-9]*/stat') ?: [] as $stat) {
-            // pid (comm) state ppid ...; comm may contain spaces, so parse after ')'.
+            // pid (comm) state ppid pgrp ...; comm may contain spaces, so parse after ')'.
             $line = @file_get_contents($stat);
             if (false === $line || false === ($end = strrpos($line, ')'))) {
                 continue;
             }
             $fields = explode(' ', substr($line, $end + 2));
-            if ((int) ($fields[1] ?? 0) === $this->masterPid && 'Z' !== $fields[0]) {
-                $pids[] = (int) basename(\dirname($stat));
+            if ('Z' === $fields[0] || (int) ($fields[2] ?? 0) !== $this->masterPid) {
+                continue;
+            }
+            $pid = (int) basename(\dirname($stat));
+            $command = str_replace("\0", ' ', (string) @file_get_contents("/proc/{$pid}/cmdline"));
+            if (str_contains($command, $this->dir.'/fpm.conf') || str_contains($command, 'pool '.$this->poolName)) {
+                $pids[] = $pid;
             }
         }
+        sort($pids);
 
         return $pids;
     }

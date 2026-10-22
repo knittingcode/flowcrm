@@ -51,6 +51,52 @@ final class FpmServerTest extends TestCase
         }
     }
 
+    public function testTheServerRunsInAProcessGroupOfItsOwn(): void
+    {
+        $fpm = new FpmServer();
+        $fpm->start();
+        try {
+            $pids = $fpm->processes();
+            $master = $fpm->master();
+            self::assertNotNull($master);
+            self::assertContains($master, $pids, 'setsid kept the PID: the master is the process started');
+            self::assertSame($master, posix_getpgid($master), 'the master leads its own process group');
+            self::assertNotSame(posix_getpgid(0), posix_getpgid($master), 'not the group of the test process');
+            foreach ($pids as $pid) {
+                self::assertSame($master, posix_getpgid($pid));
+            }
+        } finally {
+            $fpm->remove();
+        }
+    }
+
+    /**
+     * When the master dies on its own (here: killed from outside), its
+     * workers get a new parent; they are still found by their process group
+     * and pool name and stopped.
+     */
+    public function testWorkersOfAMasterKilledFromOutsideAreStopped(): void
+    {
+        $fpm = new FpmServer();
+        $fpm->start();
+        $master = $fpm->master();
+        self::assertNotNull($master);
+        $workers = array_values(array_diff($fpm->processes(), [$master]));
+        self::assertCount(4, $workers);
+
+        posix_kill($master, 9);
+        for ($i = 0; $i < 50 && self::running($master); ++$i) {
+            usleep(20_000);
+        }
+        self::assertSame($workers, $fpm->processes(), 'the orphaned workers are still recognised');
+
+        $fpm->remove();
+
+        foreach ($workers as $pid) {
+            self::assertFalse(self::running($pid), "worker $pid is still running");
+        }
+    }
+
     /** @return list<int> running children of this PHP process with that command name */
     private static function childrenNamed(string $name): array
     {
