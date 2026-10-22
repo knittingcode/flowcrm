@@ -97,6 +97,23 @@ refuses to change anything (exit 14) while one cannot be ended within
 for example one ended with SIGKILL. It also removes an interrupted backup's
 dump and scratch database. No other session is touched.
 
+**Protection before every change.** Before `bin/devenv` changes roles,
+passwords, ownership or grants (role corrections, migrations, the upgrade,
+a rotation or its abort), it records the security gate in
+`.runtime/security-gate` (atomic rename), stops a running edge and checks
+that it stopped; only then does the change start. A command that dies from
+then on, even by SIGKILL, which runs no handler, leaves the stack blocked:
+no edge serves, `make status` and `make url` report `blocked`, and a change
+that commits later is still not served. The gate is removed only by a
+command that finished with every check passed (credentials, roles,
+migrations, runtime privileges); a rotation or abort then starts the edge
+it had stopped, `make up` does so itself. `make up` changes nothing
+needlessly: it first checks, read-only, whether the role attributes and
+privileges need corrections (the corrections run in a transaction that is
+always rolled back, and catalog fingerprints are compared), and protects
+the stack only if they do or a migration is pending. A failing migration
+therefore leaves a running stack blocked until a `make up` succeeds.
+
 When the cancellation cannot be confirmed (the db container cannot be
 reached, or the old script does not end in time), the old operation may
 still commit later. The command then fails closed: it records the
@@ -305,7 +322,11 @@ example, hash-chained or off-host records).
   FND-009 is refused; an upgrade interrupted after the backup and while an
   `ALTER TABLE` waits on a real lock (SIGTERM, SIGINT, a cut connection)
   leaves it unchanged (no later commit); a cancellation that cannot be
-  confirmed (db container paused, old script not ending) blocks the stack,
+  confirmed (db container paused, old script not ending) blocks the stack;
+  SIGKILL of `bin/devenv` while `ALTER ROLE … PASSWORD` or `ALTER TABLE …
+  OWNER` waits, and after a committed but unverified change, finds the edge
+  already stopped and the stack blocked, and the next command ends the old
+  operation first (no delayed commit) or completes the verification,
   and the next command ends the old operation first or refuses; a foreign
   holder of the advisory lock cannot make `make up` wait forever;
   a backup that does not restore, differs in its contents or is damaged on

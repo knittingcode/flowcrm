@@ -77,7 +77,9 @@ and leaves `.runtime/dev.env` unchanged:
 6. recreate a running `db` or `api` whose mounted secret files differ from
    the files in `.runtime/secrets` (a file replaced on the host is not seen
    by a running container; application stack only), then apply pending
-   database migrations in a one-off `migrate` container
+   database migrations (when role corrections or migrations are needed, a
+   running edge is stopped and the security gate recorded first, see
+   ADR-018) in a one-off `migrate` container
    (`docker compose run --rm`) that connects as the schema owner
    `flowcrm_owner` (`doctrine:migrations:migrate --all-or-nothing`;
    application stack only);
@@ -327,7 +329,7 @@ shows this project's logs (`edge` logs each HTTP request).
 | `stopping project … failed: …` (exit 2) | `docker compose down` failed or was terminated |
 | `project … has containers of another stack` (exit 6) | the other `FLOWCRM_STACK` runs in this checkout; stop it with the command shown |
 | `.runtime/secrets/db_password is missing, but the volume … was initialised with it` (exit 6) | restore the secret, or reset the database (README) |
-| `applying the database migrations failed` (exit 2) | a migration failed; nothing was saved; the output of the `migrate` job is shown |
+| `applying the database migrations failed` (exit 2) | a migration failed; nothing was saved; the output of the `migrate` job is shown; the stack stays blocked (`make status`) until a `make up` succeeds |
 | `… was created before role separation` / `.runtime/secrets/db_owner_password is missing, but the volume … exists` (exit 6) | the volume predates the role separation: `make db-upgrade-roles` |
 | `… is malformed (expected 48 lowercase hex characters)` (exit 6) | restore the role secret, or `make db-rotate-password ROLE=…` |
 | `the database roles of … are inconsistent` (exit 6) | nothing was changed; see the recovery table in [ADR-018](architecture/adr/ADR-018-database-roles.md#recovery) |
@@ -414,7 +416,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   [architecture/adr/ADR-018-database-roles.md](architecture/adr/ADR-018-database-roles.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-61): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-66): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -438,7 +440,9 @@ Application suites (`tests/app/`), each in its own Compose projects:
   unreadable credential answering 503 through the edge, and cancellations
   that cannot be confirmed (db container paused, old script not ending, a
   foreign holder of the advisory lock) keeping the stack blocked until the
-  old operation has ended.
+  old operation has ended, and SIGKILL of `bin/devenv` during a rotation,
+  an ownership conversion and after a committed but unverified change, with
+  the edge already stopped before the change began.
 - `prodlike.sh` (PL-01 to PL-15): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey

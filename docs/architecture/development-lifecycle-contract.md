@@ -189,9 +189,13 @@ Compose profile `migrate`), which connects as the schema owner
 never receives the owner password. This runs under the lock and in a recorded process
 group like every other mutating call. A migration added while the stack runs
 is therefore applied by the next `make up` without recreating a container. A
-failed migration stops `make up` with exit 2 and keeps the saved state.
+failed migration stops `make up` with exit 2 and keeps the saved state;
+because the migration phase, like any role correction, first stops a
+running edge and records the security gate (ADR-018), the stack then stays
+blocked until a `make up` succeeds.
 Before the migrations, `make up` checks the database roles in the `db`
-container (`flowcrm-db-roles ensure`); after them it verifies the runtime
+container (`flowcrm-db-roles check`, read-only; `ensure` only when it
+reports corrections); after them it verifies the runtime
 privileges (`app:database:verify-privileges --runtime` in the `api`); both
 refuse with exit 6 on failure, and a stack that was already running is then
 no longer served: its edge is stopped (the database, its volume and the
