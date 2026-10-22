@@ -27,7 +27,8 @@
 #   backup-verify NAME (roles_upgrade_<digits and _>)
 #                  dump the database to /tmp/NAME.dump, restore it into a
 #                  scratch database and compare the schema, the contents of
-#                  every table, the migration history and the triggers;
+#                  every table, the migration history and the audit log
+#                  (intact triggers, or none before its migration);
 #                  drop the scratch database; prints the dump's SHA-256.
 #                  The dump is removed unless it was verified.
 #   cancel OP      stop operation OP of this script (bin/devenv after a
@@ -321,6 +322,24 @@ SELECT md5(string_agg(x, E'\\n' ORDER BY x)) FROM (
     FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.prokind IN ('f', 'p')
 ) s"
 
+# The audit log (FND-007): the migration AUDIT_MIGRATION creates
+# audit_events and both of its triggers, so they must exist and be enabled
+# whenever that migration, or a later one, is recorded. A database from
+# before it legitimately has no audit log. to_regclass, not ::regclass: the
+# cast would fail while the statement is parsed when the table is absent.
+AUDIT_MIGRATION='DoctrineMigrations\Version20261022000000'
+AUDIT_TRIGGERS='audit_events_append_only:O,audit_events_no_truncate:O'
+AUDIT_BEFORE='no audit log before its migration'
+AUDIT_STATE="
+SELECT CASE
+  WHEN to_regclass('public.audit_events') IS NOT NULL
+    THEN coalesce((SELECT string_agg(tgname || ':' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger
+                    WHERE tgrelid = to_regclass('public.audit_events') AND NOT tgisinternal), 'no triggers')
+  WHEN EXISTS (SELECT FROM doctrine_migration_versions WHERE version >= '$AUDIT_MIGRATION')
+    THEN 'audit_events missing although its migration is recorded'
+  ELSE '$AUDIT_BEFORE'
+END"
+
 in_db() { # database sql: one value; fails on any error
   psql -X -q -t -A -v ON_ERROR_STOP=1 -U "$ADMIN" -d "$1" -c "$2"
 }
@@ -353,7 +372,12 @@ backup_verify() { # name
     compare "the contents of $t" "SELECT count(*) || ' ' || md5(coalesce(string_agg(r::text, E'\\n' ORDER BY r::text), '')) FROM public.$t r" || exit 13
   done
   compare "the migration history" "SELECT coalesce(string_agg(version, ',' ORDER BY version), '') FROM doctrine_migration_versions" || exit 13
-  compare "the audit triggers" "SELECT string_agg(tgname || ':' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'public.audit_events'::regclass AND NOT tgisinternal" || exit 13
+  compare "the audit log and its triggers" "$AUDIT_STATE" || exit 13
+  audit=$(in_db "$DB" "$AUDIT_STATE") || { err "could not check the audit log"; exit 13; }
+  case $audit in
+    "$AUDIT_TRIGGERS" | "$AUDIT_BEFORE") ;;
+    *) err "the audit log is not intact ($audit; expected $AUDIT_TRIGGERS, or $AUDIT_BEFORE)"; exit 13 ;;
+  esac
   sum=$(sha256sum "$dump" | cut -d' ' -f1)
   rm -f "/tmp/$name.restore.log"
   CLEANUP_DUMP=
