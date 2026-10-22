@@ -302,6 +302,18 @@ v "ST-42 api log lines are complete JSON records (lines, invalid: $json_check)" 
 ! grep -qE 'st40-(query|header|cookie|csrf)-secret' "$api_log" "$edge_log"
 v "ST-43 query, Authorization, Cookie and CSRF values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3)"
 
+# Sessions are lazy (FND-008): stateless routes neither start a session nor
+# set a cookie, even when a session cookie is sent; the migration that runs
+# during make up created the session and cache tables.
+cookies=''
+for route in /api/v1/system/status /health/live /health/ready /api/v1/does-not-exist; do
+  get "$PA" "$route" -H 'Cookie: flowcrm_sid=st44unknownsessionid0000000000000'
+  cookies="$cookies$(header Set-Cookie)"
+done
+[ -z "$cookies" ] && [ "$(psql_in "$A" 'SELECT count(*) FROM sessions')" = 0 ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('sessions', 'cache_items')")" = 2 ]
+v "ST-44 stateless requests set no cookie and store no session (sessions and cache_items exist)" $? "Set-Cookie: $cookies"
+
 sd=$A/.runtime/secrets
 perm() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"

@@ -5,7 +5,8 @@
 # composer validate and audit, the coding standard, PHPStan, the Deptrac
 # architecture rules and their tests, migrations from an empty database
 # (with a full down/up round trip and a schema check) and PHPUnit (unit +
-# integration against the real PostgreSQL).
+# integration against the real PostgreSQL, including sessions through a real
+# PHP-FPM) and the session and cache configuration of dev and prod.
 # Removes only its own test project afterwards.
 #
 # Usage: tests/app/backend.sh
@@ -74,5 +75,18 @@ check "BE-10 PHPUnit integration suite (real PostgreSQL)" 'vendor/bin/phpunit --
 check "BE-11 module boundaries (Deptrac, deptrac.modules.yaml)" 'vendor/bin/deptrac analyse --config-file=deptrac.modules.yaml --no-cache --no-progress'
 check "BE-12 layer rules (Deptrac, deptrac.layers.yaml)" 'vendor/bin/deptrac analyse --config-file=deptrac.layers.yaml --no-cache --no-progress'
 check "BE-13 architecture tests (rules on fixtures, source layout)" 'vendor/bin/phpunit --colors=never --testsuite architecture'
+# The integration suite checks the test environment; this checks dev and
+# prod, and that the test-only session routes exist in no other environment
+# (the control proves the route check finds them where they do exist).
+# shellcheck disable=SC2016 # $e expands in the api container
+check "BE-14 dev and prod: PostgreSQL sessions and cache, no test-only routes" '
+  APP_ENV=test bin/console debug:router | grep -qF /api/_test/session || { echo "control: test routes not found in test" >&2; exit 1; }
+  for e in dev prod; do
+    APP_ENV=$e bin/console debug:container session.handler | grep -qF PdoSessionHandler &&
+      APP_ENV=$e bin/console debug:container cache.app | grep -qF DoctrineDbalAdapter &&
+      APP_ENV=$e bin/console debug:container --parameter=cache.prefix.seed | grep -qw flowcrm &&
+      ! APP_ENV=$e bin/console debug:router | grep -qF /_test/ || { echo "$e: unexpected session or cache configuration" >&2; exit 1; }
+    echo "OK $e: PdoSessionHandler, DoctrineDbalAdapter, prefix seed flowcrm, no test routes"
+  done'
 
 tally_finish "(backend)"
