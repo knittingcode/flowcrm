@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # FlowCRM db: PostgreSQL 18, run as the image's postgres user (uid 70).
 # The container never starts as root, so the image's gosu (used only to drop
 # from root to postgres) is never executed; it is removed because its Go

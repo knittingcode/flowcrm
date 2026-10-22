@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # FlowCRM edge: Caddy 2, the only service with a published host port.
 # Targets: dev (proxies the Vite dev server) and prod (serves the built SPA).
 # Build context: the repository root.

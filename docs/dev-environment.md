@@ -303,6 +303,31 @@ shows this project's logs (`edge` logs each HTTP request).
 | `… still running …; .runtime/lock is kept until they end` (exit 4) | Docker Compose processes outlived the Docker CLI for `FLOWCRM_LOCK_WAIT` seconds; the next command proceeds once they have ended |
 | refused with exit 6 | resources of another checkout; see the message |
 
+## Image pinning
+
+Base images are pinned by tag and digest in `docker/*/Dockerfile` and
+`compose.fixture.yaml`. The BuildKit Dockerfile frontend is pinned the same way: line
+1 of every Dockerfile is
+
+```dockerfile
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+```
+
+so the build no longer resolves the mutable `docker/dockerfile:1` tag on
+every build (the digest is the multi-platform index; `linux/amd64` and
+`linux/arm64` are among its platforms). Docker Engine and Docker Desktop with
+BuildKit, as used by `docker compose build`, load the frontend from this
+reference.
+
+`scripts/ci/guard-dockerfile-frontend.sh` (job `Repository guard`) fails
+unless every tracked Dockerfile (`Dockerfile`, `Dockerfile.<x>`,
+`<x>.Dockerfile`, `Containerfile`) has such a directive on line 1, as
+`<image>:<tag>@sha256:<64 hex>`, all Dockerfiles use the same reference and
+no other `syntax` directive appears. To update the frontend, resolve the new
+version's index digest (`docker buildx imagetools inspect
+docker/dockerfile:<version>`) and change line 1 of all Dockerfiles together.
+Its regression suite is `scripts/ci/tests/guard-dockerfile-frontend.test.sh`.
+
 ## macOS and Linux
 
 - The commands use bash 3.2-compatible syntax and BSD/GNU-neutral tools.
