@@ -137,6 +137,37 @@ final class RuntimePrivilegesTest extends KernelTestCase
         }
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function maintenanceDatabases(): iterable
+    {
+        yield 'postgres' => ['postgres'];
+        yield 'template1' => ['template1'];
+    }
+
+    /** The runtime role logs in to the application database only (no CONNECT, no TEMPORARY elsewhere). */
+    #[DataProvider('maintenanceDatabases')]
+    public function testItCannotConnectToAMaintenanceDatabase(string $database): void
+    {
+        $connect = fn (string $dbname): Connection => DriverManager::getConnection([
+            'driver' => 'pdo_pgsql',
+            'host' => self::string($this->db()->getParams()['host'] ?? null),
+            'dbname' => $dbname,
+            'user' => 'flowcrm_app',
+            'password' => self::string($this->db()->getParams()['password'] ?? null),
+            'serverVersion' => '18',
+        ]);
+        // Control: the same credentials open the application database.
+        self::assertSame('flowcrm_app', $connect('flowcrm')->fetchOne('SELECT current_user'));
+        try {
+            $connect($database)->fetchOne('SELECT 1');
+            self::fail("flowcrm_app could connect to {$database}");
+        } catch (DriverException $e) {
+            self::assertStringContainsString('permission denied for database "'.$database.'"', $e->getMessage());
+        }
+    }
+
     private function db(): Connection
     {
         $db = self::getContainer()->get('doctrine.dbal.default_connection');

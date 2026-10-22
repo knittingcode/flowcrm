@@ -29,6 +29,34 @@ final class HttpEndpointsTest extends WebTestCase
         self::assertSame('{"status":"ready"}', $client->getResponse()->getContent());
     }
 
+    /**
+     * A database credential that cannot be read (a missing secret file) makes
+     * the API not ready (503 with the usual body and request ID), not a 500:
+     * the check is built only when it runs.
+     */
+    public function testReadinessWithAnUnavailableCredentialIsNotReady(): void
+    {
+        $server = $_SERVER['DATABASE_PASSWORD_FILE'] ?? null;
+        $env = $_ENV['DATABASE_PASSWORD_FILE'] ?? null;
+        $_SERVER['DATABASE_PASSWORD_FILE'] = $_ENV['DATABASE_PASSWORD_FILE'] = '/run/secrets/does-not-exist';
+        try {
+            $client = self::createClient();
+            $client->request('GET', '/health/ready');
+
+            self::assertResponseStatusCodeSame(503);
+            self::assertSame('{"status":"not-ready"}', $client->getResponse()->getContent());
+            self::assertResponseHasHeader('X-Request-Id');
+        } finally {
+            unset($_SERVER['DATABASE_PASSWORD_FILE'], $_ENV['DATABASE_PASSWORD_FILE']);
+            if (null !== $server) {
+                $_SERVER['DATABASE_PASSWORD_FILE'] = $server;
+            }
+            if (null !== $env) {
+                $_ENV['DATABASE_PASSWORD_FILE'] = $env;
+            }
+        }
+    }
+
     public function testSystemStatusReadsFromTheDatabase(): void
     {
         $client = self::createClient();

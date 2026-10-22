@@ -20,6 +20,13 @@ use Symfony\Component\Yaml\Yaml;
  * schema public is owned by flowcrm_owner and listed in the manifest, and
  * flowcrm_app holds exactly the listed privileges (no grant option, no
  * column privileges); default privileges give new objects no access.
+ *
+ * Beyond schema public: flowcrm_app may not connect to any other database
+ * (postgres, template1 included), use or create in any other non-system
+ * schema, reach any object there, own anything, or hold parameter,
+ * tablespace or foreign-server privileges; no role's default privileges may
+ * give it or PUBLIC anything. System schemas (pg_*, information_schema) keep
+ * PostgreSQL's built-in defaults and are not inspected.
  */
 final readonly class RuntimePrivileges
 {
@@ -49,6 +56,7 @@ final readonly class RuntimePrivileges
             ...$this->objects($manifest['tables'], $manifest['sequences']),
             ...$this->functions($manifest['functions']),
             ...$this->defaults(),
+            ...$this->beyondPublic(),
         ];
         sort($violations);
 
@@ -237,14 +245,13 @@ final readonly class RuntimePrivileges
     private function defaults(): array
     {
         $violations = [];
-        foreach ($this->connection->fetchFirstColumn(
-            "SELECT DISTINCT d.defaclobjtype::text FROM pg_default_acl d, aclexplode(d.defaclacl) a
-              WHERE d.defaclrole = (SELECT oid FROM pg_roles WHERE rolname = ?)
-                AND d.defaclobjtype IN ('r', 'S', 'f', 'n')
-                AND (a.grantee = 0 OR a.grantee = (SELECT oid FROM pg_roles WHERE rolname = ?))",
-            [self::OWNER, self::RUNTIME],
-        ) as $type) {
-            $violations[] = \sprintf('default privileges of %s give new %s to PUBLIC or %s', self::OWNER, ['r' => 'tables', 'S' => 'sequences', 'f' => 'functions', 'n' => 'schemas'][self::text($type)] ?? 'objects', self::RUNTIME);
+        foreach ($this->connection->fetchAllAssociative(
+            'SELECT DISTINCT pg_get_userbyid(d.defaclrole) AS role, d.defaclobjtype::text AS type FROM pg_default_acl d, aclexplode(d.defaclacl) a
+              WHERE a.grantee = 0 OR a.grantee = (SELECT oid FROM pg_roles WHERE rolname = ?)
+              ORDER BY 1, 2',
+            [self::RUNTIME],
+        ) as $d) {
+            $violations[] = \sprintf('default privileges of %s give new %s to PUBLIC or %s', self::text($d['role']), ['r' => 'tables', 'S' => 'sequences', 'f' => 'functions', 'n' => 'schemas', 'T' => 'types', 'L' => 'large objects'][self::text($d['type'])] ?? 'objects', self::RUNTIME);
         }
         $revoked = $this->connection->fetchOne(
             "SELECT count(*) FROM pg_default_acl WHERE defaclrole = (SELECT oid FROM pg_roles WHERE rolname = ?) AND defaclobjtype = 'f' AND defaclnamespace = 0",
@@ -252,6 +259,53 @@ final readonly class RuntimePrivileges
         );
         if (0 === self::int($revoked)) {
             $violations[] = 'new functions of '.self::OWNER.' would be executable by PUBLIC (default privileges not revoked)';
+        }
+
+        return $violations;
+    }
+
+    /**
+     * Everything outside schema public that could give flowcrm_app access.
+     *
+     * @return list<string>
+     */
+    private function beyondPublic(): array
+    {
+        $runtime = '(SELECT oid FROM pg_roles WHERE rolname = :runtime)';
+        $userSchemas = "n.nspname <> 'public' AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'";
+        $checks = [
+            // Other databases, postgres and template1 included.
+            "SELECT 'flowcrm_app may connect to or create objects in database ' || datname FROM pg_database
+              WHERE datname <> current_database() AND datallowconn
+                AND (has_database_privilege(:runtime, oid, 'CONNECT') OR has_database_privilege(:runtime, oid, 'TEMPORARY')
+                     OR has_database_privilege(:runtime, oid, 'CREATE'))",
+            // Other non-system schemas of this database.
+            "SELECT 'schema ' || n.nspname || ' is usable by PUBLIC or flowcrm_app' FROM pg_namespace n
+              WHERE {$userSchemas} AND (has_schema_privilege(:runtime, n.oid, 'USAGE') OR has_schema_privilege(:runtime, n.oid, 'CREATE')
+                    OR EXISTS (SELECT FROM aclexplode(n.nspacl) a WHERE a.grantee = 0))",
+            "SELECT 'relation ' || n.nspname || '.' || c.relname || ' grants privileges to PUBLIC or flowcrm_app' FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE {$userSchemas} AND EXISTS (SELECT FROM aclexplode(c.relacl) a WHERE a.grantee = 0 OR a.grantee = {$runtime})",
+            "SELECT 'function ' || n.nspname || '.' || p.proname || ' is executable by PUBLIC or flowcrm_app' FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE {$userSchemas} AND (p.proacl IS NULL OR EXISTS (SELECT FROM aclexplode(p.proacl) a WHERE a.grantee = 0 OR a.grantee = {$runtime}))",
+            // Ownership gives every privilege on the object.
+            "SELECT 'flowcrm_app owns schema ' || nspname FROM pg_namespace WHERE nspowner = {$runtime}",
+            "SELECT 'flowcrm_app owns relation ' || relnamespace::regnamespace::text || '.' || relname FROM pg_class WHERE relowner = {$runtime}",
+            "SELECT 'flowcrm_app owns function ' || pronamespace::regnamespace::text || '.' || proname FROM pg_proc WHERE proowner = {$runtime}",
+            // Cluster-wide privileges.
+            "SELECT 'parameter ' || parname || ' grants privileges to PUBLIC or flowcrm_app' FROM pg_parameter_acl
+              WHERE EXISTS (SELECT FROM aclexplode(paracl) a WHERE a.grantee = 0 OR a.grantee = {$runtime})",
+            "SELECT 'tablespace ' || spcname || ' grants privileges to PUBLIC or flowcrm_app' FROM pg_tablespace
+              WHERE EXISTS (SELECT FROM aclexplode(spcacl) a WHERE a.grantee = 0 OR a.grantee = {$runtime})",
+            "SELECT 'foreign server ' || srvname || ' grants privileges to PUBLIC or flowcrm_app' FROM pg_foreign_server
+              WHERE EXISTS (SELECT FROM aclexplode(srvacl) a WHERE a.grantee = 0 OR a.grantee = {$runtime})",
+            "SELECT 'foreign-data wrapper ' || fdwname || ' grants privileges to PUBLIC or flowcrm_app' FROM pg_foreign_data_wrapper
+              WHERE EXISTS (SELECT FROM aclexplode(fdwacl) a WHERE a.grantee = 0 OR a.grantee = {$runtime})",
+        ];
+        $violations = [];
+        foreach ($checks as $sql) {
+            foreach ($this->connection->fetchFirstColumn($sql.' ORDER BY 1', ['runtime' => self::RUNTIME]) as $violation) {
+                $violations[] = self::text($violation);
+            }
         }
 
         return $violations;

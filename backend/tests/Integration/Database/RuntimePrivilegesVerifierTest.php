@@ -64,6 +64,17 @@ final class RuntimePrivilegesVerifierTest extends KernelTestCase
         yield 'runtime role is a superuser' => ['admin', 'ALTER ROLE flowcrm_app SUPERUSER', 'role flowcrm_app has rolsuper'];
         yield 'owner may create roles' => ['admin', 'ALTER ROLE flowcrm_owner CREATEROLE', 'role flowcrm_owner has rolcreaterole'];
         yield 'runtime role member of the owner' => ['admin', 'GRANT flowcrm_owner TO flowcrm_app', 'role flowcrm_app is a member of flowcrm_owner'];
+        yield 'predefined role pg_read_all_data' => ['admin', 'GRANT pg_read_all_data TO flowcrm_app', 'role flowcrm_app is a member of pg_read_all_data'];
+        // Beyond schema public (FND-009V F-05, F-06).
+        yield 'table in another schema granted to the runtime role' => ['admin', 'CREATE SCHEMA rt_shadow; CREATE TABLE rt_shadow.copy (i int); GRANT USAGE ON SCHEMA rt_shadow TO flowcrm_app; GRANT SELECT ON rt_shadow.copy TO flowcrm_app', 'relation rt_shadow.copy grants privileges to PUBLIC or flowcrm_app'];
+        yield 'another schema usable by the runtime role' => ['admin', 'CREATE SCHEMA rt_shadow; GRANT USAGE ON SCHEMA rt_shadow TO flowcrm_app', 'schema rt_shadow is usable by PUBLIC or flowcrm_app'];
+        yield 'another schema usable by PUBLIC' => ['admin', 'CREATE SCHEMA rt_shadow; GRANT USAGE ON SCHEMA rt_shadow TO PUBLIC', 'schema rt_shadow is usable by PUBLIC or flowcrm_app'];
+        yield 'function in another schema executable by PUBLIC' => ['admin', 'CREATE SCHEMA rt_shadow; CREATE FUNCTION rt_shadow.f() RETURNS int LANGUAGE sql AS $$SELECT 1$$', 'function rt_shadow.f is executable by PUBLIC or flowcrm_app'];
+        yield 'schema owned by the runtime role' => ['admin', 'CREATE SCHEMA rt_shadow AUTHORIZATION flowcrm_app', 'flowcrm_app owns schema rt_shadow'];
+        yield 'default privileges of the superuser' => ['admin', 'ALTER DEFAULT PRIVILEGES FOR ROLE flowcrm GRANT SELECT ON TABLES TO flowcrm_app', 'default privileges of flowcrm give new tables to PUBLIC or flowcrm_app'];
+        yield 'maintenance database postgres open to PUBLIC' => ['admin', 'GRANT CONNECT, TEMPORARY ON DATABASE postgres TO PUBLIC', 'flowcrm_app may connect to or create objects in database postgres'];
+        yield 'maintenance database template1 open to the runtime role' => ['admin', 'GRANT CONNECT ON DATABASE template1 TO flowcrm_app', 'flowcrm_app may connect to or create objects in database template1'];
+        yield 'parameter privilege' => ['admin', 'GRANT SET ON PARAMETER log_statement TO flowcrm_app', 'parameter log_statement grants privileges to PUBLIC or flowcrm_app'];
     }
 
     /**
