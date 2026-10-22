@@ -150,8 +150,15 @@ $ make db-upgrade-roles
    database and compares, original against copy: the schema (relations,
    columns, defaults, constraints, indexes, triggers with their enabled
    state, functions, ACLs), the contents of every table (row count and a
-   hash over all rows), the migration history and the audit triggers. Any
-   difference, or a comparison that cannot be computed, fails. The scratch
+   hash over all rows), the migration history and the audit log. Any
+   difference, or a comparison that cannot be computed, fails. The audit
+   log must be intact in both: `audit_events` with both triggers enabled
+   whenever its migration (`Version20261022000000`, FND-007) or a later
+   one is recorded. A database from before that migration (for example
+   one created at FND-004) legitimately has no audit log; the upgrade then
+   runs that migration and the later ones as `flowcrm_owner`. A disabled or
+   missing trigger, or a missing table despite the recorded migration,
+   stops the upgrade with nothing changed. The scratch
    database is dropped. The verified dump is copied to
    `.runtime/backups/roles_upgrade_<UTC time>_<pid>.dump` (directory `0700`,
    file `0600`) and its SHA-256 checked against the verified one. Any
