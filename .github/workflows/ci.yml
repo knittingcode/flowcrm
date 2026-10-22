@@ -69,12 +69,14 @@ jobs:
           koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
           -x bin/devenv tests/devenv/unit.sh tests/devenv/integration.sh tests/devenv/tally.sh
           tests/app/lib.sh tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh tests/app/scan.sh
-          docker/api/entrypoint.sh docker/api/healthcheck.sh
+          docker/api/entrypoint.sh docker/api/healthcheck.sh docker/db/flowcrm-db-roles docker/db/initdb-roles.sh
 
       - name: Validate Compose configuration
         run: |
           secrets=$(mktemp -d)
           printf 'ci\n' >"$secrets/db_password"
+          printf 'ci\n' >"$secrets/db_owner_password"
+          printf 'ci\n' >"$secrets/db_app_password"
           printf 'ci\n' >"$secrets/app_secret"
           export FLOWCRM_SECRETS_DIR=$secrets
           FLOWCRM_HTTP_PORT=8080 docker compose --project-name flowcrm-config-check --file compose.fixture.yaml config --quiet

@@ -4,14 +4,19 @@
 #        to 127.0.0.1. Routes /api and /health/{live,ready} to the api service
 #        and everything else to the Vite dev server.
 # web  - React + TypeScript with the Vite dev server (profile "dev").
-# api  - Symfony 7.4 under PHP-FPM 8.5. bin/devenv applies pending
-#        migrations after the internal services are healthy.
-# db   - PostgreSQL 18 with the persistent volume db-data.
+# api  - Symfony 7.4 under PHP-FPM 8.5, connected as the runtime role
+#        flowcrm_app (ADR-018).
+# migrate - one-off job (profile "migrate"): Doctrine migrations as the
+#        schema owner flowcrm_owner; bin/devenv runs it after the internal
+#        services are healthy. Never a long-running service.
+# db   - PostgreSQL 18 with the persistent volume db-data; its bootstrap
+#        superuser is used only inside the container.
 #
 # The project name, project directory, host port and profile are supplied by
 # bin/devenv: run `make up`. A plain `docker compose up` fails on the
 # required FLOWCRM_HTTP_PORT instead of creating an unmanaged project.
-# Secrets are generated per checkout by bin/devenv in .runtime/secrets.
+# Secrets are generated per checkout by bin/devenv in .runtime/secrets; each
+# container gets only the ones it needs (ADR-018).
 
 x-hardening: &hardening
   init: true
@@ -84,10 +89,12 @@ services:
       - /app/var:uid=82,gid=82
     environment:
       APP_ENV: dev
-      # Migrations are a phase of make up (bin/devenv), not of the container
-      # start, so a migration added while the stack runs is applied too.
+      # Migrations are a phase of make up (bin/devenv, the migrate job), not
+      # of the container start, so a migration added while the stack runs is
+      # applied too.
       FLOWCRM_MIGRATE_ON_START: "0"
-    secrets: [db_password, app_secret]
+    # The runtime role's password only: never the owner's or the superuser's.
+    secrets: [db_app_password, app_secret]
     volumes:
       - ./backend/src:/app/src:ro
       - ./backend/config:/app/config:ro
@@ -105,6 +112,33 @@ services:
       start_period: 60s
       start_interval: 1s
 
+  migrate:
+    <<: *hardening
+    profiles: [migrate]
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+      target: dev
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/var:uid=82,gid=82
+    environment:
+      APP_ENV: dev
+      FLOWCRM_MIGRATE_ON_START: "0"
+      DATABASE_USER: flowcrm_owner
+      DATABASE_PASSWORD_FILE: /run/secrets/db_owner_password
+    secrets: [db_owner_password, app_secret]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./backend/config:/app/config:ro
+      - ./backend/migrations:/app/migrations:ro
+    networks: [back]
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["php", "bin/console", "doctrine:migrations:migrate", "--no-interaction", "--allow-no-migration", "--all-or-nothing"]
+
   db:
     <<: *hardening
     build:
@@ -121,7 +155,9 @@ services:
       POSTGRES_DB: flowcrm
       POSTGRES_USER: flowcrm
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
-    secrets: [db_password]
+    # db_owner_password and db_app_password are read by flowcrm-db-roles to
+    # create (new volume), upgrade or rotate the roles.
+    secrets: [db_password, db_owner_password, db_app_password]
     volumes:
       - db-data:/var/lib/postgresql
     networks: [back]
@@ -147,3 +183,7 @@ secrets:
     file: ${FLOWCRM_SECRETS_DIR:-./.runtime/secrets}/db_password
   app_secret:
     file: ${FLOWCRM_SECRETS_DIR:-./.runtime/secrets}/app_secret
+  db_owner_password:
+    file: ${FLOWCRM_SECRETS_DIR:-./.runtime/secrets}/db_owner_password
+  db_app_password:
+    file: ${FLOWCRM_SECRETS_DIR:-./.runtime/secrets}/db_app_password

@@ -142,6 +142,20 @@ sessions=$(dc exec -T db psql -U flowcrm -d flowcrm -tAq -c 'SELECT count(*) FRO
 [ -z "$cookies" ] && [ "$sessions" = 0 ]
 v "PL-14 stateless requests set no cookie and store no session (production mode)" $? "Set-Cookie: $cookies, sessions: $sessions"
 
+# Role separation in production mode (ADR-018): the migrate job ran as the
+# owner and finished before the api started; the api holds only its own
+# secret, runs as flowcrm_app and matches the privilege manifest.
+migrate_id=$(dc ps --all --quiet migrate | head -n 1)
+api_id=$(dc ps --quiet api | head -n 1)
+migrate_exit=$(docker inspect -f '{{.State.ExitCode}}' "$migrate_id" 2>/dev/null)
+migrate_end=$(docker inspect -f '{{.State.FinishedAt}}' "$migrate_id" 2>/dev/null)
+api_start=$(docker inspect -f '{{.State.StartedAt}}' "$api_id" 2>/dev/null)
+api_secrets=$(docker exec "$api_id" ls /run/secrets | tr '\n' ' ')
+dc exec -T api php bin/console app:database:verify-privileges --runtime >"$work/verify.log" 2>&1
+verify_rc=$?
+[ "$migrate_exit" = 0 ] && [[ $migrate_end < $api_start ]] && [ "$api_secrets" = "app_secret db_app_password " ] && [ "$verify_rc" = 0 ]
+v "PL-15 migrations ran as the owner before the api; the api runs as flowcrm_app with only its own secret" $? "migrate exit $migrate_exit at $migrate_end, api from $api_start, secrets: $api_secrets, verify: $(tail -n 1 "$work/verify.log")"
+
 need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2e/Dockerfile" -t "$e2e_image" "$APP_REPO" >/dev/null && {
   docker run --rm --network "$net" -e BASE_URL=http://edge:8080 -e MODE=prod "$e2e_image" >"$work/browser.out" 2>&1
   r=$?

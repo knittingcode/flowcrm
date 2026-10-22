@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Cache;
 
+use App\Shared\Infrastructure\Cache\RejectSchemaChanges;
 use App\Shared\Infrastructure\Cache\SchemaChangeRejected;
+use App\Tests\Support\Database\TestDatabase;
 use App\Tests\Support\TypedValues;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception\DriverException;
@@ -59,7 +61,8 @@ final class CacheConnectionTest extends KernelTestCase
     #[DataProvider('schemaChanges')]
     public function testTheCacheConnectionRefusesSchemaChanges(string $sql): void
     {
-        $default = $this->connection('default');
+        // The probe table belongs to the owner; the runtime role could not create it.
+        $default = TestDatabase::owner();
         $default->executeStatement('CREATE TABLE cache_guard_probe (id INT)');
         $default->executeStatement('INSERT INTO cache_guard_probe VALUES (1)');
         try {
@@ -72,16 +75,23 @@ final class CacheConnectionTest extends KernelTestCase
             $created = self::int($default->fetchOne("SELECT count(*) FROM pg_tables WHERE tablename = 'cache_guard_other'"));
             $default->executeStatement('DROP TABLE IF EXISTS cache_guard_probe');
             $default->executeStatement('DROP TABLE IF EXISTS cache_guard_other');
+            $default->close();
         }
         self::assertSame(0, $created, 'no table was created');
         self::assertSame([['column_name' => 'id']], $after, 'the probe table is unchanged');
         self::assertSame(1, $rows, 'its row is still there');
     }
 
-    public function testTheDefaultConnectionIsNotRestricted(): void
+    /**
+     * The guard belongs to the cache connection only; the default connection
+     * is restricted by the runtime role's privileges instead (ADR-018).
+     */
+    public function testTheGuardIsRegisteredForTheCacheConnectionOnly(): void
     {
-        $this->connection('default')->executeStatement('CREATE TEMPORARY TABLE cache_guard_scope (id INT)');
-        self::assertSame(0, self::int($this->connection('default')->fetchOne('SELECT count(*) FROM cache_guard_scope')));
+        $guarded = static fn (Connection $c): bool => [] !== array_filter($c->getConfiguration()->getMiddlewares(), static fn (object $m): bool => $m instanceof RejectSchemaChanges);
+
+        self::assertTrue($guarded($this->connection('cache')));
+        self::assertFalse($guarded($this->connection('default')));
     }
 
     public function testACacheFailureDoesNotAbortABusinessTransaction(): void

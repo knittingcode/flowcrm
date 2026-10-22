@@ -18,6 +18,13 @@ services:
     environment:
       APP_ENV: test
       FLOWCRM_MIGRATE_ON_START: "0"
+      # Test-only: the integration tests run as flowcrm_app (the default)
+      # and need the owner and the bootstrap superuser for schema and
+      # database operations (tests/Support/Database/TestDatabase.php). The
+      # dev and prod api never get these secrets (BE-17).
+      FLOWCRM_TEST_OWNER_PASSWORD_FILE: /run/secrets/db_owner_password
+      FLOWCRM_TEST_ADMIN_PASSWORD_FILE: /run/secrets/db_password
+    secrets: !override [db_app_password, db_owner_password, db_password, app_secret]
     volumes: !reset []
     # Runs the checks given as the command, then exits.
     entrypoint: ["/bin/sh", "-c"]

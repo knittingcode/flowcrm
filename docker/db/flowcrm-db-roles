@@ -1,0 +1,254 @@
+#!/bin/sh
+# FlowCRM database roles (ADR-018): the migration owner flowcrm_owner and
+# the runtime role flowcrm_app, next to the image's bootstrap superuser.
+# Runs inside the db container as the superuser over the local socket
+# (pg_hba trust), so it never needs the superuser password.
+#
+# Usage: flowcrm-db-roles <command>
+#   state          print legacy, complete or inconsistent (read-only)
+#   init           new database (initdb hook): create the roles and the
+#                  schema privileges, passwords from the secret files
+#   ensure         complete database: correct role attributes, memberships,
+#                  database, schema and default privileges (no passwords,
+#                  no ownership change); fails closed on any other state
+#   upgrade        legacy database (one account): create the roles and move
+#                  the objects of schema public to flowcrm_owner, in one
+#                  transaction; a no-op on a complete database
+#   set-password ROLE
+#                  set the password of flowcrm_owner or flowcrm_app from
+#                  its secret file (rotation)
+#   backup-verify NAME
+#                  dump the database to /tmp/NAME.dump, restore it into a
+#                  scratch database, compare every table, drop the scratch
+#                  database; prints the dump's SHA-256
+#
+# Passwords are read from /run/secrets/db_owner_password and
+# /run/secrets/db_app_password (48 lowercase hex characters), passed to psql
+# through its environment (\getenv), never on a command line, and the
+# session neither logs statements nor echoes failing ones.
+#
+# Exit codes: 0 ok, 1 error, 10 legacy database, 11 inconsistent database,
+# 12 missing or malformed secret, 13 backup did not restore identically.
+
+set -eu
+# Notices ("does not exist, skipping") are not errors.
+PGOPTIONS='-c client_min_messages=warning'
+export PGOPTIONS
+
+DB=${POSTGRES_DB:-flowcrm}
+ADMIN=${POSTGRES_USER:-flowcrm}
+OWNER=flowcrm_owner
+APP=flowcrm_app
+SECRETS=/run/secrets
+
+err() { printf 'flowcrm-db-roles: %s\n' "$*" >&2; }
+
+q() { # sql: one value, read-only
+  psql -X -q -t -A -v ON_ERROR_STOP=1 -U "$ADMIN" -d "$DB" -c "$1"
+}
+
+# run: execute SQL from stdin with the hardening below, in one transaction.
+run() {
+  {
+    cat <<'SQL'
+\set ON_ERROR_STOP on
+\set VERBOSITY terse
+\set SHOW_CONTEXT never
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = panic;
+BEGIN;
+SQL
+    cat
+    printf 'COMMIT;\n'
+  } | psql -X -q -U "$ADMIN" -d "$DB"
+}
+
+password() { # owner|app -> exported as FLOWCRM_OWNER_PASSWORD or FLOWCRM_APP_PASSWORD
+  file=$SECRETS/db_${1}_password
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    err "the secret db_${1}_password is not available in $SECRETS"
+    exit 12
+  fi
+  value=$(cat "$file")
+  case $value in
+    *[!0-9a-f]* | '') err "the secret db_${1}_password is malformed (expected 48 lowercase hex characters)"; exit 12 ;;
+  esac
+  [ ${#value} -eq 48 ] || { err "the secret db_${1}_password is malformed (expected 48 lowercase hex characters)"; exit 12; }
+  case $1 in
+    owner) FLOWCRM_OWNER_PASSWORD=$value && export FLOWCRM_OWNER_PASSWORD ;;
+    app) FLOWCRM_APP_PASSWORD=$value && export FLOWCRM_APP_PASSWORD ;;
+  esac
+}
+
+# Objects of schema public that are not owned by flowcrm_owner (indexes,
+# TOAST tables and table row types follow their table).
+FOREIGN_OBJECTS="
+  SELECT count(*) FROM pg_class c
+   WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+     AND c.relowner <> '$OWNER'::regrole
+  UNION ALL
+  SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner <> '$OWNER'::regrole
+  UNION ALL
+  SELECT count(*) FROM pg_type t
+   WHERE t.typnamespace = 'public'::regnamespace AND t.typtype IN ('e', 'd', 'r', 'm')
+     AND t.typowner <> '$OWNER'::regrole"
+
+state() {
+  roles=$(q "SELECT count(*) FROM pg_roles WHERE rolname IN ('$OWNER', '$APP')")
+  if [ "$roles" = 0 ]; then
+    # Legacy: one account, nothing owned by anybody else.
+    others=$(q "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace AND c.relowner <> '$ADMIN'::regrole AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')")
+    [ "$others" = 0 ] && echo legacy || echo inconsistent
+    return
+  fi
+  if [ "$roles" != 2 ]; then
+    echo inconsistent
+    return
+  fi
+  schema=$(q "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'public'")
+  foreign=$(q "SELECT sum(count) FROM ($FOREIGN_OBJECTS) x")
+  if [ "$schema" = "$OWNER" ] && [ "$foreign" = 0 ]; then echo complete; else echo inconsistent; fi
+}
+
+# Role attributes, memberships, database, schema and default privileges:
+# everything that does not depend on a password or on object ownership.
+PRIVILEGES_SQL="
+ALTER ROLE $OWNER WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT 10;
+ALTER ROLE $APP WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 64;
+SELECT format('REVOKE %I FROM %I', r.rolname, m.rolname)
+  FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid JOIN pg_roles m ON m.oid = a.member
+ WHERE m.rolname IN ('$OWNER', '$APP') OR r.rolname IN ('$OWNER', '$APP') \\gexec
+REVOKE ALL ON DATABASE $DB FROM PUBLIC, $OWNER, $APP;
+GRANT CONNECT ON DATABASE $DB TO $OWNER, $APP;
+REVOKE ALL ON SCHEMA public FROM PUBLIC, $APP;
+GRANT USAGE ON SCHEMA public TO $APP;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER REVOKE ALL ON TABLES FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER REVOKE ALL ON SEQUENCES FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC, $APP;
+"
+
+CREATE_ROLES_SQL="
+\\getenv owner_password FLOWCRM_OWNER_PASSWORD
+\\getenv app_password FLOWCRM_APP_PASSWORD
+SELECT 'CREATE ROLE $OWNER' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$OWNER') \\gexec
+SELECT 'CREATE ROLE $APP' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$APP') \\gexec
+ALTER ROLE $OWNER PASSWORD :'owner_password';
+ALTER ROLE $APP PASSWORD :'app_password';
+"
+
+require() { # expected state
+  now=$(state)
+  [ "$now" = "$1" ] && return 0
+  case $now in
+    legacy) err "this database still uses one account for everything; upgrade it explicitly (make db-upgrade-roles, docs/architecture/adr/ADR-018-database-roles.md)"; exit 10 ;;
+    *) err "the database roles are in an inconsistent state ($now); nothing was changed; see docs/architecture/adr/ADR-018-database-roles.md (Recovery)"; exit 11 ;;
+  esac
+}
+
+cmd=${1-}
+case $cmd in
+  state)
+    state
+    ;;
+  init)
+    password owner
+    password app
+    roles=$(q "SELECT count(*) FROM pg_roles WHERE rolname IN ('$OWNER', '$APP')")
+    tables=$(q "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace")
+    if [ "$roles" != 0 ] || [ "$tables" != 0 ]; then
+      err "init expects a new, empty database"
+      exit 11
+    fi
+    printf '%s\nALTER SCHEMA public OWNER TO %s;\n%s' "$CREATE_ROLES_SQL" "$OWNER" "$PRIVILEGES_SQL" | run
+    require complete
+    echo "initialised the roles $OWNER and $APP"
+    ;;
+  ensure)
+    require complete
+    printf '%s' "$PRIVILEGES_SQL" | run
+    require complete
+    ;;
+  upgrade)
+    now=$(state)
+    if [ "$now" = complete ]; then
+      printf '%s' "$PRIVILEGES_SQL" | run
+      echo "already upgraded; role attributes and privileges checked"
+      exit 0
+    fi
+    require legacy
+    password owner
+    password app
+    # Explicit per object type, limited to schema public; never REASSIGN OWNED.
+    printf '%s\nALTER SCHEMA public OWNER TO %s;\n%s\n%s' "$CREATE_ROLES_SQL" "$OWNER" "
+SELECT format(CASE c.relkind WHEN 'v' THEN 'ALTER VIEW %I.%I OWNER TO $OWNER'
+                             WHEN 'm' THEN 'ALTER MATERIALIZED VIEW %I.%I OWNER TO $OWNER'
+                             WHEN 'f' THEN 'ALTER FOREIGN TABLE %I.%I OWNER TO $OWNER'
+                             ELSE 'ALTER TABLE %I.%I OWNER TO $OWNER' END, n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND c.relowner <> '$OWNER'::regrole \\gexec
+SELECT format('ALTER SEQUENCE %I.%I OWNER TO $OWNER', n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relowner <> '$OWNER'::regrole
+   AND NOT EXISTS (SELECT FROM pg_depend d WHERE d.objid = c.oid AND d.deptype IN ('a', 'i')) \\gexec
+SELECT format('ALTER ROUTINE %s OWNER TO $OWNER', p.oid::regprocedure)
+  FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner <> '$OWNER'::regrole \\gexec
+SELECT format('ALTER TYPE %s OWNER TO $OWNER', t.oid::regtype)
+  FROM pg_type t WHERE t.typnamespace = 'public'::regnamespace AND t.typtype IN ('e', 'd', 'r', 'm') AND t.typowner <> '$OWNER'::regrole \\gexec
+SELECT CASE WHEN sum(count) <> 0 THEN 'SELECT (1/0)::text AS objects_not_moved' END FROM ($FOREIGN_OBJECTS) x \\gexec
+" "$PRIVILEGES_SQL" | run
+    require complete
+    echo "upgraded: schema public and its objects belong to $OWNER; runtime privileges come from the migrations"
+    ;;
+  set-password)
+    case ${2-} in
+      owner | app) ;;
+      *) err "usage: flowcrm-db-roles set-password owner|app"; exit 1 ;;
+    esac
+    require complete
+    password "$2"
+    role=flowcrm_$2
+    case $2 in owner) var=OWNER ;; *) var=APP ;; esac
+    printf '\\getenv new_password FLOWCRM_%s_PASSWORD\nALTER ROLE %s PASSWORD :'"'"'new_password'"'"';\n' "$var" "$role" | run
+    echo "set the password of $role"
+    ;;
+  backup-verify)
+    name=${2-}
+    case $name in
+      '' | *[!a-z0-9_]*) err "usage: flowcrm-db-roles backup-verify NAME (lowercase letters, digits, _)"; exit 1 ;;
+    esac
+    dump=/tmp/$name.dump
+    check=${name}_restore_check
+    pg_dump -U "$ADMIN" -d "$DB" -Fc -f "$dump"
+    chmod 0600 "$dump"
+    psql -X -q -v ON_ERROR_STOP=1 -U "$ADMIN" -d postgres -c "DROP DATABASE IF EXISTS $check WITH (FORCE)" -c "CREATE DATABASE $check"
+    status=0
+    if ! pg_restore -U "$ADMIN" -d "$check" --exit-on-error "$dump" 2>/tmp/"$name".restore.log; then
+      err "the backup did not restore: $(tail -n 3 /tmp/"$name".restore.log)"
+      status=13
+    else
+      for t in $(q "SELECT quote_ident(relname) FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r', 'p') ORDER BY 1"); do
+        a=$(q "SELECT count(*) FROM public.$t")
+        b=$(psql -X -q -t -A -v ON_ERROR_STOP=1 -U "$ADMIN" -d "$check" -c "SELECT count(*) FROM public.$t")
+        if [ "$a" != "$b" ]; then err "restore differs for $t: $a rows, restored $b"; status=13; fi
+      done
+      a=$(q "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions" 2>/dev/null || true)
+      b=$(psql -X -q -t -A -U "$ADMIN" -d "$check" -c "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions" 2>/dev/null || true)
+      [ "$a" = "$b" ] || { err "restore differs in the migration history"; status=13; }
+      a=$(q "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")
+      b=$(psql -X -q -t -A -U "$ADMIN" -d "$check" -c "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal")
+      [ "$a" = "$b" ] || { err "restore differs in its triggers: $a, restored $b"; status=13; }
+    fi
+    psql -X -q -v ON_ERROR_STOP=1 -U "$ADMIN" -d postgres -c "DROP DATABASE IF EXISTS $check WITH (FORCE)"
+    rm -f /tmp/"$name".restore.log
+    [ "$status" = 0 ] || exit "$status"
+    sha256sum "$dump" | cut -d' ' -f1
+    ;;
+  *)
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 1
+    ;;
+esac

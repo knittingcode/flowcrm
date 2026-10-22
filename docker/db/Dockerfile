@@ -9,4 +9,8 @@ ARG POSTGRES_IMAGE=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596
 
 FROM ${POSTGRES_IMAGE}
 RUN rm -f /usr/local/bin/gosu
+# Database roles (ADR-018): created on a new volume by the initdb hook, and
+# checked or upgraded by bin/devenv through flowcrm-db-roles.
+COPY --chmod=0755 docker/db/flowcrm-db-roles /usr/local/bin/flowcrm-db-roles
+COPY --chmod=0755 docker/db/initdb-roles.sh /docker-entrypoint-initdb.d/10-flowcrm-roles.sh
 USER postgres

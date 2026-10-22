@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Database;
 
+use App\Tests\Support\Database\TestDatabase;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception\DriverException;
 use Symfony\Bundle\FrameworkBundle\Test\KernelTestCase;
@@ -135,15 +136,54 @@ final class CoreSchemaTest extends KernelTestCase
         });
     }
 
-    public function testTheAuditLogIsAppendOnly(): void
+    /**
+     * The runtime role (this test's connection, like the API's) may append
+     * and read audit events; PostgreSQL refuses it UPDATE, DELETE and
+     * TRUNCATE by privilege, before the trigger is reached (ADR-018).
+     */
+    public function testTheRuntimeRoleCanOnlyAppendToTheAuditLog(): void
     {
         $id = $this->auditEvent($this->organization());
         $this->auditEvent(null);
 
-        $this->assertViolation(self::NOT_ALLOWED, 'append-only: UPDATE', fn () => $this->db->executeStatement("UPDATE audit_events SET action = 'changed' WHERE id = ?", [$id]));
-        $this->assertViolation(self::NOT_ALLOWED, 'append-only: DELETE', fn () => $this->db->executeStatement('DELETE FROM audit_events WHERE id = ?', [$id]));
-        $this->assertViolation(self::NOT_ALLOWED, 'append-only: TRUNCATE', fn () => $this->db->executeStatement('TRUNCATE audit_events'));
+        $denied = 'permission denied for table audit_events';
+        $this->assertViolation(self::NOT_ALLOWED, $denied, fn () => $this->db->executeStatement("UPDATE audit_events SET action = 'changed' WHERE id = ?", [$id]));
+        $this->assertViolation(self::NOT_ALLOWED, $denied, fn () => $this->db->executeStatement('DELETE FROM audit_events WHERE id = ?', [$id]));
+        $this->assertViolation(self::NOT_ALLOWED, $denied, fn () => $this->db->executeStatement('TRUNCATE audit_events'));
         self::assertEquals(2, $this->db->fetchOne('SELECT count(*) FROM audit_events'));
+    }
+
+    /**
+     * The trigger rejects changes even for the schema owner, who holds every
+     * privilege on the table (it could still disable the trigger: ADR-018).
+     */
+    public function testTheAuditTriggerAlsoStopsTheOwner(): void
+    {
+        $owner = TestDatabase::owner();
+        $owner->beginTransaction();
+        try {
+            $id = Uuid::v7()->toRfc4122();
+            $owner->insert('audit_events', ['id' => $id, 'occurred_at' => '2026-10-22T00:00:00Z', 'actor_type' => 'system', 'action' => 'a', 'entity_type' => 'e', 'changes' => '{}']);
+            foreach ([
+                'append-only: UPDATE' => "UPDATE audit_events SET action = 'changed' WHERE id = '{$id}'",
+                'append-only: DELETE' => "DELETE FROM audit_events WHERE id = '{$id}'",
+                'append-only: TRUNCATE' => 'TRUNCATE audit_events',
+            ] as $detail => $sql) {
+                $owner->createSavepoint('expected_violation');
+                try {
+                    $owner->executeStatement($sql);
+                    self::fail("the owner could run: {$sql}");
+                } catch (DriverException $e) {
+                    self::assertSame(self::NOT_ALLOWED, $e->getSQLState());
+                    self::assertStringContainsString($detail, $e->getMessage());
+                } finally {
+                    $owner->rollbackSavepoint('expected_violation');
+                }
+            }
+        } finally {
+            $owner->rollBack();
+            $owner->close();
+        }
     }
 
     public function testAuditEventsAreChecked(): void

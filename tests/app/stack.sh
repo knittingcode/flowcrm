@@ -148,6 +148,19 @@ psql_in() { # dir sql
   docker exec "$(cid "$1" db)" psql -U flowcrm -d flowcrm -tAq -c "$2" 2>&1
 }
 
+# As the schema owner, through the checkout's migrate job (ADR-018): the api
+# runs as flowcrm_app and may not change the schema or the migration history.
+owner_console_in() { # dir args...
+  local dir=$1
+  shift
+  (cd "$dir" && FLOWCRM_HTTP_PORT="$(saved_port "$dir")" COMPOSE_PROFILES=dev,migrate docker compose --project-name "$(project_of "$dir")" \
+    run --rm --no-deps -T migrate php bin/console --no-interaction "$@") >"$work/out/console.log" 2>&1
+}
+# psql as a given role over the db container's local socket.
+psql_as_in() { # dir role sql
+  docker exec "$(cid "$1" db)" psql -U "$2" -d flowcrm -tAq -c "$3" 2>&1
+}
+
 console_in() { # dir args...
   local dir=$1
   shift
@@ -319,14 +332,15 @@ perm() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 leak=0
-for f in db_password app_secret; do
+for f in db_password db_owner_password db_app_password app_secret; do
   s=$(cat "$sd/$f")
   for p in /health/live /health/ready /api/v1/system/status /api/v1/x; do
     get "$PA" "$p"
     grep -q -- "$s" "$BODY" "$HEADERS" && leak=1
   done
 done
-[ "$(perm "$sd")" = 700 ] && [ "$(perm "$sd/db_password")" = 444 ] && [ "$(perm "$sd/app_secret")" = 444 ] && [ "$leak" = 0 ] &&
+[ "$(perm "$sd")" = 700 ] && [ "$(perm "$sd/db_password")" = 444 ] && [ "$(perm "$sd/app_secret")" = 444 ] &&
+  [ "$(perm "$sd/db_owner_password")" = 444 ] && [ "$(perm "$sd/db_app_password")" = 444 ] && [ "$leak" = 0 ] &&
   git -C "$APP_REPO" check-ignore -q .runtime/secrets/db_password
 v "ST-13 generated secrets: private directory, ignored by Git, never in responses" $?
 
@@ -355,14 +369,14 @@ need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2
 
 # --- readiness failures -----------------------------------------------------
 
-console_in "$A" doctrine:migrations:migrate prev
+owner_console_in "$A" doctrine:migrations:migrate prev
 get "$PA" /health/ready
 r1="$CODE $(cat "$BODY")"
 get "$PA" /health/live
 dv a-url-pending "$A" url
 [ "$r1" = '503 {"status":"not-ready"}' ] && [ "$CODE" = 200 ] && [ "$(rc_of a-url-pending)" = 1 ]
 v "ST-17 a pending migration makes /health/ready 503 (live stays 200, make url fails)" $?
-console_in "$A" doctrine:migrations:migrate
+owner_console_in "$A" doctrine:migrations:migrate
 until_ready "$PA" 200 30; v "ST-18 applying the migration makes it ready again" $?
 
 # The session and cache migration only creates its tables (FND-008). With
@@ -372,8 +386,8 @@ until_ready "$PA" 200 30; v "ST-18 applying the migration makes it ready again" 
 # the renamed table keeps its rows.
 fnd008='DoctrineMigrations\Version20261022000000'
 state0=$(cat "$A/.runtime/dev.env")
-console_in "$A" doctrine:migrations:migrate "$fnd008"
-psql_in "$A" "CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id)); INSERT INTO cache_items VALUES ('st45:kept', 'v', NULL, 1)" >/dev/null
+owner_console_in "$A" doctrine:migrations:migrate "$fnd008"
+psql_as_in "$A" flowcrm_owner "CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id)); INSERT INTO cache_items VALUES ('st45:kept', 'v', NULL, 1)" >/dev/null
 dv a-up-existing "$A" up
 [ "$(rc_of a-up-existing)" = 2 ] && err_has a-up-existing 'applying the database migrations failed' &&
   err_has a-up-existing 'Not migrating: cache_items already exist' && [ "$(cat "$A/.runtime/dev.env")" = "$state0" ] &&
@@ -381,14 +395,73 @@ dv a-up-existing "$A" up
   [ "$(psql_in "$A" "SELECT count(*) FROM cache_items WHERE item_id = 'st45:kept'")" = 1 ] &&
   until_ready "$PA" 503 5
 v "ST-45 an existing cache_items table stops make up without changes; the saved state is kept" $? "$(tail -n 3 "$work/out/a-up-existing.err")"
-psql_in "$A" "ALTER TABLE cache_items RENAME TO cache_items_preexisting; ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey" >/dev/null
+# The recovery of docs/architecture/sessions-and-cache.md: rename, then move
+# it out of schema public (make up accepts only known objects there).
+psql_in "$A" "ALTER TABLE cache_items RENAME TO cache_items_preexisting; ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey; CREATE SCHEMA preexisting; ALTER TABLE cache_items_preexisting SET SCHEMA preexisting" >/dev/null
 dv a-up-renamed "$A" up
 [ "$(rc_of a-up-renamed)" = 0 ] && err_has a-up-renamed 'applied pending database migrations' &&
-  [ "$(psql_in "$A" "SELECT count(*) FROM cache_items_preexisting WHERE item_id = 'st45:kept'")" = 1 ] &&
-  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE tablename IN ('sessions', 'cache_items')")" = 2 ] &&
-  until_ready "$PA" 200 10 && ! console_in "$A" doctrine:schema:validate &&
-  psql_in "$A" "DROP TABLE cache_items_preexisting" >/dev/null && console_in "$A" doctrine:schema:validate
+  [ "$(psql_in "$A" "SELECT count(*) FROM preexisting.cache_items_preexisting WHERE item_id = 'st45:kept'")" = 1 ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('sessions', 'cache_items')")" = 2 ] &&
+  until_ready "$PA" 200 10 && ! owner_console_in "$A" doctrine:schema:validate &&
+  psql_in "$A" "DROP TABLE preexisting.cache_items_preexisting; DROP SCHEMA preexisting" >/dev/null && owner_console_in "$A" doctrine:schema:validate
 v "ST-46 after renaming the existing table by hand, make up migrates; the renamed table keeps its rows until dropped" $? "$(tail -n 3 "$work/out/a-up-renamed.err")"
+
+# --- database roles (ADR-018) ------------------------------------------------
+
+# The api runs as the runtime role with only its own secret; the schema
+# belongs to the owner; the superuser cannot be used from the api.
+secrets_in_api=$(docker exec "$(cid "$A" api)" ls /run/secrets | tr '\n' ' ')
+superuser=$(docker exec "$(cid "$A" api)" php -r 'try { new PDO("pgsql:host=db;dbname=flowcrm", "flowcrm", ""); echo "connected"; } catch (Throwable $e) { echo "refused"; }')
+[ "$secrets_in_api" = "app_secret db_app_password " ] && [ "$superuser" = refused ] &&
+  console_in "$A" app:database:verify-privileges --runtime &&
+  [ "$(psql_in "$A" "SELECT string_agg(DISTINCT pg_get_userbyid(relowner), ',') FROM pg_class WHERE relnamespace = 'public'::regnamespace")" = flowcrm_owner ] &&
+  [ "$(psql_in "$A" "SELECT rolsuper OR rolinherit FROM pg_roles WHERE rolname = 'flowcrm_app'")" = f ]
+v "ST-47 the api runs as flowcrm_app with only its own secret; the schema belongs to flowcrm_owner" $? "secrets: $secrets_in_api superuser: $superuser"
+
+# Privilege drift fails closed: make up refuses to publish, then works again.
+psql_as_in "$A" flowcrm_owner "GRANT TRUNCATE ON users TO flowcrm_app" >/dev/null
+dv a-up-drift "$A" up
+psql_as_in "$A" flowcrm_owner "REVOKE TRUNCATE ON users FROM flowcrm_app" >/dev/null
+dv a-up-nodrift "$A" up
+[ "$(rc_of a-up-drift)" = 6 ] && err_has a-up-drift 'VIOLATION: table users' && err_has a-up-drift 'stack was not published' &&
+  [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10
+v "ST-48 a runtime privilege outside the manifest stops make up (exit 6); removing it restores it" $? "$(grep -m1 VIOLATION "$work/out/a-up-drift.err")"
+
+# A missing or malformed role secret of an existing volume fails closed and
+# is never regenerated by make up.
+mv "$sd/db_app_password" "$work/db_app_password.kept"
+dv a-up-nosecret "$A" up
+nosecret=$( [ ! -e "$sd/db_app_password" ] && echo absent)
+mv "$work/db_app_password.kept" "$sd/db_app_password"
+cp -p "$sd/db_owner_password" "$work/db_owner_password.kept"
+chmod 0644 "$sd/db_owner_password" && printf 'short' >"$sd/db_owner_password"
+dv a-up-badsecret "$A" up
+mv -f "$work/db_owner_password.kept" "$sd/db_owner_password"
+dv a-up-secrets-back "$A" up
+[ "$(rc_of a-up-nosecret)" = 6 ] && [ "$nosecret" = absent ] && err_has a-up-nosecret 'make db-upgrade-roles' &&
+  [ "$(rc_of a-up-badsecret)" = 6 ] && err_has a-up-badsecret 'db_owner_password is malformed' &&
+  [ "$(rc_of a-up-secrets-back)" = 0 ] && until_ready "$PA" 200 10
+v "ST-49 missing or malformed role secrets of an existing volume: refused (exit 6), never regenerated" $?
+
+# Development rotation of the runtime and owner passwords.
+app_pw0=$(cat "$sd/db_app_password")
+owner_pw0=$(cat "$sd/db_owner_password")
+(cd "$A" && ROLE=app ./bin/devenv rotate-db-password) >"$work/out/a-rot-app.out" 2>"$work/out/a-rot-app.err"
+echo $? >"$work/out/a-rot-app.rc"
+(cd "$A" && ROLE=owner ./bin/devenv rotate-db-password) >"$work/out/a-rot-owner.out" 2>"$work/out/a-rot-owner.err"
+echo $? >"$work/out/a-rot-owner.rc"
+ip=$(docker exec "$(cid "$A" db)" sh -c 'hostname -i | cut -d" " -f1')
+old_app=$(docker exec -e PGPASSWORD="$app_pw0" "$(cid "$A" db)" psql -X -h "$ip" -U flowcrm_app -d flowcrm -tAc 'SELECT 1' 2>&1)
+new_app=$(docker exec -e PGPASSWORD="$(cat "$sd/db_app_password")" "$(cid "$A" db)" psql -X -h "$ip" -U flowcrm_app -d flowcrm -tAc 'SELECT 1' 2>&1)
+[ "$(rc_of a-rot-app)" = 0 ] && [ "$(rc_of a-rot-owner)" = 0 ] &&
+  [ "$(cat "$sd/db_app_password")" != "$app_pw0" ] && [ "$(cat "$sd/db_owner_password")" != "$owner_pw0" ] &&
+  [ "$(perm "$sd/db_app_password")" = 444 ] && [ -z "$(find "$sd" -name '.*' -type f)" ] &&
+  printf '%s' "$old_app" | grep -q 'password authentication failed' && [ "$new_app" = 1 ] &&
+  owner_console_in "$A" doctrine:migrations:up-to-date && until_ready "$PA" 200 30
+v "ST-50 rotate-db-password ROLE=app and ROLE=owner: new passwords work, old ones are refused" $? "$(tail -n 2 "$work/out/a-rot-app.err")"
+dv a-up-rotated "$A" up
+[ "$(rc_of a-up-rotated)" = 0 ] && until_ready "$PA" 200 10
+v "ST-51 make up after the rotations publishes the stack as before" $?
 
 docker stop "$(cid "$A" db)" >/dev/null
 until_ready "$PA" 503 60
@@ -404,7 +477,9 @@ v "ST-20 make up restarts the database and the stack is ready again" $?
 
 # --- persistence ------------------------------------------------------------
 
-psql_in "$A" "CREATE TABLE st_marker (v text); INSERT INTO st_marker VALUES ('kept')" >/dev/null
+# The marker lives outside schema public, which only the migrations and the
+# privilege manifest govern (ADR-018).
+psql_in "$A" "CREATE SCHEMA st; CREATE TABLE st.marker (v text); INSERT INTO st.marker VALUES ('kept')" >/dev/null
 base1=$(psql_in "$A" "SELECT created_at FROM schema_baseline")
 mig1=$(psql_in "$A" "SELECT count(*) FROM doctrine_migration_versions")
 vol=$(project_of "$A")_db-data
@@ -413,13 +488,13 @@ dv a-down "$A" down
   docker volume inspect "$vol" >/dev/null 2>&1 && [ "$(saved_port "$A")" = "$PA" ]
 v "ST-21 make down removes the containers, keeps the volume and the saved port" $?
 dv a-up4 "$A" up
-[ "$(rc_of a-up4)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ] &&
+[ "$(rc_of a-up4)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ] &&
   [ "$(psql_in "$A" "SELECT created_at FROM schema_baseline")" = "$base1" ] &&
   [ "$(psql_in "$A" "SELECT count(*) FROM doctrine_migration_versions")" = "$mig1" ] && [ "$(mapped_port "$A")" = "$PA" ]
 v "ST-22 data survives down/up; the database is not re-initialised; same port" $?
 
 dv a-restart "$A" restart
-[ "$(rc_of a-restart)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ] && until_ready "$PA" 200 10
+[ "$(rc_of a-restart)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ] && until_ready "$PA" 200 10
 v "ST-23 make restart keeps the data and the port" $?
 
 # --- port conflict and a second checkout ------------------------------------
@@ -435,7 +510,7 @@ v "ST-24 ports in use (checkout A, an unrelated listener) are skipped: B starts 
 kill -0 "$HOLDER" 2>/dev/null; v "ST-25 the unrelated listener is untouched" $?
 
 [ "$(project_of "$A")" != "$(project_of "$B")" ] && docker volume inspect "$(project_of "$B")_db-data" >/dev/null 2>&1 &&
-  [ "$(psql_in "$B" "SELECT to_regclass('st_marker') IS NULL")" = t ] && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ] &&
+  [ "$(psql_in "$B" "SELECT to_regclass('st.marker') IS NULL")" = t ] && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ] &&
   until_ready "$PA" 200 5 && until_ready "$PB" 200 5
 v "ST-26 checkouts are isolated: own projects, volumes, databases and ports" $?
 ev "A=$(project_of "$A"):$PA B=$(project_of "$B"):$PB"
@@ -483,6 +558,7 @@ final class Version20991231000000 extends AbstractMigration
     public function up(Schema $schema): void
     {
         $this->addSql('CREATE TABLE st_added_migration (id INT NOT NULL, PRIMARY KEY (id))');
+        $this->addSql('GRANT SELECT ON st_added_migration TO flowcrm_app');
     }
 
     public function down(Schema $schema): void
@@ -491,10 +567,19 @@ final class Version20991231000000 extends AbstractMigration
     }
 }
 PHP
+# A new table is classified in the privilege manifest with what its migration grants.
+python3 - "$A/backend/config/database/runtime-privileges.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+open(p, 'w').write(s.replace('tables:\n', 'tables:\n  st_added_migration: [SELECT]\n', 1))
+PY
 dv a-migrate "$A" up
 [ "$(rc_of a-migrate)" = 0 ] && err_has a-migrate 'applied pending database migrations' && [ "$(cid "$A" api)" = "$api0" ] &&
-  [ "$(psql_in "$A" "SELECT to_regclass('st_added_migration') IS NOT NULL")" = t ] && until_ready "$PA" 200 5
-v "ST-31 a migration added while running is applied by make up, without recreating the api" $?
+  [ "$(psql_in "$A" "SELECT to_regclass('st_added_migration') IS NOT NULL")" = t ] &&
+  [ "$(psql_in "$A" "SELECT has_table_privilege('flowcrm_app', 'st_added_migration', 'SELECT') AND NOT has_table_privilege('flowcrm_app', 'st_added_migration', 'INSERT')")" = t ] &&
+  until_ready "$PA" 200 5
+v "ST-31 a migration added while running is applied by make up (as the owner, with its grant), without recreating the api" $?
 dv a-noop "$A" up
 [ "$(rc_of a-noop)" = 0 ] && err_has a-noop 'already running; nothing to change'
 v "ST-32 the next make up changes nothing" $?
@@ -513,6 +598,72 @@ if sudo -n -u nobody true 2>/dev/null; then
 else
   say "      INFO ST-34 cross-user read check needs passwordless sudo (runs in CI)"
 fi
+
+# --- a volume from before role separation: explicit upgrade (ADR-018) --------
+# Checkout C gets a volume exactly as the stack created it before FND-009:
+# the upstream PostgreSQL image, one superuser account, the migrations up to
+# FND-008 run as that superuser, data in the core tables, the audit log,
+# sessions and cache. make up must refuse it; make db-upgrade-roles must
+# convert it after a verified backup, keeping every row.
+new_checkout c
+C=$CO
+pc=$(project_of "$C")
+cs=$C/.runtime/secrets
+(umask 077 && mkdir -p "$cs")
+for f in db_password app_secret; do random_secret >"$cs/$f" && chmod 0444 "$cs/$f"; done
+legacy_label="devenv.test=stack-$(sha6 "$work")"
+legacy_image=$(sed -n 's/^ARG POSTGRES_IMAGE=//p' "$APP_REPO/docker/db/Dockerfile")
+docker network create --label "$legacy_label" "$pc-legacy" >/dev/null
+docker volume create --label "com.docker.compose.project=$pc" --label com.docker.compose.volume=db-data "${pc}_db-data" >/dev/null
+docker run -d --name "$pc-legacy-db" --label "$legacy_label" --network "$pc-legacy" --network-alias db --user postgres \
+  -e POSTGRES_DB=flowcrm -e POSTGRES_USER=flowcrm -e POSTGRES_PASSWORD_FILE=/run/secrets/db_password \
+  -v "$cs/db_password:/run/secrets/db_password:ro" -v "${pc}_db-data:/var/lib/postgresql" "$legacy_image" >/dev/null
+i=0
+until docker logs "$pc-legacy-db" 2>&1 | grep -q 'init process complete' && docker exec "$pc-legacy-db" pg_isready -q -h 127.0.0.1 -U flowcrm -d flowcrm || [ "$i" -ge 90 ]; do sleep 1; i=$((i + 1)); done
+docker run --rm --network "$pc-legacy" --read-only --tmpfs /tmp --tmpfs /app/var:uid=82,gid=82 \
+  -e APP_ENV=dev -e DATABASE_USER=flowcrm -e DATABASE_PASSWORD_FILE=/run/secrets/db_password \
+  -v "$cs/db_password:/run/secrets/db_password:ro" -v "$cs/app_secret:/run/secrets/app_secret:ro" \
+  -v "$C/backend/src:/app/src:ro" -v "$C/backend/config:/app/config:ro" -v "$C/backend/migrations:/app/migrations:ro" \
+  "$(project_of "$A")-api" php bin/console doctrine:migrations:migrate --no-interaction 'DoctrineMigrations\Version20261022100000' >"$work/out/c-legacy-migrate.log" 2>&1
+legacy_rc=$?
+legacy_sql() { docker exec "$pc-legacy-db" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
+legacy_sql "INSERT INTO users (id, email, password_hash, display_name, created_at) VALUES ('0192f0c4-7d1e-7b8a-9f3c-00000000c001', 'legacy@example.com', 'h', 'Legacy', now());
+  INSERT INTO organizations (id, name, currency, timezone, created_at) VALUES ('0192f0c4-7d1e-7b8a-9f3c-00000000c002', 'Legacy Org', 'EUR', 'Europe/Warsaw', now());
+  INSERT INTO audit_events (id, organization_id, occurred_at, actor_type, action, entity_type, changes) VALUES ('0192f0c4-7d1e-7b8a-9f3c-00000000c003', '0192f0c4-7d1e-7b8a-9f3c-00000000c002', now(), 'system', 'organization.created', 'organization', '{}');
+  INSERT INTO sessions VALUES ('legacysession', 'data', 2000000000, 1);
+  INSERT INTO cache_items VALUES ('ns:legacy', 'v', NULL, 1)" >/dev/null
+rows_sql="SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT u::text t FROM users u UNION ALL SELECT o::text FROM organizations o UNION ALL SELECT a::text FROM audit_events a UNION ALL SELECT s::text FROM sessions s UNION ALL SELECT c::text FROM cache_items c UNION ALL SELECT v.version::text FROM doctrine_migration_versions v) x"
+legacy_rows=$(legacy_sql "$rows_sql")
+legacy_versions=$(legacy_sql "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions")
+docker rm -f "$pc-legacy-db" >/dev/null 2>&1
+docker network rm "$pc-legacy" >/dev/null 2>&1
+
+dv c-up "$C" up
+c_running=$(docker ps -q --filter "label=com.docker.compose.project=$pc" | wc -l | tr -d ' ')
+dv c-upgrade "$C" upgrade-roles
+dump=$(find "$C/.runtime/backups" -name 'roles_upgrade_*.dump' -type f 2>/dev/null | head -n 1)
+psql_c() { docker exec "$(cid "$C" db)" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
+[ "$legacy_rc" = 0 ] && [ -n "$legacy_rows" ] && [ "$(rc_of c-up)" = 6 ] && err_has c-up 'make db-upgrade-roles' && [ "$c_running" = 0 ] &&
+  [ "$(rc_of c-upgrade)" = 0 ] && err_has c-upgrade 'verified backup: .runtime/backups/roles_upgrade_' &&
+  [ -s "$dump" ] && [ "$(perm "$dump")" = 600 ] && [ "$(perm "$C/.runtime/backups")" = 700 ] &&
+  [ "$(docker exec "$(cid "$C" db)" flowcrm-db-roles state)" = complete ] &&
+  [ "$(psql_c "SELECT string_agg(DISTINCT pg_get_userbyid(relowner), ',') FROM pg_class WHERE relnamespace = 'public'::regnamespace")" = flowcrm_owner ] &&
+  [ "$(psql_c "SELECT string_agg(tgname || ':' || tgenabled::text, ' ' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'audit_events'::regclass AND NOT tgisinternal")" = 'audit_events_append_only:O audit_events_no_truncate:O' ] &&
+  [ "$(psql_c "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions WHERE version <> 'DoctrineMigrations\Version20261023000000'")" = "$legacy_versions" ] &&
+  [ "$(psql_c "SELECT count(*) FROM pg_database WHERE datname LIKE '%restore_check'")" = 0 ] &&
+  [ "$(psql_c "SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT u::text t FROM users u UNION ALL SELECT o::text FROM organizations o UNION ALL SELECT a::text FROM audit_events a UNION ALL SELECT s::text FROM sessions s UNION ALL SELECT c::text FROM cache_items c UNION ALL SELECT v.version::text FROM doctrine_migration_versions v WHERE v.version <> 'DoctrineMigrations\Version20261023000000') x")" = "$legacy_rows" ]
+v "ST-52 a volume from before role separation: make up refuses it; make db-upgrade-roles converts it after a verified backup, keeping every row" $? "$(tail -n 3 "$work/out/c-upgrade.err")"
+dv c-up2 "$C" up
+[ "$(rc_of c-up2)" = 0 ] && until_ready "$(saved_port "$C")" 200 30 && console_in "$C" app:database:verify-privileges --runtime
+c_published=$?
+c_rows=$(psql_c "$rows_sql")
+# A second upgrade stops api, web and edge, re-checks and converts nothing.
+dv c-upgrade2 "$C" upgrade-roles
+[ "$c_published" = 0 ] && [ "$(rc_of c-upgrade2)" = 0 ] && err_has c-upgrade2 'nothing to upgrade' &&
+  ! err_has c-upgrade2 'verified backup' && [ "$(psql_c "$rows_sql")" = "$c_rows" ] &&
+  [ "$(docker exec "$(cid "$C" db)" flowcrm-db-roles state)" = complete ]
+v "ST-53 after the upgrade make up publishes the stack as flowcrm_app; a second upgrade changes nothing" $? "$(tail -n 2 "$work/out/c-up2.err")"
+dv c-down "$C" down
 
 # --- one checkout, two stacks: the other stack's commands are refused --------
 
@@ -547,7 +698,7 @@ done
 v "ST-38 fixture running: app up/down/restart/status/url/logs refused (exit 6), fixture untouched" $? "not refused:$refused"
 FLOWCRM_STACK=fixture dv fx-down "$A" down
 dv a-up5 "$A" up
-[ "$(rc_of fx-down)" = 0 ] && [ "$(rc_of a-up5)" = 0 ] && until_ready "$PA" 200 10 && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ]
+[ "$(rc_of fx-down)" = 0 ] && [ "$(rc_of a-up5)" = 0 ] && until_ready "$PA" 200 10 && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ]
 v "ST-39 back to the app: data kept, stack ready" $?
 
 # --- cleanup verification ---------------------------------------------------
@@ -556,7 +707,7 @@ final_cleanup
 : >"$work/checkouts"
 : >"$work/holders"
 left=0
-for d in "$A" "$B"; do left=$((left + $(project_resources "$(project_of "$d")"))); done
+for d in "$A" "$B" "$C"; do left=$((left + $(project_resources "$(project_of "$d")"))); done
 [ "$left" = 0 ]; v "CLEAN no containers, volumes or networks of the test checkouts left" $?
 snapshot >"$work/after.containers"
 missing=$(comm -23 "$work/before.containers" "$work/after.containers")
