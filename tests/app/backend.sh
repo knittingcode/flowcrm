@@ -88,5 +88,9 @@ check "BE-14 dev and prod: PostgreSQL sessions and cache, no test-only routes" '
       ! APP_ENV=$e bin/console debug:router | grep -qF /_test/ || { echo "$e: unexpected session or cache configuration" >&2; exit 1; }
     echo "OK $e: PdoSessionHandler, DoctrineDbalAdapter, prefix seed flowcrm, no test routes"
   done'
+# PHP-FPM bounds the wall-clock time of a request (docker/api/php-fpm.conf),
+# read from the configuration PHP-FPM itself parsed.
+check "BE-15 PHP-FPM ends requests after 60 seconds (request_terminate_timeout)" \
+  'php-fpm -tt 2>&1 | grep -E "^\[[^]]+\] NOTICE:[[:space:]]+request_terminate_timeout = 60s$" && echo "OK request_terminate_timeout = 60s"'
 
 tally_finish "(backend)"

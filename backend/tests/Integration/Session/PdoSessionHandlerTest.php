@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Session;
 
+use App\Tests\Support\Session\SeparateConnection;
 use App\Tests\Support\TypedValues;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
@@ -50,6 +51,33 @@ final class PdoSessionHandlerTest extends KernelTestCase
         self::assertIsString($property('dsn'), 'a DSN, not the Doctrine connection: the lock transaction stays separate');
         self::assertStringContainsString('application_name=flowcrm_sessions', (string) $property('dsn'));
         self::assertStringNotContainsString('password', (string) $property('dsn'));
+    }
+
+    /**
+     * The session connection waits at most 5 s for a lock; Doctrine's
+     * connections keep PostgreSQL's default (no limit).
+     */
+    public function testOnlyTheSessionConnectionHasALockTimeout(): void
+    {
+        $handler = $this->configured();
+        $handler->open('', 'flowcrm_sid');
+        try {
+            $pdo = new \ReflectionProperty(PdoSessionHandler::class, 'pdo')->getValue($handler);
+            self::assertInstanceOf(\PDO::class, $pdo);
+            foreach (['lock_timeout' => '5s', 'application_name' => 'flowcrm_sessions'] as $setting => $value) {
+                $statement = $pdo->query('SHOW '.$setting);
+                self::assertInstanceOf(\PDOStatement::class, $statement);
+                self::assertSame($value, $statement->fetchColumn(), $setting);
+            }
+        } finally {
+            $handler->close();
+        }
+
+        foreach (['default', 'cache'] as $name) {
+            $connection = self::getContainer()->get("doctrine.dbal.{$name}_connection");
+            self::assertInstanceOf(Connection::class, $connection);
+            self::assertSame('0', $connection->fetchOne('SHOW lock_timeout'), $name);
+        }
     }
 
     public function testWriteReadAndDestroy(): void
@@ -183,26 +211,12 @@ final class PdoSessionHandlerTest extends KernelTestCase
     /** A handler on a new connection, as another PHP-FPM worker would have. */
     private function handler(int $lockMode, ?int $lockTimeoutMs = null): PdoSessionHandler
     {
-        $pdo = new \PDO(
-            \sprintf('pgsql:host=%s;port=%s;dbname=%s', self::env('DATABASE_HOST'), self::env('DATABASE_PORT'), self::env('DATABASE_NAME')),
-            self::env('DATABASE_USER'),
-            trim((string) file_get_contents(self::env('DATABASE_PASSWORD_FILE'))),
-            [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION],
-        );
+        $pdo = SeparateConnection::open();
         if (null !== $lockTimeoutMs) {
             $pdo->exec(\sprintf("SET lock_timeout = '%dms'", $lockTimeoutMs));
         }
 
         return new PdoSessionHandler($pdo, ['lock_mode' => $lockMode]);
-    }
-
-    /** The configuration the kernel sees (.env and the container environment). */
-    private static function env(string $name): string
-    {
-        $value = $_SERVER[$name] ?? $_ENV[$name] ?? null;
-        self::assertIsString($value, $name);
-
-        return $value;
     }
 
     private function newId(): string

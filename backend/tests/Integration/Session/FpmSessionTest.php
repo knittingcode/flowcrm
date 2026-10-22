@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace App\Tests\Integration\Session;
 
 use App\Tests\Support\Session\FastCgiResponse;
+use App\Tests\Support\Session\FastCgiTimeout;
 use App\Tests\Support\Session\FpmServer;
+use App\Tests\Support\Session\SeparateConnection;
 use App\Tests\Support\TypedValues;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
@@ -54,13 +56,37 @@ final class FpmSessionTest extends KernelTestCase
         parent::tearDown();
     }
 
-    public function testStatelessRoutesNeitherSetACookieNorStoreASession(): void
+    /**
+     * Stateless routes never touch the session. While another transaction
+     * holds an exclusive lock on the sessions table, they still answer at
+     * once, with or without a session cookie: a route that started the
+     * session would wait for that lock (and with a cookie would also send
+     * a Set-Cookie), so this fails for sessions started eagerly too.
+     */
+    public function testStatelessRoutesNeverTouchTheSession(): void
     {
+        $known = $this->idFrom(self::$fpm->request('POST', '/api/_test/session/increment'));
         $before = $this->sessionCount();
-        foreach (['/health/live', '/health/ready', '/api/v1/system/status', '/api/v1/does-not-exist'] as $uri) {
-            $response = self::$fpm->request('GET', $uri);
-            self::assertSame([], $response->header('Set-Cookie'), $uri);
+        $routes = ['/health/live' => 200, '/health/ready' => 200, '/api/v1/system/status' => 200, '/api/v1/does-not-exist' => 404];
+
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->exec('LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE');
+        try {
+            foreach (['no cookie' => [], 'known session' => [self::COOKIE => $known], 'unknown session' => [self::COOKIE => str_repeat('0', 32)]] as $case => $cookies) {
+                foreach ($routes as $uri => $status) {
+                    $start = microtime(true);
+                    $response = self::$fpm->request('GET', $uri, $cookies, timeout: 3.0);
+                    self::assertLessThan(2.0, microtime(true) - $start, "$uri ($case) waited for the sessions table");
+                    self::assertSame($status, $response->status, "$uri ($case)");
+                    self::assertSame([], $response->header('Set-Cookie'), "$uri ($case)");
+                }
+            }
+        } finally {
+            $holder->rollBack();
         }
+        self::assertSame($before, $this->sessionCount());
+
         // Reading an empty session starts it, but nothing is stored or sent.
         $response = self::$fpm->request('GET', '/api/_test/session');
         self::assertSame(['n' => null], $response->json());
@@ -196,6 +222,79 @@ final class FpmSessionTest extends KernelTestCase
         self::assertSame([2, 3], $counts, 'no lost update');
         self::assertSame(['n' => 3], self::$fpm->request('GET', '/api/_test/session', [self::COOKIE => $id])->json());
         self::assertGreaterThanOrEqual(1.0, $elapsed, 'the second request waited for the first');
+    }
+
+    /**
+     * A request that waits for a session locked by another request gives up
+     * after the session connection's lock_timeout (5 s) with a problem
+     * document; its connection is closed, the lock holder is unaffected and
+     * the session works again afterwards.
+     */
+    public function testWaitingForASessionLockIsBoundedAndFailsSafely(): void
+    {
+        $id = $this->idFrom(self::$fpm->request('POST', '/api/_test/session/increment'));
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->prepare('SELECT sess_data FROM sessions WHERE sess_id = ? FOR UPDATE')->execute([$id]);
+        try {
+            $start = microtime(true);
+            $response = self::$fpm->request('GET', '/api/_test/session', [self::COOKIE => $id]);
+            $waited = microtime(true) - $start;
+
+            self::assertGreaterThanOrEqual(4.5, $waited, 'it waited for the lock');
+            self::assertLessThan(8.0, $waited, 'it gave up after lock_timeout');
+            self::assertSame(500, $response->status);
+            self::assertSame(['application/problem+json'], $response->header('Content-Type'));
+            self::assertSame([], $response->header('Set-Cookie'));
+            foreach ([$id, 'SQLSTATE', '55P03', 'lock', 'sessions', 'pgsql', 'flowcrm_sessions'] as $detail) {
+                self::assertStringNotContainsString($detail, $response->body);
+            }
+            self::assertSame(0, SeparateConnection::sessionConnectionsAfterRequests($holder), 'the waiting connection was closed');
+
+            $holder->prepare('UPDATE sessions SET sess_time = sess_time WHERE sess_id = ?')->execute([$id]);
+            $holder->commit();
+        } finally {
+            if ($holder->inTransaction()) {
+                $holder->rollBack();
+            }
+        }
+
+        $start = microtime(true);
+        self::assertSame(['n' => 1], self::$fpm->request('GET', '/api/_test/session', [self::COOKIE => $id])->json());
+        self::assertLessThan(1.0, microtime(true) - $start);
+    }
+
+    /**
+     * request_terminate_timeout (60 s in docker/api/php-fpm.conf, 1 s here)
+     * kills a worker that runs too long; its connections close, so the
+     * session lock it held is released and its unsaved change is lost.
+     */
+    public function testAWorkerPastTheRequestTimeLimitReleasesTheSessionLock(): void
+    {
+        $fpm = new FpmServer(pool: ['request_terminate_timeout' => '1s']);
+        $fpm->start();
+        try {
+            $id = $this->idFrom($fpm->request('POST', '/api/_test/session/increment'));
+
+            $start = microtime(true);
+            try {
+                $response = $fpm->request('POST', '/api/_test/session/increment?pause_ms=2000', [self::COOKIE => $id], timeout: 10.0);
+                self::assertNotSame(200, $response->status, 'the request was not terminated');
+            } catch (FastCgiTimeout $e) {
+                throw $e;
+            } catch (\RuntimeException) {
+                // PHP-FPM closed the connection of the killed worker.
+            }
+            self::assertLessThan(3.0, microtime(true) - $start);
+            self::assertStringContainsString('execution timed out', $fpm->log());
+            self::assertSame(0, SeparateConnection::sessionConnectionsAfterRequests(SeparateConnection::open()));
+
+            $start = microtime(true);
+            self::assertSame(['n' => 1], $fpm->request('GET', '/api/_test/session', [self::COOKIE => $id])->json());
+            self::assertLessThan(1.0, microtime(true) - $start, 'the lock was released');
+        } finally {
+            $fpm->remove();
+        }
     }
 
     public function testWithoutTheDatabaseOnlySessionRoutesFailAndTheyFailSafely(): void

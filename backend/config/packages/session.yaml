@@ -26,9 +26,12 @@ services:
     # session lock transaction never mixes with Doctrine's transactions.
     # LOCK_TRANSACTIONAL: SELECT ... FOR UPDATE on the session row until the
     # request ends, so concurrent requests of one session are serialised.
+    # lock_timeout (this connection only): a request waits at most 5 seconds
+    # for the session lock, then fails with a 500 problem document instead
+    # of blocking a PHP-FPM worker; PHP's time limit does not count waits.
     Symfony\Component\HttpFoundation\Session\Storage\Handler\PdoSessionHandler:
         arguments:
-            - 'pgsql:host=%env(DATABASE_HOST)%;port=%env(DATABASE_PORT)%;dbname=%env(DATABASE_NAME)%;connect_timeout=5;application_name=flowcrm_sessions'
+            - "pgsql:host=%env(DATABASE_HOST)%;port=%env(DATABASE_PORT)%;dbname=%env(DATABASE_NAME)%;connect_timeout=5;application_name=flowcrm_sessions;options='-c lock_timeout=5s'"
             - db_username: '%env(DATABASE_USER)%'
               db_password: '%env(trim:file:DATABASE_PASSWORD_FILE)%'
               lock_mode: !php/const Symfony\Component\HttpFoundation\Session\Storage\Handler\PdoSessionHandler::LOCK_TRANSACTIONAL
