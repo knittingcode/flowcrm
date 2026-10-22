@@ -636,13 +636,14 @@ result "U-13 SIGTERM is forwarded to the Docker process group; exit 143 after it
 # --- U-14 Makefile interface (kept stable for the application stack)
 mk_root=$(cd -P "$here/../.." && pwd -P)
 mk() { (cd "$mk_root" && make "$@") 2>&1; }
-expect_eq "U-14 make help lists the public targets" "help up down restart status url ports logs doctor db-upgrade-roles db-rotate-password test-devenv test-app" \
+expect_eq "U-14 make help lists the public targets" "help up down restart status url ports logs doctor db-upgrade-roles db-rotate-password db-rotate-password-abort test-devenv test-app" \
   "$(mk -s help | awk '/^  [a-z-]+ / { printf "%s%s", sep, $1; sep = " " }')"
 for t in up down restart status url ports logs doctor; do
   expect_eq "U-14 make $t runs bin/devenv $t" "./bin/devenv $t" "$(mk -n "$t")"
 done
 expect_eq "U-14 make db-upgrade-roles runs bin/devenv upgrade-roles" "./bin/devenv upgrade-roles" "$(mk -n db-upgrade-roles)"
 expect_eq "U-14 make db-rotate-password runs bin/devenv rotate-db-password" "./bin/devenv rotate-db-password" "$(mk -n db-rotate-password)"
+expect_eq "U-14 make db-rotate-password-abort runs bin/devenv rotate-db-password-abort" "./bin/devenv rotate-db-password-abort" "$(mk -n db-rotate-password-abort)"
 expect_eq "U-14 make test-devenv runs both suites" "tests/devenv/unit.sh tests/devenv/integration.sh" "$(mk -n test-devenv | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "U-14 make test-app runs the application suites" "tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh" "$(mk -n test-app | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "U-14 make without a target shows help" "$(mk -s help)" "$(mk -s)"
@@ -755,11 +756,11 @@ mkdir -p "$work/fakevol"
 printf '#!/bin/sh\n[ "$FAKE_VOLUME" = exists ]\n' >"$work/fakevol/docker"
 chmod +x "$work/fakevol/docker"
 # shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
-secrets_rc() { # volume-state: runs ensure_secrets, prints its exit code
+secrets_rc() { # volume-state [ensure_secrets argument]: runs ensure_secrets, prints its exit code
   (
     PATH=$work/fakevol:$PATH FAKE_VOLUME=$1
     export FAKE_VOLUME
-    ensure_secrets
+    ensure_secrets ${2:+"$2"}
   ) >/dev/null 2>"$work/secrets.err"
   echo $?
 }
@@ -809,9 +810,13 @@ r=$(secrets_rc exists)
 [ "$r" = "$EX_SAFETY" ] && [ ! -e "$SECRETS_DIR/db_app_password" ] && grep -q 'make db-upgrade-roles' "$work/secrets.err" &&
   grep -q 'make db-rotate-password ROLE=app' "$work/secrets.err"
 result "U-16 missing role secret with an existing volume: refused, nothing generated, upgrade and rotation explained" $? "(rc $r)"
-r=$( (ALLOW_ROLE_SECRETS=1 secrets_rc exists) )
+# The former environment switch, and similar names, must not authorise it.
+r=$(export ALLOW_ROLE_SECRETS=1 ALLOW_NEW_ROLE_SECRETS=1 allow=allow-new-role-secrets && secrets_rc exists)
+[ "$r" = "$EX_SAFETY" ] && [ ! -e "$SECRETS_DIR/db_app_password" ] && grep -q 'so none was generated' "$work/secrets.err"
+result "U-16 a role secret is not generated for an existing volume when the caller sets ALLOW_ROLE_SECRETS=1 (or similar) in the environment" $? "(rc $r)"
+r=$(secrets_rc exists allow-new-role-secrets)
 [ "$r" = 0 ] && [[ $(cat "$SECRETS_DIR/db_app_password") =~ ^[0-9a-f]{48}$ ]]
-result "U-16 only the explicit upgrade (ALLOW_ROLE_SECRETS=1) creates a role secret for an existing volume" $? "(rc $r)"
+result "U-16 only the explicit upgrade (internal argument allow-new-role-secrets) creates a role secret for an existing volume" $? "(rc $r)"
 chmod 0644 "$SECRETS_DIR/db_owner_password" && printf 'not-a-secret' >"$SECRETS_DIR/db_owner_password"
 r=$(secrets_rc exists)
 [ "$r" = "$EX_SAFETY" ] && grep -q 'db_owner_password is malformed' "$work/secrets.err" && grep -q 'ROLE=owner' "$work/secrets.err"
