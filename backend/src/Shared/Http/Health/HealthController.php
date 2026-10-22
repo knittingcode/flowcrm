@@ -7,6 +7,7 @@ namespace App\Shared\Http\Health;
 use App\Shared\Application\Health\ReadinessCheck;
 use Monolog\Attribute\WithMonologChannel;
 use Psr\Log\LoggerInterface;
+use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Attribute\Route;
@@ -18,7 +19,14 @@ use Symfony\Component\Routing\Attribute\Route;
 #[WithMonologChannel('health')]
 final readonly class HealthController
 {
+    /**
+     * The check is a lazy proxy: building it (the database connection, whose
+     * password is read from a secret file) happens inside ready(), so a
+     * missing credential is reported as not-ready (503), not as an error
+     * while the controller is created (500).
+     */
     public function __construct(
+        #[Autowire(lazy: true)]
         private ReadinessCheck $readiness,
         private LoggerInterface $logger,
     ) {

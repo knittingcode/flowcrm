@@ -6,7 +6,7 @@
 DEVENV := ./bin/devenv
 
 .DEFAULT_GOAL := help
-.PHONY: help up down restart status url ports logs doctor test-devenv test-app
+.PHONY: help up down restart status url ports logs doctor db-upgrade-roles db-rotate-password db-rotate-password-abort test-devenv test-app
 
 help: ## Show this help
 	@echo 'Usage: make <target>'
@@ -39,6 +39,15 @@ logs: ## Show recent logs (SERVICE=edge|web|api|db TAIL=200 FOLLOW=1)
 
 doctor: ## Check prerequisites (read-only)
 	@$(DEVENV) doctor
+
+db-upgrade-roles: ## Upgrade a volume from before role separation (verified backup first; ADR-018)
+	@$(DEVENV) upgrade-roles
+
+db-rotate-password: ## New database password for ROLE=app|owner (development); run again to finish an interrupted one
+	@$(DEVENV) rotate-db-password
+
+db-rotate-password-abort: ## Undo an unfinished rotation of ROLE=app|owner (the current password stays)
+	@$(DEVENV) rotate-db-password-abort
 
 test-devenv: ## Run the allocator unit and real-Docker integration tests
 	@tests/devenv/unit.sh

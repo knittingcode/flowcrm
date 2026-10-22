@@ -1,0 +1,24 @@
+# Runtime privileges of flowcrm_app (ADR-018). Default-deny: the runtime role
+# has exactly these privileges and nothing else. Every table, view and
+# sequence of schema public must be listed (an empty list means no access),
+# so a new object is classified on purpose. The migration that creates an
+# object grants what is listed here; `bin/console app:database:verify-privileges`
+# (run by make up, BE-16 and the tests) fails on any difference.
+tables:
+  # Business data: the application reads and writes it.
+  users: [SELECT, INSERT, UPDATE, DELETE]
+  organizations: [SELECT, INSERT, UPDATE, DELETE]
+  memberships: [SELECT, INSERT, UPDATE, DELETE]
+  pipelines: [SELECT, INSERT, UPDATE, DELETE]
+  pipeline_stages: [SELECT, INSERT, UPDATE, DELETE]
+  # Append-only: never UPDATE, DELETE or TRUNCATE (the trigger also refuses).
+  audit_events: [SELECT, INSERT]
+  # PdoSessionHandler: SELECT ... FOR UPDATE needs UPDATE; garbage collection DELETE.
+  sessions: [SELECT, INSERT, UPDATE, DELETE]
+  # DoctrineDbalAdapter: upsert, expiry and prune.
+  cache_items: [SELECT, INSERT, UPDATE, DELETE]
+  # Readiness reads the migration status; only the owner changes it.
+  doctrine_migration_versions: [SELECT]
+  schema_baseline: []
+sequences: {}
+functions: {}

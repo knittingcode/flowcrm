@@ -1,7 +1,8 @@
 # Production-like override for tests/app/prodlike.sh, used only with a
 # separate "<project>-prod" Compose project: the edge serves the built SPA,
 # the api runs without dev dependencies, there is no Vite dev server and no
-# port is published (the tests run inside the project network).
+# port is published (the tests run inside the project network). The migrate
+# job runs as part of up, and the api starts only after it succeeded.
 services:
   edge:
     build:
@@ -13,7 +14,18 @@ services:
       target: prod
     environment:
       APP_ENV: prod
-      FLOWCRM_MIGRATE_ON_START: "1"
+      FLOWCRM_MIGRATE_ON_START: "0"
+    volumes: !reset []
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    profiles: !reset []
+    build:
+      target: prod
+    environment:
+      APP_ENV: prod
     volumes: !reset []
 
   db:

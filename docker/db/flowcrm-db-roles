@@ -1,0 +1,492 @@
+#!/bin/sh
+# FlowCRM database roles (ADR-018): the migration owner flowcrm_owner and
+# the runtime role flowcrm_app, next to the image's bootstrap superuser.
+# Runs inside the db container as the superuser over the local socket
+# (pg_hba trust), so it never needs the superuser password.
+#
+# Usage: flowcrm-db-roles <command>
+#   state          print legacy, complete or inconsistent (read-only)
+#   init           new database (initdb hook): create the roles and the
+#                  schema privileges, passwords from the secret files
+#   check          complete database: whether ensure would change anything
+#                  (exit 0: nothing, 20: it would); the corrections run in a
+#                  transaction that is always rolled back, nothing commits
+#   ensure         complete database: correct role attributes, memberships,
+#                  database, schema and default privileges (no passwords,
+#                  no ownership change); fails closed on any other state
+#   upgrade        legacy database (one account): create the roles and move
+#                  the objects of schema public to flowcrm_owner, in one
+#                  transaction; a no-op on a complete database
+#   set-password ROLE
+#                  set the password of flowcrm_owner or flowcrm_app (ROLE
+#                  owner or app) to the one read from standard input
+#   check-login ROLE
+#                  log in as flowcrm_ROLE over TCP (SCRAM, as every client
+#                  does) with the password read from standard input; a
+#                  wrong password must be refused first (read-only)
+#   backup-verify NAME (roles_upgrade_<digits and _>)
+#                  dump the database to /tmp/NAME.dump, restore it into a
+#                  scratch database and compare the schema, the contents of
+#                  every table, the migration history and the triggers;
+#                  drop the scratch database; prints the dump's SHA-256.
+#                  The dump is removed unless it was verified.
+#   cancel OP      stop operation OP of this script (bin/devenv after a
+#                  signal): end the script, terminate its database sessions
+#                  (their transactions roll back) and wait until both are gone
+#
+# Operation identity: bin/devenv passes FLOWCRM_OP_ID; every session of a
+# changing command is named flowcrm-db-roles:<id> (application_name) and
+# holds the advisory lock below inside its transaction (no lock is waited
+# for longer than 120 s: the transaction then fails). A changing command
+# first ends operations of earlier runs that are still alive (bin/devenv
+# holds the checkout lock, so they belong to an interrupted command): their
+# transactions roll back before anything else happens.
+#
+# Passwords are read from /run/secrets/db_owner_password and
+# /run/secrets/db_app_password (init, upgrade) or standard input
+# (set-password, check-login), always 48 lowercase hex characters, passed to
+# psql through its environment (\getenv, PGPASSWORD), never on a command
+# line, and the session neither logs statements nor echoes failing ones.
+#
+# Exit codes: 0 ok, 1 error, 10 legacy database, 11 inconsistent database,
+# 12 missing or malformed secret, 13 backup did not restore identically,
+# 14 an operation could not be stopped, 15 login refused, 20 ensure would
+# change role attributes or privileges.
+
+set -eu
+# Notices ("does not exist, skipping") are not errors.
+PGOPTIONS='-c client_min_messages=warning'
+export PGOPTIONS
+
+DB=${POSTGRES_DB:-flowcrm}
+ADMIN=${POSTGRES_USER:-flowcrm}
+OWNER=flowcrm_owner
+APP=flowcrm_app
+SECRETS=/run/secrets
+PREFIX=flowcrm-db-roles
+# Any constant: one changing operation at a time per database cluster.
+LOCK_KEY=1179796833
+STOP_WAIT=30
+
+err() { printf 'flowcrm-db-roles: %s\n' "$*" >&2; }
+
+OP=${FLOWCRM_OP_ID:-manual$$}
+case $OP in
+  '' | *[!a-z0-9]*) err "invalid operation id"; exit 1 ;;
+esac
+
+q() { # sql: one value
+  psql -X -q -t -A -v ON_ERROR_STOP=1 -U "$ADMIN" -d "$DB" -c "$1"
+}
+
+# run: execute SQL from stdin with the hardening below, in one transaction
+# that holds the advisory lock; it ends with COMMIT, or RUN_END.
+run() {
+  {
+    cat <<SQL
+\\set ON_ERROR_STOP on
+\\set VERBOSITY terse
+\\set SHOW_CONTEXT never
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = panic;
+SET lock_timeout = '120s';
+BEGIN;
+SELECT pg_advisory_xact_lock($LOCK_KEY) \\g /dev/null
+SQL
+    cat
+    printf '%s;\n' "${RUN_END:-COMMIT}"
+  } | psql -X -q -U "$ADMIN" -d "$DB"
+}
+
+valid_password() { # value
+  case $1 in *[!0-9a-f]* | '') return 1 ;; esac
+  [ ${#1} -eq 48 ]
+}
+
+password() { # owner|app -> exported as FLOWCRM_OWNER_PASSWORD or FLOWCRM_APP_PASSWORD
+  file=$SECRETS/db_${1}_password
+  if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    err "the secret db_${1}_password is not available in $SECRETS"
+    exit 12
+  fi
+  value=$(cat "$file")
+  valid_password "$value" || { err "the secret db_${1}_password is malformed (expected 48 lowercase hex characters)"; exit 12; }
+  export_password "$1" "$value"
+}
+
+password_from_stdin() { # owner|app
+  value=
+  IFS= read -r value || [ -n "$value" ] || { err "no password on standard input"; exit 12; }
+  valid_password "$value" || { err "the password on standard input is malformed (expected 48 lowercase hex characters)"; exit 12; }
+  export_password "$1" "$value"
+}
+
+export_password() { # owner|app value
+  case $1 in
+    owner) FLOWCRM_OWNER_PASSWORD=$2 && export FLOWCRM_OWNER_PASSWORD ;;
+    app) FLOWCRM_APP_PASSWORD=$2 && export FLOWCRM_APP_PASSWORD ;;
+  esac
+}
+
+role_arg() { # value: owner|app, or exit
+  case ${1-} in
+    owner | app) ;;
+    *) err "usage: flowcrm-db-roles ${cmd} owner|app"; exit 1 ;;
+  esac
+}
+
+# --- operation lifetime ------------------------------------------------------
+
+pidfile() { printf '/tmp/%s.%s.pid' "$PREFIX" "$1"; }
+
+# Ends earlier operations that are still alive: their scripts, then their
+# sessions (application_name flowcrm-db-roles:<other id>), and waits.
+# Leftovers of an interrupted backup (dumps, scratch databases) are removed.
+reap_others() {
+  for f in /tmp/"$PREFIX".*.pid; do
+    [ -e "$f" ] || continue
+    other=${f#/tmp/"$PREFIX".}
+    other=${other%.pid}
+    [ "$other" = "$OP" ] && continue
+    pid=$(cat "$f" 2>/dev/null || true)
+    case $pid in '' | *[!0-9]*) ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+  done
+  i=0
+  while :; do
+    left=$(PGAPPNAME=$PREFIX-janitor q "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+      WHERE application_name LIKE '$PREFIX:%' AND application_name <> '$PREFIX:$OP' AND pid <> pg_backend_pid()")
+    alive=0
+    for f in /tmp/"$PREFIX".*.pid; do
+      [ -e "$f" ] || continue
+      case $f in "$(pidfile "$OP")") continue ;; esac
+      pid=$(cat "$f" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then alive=1; else rm -f "$f"; fi
+    done
+    [ "$left" = 0 ] && [ "$alive" = 0 ] && break
+    i=$((i + 1))
+    [ "$i" -lt "$STOP_WAIT" ] || { err "an earlier operation is still running after ${STOP_WAIT}s; nothing was changed"; exit 14; }
+    sleep 1
+  done
+  # The dump of an interrupted backup is unverified: remove it.
+  for f in /tmp/roles_upgrade_*.dump /tmp/roles_upgrade_*.restore.log; do
+    [ -e "$f" ] && rm -f "$f"
+  done
+  for d in $(PGAPPNAME=$PREFIX-janitor q "SELECT datname FROM pg_database WHERE datname ~ '^roles_upgrade_[0-9_]+_restore_check\$'"); do
+    PGAPPNAME=$PREFIX-janitor psql -X -q -v ON_ERROR_STOP=1 -U "$ADMIN" -d postgres -c "DROP DATABASE IF EXISTS $d WITH (FORCE)"
+  done
+}
+
+# A changing command: name its sessions, record its process, end earlier
+# operations, and clean up after itself on exit or signal.
+begin_op() {
+  PGAPPNAME=$PREFIX:$OP
+  export PGAPPNAME
+  printf '%s\n' "$$" >"$(pidfile "$OP")"
+  trap 'on_end' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  reap_others
+}
+
+CLEANUP_DUMP=
+CLEANUP_DB=
+on_end() {
+  rc=$?
+  trap - EXIT TERM INT HUP
+  if [ -n "$CLEANUP_DB" ]; then
+    PGAPPNAME=$PREFIX-janitor psql -X -q -U "$ADMIN" -d postgres -c "DROP DATABASE IF EXISTS $CLEANUP_DB WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$CLEANUP_DUMP" ]; then rm -f "$CLEANUP_DUMP" "${CLEANUP_DUMP%.dump}.restore.log"; fi
+  rm -f "$(pidfile "$OP")"
+  exit "$rc"
+}
+
+# --- states ------------------------------------------------------------------
+
+# Objects of schema public that are not owned by flowcrm_owner (indexes,
+# TOAST tables and table row types follow their table).
+FOREIGN_OBJECTS="
+  SELECT count(*) FROM pg_class c
+   WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+     AND c.relowner <> '$OWNER'::regrole
+  UNION ALL
+  SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner <> '$OWNER'::regrole
+  UNION ALL
+  SELECT count(*) FROM pg_type t
+   WHERE t.typnamespace = 'public'::regnamespace AND t.typtype IN ('e', 'd', 'r', 'm')
+     AND t.typowner <> '$OWNER'::regrole"
+
+state() {
+  roles=$(q "SELECT count(*) FROM pg_roles WHERE rolname IN ('$OWNER', '$APP')")
+  if [ "$roles" = 0 ]; then
+    # Legacy: one account, nothing owned by anybody else.
+    others=$(q "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace AND c.relowner <> '$ADMIN'::regrole AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')")
+    [ "$others" = 0 ] && echo legacy || echo inconsistent
+    return
+  fi
+  if [ "$roles" != 2 ]; then
+    echo inconsistent
+    return
+  fi
+  schema=$(q "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'public'")
+  foreign=$(q "SELECT sum(count) FROM ($FOREIGN_OBJECTS) x")
+  if [ "$schema" = "$OWNER" ] && [ "$foreign" = 0 ]; then echo complete; else echo inconsistent; fi
+}
+
+# Role attributes, memberships, database, schema and default privileges:
+# everything that does not depend on a password or on object ownership.
+# The maintenance databases postgres and template1 keep their contents;
+# only PUBLIC's CONNECT and TEMPORARY are revoked, so the application roles
+# can log in to the application database only (the superuser is unaffected).
+PRIVILEGES_SQL="
+ALTER ROLE $OWNER WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT CONNECTION LIMIT 10;
+ALTER ROLE $APP WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT CONNECTION LIMIT 64;
+SELECT format('REVOKE %I FROM %I', r.rolname, m.rolname)
+  FROM pg_auth_members a JOIN pg_roles r ON r.oid = a.roleid JOIN pg_roles m ON m.oid = a.member
+ WHERE m.rolname IN ('$OWNER', '$APP') OR r.rolname IN ('$OWNER', '$APP') \\gexec
+REVOKE ALL ON DATABASE $DB FROM PUBLIC, $OWNER, $APP;
+GRANT CONNECT ON DATABASE $DB TO $OWNER, $APP;
+SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC, $OWNER, $APP', datname)
+  FROM pg_database WHERE datname IN ('postgres', 'template1') AND datname <> '$DB' \\gexec
+REVOKE ALL ON SCHEMA public FROM PUBLIC, $APP;
+GRANT USAGE ON SCHEMA public TO $APP;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER REVOKE ALL ON TABLES FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER REVOKE ALL ON SEQUENCES FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC, $APP;
+ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC, $APP;
+"
+
+# Everything PRIVILEGES_SQL sets, independent of the order of ACL entries.
+ROLES_FINGERPRINT="
+SELECT md5(concat_ws('|',
+  (SELECT string_agg(rolname || rolsuper::text || rolinherit::text || rolcreaterole::text || rolcreatedb::text || rolcanlogin::text
+                     || rolreplication::text || rolbypassrls::text || rolconnlimit::text, ',' ORDER BY rolname)
+     FROM pg_roles WHERE rolname IN ('$OWNER', '$APP')),
+  (SELECT string_agg(a.roleid::regrole::text || '>' || a.member::regrole::text, ',' ORDER BY 1)
+     FROM pg_auth_members a WHERE a.member::regrole::text IN ('$OWNER', '$APP') OR a.roleid::regrole::text IN ('$OWNER', '$APP')),
+  (SELECT string_agg(datname || ':' || coalesce((SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(datacl) x), 'default'), ',' ORDER BY datname)
+     FROM pg_database WHERE datname IN ('$DB', 'postgres', 'template1')),
+  (SELECT coalesce((SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(nspacl) x), 'default') FROM pg_namespace WHERE nspname = 'public'),
+  (SELECT string_agg(p.oid::regprocedure::text || ':' || coalesce((SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(p.proacl) x), 'default'), ',' ORDER BY 1)
+     FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace),
+  (SELECT string_agg(d.defaclnamespace::text || d.defaclobjtype::text || ':' || (SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(d.defaclacl) x), ',' ORDER BY 1)
+     FROM pg_default_acl d WHERE d.defaclrole = '$OWNER'::regrole)))"
+
+CREATE_ROLES_SQL="
+\\getenv owner_password FLOWCRM_OWNER_PASSWORD
+\\getenv app_password FLOWCRM_APP_PASSWORD
+SELECT 'CREATE ROLE $OWNER' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$OWNER') \\gexec
+SELECT 'CREATE ROLE $APP' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$APP') \\gexec
+ALTER ROLE $OWNER PASSWORD :'owner_password';
+ALTER ROLE $APP PASSWORD :'app_password';
+"
+
+require() { # expected state
+  now=$(state)
+  [ "$now" = "$1" ] && return 0
+  case $now in
+    legacy) err "this database still uses one account for everything; upgrade it explicitly (make db-upgrade-roles, docs/architecture/adr/ADR-018-database-roles.md)"; exit 10 ;;
+    *) err "the database roles are in an inconsistent state ($now); nothing was changed; see docs/architecture/adr/ADR-018-database-roles.md (Recovery)"; exit 11 ;;
+  esac
+}
+
+# --- backup verification -----------------------------------------------------
+
+# Schema of public as text (relations, columns, constraints, indexes,
+# triggers with their enabled state, functions), hashed.
+SCHEMA_FINGERPRINT="
+SELECT md5(string_agg(x, E'\\n' ORDER BY x)) FROM (
+  SELECT 'rel ' || c.relname || ' ' || c.relkind::text || ' ' || pg_get_userbyid(c.relowner) || ' ' || coalesce(c.relacl::text, '') AS x
+    FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace
+  UNION ALL
+  SELECT 'col ' || c.relname || '.' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod) || ' ' || a.attnotnull::text || ' '
+         || a.attgenerated::text || ' ' || coalesce(pg_get_expr(d.adbin, d.adrelid), '')
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+   WHERE c.relnamespace = 'public'::regnamespace AND a.attnum > 0 AND NOT a.attisdropped
+  UNION ALL
+  SELECT 'con ' || conrelid::regclass::text || ' ' || conname || ' ' || pg_get_constraintdef(oid)
+    FROM pg_constraint WHERE connamespace = 'public'::regnamespace
+  UNION ALL
+  SELECT 'idx ' || pg_get_indexdef(i.indexrelid)
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relnamespace = 'public'::regnamespace
+  UNION ALL
+  SELECT 'trg ' || pg_get_triggerdef(t.oid) || ' ' || t.tgenabled::text FROM pg_trigger t WHERE NOT t.tgisinternal
+  UNION ALL
+  SELECT 'fn ' || p.oid::regprocedure::text || ' ' || md5(pg_get_functiondef(p.oid)) || ' ' || coalesce(p.proacl::text, '')
+    FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.prokind IN ('f', 'p')
+) s"
+
+in_db() { # database sql: one value; fails on any error
+  psql -X -q -t -A -v ON_ERROR_STOP=1 -U "$ADMIN" -d "$1" -c "$2"
+}
+
+compare() { # what sql: the same value in the original and the restored database
+  a=$(in_db "$DB" "$2") || { err "could not compute $1 of the original"; return 1; }
+  b=$(in_db "$check" "$2") || { err "could not compute $1 of the restored copy"; return 1; }
+  [ "$a" = "$b" ] || { err "the restored copy differs in $1"; return 1; }
+}
+
+backup_verify() { # name
+  name=$1
+  dump=/tmp/$name.dump
+  check=${name}_restore_check
+  # Removed on any failure or signal; kept (for bin/devenv to copy) only
+  # when every comparison passed.
+  CLEANUP_DUMP=$dump
+  CLEANUP_DB=$check
+  [ ! -e "$dump" ] || { err "$dump already exists"; exit 1; }
+  (umask 077 && pg_dump -U "$ADMIN" -d "$DB" -Fc -f "$dump")
+  psql -X -q -v ON_ERROR_STOP=1 -U "$ADMIN" -d postgres -c "DROP DATABASE IF EXISTS $check WITH (FORCE)" -c "CREATE DATABASE $check"
+  if ! pg_restore -U "$ADMIN" -d "$check" --exit-on-error "$dump" 2>"/tmp/$name.restore.log"; then
+    err "the backup did not restore: $(tail -n 3 "/tmp/$name.restore.log")"
+    exit 13
+  fi
+  compare "the schema (tables, columns, constraints, indexes, triggers, functions)" "$SCHEMA_FINGERPRINT" || exit 13
+  tables=$(in_db "$DB" "SELECT quote_ident(relname) FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r', 'p') ORDER BY 1") ||
+    { err "could not list the tables"; exit 13; }
+  for t in $tables; do
+    compare "the contents of $t" "SELECT count(*) || ' ' || md5(coalesce(string_agg(r::text, E'\\n' ORDER BY r::text), '')) FROM public.$t r" || exit 13
+  done
+  compare "the migration history" "SELECT coalesce(string_agg(version, ',' ORDER BY version), '') FROM doctrine_migration_versions" || exit 13
+  compare "the audit triggers" "SELECT string_agg(tgname || ':' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'public.audit_events'::regclass AND NOT tgisinternal" || exit 13
+  sum=$(sha256sum "$dump" | cut -d' ' -f1)
+  rm -f "/tmp/$name.restore.log"
+  CLEANUP_DUMP=
+  printf '%s\n' "$sum"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd=${1-}
+case $cmd in
+  state)
+    PGAPPNAME=$PREFIX-ro:$OP
+    export PGAPPNAME
+    state
+    ;;
+  init)
+    begin_op
+    password owner
+    password app
+    roles=$(q "SELECT count(*) FROM pg_roles WHERE rolname IN ('$OWNER', '$APP')")
+    tables=$(q "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace")
+    if [ "$roles" != 0 ] || [ "$tables" != 0 ]; then
+      err "init expects a new, empty database"
+      exit 11
+    fi
+    printf '%s\nALTER SCHEMA public OWNER TO %s;\n%s' "$CREATE_ROLES_SQL" "$OWNER" "$PRIVILEGES_SQL" | run
+    require complete
+    echo "initialised the roles $OWNER and $APP"
+    ;;
+  check)
+    begin_op
+    require complete
+    RUN_END=ROLLBACK
+    result=$(printf 'SELECT (%s) AS before \\gset\n%s\nSELECT (%s) AS after \\gset\n\\pset tuples_only on\n\\pset format unaligned\nSELECT CASE WHEN :%s = :%s THEN %s ELSE %s END;\n' \
+      "$ROLES_FINGERPRINT" "$PRIVILEGES_SQL" "$ROLES_FINGERPRINT" "'before'" "'after'" "'same'" "'drift'" | run | tr -d '[:space:]')
+    RUN_END=
+    case $result in
+      same) echo "role attributes and privileges are as required" ;;
+      drift) echo "role attributes or privileges differ; ensure corrects them"; exit 20 ;;
+      *) err "could not compare the role attributes and privileges"; exit 1 ;;
+    esac
+    ;;
+  ensure)
+    begin_op
+    require complete
+    printf '%s' "$PRIVILEGES_SQL" | run
+    require complete
+    ;;
+  upgrade)
+    begin_op
+    now=$(state)
+    if [ "$now" = complete ]; then
+      printf '%s' "$PRIVILEGES_SQL" | run
+      echo "already upgraded; role attributes and privileges checked"
+      exit 0
+    fi
+    require legacy
+    password owner
+    password app
+    # Explicit per object type, limited to schema public; never REASSIGN OWNED.
+    printf '%s\nALTER SCHEMA public OWNER TO %s;\n%s\n%s' "$CREATE_ROLES_SQL" "$OWNER" "
+SELECT format(CASE c.relkind WHEN 'v' THEN 'ALTER VIEW %I.%I OWNER TO $OWNER'
+                             WHEN 'm' THEN 'ALTER MATERIALIZED VIEW %I.%I OWNER TO $OWNER'
+                             WHEN 'f' THEN 'ALTER FOREIGN TABLE %I.%I OWNER TO $OWNER'
+                             ELSE 'ALTER TABLE %I.%I OWNER TO $OWNER' END, n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND c.relowner <> '$OWNER'::regrole \\gexec
+SELECT format('ALTER SEQUENCE %I.%I OWNER TO $OWNER', n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind = 'S' AND c.relowner <> '$OWNER'::regrole
+   AND NOT EXISTS (SELECT FROM pg_depend d WHERE d.objid = c.oid AND d.deptype IN ('a', 'i')) \\gexec
+SELECT format('ALTER ROUTINE %s OWNER TO $OWNER', p.oid::regprocedure)
+  FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner <> '$OWNER'::regrole \\gexec
+SELECT format('ALTER TYPE %s OWNER TO $OWNER', t.oid::regtype)
+  FROM pg_type t WHERE t.typnamespace = 'public'::regnamespace AND t.typtype IN ('e', 'd', 'r', 'm') AND t.typowner <> '$OWNER'::regrole \\gexec
+SELECT CASE WHEN sum(count) <> 0 THEN 'SELECT (1/0)::text AS objects_not_moved' END FROM ($FOREIGN_OBJECTS) x \\gexec
+" "$PRIVILEGES_SQL" | run
+    require complete
+    echo "upgraded: schema public and its objects belong to $OWNER; runtime privileges come from the migrations"
+    ;;
+  set-password)
+    role_arg "${2-}"
+    begin_op
+    require complete
+    password_from_stdin "$2"
+    case $2 in owner) var=OWNER ;; *) var=APP ;; esac
+    printf '\\getenv new_password FLOWCRM_%s_PASSWORD\nALTER ROLE flowcrm_%s PASSWORD :'"'"'new_password'"'"';\n' "$var" "$2" | run
+    echo "set the password of flowcrm_$2"
+    ;;
+  check-login)
+    role_arg "${2-}"
+    password_from_stdin "$2"
+    case $2 in owner) var=$FLOWCRM_OWNER_PASSWORD ;; *) var=$FLOWCRM_APP_PASSWORD ;; esac
+    # The container's own network address: pg_hba requires SCRAM there
+    # (only the socket and loopback are trusted), as for every client.
+    host=$(hostname -i | cut -d' ' -f1)
+    if PGPASSWORD=wrong-password-for-the-negative-control PGAPPNAME=$PREFIX-ro:$OP psql -X -q -t -A -w -h "$host" -U "flowcrm_$2" -d "$DB" -c 'SELECT 1' >/dev/null 2>&1; then
+      err "a wrong password was accepted for flowcrm_$2; pg_hba does not require SCRAM on $host"
+      exit 15
+    fi
+    who=$(PGPASSWORD=$var PGAPPNAME=$PREFIX-ro:$OP psql -X -q -t -A -w -h "$host" -U "flowcrm_$2" -d "$DB" -c 'SELECT current_user' 2>/dev/null) || who=
+    [ "$who" = "flowcrm_$2" ] || { err "flowcrm_$2 cannot log in with this password"; exit 15; }
+    echo "flowcrm_$2 logs in with this password (SCRAM)"
+    ;;
+  backup-verify)
+    name=${2-}
+    case $name in
+      roles_upgrade_[0-9]*) ;;
+      *) err "usage: flowcrm-db-roles backup-verify roles_upgrade_<digits>"; exit 1 ;;
+    esac
+    case $name in *[!a-z0-9_]*) err "usage: flowcrm-db-roles backup-verify roles_upgrade_<digits>"; exit 1 ;; esac
+    begin_op
+    backup_verify "$name"
+    ;;
+  cancel)
+    target=${2-}
+    case $target in '' | *[!a-z0-9]*) err "usage: flowcrm-db-roles cancel OP"; exit 1 ;; esac
+    f=$(pidfile "$target")
+    pid=$(cat "$f" 2>/dev/null || true)
+    case $pid in '' | *[!0-9]*) pid= ;; *) kill -TERM "$pid" 2>/dev/null || true ;; esac
+    i=0
+    while :; do
+      left=$(PGAPPNAME=$PREFIX-janitor q "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = '$PREFIX:$target'")
+      if [ "$left" = 0 ] && { [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; }; then break; fi
+      i=$((i + 1))
+      [ "$i" -lt "$STOP_WAIT" ] || { err "operation $target is still running after ${STOP_WAIT}s"; exit 14; }
+      sleep 1
+    done
+    rm -f "$f"
+    echo "operation $target ended; its open transaction, if any, was rolled back"
+    ;;
+  *)
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 1
+    ;;
+esac

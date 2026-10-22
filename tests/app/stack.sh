@@ -148,6 +148,19 @@ psql_in() { # dir sql
   docker exec "$(cid "$1" db)" psql -U flowcrm -d flowcrm -tAq -c "$2" 2>&1
 }
 
+# As the schema owner, through the checkout's migrate job (ADR-018): the api
+# runs as flowcrm_app and may not change the schema or the migration history.
+owner_console_in() { # dir args...
+  local dir=$1
+  shift
+  (cd "$dir" && FLOWCRM_HTTP_PORT="$(saved_port "$dir")" COMPOSE_PROFILES=dev,migrate docker compose --project-name "$(project_of "$dir")" \
+    run --rm --no-deps -T migrate php bin/console --no-interaction "$@") >"$work/out/console.log" 2>&1
+}
+# psql as a given role over the db container's local socket.
+psql_as_in() { # dir role sql
+  docker exec "$(cid "$1" db)" psql -U "$2" -d flowcrm -tAq -c "$3" 2>&1
+}
+
 console_in() { # dir args...
   local dir=$1
   shift
@@ -319,14 +332,15 @@ perm() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 leak=0
-for f in db_password app_secret; do
+for f in db_password db_owner_password db_app_password app_secret; do
   s=$(cat "$sd/$f")
   for p in /health/live /health/ready /api/v1/system/status /api/v1/x; do
     get "$PA" "$p"
     grep -q -- "$s" "$BODY" "$HEADERS" && leak=1
   done
 done
-[ "$(perm "$sd")" = 700 ] && [ "$(perm "$sd/db_password")" = 444 ] && [ "$(perm "$sd/app_secret")" = 444 ] && [ "$leak" = 0 ] &&
+[ "$(perm "$sd")" = 700 ] && [ "$(perm "$sd/db_password")" = 444 ] && [ "$(perm "$sd/app_secret")" = 444 ] &&
+  [ "$(perm "$sd/db_owner_password")" = 444 ] && [ "$(perm "$sd/db_app_password")" = 444 ] && [ "$leak" = 0 ] &&
   git -C "$APP_REPO" check-ignore -q .runtime/secrets/db_password
 v "ST-13 generated secrets: private directory, ignored by Git, never in responses" $?
 
@@ -355,14 +369,14 @@ need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2
 
 # --- readiness failures -----------------------------------------------------
 
-console_in "$A" doctrine:migrations:migrate prev
+owner_console_in "$A" doctrine:migrations:migrate prev
 get "$PA" /health/ready
 r1="$CODE $(cat "$BODY")"
 get "$PA" /health/live
 dv a-url-pending "$A" url
 [ "$r1" = '503 {"status":"not-ready"}' ] && [ "$CODE" = 200 ] && [ "$(rc_of a-url-pending)" = 1 ]
 v "ST-17 a pending migration makes /health/ready 503 (live stays 200, make url fails)" $?
-console_in "$A" doctrine:migrations:migrate
+owner_console_in "$A" doctrine:migrations:migrate
 until_ready "$PA" 200 30; v "ST-18 applying the migration makes it ready again" $?
 
 # The session and cache migration only creates its tables (FND-008). With
@@ -372,23 +386,446 @@ until_ready "$PA" 200 30; v "ST-18 applying the migration makes it ready again" 
 # the renamed table keeps its rows.
 fnd008='DoctrineMigrations\Version20261022000000'
 state0=$(cat "$A/.runtime/dev.env")
-console_in "$A" doctrine:migrations:migrate "$fnd008"
-psql_in "$A" "CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id)); INSERT INTO cache_items VALUES ('st45:kept', 'v', NULL, 1)" >/dev/null
+owner_console_in "$A" doctrine:migrations:migrate "$fnd008"
+psql_as_in "$A" flowcrm_owner "CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id)); INSERT INTO cache_items VALUES ('st45:kept', 'v', NULL, 1)" >/dev/null
 dv a-up-existing "$A" up
 [ "$(rc_of a-up-existing)" = 2 ] && err_has a-up-existing 'applying the database migrations failed' &&
   err_has a-up-existing 'Not migrating: cache_items already exist' && [ "$(cat "$A/.runtime/dev.env")" = "$state0" ] &&
   [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE tablename = 'sessions'")" = 0 ] &&
   [ "$(psql_in "$A" "SELECT count(*) FROM cache_items WHERE item_id = 'st45:kept'")" = 1 ] &&
-  until_ready "$PA" 503 5
-v "ST-45 an existing cache_items table stops make up without changes; the saved state is kept" $? "$(tail -n 3 "$work/out/a-up-existing.err")"
-psql_in "$A" "ALTER TABLE cache_items RENAME TO cache_items_preexisting; ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey" >/dev/null
+  until_ready "$PA" 000 5 && dv a-status-existing "$A" status && grep -q '^blocked: *applying database migrations' "$work/out/a-status-existing.out"
+v "ST-45 an existing cache_items table stops make up without changes; the saved state is kept; the stack stays blocked (the migration phase is protected)" $? "$(tail -n 3 "$work/out/a-up-existing.err")"
+# The recovery of docs/architecture/sessions-and-cache.md: rename, then move
+# it out of schema public (make up accepts only known objects there).
+psql_in "$A" "ALTER TABLE cache_items RENAME TO cache_items_preexisting; ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey; CREATE SCHEMA preexisting; ALTER TABLE cache_items_preexisting SET SCHEMA preexisting" >/dev/null
 dv a-up-renamed "$A" up
 [ "$(rc_of a-up-renamed)" = 0 ] && err_has a-up-renamed 'applied pending database migrations' &&
-  [ "$(psql_in "$A" "SELECT count(*) FROM cache_items_preexisting WHERE item_id = 'st45:kept'")" = 1 ] &&
-  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE tablename IN ('sessions', 'cache_items')")" = 2 ] &&
-  until_ready "$PA" 200 10 && ! console_in "$A" doctrine:schema:validate &&
-  psql_in "$A" "DROP TABLE cache_items_preexisting" >/dev/null && console_in "$A" doctrine:schema:validate
+  [ "$(psql_in "$A" "SELECT count(*) FROM preexisting.cache_items_preexisting WHERE item_id = 'st45:kept'")" = 1 ] &&
+  [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('sessions', 'cache_items')")" = 2 ] &&
+  until_ready "$PA" 200 10 && ! owner_console_in "$A" doctrine:schema:validate &&
+  psql_in "$A" "DROP TABLE preexisting.cache_items_preexisting; DROP SCHEMA preexisting" >/dev/null && owner_console_in "$A" doctrine:schema:validate
 v "ST-46 after renaming the existing table by hand, make up migrates; the renamed table keeps its rows until dropped" $? "$(tail -n 3 "$work/out/a-up-renamed.err")"
+
+# --- database roles (ADR-018) ------------------------------------------------
+
+# The api runs as the runtime role with only its own secret; the schema
+# belongs to the owner; the superuser cannot be used from the api.
+secrets_in_api=$(docker exec "$(cid "$A" api)" ls /run/secrets | tr '\n' ' ')
+superuser=$(docker exec "$(cid "$A" api)" php -r 'try { new PDO("pgsql:host=db;dbname=flowcrm", "flowcrm", ""); echo "connected"; } catch (Throwable $e) { echo "refused"; }')
+[ "$secrets_in_api" = "app_secret db_app_password " ] && [ "$superuser" = refused ] &&
+  console_in "$A" app:database:verify-privileges --runtime &&
+  [ "$(psql_in "$A" "SELECT string_agg(DISTINCT pg_get_userbyid(relowner), ',') FROM pg_class WHERE relnamespace = 'public'::regnamespace")" = flowcrm_owner ] &&
+  [ "$(psql_in "$A" "SELECT rolsuper OR rolinherit FROM pg_roles WHERE rolname = 'flowcrm_app'")" = f ]
+v "ST-47 the api runs as flowcrm_app with only its own secret; the schema belongs to flowcrm_owner" $? "secrets: $secrets_in_api superuser: $superuser"
+
+# Privilege drift on a stack that is already serving fails closed (FND-009V
+# F-01): the gate stops the edge, so nothing is served; make status and make
+# url report the block; the database and the saved port are kept; make up
+# serves again once the drift is removed.
+get "$PA" /health/ready
+drift_before=$CODE
+psql_as_in "$A" flowcrm_owner "GRANT TRUNCATE ON users TO flowcrm_app" >/dev/null
+dv a-up-drift "$A" up
+get "$PA" /health/ready
+drift_code=$CODE
+dv a-status-drift "$A" status
+dv a-url-drift "$A" url
+drift_db=$(docker inspect -f '{{.State.Running}}' "$(cid "$A" db)" 2>/dev/null)
+psql_as_in "$A" flowcrm_owner "REVOKE TRUNCATE ON users FROM flowcrm_app" >/dev/null
+dv a-up-nodrift "$A" up
+[ "$drift_before" = 200 ] && [ "$(rc_of a-up-drift)" = 6 ] && err_has a-up-drift 'VIOLATION: table users' &&
+  err_has a-up-drift 'stopped the edge' && err_has a-up-drift 'the stack is not served' && [ "$drift_code" = 000 ] &&
+  [ "$(rc_of a-status-drift)" = 1 ] && grep -q '^blocked: ' "$work/out/a-status-drift.out" &&
+  [ "$(rc_of a-url-drift)" = 1 ] && err_has a-url-drift 'blocked by the security gate' &&
+  [ "$drift_db" = true ] && [ "$(saved_port "$A")" = "$PA" ] &&
+  [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10 && [ ! -e "$A/.runtime/security-gate" ]
+v "ST-48 privilege drift on a running stack: make up exits 6 and stops the edge (no request served, status and url blocked, db and port kept); after the fix make up serves again" $? "before=$drift_before during=$drift_code $(grep -m1 VIOLATION "$work/out/a-up-drift.err")"
+
+# A missing or malformed role secret of an existing volume fails closed and
+# is never regenerated by make up, not even when the caller's environment
+# sets the former switch (FND-009V F-02).
+mv "$sd/db_app_password" "$work/db_app_password.kept"
+dv a-up-nosecret "$A" up
+(export ALLOW_ROLE_SECRETS=1 && dv a-up-nosecret-env "$A" up)
+nosecret=$( [ ! -e "$sd/db_app_password" ] && echo absent)
+mv "$work/db_app_password.kept" "$sd/db_app_password"
+cp -p "$sd/db_owner_password" "$work/db_owner_password.kept"
+chmod 0644 "$sd/db_owner_password" && printf 'short' >"$sd/db_owner_password"
+dv a-up-badsecret "$A" up
+mv -f "$work/db_owner_password.kept" "$sd/db_owner_password"
+dv a-up-secrets-back "$A" up
+[ "$(rc_of a-up-nosecret)" = 6 ] && [ "$(rc_of a-up-nosecret-env)" = 6 ] && [ "$nosecret" = absent ] &&
+  err_has a-up-nosecret 'make db-upgrade-roles' && err_has a-up-nosecret-env 'so none was generated' &&
+  [ "$(rc_of a-up-badsecret)" = 6 ] && err_has a-up-badsecret 'db_owner_password is malformed' &&
+  [ "$(rc_of a-up-secrets-back)" = 0 ] && until_ready "$PA" 200 10
+v "ST-49 missing or malformed role secrets of an existing volume: refused (exit 6), never regenerated, also with ALLOW_ROLE_SECRETS=1 in the environment" $?
+
+# --- development rotation of the role passwords (ADR-018, FND-009V F-03) -----
+# Each phase boundary is interrupted with a real SIGTERM (FLOWCRM_DEVENV_FAULT)
+# and recovered with the documented commands; every check is a SCRAM login
+# over TCP inside the db container, never just the presence of a file.
+rot() { # label role [fault] [command]
+  (cd "$A" && ROLE=$2 FLOWCRM_DEVENV_FAULT=${3-} ./bin/devenv "${4:-rotate-db-password}") >"$work/out/$1.out" 2>"$work/out/$1.err"
+  echo $? >"$work/out/$1.rc"
+}
+login_ok() { # role password-file: SCRAM login as flowcrm_<role>
+  [ -s "$2" ] && docker exec -e PGPASSWORD="$(cat "$2")" "$(cid "$A" db)" \
+    sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>/dev/null | grep -qx 1
+}
+no_leftovers() { [ -z "$(find "$sd" -name '.*' -type f ! -name '.db_*_password.pending')" ]; }
+pend() { printf '%s/.db_%s_password.pending' "$sd" "$1"; }
+
+# Interrupted after the pending password was written: the database still
+# has the current one, the stack keeps serving; running the command again
+# finishes the rotation.
+cp -p "$sd/db_app_password" "$work/app.0"
+rot a-rot1 app rotate-after-pending
+r1_pending=$(perm "$(pend app)")
+r1_current=$(login_ok app "$sd/db_app_password" && echo ok)
+get "$PA" /health/ready
+r1_ready=$CODE
+rot a-rot1b app
+[ "$(rc_of a-rot1)" = 143 ] && [ "$r1_pending" = 600 ] && [ "$r1_current" = ok ] && [ "$r1_ready" = 200 ] &&
+  [ "$(rc_of a-rot1b)" = 0 ] && err_has a-rot1b 'resuming the unfinished rotation' && [ ! -e "$(pend app)" ] &&
+  ! cmp -s "$sd/db_app_password" "$work/app.0" && login_ok app "$sd/db_app_password" && ! login_ok app "$work/app.0" &&
+  [ "$(perm "$sd/db_app_password")" = 444 ] && no_leftovers && until_ready "$PA" 200 30
+v "ST-50 rotation interrupted after the pending password (SIGTERM): the current password keeps working; running it again finishes it (new password logs in, old refused)" $? "$(tail -n 2 "$work/out/a-rot1b.err")"
+
+# Interrupted after the database got the new password, before the file was
+# replaced: the abort gives the database the current password back.
+cp -p "$sd/db_app_password" "$work/app.1"
+rot a-rot2 app rotate-after-db
+r2_db=$(login_ok app "$(pend app)" && echo pending)
+r2_old=$(login_ok app "$sd/db_app_password" && echo current)
+rot a-rot2a app '' rotate-db-password-abort
+[ "$(rc_of a-rot2)" = 143 ] && [ "$r2_db" = pending ] && [ -z "$r2_old" ] &&
+  [ "$(rc_of a-rot2a)" = 0 ] && err_has a-rot2a 'aborted the rotation' && [ ! -e "$(pend app)" ] &&
+  cmp -s "$sd/db_app_password" "$work/app.1" && login_ok app "$sd/db_app_password" && no_leftovers && until_ready "$PA" 200 30
+v "ST-50 rotation interrupted after the database change (SIGTERM): the abort restores the current password (SCRAM login checked) and the stack serves" $? "$(tail -n 2 "$work/out/a-rot2a.err")"
+
+# Interrupted after the file was replaced, before the api was recreated: the
+# running api still mounts the replaced file; make up recreates it.
+rot a-rot3 app rotate-after-promote
+r3_seen=$(docker exec "$(cid "$A" api)" sh -c 'cat /run/secrets/db_app_password 2>/dev/null' || true)
+if [ -z "$r3_seen" ]; then r3_mount=missing; elif [ "$r3_seen" = "$(cat "$sd/db_app_password")" ]; then r3_mount=new; else r3_mount=old; fi
+dv a-up-rot3 "$A" up
+[ "$(rc_of a-rot3)" = 143 ] && [ ! -e "$(pend app)" ] && login_ok app "$sd/db_app_password" &&
+  [ "$(rc_of a-up-rot3)" = 0 ] && err_has a-up-rot3 'recreating api: its secret files changed' && until_ready "$PA" 200 30 &&
+  console_in "$A" app:database:verify-privileges --runtime
+v "ST-50 rotation interrupted after the file replacement (SIGTERM): make up recreates the api that still mounts the replaced file, and it logs in" $? "mount=$r3_mount $(tail -n 2 "$work/out/a-up-rot3.err")"
+say "      INFO  a running container saw a secret file replaced on the host as: $r3_mount ($(docker info --format '{{.OperatingSystem}}' 2>/dev/null))"
+
+# Owner rotation, interrupted after the database change and resumed; the
+# migrate job proves the login, the old owner password is refused.
+cp -p "$sd/db_owner_password" "$work/owner.0"
+rot a-rot4 owner rotate-after-db
+rot a-rot4b owner
+[ "$(rc_of a-rot4)" = 143 ] && [ "$(rc_of a-rot4b)" = 0 ] && [ ! -e "$(pend owner)" ] &&
+  login_ok owner "$sd/db_owner_password" && ! login_ok owner "$work/owner.0" &&
+  owner_console_in "$A" doctrine:migrations:up-to-date && no_leftovers
+v "ST-50 owner rotation interrupted after the database change and resumed: the migrate job logs in with the new password, the old one is refused" $? "$(tail -n 2 "$work/out/a-rot4b.err")"
+
+# Repeated rotations, and a failed recreation of the api (it does not get
+# healthy): the rotation reports it; after the cause is fixed, make up serves.
+cp -p "$sd/db_app_password" "$work/app.2"
+rot a-rot5 app
+cp -p "$sd/db_app_password" "$work/app.3"
+cp -p "$A/backend/public/index.php" "$work/index.php.kept"
+printf '<?php syntax error\n' >"$A/backend/public/index.php"
+(cd "$A" && ROLE=app FLOWCRM_WAIT_TIMEOUT=20 ./bin/devenv rotate-db-password) >"$work/out/a-rot6.out" 2>"$work/out/a-rot6.err"
+echo $? >"$work/out/a-rot6.rc"
+cp -p "$work/index.php.kept" "$A/backend/public/index.php"
+dv a-up-rot6 "$A" up
+[ "$(rc_of a-rot5)" = 0 ] && ! cmp -s "$work/app.2" "$work/app.3" && [ "$(rc_of a-rot6)" = 2 ] &&
+  err_has a-rot6 'recreating api with the current secret files failed' && ! cmp -s "$work/app.3" "$sd/db_app_password" &&
+  login_ok app "$sd/db_app_password" && [ "$(rc_of a-up-rot6)" = 0 ] && until_ready "$PA" 200 30 &&
+  console_in "$A" app:database:verify-privileges --runtime && no_leftovers
+v "ST-50 repeated rotations; a failed api recreation is reported (exit 2) and make up serves once the cause is fixed" $? "$(tail -n 2 "$work/out/a-rot6.err")"
+
+# Interrupted while the password change waits inside PostgreSQL (another
+# session holds the operations' advisory lock): the interrupted transaction
+# is ended before the command exits, and nothing commits later.
+docker exec -d -e PGAPPNAME=st-holder "$(cid "$A" db)" psql -U flowcrm -d flowcrm -c 'SELECT pg_advisory_lock(1179796833)' -c 'SELECT pg_sleep(120)'
+cp -p "$sd/db_app_password" "$work/app.4"
+(cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/a-rot7.out" 2>"$work/out/a-rot7.err" &
+rot7=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event = 'advisory'")" = 1 ] || [ "$i" -ge 120 ]; do sleep 0.5; i=$((i + 1)); done
+r7_waiting=$i
+kill -TERM "$rot7"
+wait "$rot7"
+r7_rc=$?
+r7_left=$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+psql_in "$A" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null
+sleep 3
+r7_current=$(login_ok app "$sd/db_app_password" && echo ok)
+rot a-rot7a app '' rotate-db-password-abort
+[ "$r7_waiting" -lt 120 ] && [ "$r7_rc" = 143 ] && grep -q 'the interrupted database operation ended' "$work/out/a-rot7.err" &&
+  [ "$r7_left" = 0 ] && [ "$r7_current" = ok ] && cmp -s "$sd/db_app_password" "$work/app.4" &&
+  [ "$(rc_of a-rot7a)" = 0 ] && login_ok app "$sd/db_app_password" && no_leftovers && until_ready "$PA" 200 30
+v "ST-50 rotation interrupted while its transaction waits on a PostgreSQL lock: the session is ended before exit, no delayed commit, the abort restores a clean state" $? "rc=$r7_rc left=$r7_left current=$r7_current $(tail -n 2 "$work/out/a-rot7.err")"
+
+# --- unconfirmed cancellation (FND-009G) --------------------------------------
+# The cancellation of an interrupted operation cannot always be confirmed
+# (here: the db container is paused, so nothing can be executed in it). The
+# stack must then stay blocked, and the next command must end the old
+# operation, or find it finished, before it changes anything.
+holder_up() { docker exec -d -e PGAPPNAME=st-holder "$(cid "$A" db)" psql -U flowcrm -d flowcrm -c 'SELECT pg_advisory_lock(1179796833)' -c 'SELECT pg_sleep(300)'; }
+holder_down() { psql_in "$A" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null; }
+waiting_op() { # seconds: until a role operation waits for the advisory lock
+  local i=0
+  until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event = 'advisory'")" = 1 ] || [ "$i" -ge $(($1 * 2)) ]; do sleep 0.5; i=$((i + 1)); done
+  [ "$i" -lt $(($1 * 2)) ]
+}
+db_healthy() { local i=0; until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cid "$A" db)" 2>/dev/null)" = healthy ] || [ "$i" -ge 120 ]; do sleep 1; i=$((i + 1)); done; }
+paused_interrupt() { # label: rotation blocked on the advisory lock, db paused, SIGTERM
+  holder_up
+  (cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  local p=$!
+  waiting_op 60
+  OLD_OP=$(psql_in "$A" "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+  docker pause "$(cid "$A" db)" >/dev/null
+  kill -TERM "$p"
+  wait "$p"
+  echo $? >"$work/out/$1.rc"
+  get "$PA" /health/live
+  PAUSED_EDGE=$CODE
+  dv "$1-status" "$A" status
+  dv "$1-url" "$A" url
+  docker unpause "$(cid "$A" db)" >/dev/null
+  db_healthy
+}
+
+# The new make up ends the old operation; it never commits.
+cp -p "$sd/db_app_password" "$work/app.5"
+paused_interrupt a-unconf
+u_old=$OLD_OP
+(cd "$A" && exec ./bin/devenv up) >"$work/out/a-unconf-up.out" 2>"$work/out/a-unconf-up.err" &
+upp=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $u_old")" = 0 ] || [ "$i" -ge 120 ]; do sleep 0.5; i=$((i + 1)); done
+u_ended=$i
+holder_down
+wait "$upp"
+u_up=$?
+[ "$(rc_of a-unconf)" = 143 ] && err_has a-unconf 'could not confirm that the interrupted database operation ended' &&
+  err_has a-unconf 'stopped the edge' && [ "$PAUSED_EDGE" = 000 ] && [ "$(rc_of a-unconf-status)" = 1 ] &&
+  grep -q '^blocked: .*could not be confirmed' "$work/out/a-unconf-status.out" && [ "$(rc_of a-unconf-url)" = 1 ] &&
+  [ "$u_ended" -lt 120 ] && [ "$u_up" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
+  cmp -s "$sd/db_app_password" "$work/app.5" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+v "ST-59 unconfirmed cancellation (db paused): the stack is blocked (edge stopped, status and url refuse); the next make up ends the old operation before changing anything, and it never commits" $? "rc=$(rc_of a-unconf) edge=$PAUSED_EDGE ended=$u_ended up=$u_up $(tail -n 1 "$work/out/a-unconf-up.err")"
+rot a-unconf-abort app '' rotate-db-password-abort
+
+# The old operation commits before any newer command runs: the next make up
+# finds the database and the files disagree and stays blocked; finishing the
+# rotation restores a consistent state.
+paused_interrupt a-unconf2
+holder_down
+sleep 3
+c_pending=$(login_ok app "$(pend app)" && echo committed)
+dv a-unconf2-up "$A" up
+get "$PA" /health/ready
+c_code=$CODE
+rot a-unconf2-finish app
+dv a-unconf2-up2 "$A" up
+[ "$(rc_of a-unconf2)" = 143 ] && [ "$c_pending" = committed ] && [ "$(rc_of a-unconf2-up)" = 6 ] && [ "$c_code" = 000 ] &&
+  [ "$(rc_of a-unconf2-finish)" = 0 ] && [ "$(rc_of a-unconf2-up2)" = 0 ] && login_ok app "$sd/db_app_password" &&
+  until_ready "$PA" 200 30 && no_leftovers
+v "ST-59 unconfirmed cancellation whose operation later commits: make up stays blocked (exit 6, edge stopped); finishing the rotation and make up restore a consistent, served stack" $? "pending=$c_pending up=$(rc_of a-unconf2-up) code=$c_code"
+
+# Cancellation times out although the database is reachable: the old
+# operation's psql client is stopped (SIGSTOP), so its script cannot end.
+# The command reports it, the stack is blocked, and a new rotation refuses
+# to change anything until the old operation ended.
+holder_up
+(cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/a-ctimeout.out" 2>"$work/out/a-ctimeout.err" &
+ctp=$!
+waiting_op 60
+cpid=$(docker exec "$(cid "$A" db)" sh -c 'for p in /proc/[0-9]*; do tr "\0" "\n" <"$p/environ" 2>/dev/null | grep -q "^PGAPPNAME=flowcrm-db-roles:" && tr "\0" " " <"$p/cmdline" | grep -q "^psql " && echo "${p#/proc/}"; done' | head -n 1)
+docker exec "$(cid "$A" db)" kill -STOP "$cpid"
+kill -TERM "$ctp"
+wait "$ctp"
+ct_rc=$?
+rot a-ctimeout-next app
+docker exec "$(cid "$A" db)" kill -CONT "$cpid"
+holder_down
+sleep 3
+ct_db=$(login_ok app "$sd/db_app_password" && echo current)
+rot a-ctimeout-abort app '' rotate-db-password-abort
+dv a-ctimeout-up "$A" up
+[ -n "$cpid" ] && [ "$ct_rc" = 143 ] && grep -q 'could not confirm .*(exit 14)' "$work/out/a-ctimeout.err" &&
+  [ "$(rc_of a-ctimeout-next)" = 6 ] && err_has a-ctimeout-next 'an earlier operation is still running' && [ "$ct_db" = current ] &&
+  [ "$(rc_of a-ctimeout-abort)" = 0 ] && [ "$(rc_of a-ctimeout-up)" = 0 ] && until_ready "$PA" 200 30 && no_leftovers
+v "ST-60 cancellation timeout with the database reachable: reported (exit 14), stack blocked; a new rotation refuses (earlier operation still running, nothing changed); recovery after the old one ended" $? "client=$cpid rc=$ct_rc next=$(rc_of a-ctimeout-next) $(tail -n 1 "$work/out/a-ctimeout-next.err")"
+
+# A session outside the role script holds the operations' advisory lock: the
+# role check does not wait forever; make up fails closed (edge stopped) and
+# serves again once the session ended.
+holder_up
+sleep 1
+dv a-holder-up "$A" up
+get "$PA" /health/ready
+h_code=$CODE
+holder_down
+dv a-holder-up2 "$A" up
+[ "$(rc_of a-holder-up)" != 0 ] && err_has a-holder-up 'lock timeout' && [ "$h_code" = 000 ] &&
+  [ "$(rc_of a-holder-up2)" = 0 ] && until_ready "$PA" 200 30
+v "ST-61 a foreign holder of the advisory lock: make up does not wait forever (lock timeout), stays blocked, and serves after the holder ended" $? "rc=$(rc_of a-holder-up) code=$h_code"
+
+# --- SIGKILL of bin/devenv during privileged changes (FND-009G2) ---------------
+# A killed command runs no handler, so the stack must already be protected
+# when the change starts: the edge is stopped and the security gate is
+# recorded before any role, password, ownership or grant changes.
+blocked_now() { # label: make status and make url report the gate
+  dv "$1-status" "$A" status
+  dv "$1-url" "$A" url
+  [ "$(rc_of "$1-status")" = 1 ] && grep -q '^blocked: ' "$work/out/$1-status.out" && [ "$(rc_of "$1-url")" = 1 ] &&
+    err_has "$1-url" 'blocked by the security gate'
+}
+killed_rotation() { # label: rotation blocked on the advisory lock, then SIGKILL -> sets K_EDGE (while blocked), K_OLD (pid)
+  holder_up
+  (cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  local p=$!
+  waiting_op 60
+  K_OLD=$(psql_in "$A" "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+  get "$PA" /health/ready
+  K_EDGE=$CODE
+  kill -KILL "$p"
+  wait "$p"
+  echo $? >"$work/out/$1.rc"
+}
+
+# Killed while ALTER ROLE ... PASSWORD waits: the edge was already stopped.
+# The killed command's docker compose exec outlives it, so the checkout
+# lock stays held and the newer command (the abort) waits instead of
+# overlapping; the old operation ends by its lock timeout (rolled back,
+# never committed); then the abort runs and the edge serves again.
+get "$PA" /health/ready
+k_before=$CODE
+cp -p "$sd/db_app_password" "$work/app.6"
+killed_rotation a-kill1
+k1_edge=$K_EDGE
+k1_blocked=$(blocked_now a-kill1 && echo yes)
+k1_alive=$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $K_OLD")
+(cd "$A" && ROLE=app FLOWCRM_LOCK_WAIT=300 exec ./bin/devenv rotate-db-password-abort) >"$work/out/a-kill1-abort.out" 2>"$work/out/a-kill1-abort.err" &
+abp=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $K_OLD")" = 0 ] || [ "$i" -ge 400 ]; do sleep 0.5; i=$((i + 1)); done
+k1_waited=$(grep -c 'waiting for another devenv command' "$work/out/a-kill1-abort.err")
+holder_down
+wait "$abp"
+k1_abort=$?
+[ "$k_before" = 200 ] && [ "$k1_edge" = 000 ] && [ "$(rc_of a-kill1)" = 137 ] && [ "$k1_blocked" = yes ] && [ "$k1_alive" = 1 ] &&
+  [ "$i" -lt 400 ] && [ "$k1_waited" = 1 ] && [ "$k1_abort" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
+  cmp -s "$sd/db_app_password" "$work/app.6" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+v "ST-62 SIGKILL while ALTER ROLE PASSWORD waits: the edge was already stopped (200 -> 000), status and url blocked; the abort waits for the old operation (no overlap), which rolls back and never commits; the abort then serves again" $? "before=$k_before during=$k1_edge rc=$(rc_of a-kill1) blocked=$k1_blocked alive=$k1_alive waited=$k1_waited/$i abort=$k1_abort"
+
+# Killed, and the old operation commits before a newer command runs: the
+# stack stays blocked; finishing the rotation serves again.
+killed_rotation a-kill2
+holder_down
+sleep 3
+k2_committed=$(login_ok app "$(pend app)" && echo committed)
+get "$PA" /health/ready
+k2_code=$CODE
+k2_blocked=$(blocked_now a-kill2b && echo yes)
+rot a-kill2-finish app
+[ "$K_EDGE" = 000 ] && [ "$(rc_of a-kill2)" = 137 ] && [ "$k2_committed" = committed ] && [ "$k2_code" = 000 ] && [ "$k2_blocked" = yes ] &&
+  [ "$(rc_of a-kill2-finish)" = 0 ] && login_ok app "$sd/db_app_password" && until_ready "$PA" 200 30 && no_leftovers &&
+  [ ! -e "$A/.runtime/security-gate" ]
+v "ST-63 SIGKILL during a rotation whose password change commits later: no edge and blocked throughout; finishing the rotation serves again" $? "committed=$k2_committed code=$k2_code blocked=$k2_blocked"
+
+# Killed after the change committed, before it was verified: a rotation
+# (after the database change) and make up (after the migrations).
+rot a-kill3 app rotate-after-db:kill
+get "$PA" /health/ready
+k3_code=$CODE
+k3_blocked=$(blocked_now a-kill3 && echo yes)
+rot a-kill3-finish app
+cat >"$A/backend/migrations/Version20991231000002.php" <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace DoctrineMigrations;
+
+use Doctrine\DBAL\Schema\Schema;
+use Doctrine\Migrations\AbstractMigration;
+
+final class Version20991231000002 extends AbstractMigration
+{
+    public function up(Schema $schema): void
+    {
+        $this->addSql("COMMENT ON TABLE users IS 'stack test'");
+    }
+
+    public function down(Schema $schema): void
+    {
+        $this->addSql('COMMENT ON TABLE users IS NULL');
+    }
+}
+PHP
+(cd "$A" && FLOWCRM_DEVENV_FAULT=up-after-migrations:kill ./bin/devenv up) >"$work/out/a-kill4.out" 2>"$work/out/a-kill4.err"
+echo $? >"$work/out/a-kill4.rc"
+get "$PA" /health/ready
+k4_code=$CODE
+k4_blocked=$(blocked_now a-kill4 && echo yes)
+k4_migrated=$(psql_in "$A" "SELECT count(*) FROM doctrine_migration_versions WHERE version LIKE '%20991231000002'")
+dv a-kill4-up "$A" up
+[ "$(rc_of a-kill3)" = 137 ] && [ "$k3_code" = 000 ] && [ "$k3_blocked" = yes ] && [ "$(rc_of a-kill3-finish)" = 0 ] &&
+  [ "$(rc_of a-kill4)" = 137 ] && err_has a-kill4 'stopped the edge before changing the database' && [ "$k4_code" = 000 ] &&
+  [ "$k4_blocked" = yes ] && [ "$k4_migrated" = 1 ] && [ "$(rc_of a-kill4-up)" = 0 ] && until_ready "$PA" 200 30 &&
+  [ ! -e "$A/.runtime/security-gate" ]
+v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $? "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated"
+
+# Recovery while PostgreSQL is temporarily unreachable: make up fails and
+# the stack stays blocked; once the database is back, make up ends the old
+# operation (it never commits) and serves after every check.
+killed_rotation a-kill5
+docker pause "$(cid "$A" db)" >/dev/null
+(cd "$A" && FLOWCRM_WAIT_TIMEOUT=10 ./bin/devenv up) >"$work/out/a-kill5-up.out" 2>"$work/out/a-kill5-up.err"
+echo $? >"$work/out/a-kill5-up.rc"
+get "$PA" /health/ready
+k5_code=$CODE
+k5_blocked=$(blocked_now a-kill5 && echo yes)
+docker unpause "$(cid "$A" db)" >/dev/null
+db_healthy
+(cd "$A" && FLOWCRM_LOCK_WAIT=300 exec ./bin/devenv up) >"$work/out/a-kill5-up2.out" 2>"$work/out/a-kill5-up2.err" &
+upp=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $K_OLD")" = 0 ] || [ "$i" -ge 400 ]; do sleep 0.5; i=$((i + 1)); done
+holder_down
+wait "$upp"
+k5_up=$?
+k5_pending=$(login_ok app "$(pend app)" && echo committed)
+rot a-kill5-abort app '' rotate-db-password-abort
+[ "$(rc_of a-kill5)" = 137 ] && [ "$(rc_of a-kill5-up)" != 0 ] && [ "$k5_code" = 000 ] && [ "$k5_blocked" = yes ] &&
+  [ "$i" -lt 400 ] && [ "$k5_up" = 0 ] && [ -z "$k5_pending" ] && [ "$(rc_of a-kill5-abort)" = 0 ] &&
+  until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ] && no_leftovers
+v "ST-65 after SIGKILL, recovery while PostgreSQL is paused fails and stays blocked; once reachable, make up ends the old operation (no commit) and serves" $? "up=$(rc_of a-kill5-up) code=$k5_code blocked=$k5_blocked up2=$k5_up pending=$k5_pending"
+
+dv a-up-rotated "$A" up
+[ "$(rc_of a-up-rotated)" = 0 ] && err_has a-up-rotated 'already running' && until_ready "$PA" 200 10
+v "ST-51 make up after the rotations publishes the stack as before and changes nothing" $? "$(tail -n 2 "$work/out/a-up-rotated.err")"
+
+# A database credential the api cannot read makes it not ready (503 through
+# the edge, with a request ID), not a 500 (FND-009V F-08).
+printf 'services:\n  api:\n    environment:\n      DATABASE_PASSWORD_FILE: /run/secrets/does-not-exist\n' >"$work/f08.yaml"
+(cd "$A" && FLOWCRM_HTTP_PORT=$PA COMPOSE_PROFILES=dev,migrate docker compose --project-name "$(project_of "$A")" -f compose.yaml -f "$work/f08.yaml" \
+  up --detach --no-deps --wait api) >/dev/null 2>&1
+get "$PA" /health/ready
+f08="$CODE $(cat "$BODY")"
+f08_id=$(grep -ci '^x-request-id:' "$HEADERS")
+get "$PA" /health/live
+f08_live=$CODE
+# Back to the stack's own Compose file (bin/devenv refuses containers that
+# another file created), then make up.
+(cd "$A" && FLOWCRM_HTTP_PORT=$PA COMPOSE_PROFILES=dev,migrate docker compose --project-name "$(project_of "$A")" -f compose.yaml \
+  up --detach --no-deps --wait api) >/dev/null 2>&1
+dv a-up-f08 "$A" up
+[ "$f08" = '503 {"status":"not-ready"}' ] && [ "$f08_id" = 1 ] && [ "$f08_live" = 200 ] &&
+  [ "$(rc_of a-up-f08)" = 0 ] && until_ready "$PA" 200 30
+v "ST-58 an unreadable database credential: /health/ready answers 503 not-ready with a request ID through the edge (live 200); make up restores it" $? "ready: $f08 live: $f08_live"
 
 docker stop "$(cid "$A" db)" >/dev/null
 until_ready "$PA" 503 60
@@ -404,7 +841,9 @@ v "ST-20 make up restarts the database and the stack is ready again" $?
 
 # --- persistence ------------------------------------------------------------
 
-psql_in "$A" "CREATE TABLE st_marker (v text); INSERT INTO st_marker VALUES ('kept')" >/dev/null
+# The marker lives outside schema public, which only the migrations and the
+# privilege manifest govern (ADR-018).
+psql_in "$A" "CREATE SCHEMA st; CREATE TABLE st.marker (v text); INSERT INTO st.marker VALUES ('kept')" >/dev/null
 base1=$(psql_in "$A" "SELECT created_at FROM schema_baseline")
 mig1=$(psql_in "$A" "SELECT count(*) FROM doctrine_migration_versions")
 vol=$(project_of "$A")_db-data
@@ -413,13 +852,13 @@ dv a-down "$A" down
   docker volume inspect "$vol" >/dev/null 2>&1 && [ "$(saved_port "$A")" = "$PA" ]
 v "ST-21 make down removes the containers, keeps the volume and the saved port" $?
 dv a-up4 "$A" up
-[ "$(rc_of a-up4)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ] &&
+[ "$(rc_of a-up4)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ] &&
   [ "$(psql_in "$A" "SELECT created_at FROM schema_baseline")" = "$base1" ] &&
   [ "$(psql_in "$A" "SELECT count(*) FROM doctrine_migration_versions")" = "$mig1" ] && [ "$(mapped_port "$A")" = "$PA" ]
 v "ST-22 data survives down/up; the database is not re-initialised; same port" $?
 
 dv a-restart "$A" restart
-[ "$(rc_of a-restart)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ] && until_ready "$PA" 200 10
+[ "$(rc_of a-restart)" = 0 ] && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ] && until_ready "$PA" 200 10
 v "ST-23 make restart keeps the data and the port" $?
 
 # --- port conflict and a second checkout ------------------------------------
@@ -435,7 +874,7 @@ v "ST-24 ports in use (checkout A, an unrelated listener) are skipped: B starts 
 kill -0 "$HOLDER" 2>/dev/null; v "ST-25 the unrelated listener is untouched" $?
 
 [ "$(project_of "$A")" != "$(project_of "$B")" ] && docker volume inspect "$(project_of "$B")_db-data" >/dev/null 2>&1 &&
-  [ "$(psql_in "$B" "SELECT to_regclass('st_marker') IS NULL")" = t ] && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ] &&
+  [ "$(psql_in "$B" "SELECT to_regclass('st.marker') IS NULL")" = t ] && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ] &&
   until_ready "$PA" 200 5 && until_ready "$PB" 200 5
 v "ST-26 checkouts are isolated: own projects, volumes, databases and ports" $?
 ev "A=$(project_of "$A"):$PA B=$(project_of "$B"):$PB"
@@ -483,6 +922,7 @@ final class Version20991231000000 extends AbstractMigration
     public function up(Schema $schema): void
     {
         $this->addSql('CREATE TABLE st_added_migration (id INT NOT NULL, PRIMARY KEY (id))');
+        $this->addSql('GRANT SELECT ON st_added_migration TO flowcrm_app');
     }
 
     public function down(Schema $schema): void
@@ -491,10 +931,19 @@ final class Version20991231000000 extends AbstractMigration
     }
 }
 PHP
+# A new table is classified in the privilege manifest with what its migration grants.
+python3 - "$A/backend/config/database/runtime-privileges.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+open(p, 'w').write(s.replace('tables:\n', 'tables:\n  st_added_migration: [SELECT]\n', 1))
+PY
 dv a-migrate "$A" up
 [ "$(rc_of a-migrate)" = 0 ] && err_has a-migrate 'applied pending database migrations' && [ "$(cid "$A" api)" = "$api0" ] &&
-  [ "$(psql_in "$A" "SELECT to_regclass('st_added_migration') IS NOT NULL")" = t ] && until_ready "$PA" 200 5
-v "ST-31 a migration added while running is applied by make up, without recreating the api" $?
+  [ "$(psql_in "$A" "SELECT to_regclass('st_added_migration') IS NOT NULL")" = t ] &&
+  [ "$(psql_in "$A" "SELECT has_table_privilege('flowcrm_app', 'st_added_migration', 'SELECT') AND NOT has_table_privilege('flowcrm_app', 'st_added_migration', 'INSERT')")" = t ] &&
+  until_ready "$PA" 200 5
+v "ST-31 a migration added while running is applied by make up (as the owner, with its grant), without recreating the api" $?
 dv a-noop "$A" up
 [ "$(rc_of a-noop)" = 0 ] && err_has a-noop 'already running; nothing to change'
 v "ST-32 the next make up changes nothing" $?
@@ -513,6 +962,191 @@ if sudo -n -u nobody true 2>/dev/null; then
 else
   say "      INFO ST-34 cross-user read check needs passwordless sudo (runs in CI)"
 fi
+
+# --- a volume from before role separation: explicit upgrade (ADR-018) --------
+# Checkout C gets a volume exactly as the stack created it before FND-009:
+# the upstream PostgreSQL image, one superuser account, the migrations up to
+# FND-008 run as that superuser, data in the core tables, the audit log,
+# sessions and cache. make up must refuse it; make db-upgrade-roles must
+# convert it after a verified backup, keeping every row.
+new_checkout c
+C=$CO
+pc=$(project_of "$C")
+cs=$C/.runtime/secrets
+(umask 077 && mkdir -p "$cs")
+for f in db_password app_secret; do random_secret >"$cs/$f" && chmod 0444 "$cs/$f"; done
+legacy_label="devenv.test=stack-$(sha6 "$work")"
+legacy_image=$(sed -n 's/^ARG POSTGRES_IMAGE=//p' "$APP_REPO/docker/db/Dockerfile")
+docker network create --label "$legacy_label" "$pc-legacy" >/dev/null
+docker volume create --label "com.docker.compose.project=$pc" --label com.docker.compose.volume=db-data "${pc}_db-data" >/dev/null
+docker run -d --name "$pc-legacy-db" --label "$legacy_label" --network "$pc-legacy" --network-alias db --user postgres \
+  -e POSTGRES_DB=flowcrm -e POSTGRES_USER=flowcrm -e POSTGRES_PASSWORD_FILE=/run/secrets/db_password \
+  -v "$cs/db_password:/run/secrets/db_password:ro" -v "${pc}_db-data:/var/lib/postgresql" "$legacy_image" >/dev/null
+i=0
+until docker logs "$pc-legacy-db" 2>&1 | grep -q 'init process complete' && docker exec "$pc-legacy-db" pg_isready -q -h 127.0.0.1 -U flowcrm -d flowcrm || [ "$i" -ge 90 ]; do sleep 1; i=$((i + 1)); done
+docker run --rm --network "$pc-legacy" --read-only --tmpfs /tmp --tmpfs /app/var:uid=82,gid=82 \
+  -e APP_ENV=dev -e DATABASE_USER=flowcrm -e DATABASE_PASSWORD_FILE=/run/secrets/db_password \
+  -v "$cs/db_password:/run/secrets/db_password:ro" -v "$cs/app_secret:/run/secrets/app_secret:ro" \
+  -v "$C/backend/src:/app/src:ro" -v "$C/backend/config:/app/config:ro" -v "$C/backend/migrations:/app/migrations:ro" \
+  "$(project_of "$A")-api" php bin/console doctrine:migrations:migrate --no-interaction 'DoctrineMigrations\Version20261022100000' >"$work/out/c-legacy-migrate.log" 2>&1
+legacy_rc=$?
+legacy_sql() { docker exec "$pc-legacy-db" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
+legacy_sql "INSERT INTO users (id, email, password_hash, display_name, created_at) VALUES ('0192f0c4-7d1e-7b8a-9f3c-00000000c001', 'legacy@example.com', 'h', 'Legacy', now());
+  INSERT INTO organizations (id, name, currency, timezone, created_at) VALUES ('0192f0c4-7d1e-7b8a-9f3c-00000000c002', 'Legacy Org', 'EUR', 'Europe/Warsaw', now());
+  INSERT INTO audit_events (id, organization_id, occurred_at, actor_type, action, entity_type, changes) VALUES ('0192f0c4-7d1e-7b8a-9f3c-00000000c003', '0192f0c4-7d1e-7b8a-9f3c-00000000c002', now(), 'system', 'organization.created', 'organization', '{}');
+  INSERT INTO sessions VALUES ('legacysession', 'data', 2000000000, 1);
+  INSERT INTO cache_items VALUES ('ns:legacy', 'v', NULL, 1)" >/dev/null
+rows_sql="SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT u::text t FROM users u UNION ALL SELECT o::text FROM organizations o UNION ALL SELECT a::text FROM audit_events a UNION ALL SELECT s::text FROM sessions s UNION ALL SELECT c::text FROM cache_items c UNION ALL SELECT v.version::text FROM doctrine_migration_versions v) x"
+legacy_rows=$(legacy_sql "$rows_sql")
+legacy_versions=$(legacy_sql "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions")
+docker rm -f "$pc-legacy-db" >/dev/null 2>&1
+docker network rm "$pc-legacy" >/dev/null 2>&1
+
+dv c-up "$C" up
+c_running=$(docker ps -q --filter "label=com.docker.compose.project=$pc" | wc -l | tr -d ' ')
+
+# Failure injection before the real upgrade (FND-009V F-04, F-07). The
+# legacy database must be unchanged after each one: same rows, same owner,
+# no leftover dump, scratch database or session of the role script.
+legacy_same() {
+  local db
+  db=$(cid "$C" db)
+  [ -n "$db" ] && [ "$(docker exec "$db" flowcrm-db-roles state)" = legacy ] &&
+    [ "$(docker exec "$db" psql -U flowcrm -d flowcrm -tAq -c "$rows_sql")" = "$legacy_rows" ] &&
+    [ "$(docker exec "$db" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_database WHERE datname LIKE '%restore_check'")" = 0 ] &&
+    [ "$(docker exec "$db" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")" = 0 ] &&
+    [ "$(docker exec "$db" sh -c 'ls /tmp/*.dump /tmp/flowcrm-db-roles.*.pid 2>/dev/null | wc -l' | tr -d ' ')" = 0 ]
+}
+backups() { find "$C/.runtime/backups" -name '*.dump' -type f 2>/dev/null | wc -l | tr -d ' '; }
+cupg() { # label [fault]
+  (cd "$C" && FLOWCRM_DEVENV_FAULT=${2-} ./bin/devenv upgrade-roles) >"$work/out/$1.out" 2>"$work/out/$1.err"
+  echo $? >"$work/out/$1.rc"
+}
+
+# Interrupted after the verified backup (SIGTERM): nothing converted; the
+# verified backup is kept for the operator.
+cupg c-upg-fault upgrade-after-backup
+[ "$(rc_of c-upg-fault)" = 143 ] && [ "$(backups)" = 1 ] && legacy_same
+v "ST-54 upgrade interrupted after the verified backup (SIGTERM): nothing converted, the verified backup is kept" $? "$(tail -n 2 "$work/out/c-upg-fault.err")"
+
+# Interrupted while the ownership change waits on a real PostgreSQL lock
+# (another session reads audit_events): the conversion transaction is ended
+# before the command exits and never commits later, even once the lock is
+# released; a retry later succeeds (ST-52).
+cdb=$(cid "$C" db)
+docker exec -d -e PGAPPNAME=st-holder "$cdb" psql -U flowcrm -d flowcrm -c 'BEGIN' -c 'LOCK TABLE audit_events IN ACCESS SHARE MODE' -c 'SELECT pg_sleep(180)' -c 'COMMIT'
+i=0
+until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE a.application_name = 'st-holder' AND l.relation = 'audit_events'::regclass AND l.granted")" = 1 ] || [ "$i" -ge 60 ]; do sleep 0.5; i=$((i + 1)); done
+(cd "$C" && exec ./bin/devenv upgrade-roles) >"$work/out/c-upg-lock.out" 2>"$work/out/c-upg-lock.err" &
+upg=$!
+i=0
+until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event_type = 'Lock' AND query LIKE 'ALTER TABLE%'")" = 1 ] || [ "$i" -ge 240 ]; do sleep 0.5; i=$((i + 1)); done
+lock_waited=$i
+kill -TERM "$upg"
+wait "$upg"
+upg_rc=$?
+lock_left=$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null
+sleep 5
+[ "$lock_waited" -lt 240 ] && [ "$upg_rc" = 143 ] && grep -q 'the interrupted database operation ended' "$work/out/c-upg-lock.err" &&
+  [ "$lock_left" = 0 ] && legacy_same && [ "$(backups)" = 2 ]
+v "ST-55 upgrade interrupted while ALTER TABLE waits on a real lock (SIGTERM): the transaction is ended before exit and never commits later; the data are unchanged" $? "rc=$upg_rc waited=$lock_waited left=$lock_left $(tail -n 2 "$work/out/c-upg-lock.err")"
+
+# The same with SIGINT, delivered as in a terminal (job control on, so the
+# background command does not ignore it), and with the connection of the
+# operation cut from outside: both roll back, nothing commits later.
+cupg_blocked() { # label: upgrade in the background, waiting for ALTER TABLE on the held lock -> sets UPG
+  docker exec -d -e PGAPPNAME=st-holder "$cdb" psql -U flowcrm -d flowcrm -c 'BEGIN' -c 'LOCK TABLE audit_events IN ACCESS SHARE MODE' -c 'SELECT pg_sleep(180)' -c 'COMMIT'
+  sleep 1
+  set -m
+  (cd "$C" && exec ./bin/devenv upgrade-roles) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  UPG=$!
+  set +m
+  local i=0
+  until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event_type = 'Lock' AND query LIKE 'ALTER TABLE%'")" = 1 ] || [ "$i" -ge 240 ]; do sleep 0.5; i=$((i + 1)); done
+}
+holder_c_down() { docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null; }
+cupg_blocked c-upg-int
+kill -INT "$UPG"
+wait "$UPG"
+int_rc=$?
+holder_c_down
+sleep 5
+int_same=$(legacy_same && echo same)
+cupg_blocked c-upg-conn
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'" >/dev/null
+wait "$UPG"
+conn_rc=$?
+holder_c_down
+sleep 5
+[ "$int_rc" = 130 ] && grep -q 'the interrupted database operation ended' "$work/out/c-upg-int.err" && [ "$int_same" = same ] &&
+  [ "$conn_rc" = 6 ] && grep -q 'the role upgrade failed .* and was rolled back' "$work/out/c-upg-conn.err" && legacy_same
+v "ST-55 the same with SIGINT (exit 130) and with the operation's connection cut from outside (reported as failed and rolled back): nothing commits later" $? "int=$int_rc conn=$conn_rc | int: $(tail -n 3 "$work/out/c-upg-int.err" | tr '\n' ' ') | conn: $(tail -n 1 "$work/out/c-upg-conn.err")"
+
+# A backup that does not restore, a restored copy whose contents differ, and
+# a damaged host copy: each stops the upgrade with nothing changed, and no
+# unverified dump is kept (neither in the container nor on the host).
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "CREATE TABLE st_poison (i int CHECK (current_database() = 'flowcrm')); INSERT INTO st_poison VALUES (1)" >/dev/null
+cupg c-upg-norestore
+# A generated column is recomputed on restore; this one (falsely declared
+# immutable) yields the scratch database's name there.
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "DROP TABLE st_poison; CREATE FUNCTION st_dbname() RETURNS text IMMUTABLE LANGUAGE sql AS 'SELECT current_database()'; CREATE TABLE st_poison (i int, db text GENERATED ALWAYS AS (st_dbname()) STORED); INSERT INTO st_poison (i) VALUES (1)" >/dev/null
+cupg c-upg-differs
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "DROP TABLE st_poison; DROP FUNCTION st_dbname()" >/dev/null
+cupg c-upg-corrupt upgrade-corrupt-copy
+[ "$(rc_of c-upg-norestore)" = 6 ] && err_has c-upg-norestore 'the backup did not restore' &&
+  [ "$(rc_of c-upg-differs)" = 6 ] && err_has c-upg-differs 'the restored copy differs in the contents of st_poison' &&
+  [ "$(rc_of c-upg-corrupt)" = 6 ] && err_has c-upg-corrupt 'did not match the verified one' &&
+  [ "$(backups)" = 4 ] && legacy_same
+v "ST-56 a backup that does not restore, differs in its contents or is damaged on the host stops the upgrade (exit 6); nothing changed, no unverified dump kept" $? "$(tail -n 1 "$work/out/c-upg-norestore.err") | $(tail -n 1 "$work/out/c-upg-differs.err") | $(tail -n 1 "$work/out/c-upg-corrupt.err")"
+
+# SIGKILL while ALTER TABLE ... OWNER waits (FND-009G2): the security gate
+# was recorded before the conversion. The newer upgrade waits for the
+# checkout lock (the killed command's docker compose exec still runs) until
+# the old operation ended by its lock timeout, rolled back; it never
+# commits, also after the lock on audit_events is released.
+cupg_blocked c-upg-kill
+kill -KILL "$UPG"
+wait "$UPG"
+ck_rc=$?
+ck_old=$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+dv c-kill-status "$C" status
+dv c-kill-url "$C" url
+(cd "$C" && FLOWCRM_DEVENV_FAULT=upgrade-after-backup FLOWCRM_LOCK_WAIT=300 exec ./bin/devenv upgrade-roles) >"$work/out/c-upg-retry.out" 2>"$work/out/c-upg-retry.err" &
+retry=$!
+i=0
+until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE pid = ${ck_old:-0}")" = 0 ] || [ "$i" -ge 400 ]; do sleep 0.5; i=$((i + 1)); done
+holder_c_down
+wait "$retry"
+sleep 5
+[ "$ck_rc" = 137 ] && [ -n "$ck_old" ] && [ "$(rc_of c-kill-status)" = 1 ] && grep -q '^blocked: *upgrading the database roles' "$work/out/c-kill-status.out" &&
+  [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/security-gate" ]
+v "ST-66 SIGKILL while ALTER TABLE OWNER waits: blocked (status, url); the next upgrade ends the old operation first and it never commits; the gate stays until an upgrade passes every check" $? "rc=$ck_rc old=$ck_old waited=$i"
+
+dv c-upgrade "$C" upgrade-roles
+dump=$(find "$C/.runtime/backups" -name 'roles_upgrade_*.dump' -type f 2>/dev/null | head -n 1)
+psql_c() { docker exec "$(cid "$C" db)" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
+[ "$legacy_rc" = 0 ] && [ -n "$legacy_rows" ] && [ "$(rc_of c-up)" = 6 ] && err_has c-up 'make db-upgrade-roles' && [ "$c_running" = 0 ] &&
+  [ "$(rc_of c-upgrade)" = 0 ] && err_has c-upgrade 'verified backup: .runtime/backups/roles_upgrade_' &&
+  [ -s "$dump" ] && [ "$(perm "$dump")" = 600 ] && [ "$(perm "$C/.runtime/backups")" = 700 ] &&
+  [ "$(docker exec "$(cid "$C" db)" flowcrm-db-roles state)" = complete ] &&
+  [ "$(psql_c "SELECT string_agg(DISTINCT pg_get_userbyid(relowner), ',') FROM pg_class WHERE relnamespace = 'public'::regnamespace")" = flowcrm_owner ] &&
+  [ "$(psql_c "SELECT string_agg(tgname || ':' || tgenabled::text, ' ' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'audit_events'::regclass AND NOT tgisinternal")" = 'audit_events_append_only:O audit_events_no_truncate:O' ] &&
+  [ "$(psql_c "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions WHERE version <> 'DoctrineMigrations\Version20261023000000'")" = "$legacy_versions" ] &&
+  [ "$(psql_c "SELECT count(*) FROM pg_database WHERE datname LIKE '%restore_check'")" = 0 ] &&
+  [ "$(psql_c "SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT u::text t FROM users u UNION ALL SELECT o::text FROM organizations o UNION ALL SELECT a::text FROM audit_events a UNION ALL SELECT s::text FROM sessions s UNION ALL SELECT c::text FROM cache_items c UNION ALL SELECT v.version::text FROM doctrine_migration_versions v WHERE v.version <> 'DoctrineMigrations\Version20261023000000') x")" = "$legacy_rows" ]
+v "ST-52 a volume from before role separation: make up refuses it; make db-upgrade-roles converts it after a verified backup, keeping every row" $? "$(tail -n 3 "$work/out/c-upgrade.err")"
+dv c-up2 "$C" up
+[ "$(rc_of c-up2)" = 0 ] && until_ready "$(saved_port "$C")" 200 30 && console_in "$C" app:database:verify-privileges --runtime
+c_published=$?
+c_rows=$(psql_c "$rows_sql")
+# A second upgrade stops api, web and edge, re-checks and converts nothing.
+dv c-upgrade2 "$C" upgrade-roles
+[ "$c_published" = 0 ] && [ "$(rc_of c-upgrade2)" = 0 ] && err_has c-upgrade2 'nothing to upgrade' &&
+  ! err_has c-upgrade2 'verified backup' && [ "$(psql_c "$rows_sql")" = "$c_rows" ] &&
+  [ "$(docker exec "$(cid "$C" db)" flowcrm-db-roles state)" = complete ]
+v "ST-53 after the upgrade make up publishes the stack as flowcrm_app; a second upgrade changes nothing" $? "$(tail -n 2 "$work/out/c-up2.err")"
+dv c-down "$C" down
 
 # --- one checkout, two stacks: the other stack's commands are refused --------
 
@@ -547,7 +1181,7 @@ done
 v "ST-38 fixture running: app up/down/restart/status/url/logs refused (exit 6), fixture untouched" $? "not refused:$refused"
 FLOWCRM_STACK=fixture dv fx-down "$A" down
 dv a-up5 "$A" up
-[ "$(rc_of fx-down)" = 0 ] && [ "$(rc_of a-up5)" = 0 ] && until_ready "$PA" 200 10 && [ "$(psql_in "$A" "SELECT v FROM st_marker")" = kept ]
+[ "$(rc_of fx-down)" = 0 ] && [ "$(rc_of a-up5)" = 0 ] && until_ready "$PA" 200 10 && [ "$(psql_in "$A" "SELECT v FROM st.marker")" = kept ]
 v "ST-39 back to the app: data kept, stack ready" $?
 
 # --- cleanup verification ---------------------------------------------------
@@ -556,7 +1190,7 @@ final_cleanup
 : >"$work/checkouts"
 : >"$work/holders"
 left=0
-for d in "$A" "$B"; do left=$((left + $(project_resources "$(project_of "$d")"))); done
+for d in "$A" "$B" "$C"; do left=$((left + $(project_resources "$(project_of "$d")"))); done
 [ "$left" = 0 ]; v "CLEAN no containers, volumes or networks of the test checkouts left" $?
 snapshot >"$work/after.containers"
 missing=$(comm -23 "$work/before.containers" "$work/after.containers")

@@ -5,11 +5,11 @@ declare(strict_types=1);
 namespace App\Tests\Integration\Database;
 
 use App\Shared\Infrastructure\Cache\RejectSchemaChanges;
+use App\Tests\Support\Database\TestDatabase;
 use App\Tests\Support\TypedValues;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Configuration as DbalConfiguration;
 use Doctrine\DBAL\Connection;
-use Doctrine\DBAL\DriverManager;
 use Doctrine\Migrations\Configuration\Configuration;
 use Doctrine\Migrations\Configuration\Connection\ExistingConnection;
 use Doctrine\Migrations\Configuration\Migration\ExistingConfiguration;
@@ -41,11 +41,14 @@ final class SessionCacheMigrationTest extends KernelTestCase
 
     private string $database;
     private Connection $scratch;
+    private ?Connection $admin = null;
+    private ?Connection $adminScratch = null;
 
     protected function setUp(): void
     {
         $this->database = 'flowcrm_migration_'.bin2hex(random_bytes(4));
-        $this->server()->executeStatement('CREATE DATABASE '.$this->database);
+        // Owned by flowcrm_owner, like schema public of the real database.
+        $this->server()->executeStatement('CREATE DATABASE '.$this->database.' OWNER '.TestDatabase::OWNER);
         $this->scratch = $this->connect();
     }
 
@@ -153,7 +156,7 @@ final class SessionCacheMigrationTest extends KernelTestCase
     {
         $this->migrateTo(self::CORE);
         try {
-            $this->scratch->executeStatement($setup);
+            $this->adminScratch()->executeStatement($setup);
             $before = $this->catalog();
             $rows = $this->storedRows();
 
@@ -170,7 +173,8 @@ final class SessionCacheMigrationTest extends KernelTestCase
                 $this->scratch->close();
                 $this->server()->executeStatement('DROP DATABASE IF EXISTS '.$this->database.' WITH (FORCE)');
                 $this->server()->executeStatement('DROP ROLE IF EXISTS migration_test_owner');
-                $this->server()->executeStatement('CREATE DATABASE '.$this->database);
+                $this->adminScratch = null;
+                $this->server()->executeStatement('CREATE DATABASE '.$this->database.' OWNER '.TestDatabase::OWNER);
             }
         }
     }
@@ -312,7 +316,8 @@ final class SessionCacheMigrationTest extends KernelTestCase
     {
         $rows = [];
         foreach ($this->tables(['sessions', 'cache_items']) as $table) {
-            foreach ($this->scratch->fetchAllAssociative("SELECT * FROM {$table} ORDER BY 1") as $row) {
+            // Read as the superuser: a pre-existing table may belong to another role.
+            foreach ($this->adminScratch()->fetchAllAssociative("SELECT * FROM {$table} ORDER BY 1") as $row) {
                 $rows[] = ['table' => $table] + array_map(static fn (mixed $v): mixed => \is_resource($v) ? stream_get_contents($v) : $v, $row);
             }
         }
@@ -344,31 +349,31 @@ final class SessionCacheMigrationTest extends KernelTestCase
     }
 
     /** @return array<string, string> */
+    /**
+     * The console runs migrations as the schema owner, like the migrate job.
+     *
+     * @return array<string, string>
+     */
     private function consoleEnv(): array
     {
-        return [...getenv(), 'APP_ENV' => 'test', 'DATABASE_NAME' => $this->database];
+        return [...getenv(), 'APP_ENV' => 'test', 'DATABASE_NAME' => $this->database, ...TestDatabase::ownerProcessEnv()];
     }
 
+    /** The scratch database as the schema owner. */
     private function connect(?DbalConfiguration $configuration = null): Connection
     {
-        $params = $this->server()->getParams();
-
-        return DriverManager::getConnection([
-            'driver' => 'pdo_pgsql',
-            'host' => self::string($params['host'] ?? null),
-            'port' => self::int($params['port'] ?? null),
-            'user' => self::string($params['user'] ?? null),
-            'password' => self::string($params['password'] ?? null),
-            'dbname' => $this->database,
-            'serverVersion' => '18',
-        ], $configuration);
+        return TestDatabase::owner($this->database, $configuration);
     }
 
+    /** The bootstrap superuser: creates and drops the scratch databases. */
     private function server(): Connection
     {
-        $db = self::getContainer()->get('doctrine.dbal.default_connection');
-        self::assertInstanceOf(Connection::class, $db);
+        return $this->admin ??= TestDatabase::admin();
+    }
 
-        return $db;
+    /** The scratch database as the bootstrap superuser: sets up relations an owner could not (roles, foreign owners). */
+    private function adminScratch(): Connection
+    {
+        return $this->adminScratch ??= TestDatabase::admin($this->database);
     }
 }

@@ -44,6 +44,12 @@ LOCK_KEEP=0
 LOCK_TOKEN=
 OP_GROUP=
 TMP_FILE=
+# The database operation (flowcrm-db-roles) in progress, cancelled on a signal.
+DB_OP_ID=
+# Standard input of the next run_op call (default /dev/null).
+OP_STDIN=
+# Time limit in seconds of the next run_op call (default none).
+OP_TIMEOUT=
 
 log() { printf 'devenv: %s\n' "$*" >&2; }
 
@@ -73,6 +79,16 @@ Usage: bin/devenv <command>
   ports    Show candidate ports and who uses them (read-only)
   logs     Show recent logs (SERVICE=<service>, TAIL=200, FOLLOW=1)
   doctor   Check prerequisites (read-only)
+  upgrade-roles
+           Move a database volume created before role separation to the
+           three roles of ADR-018, after a verified backup (explicit only)
+  rotate-db-password
+           New password for ROLE=app or ROLE=owner (development only;
+           recreates the containers that use it). Run again after an
+           interruption to finish the rotation
+  rotate-db-password-abort
+           Undo an unfinished rotation of ROLE=app or ROLE=owner: the
+           database gets the current password back
 
 Configuration: FLOWCRM_STACK (app or fixture), FLOWCRM_PORT_DEFAULT (8080),
 FLOWCRM_PORT_RANGE (8080-8099), FLOWCRM_HTTP_PORT (explicit port, no
@@ -147,14 +163,16 @@ select_stack() {
     app)
       COMPOSE_FILE_NAME=compose.yaml
       INTERNAL_SERVICES='db api web'
-      COMPOSE_PROFILES_VALUE=dev
       READY_PATH=/health/ready
       READY_BODY='{"status":"ready"}'
       LOG_SERVICES='edge web api db'
-      SECRETS='db_password app_secret'
-      # The database volume was initialised with this secret.
-      SECRET_VOLUMES='db_password=db-data'
+      SECRETS='db_password app_secret db_owner_password db_app_password'
+      # The database volume was initialised with these secrets.
+      SECRET_VOLUMES='db_password=db-data db_owner_password=db-data db_app_password=db-data'
+      # The migrate job (profile migrate) is built with the stack, never started by up.
+      COMPOSE_PROFILES_VALUE=dev,migrate
       MIGRATIONS=1
+      ROLES=1
       URL_LABEL='FlowCRM'
       ;;
     fixture)
@@ -167,6 +185,7 @@ select_stack() {
       SECRETS=
       SECRET_VOLUMES=
       MIGRATIONS=
+      ROLES=
       URL_LABEL='FlowCRM development fixture'
       ;;
     *) die $EX_CONFIG "FLOWCRM_STACK must be app or fixture (got $(show "$STACK"))" ;;
@@ -183,6 +202,7 @@ init_paths() {
   SECRETS_DIR=$RUNTIME_DIR/secrets
   STATE_FILE=$RUNTIME_DIR/dev.env
   LOCK_DIR=$RUNTIME_DIR/lock
+  GATE_FILE=$RUNTIME_DIR/security-gate
   SELF=$here/${BASH_SOURCE[0]##*/}
   PROJECT=flowcrm-$(sha256_prefix "$ROOT")
   [[ $PROJECT =~ $PROJECT_RE ]] || die $EX_PREREQ "could not derive a project name"
@@ -193,7 +213,8 @@ ensure_runtime_dir() {
   mkdir -p "$RUNTIME_DIR" || die $EX_SAFETY "cannot create $RUNTIME_DIR"
 }
 
-new_tmp() { # prefix -> sets TMP_FILE (removed on exit)
+new_tmp() { # prefix -> sets TMP_FILE (removed on exit); removes the previous one
+  [ -z "$TMP_FILE" ] || rm -f "$TMP_FILE"
   TMP_FILE=$(mktemp "$RUNTIME_DIR/.$1.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in .runtime"
 }
 
@@ -201,10 +222,16 @@ new_tmp() { # prefix -> sets TMP_FILE (removed on exit)
 # Random per-checkout secrets in .runtime/secrets (directory 0700, files
 # 0444 so the unprivileged container users can read the bind-mounted copy).
 # An existing secret is never replaced: the database volume was initialised
-# with it.
+# with it. The role secrets (db_owner_password, db_app_password, ADR-018)
+# must be 48 lowercase hex characters; for an existing volume they are
+# created only by upgrade-roles (the argument allow-new-role-secrets, never
+# an environment variable) or replaced by rotate-db-password, never by up.
 
-ensure_secrets() {
-  local name file tmp volume
+is_role_secret() { case $1 in db_owner_password | db_app_password) return 0 ;; esac; return 1; }
+role_of() { local r=${1#db_}; printf '%s' "${r%_password}"; } # db_app_password -> app
+
+ensure_secrets() { # [allow-new-role-secrets]
+  local name file tmp volume allow=${1-}
   [ -n "$SECRETS" ] || return 0
   ensure_runtime_dir
   [ ! -L "$SECRETS_DIR" ] || die $EX_SAFETY ".runtime/secrets is a symbolic link; refusing to use it"
@@ -223,12 +250,20 @@ ensure_secrets() {
     fi
     if [ -s "$file" ]; then
       [ -O "$file" ] || die $EX_SAFETY ".runtime/secrets/$name is not owned by $(id -un); refusing to use it"
+      if is_role_secret "$name" && ! [[ $(cat "$file") =~ ^[0-9a-f]{48}$ ]]; then
+        die $EX_SAFETY ".runtime/secrets/$name is malformed (expected 48 lowercase hex characters); refusing to use it. Restore it from a backup, or set a new password: make db-rotate-password ROLE=$(role_of "$name")"
+      fi
       chmod 0444 "$file" || die $EX_SAFETY "cannot set the permissions of .runtime/secrets/$name"
       continue
     fi
     volume=$(bound_volume "$name")
     if [ -n "$volume" ] && docker volume inspect "${PROJECT}_$volume" >/dev/null 2>&1; then
-      die $EX_SAFETY ".runtime/secrets/$name is missing, but the volume ${PROJECT}_$volume was initialised with it; a new secret would not match, so none was generated. Restore .runtime/secrets/$name from a backup, or reset the data deliberately as described in README.md (Data persistence and reset), which deletes it"
+      if is_role_secret "$name"; then
+        [ "$allow" = allow-new-role-secrets ] ||
+          die $EX_SAFETY ".runtime/secrets/$name is missing, but the volume ${PROJECT}_$volume exists, so none was generated. A volume created before role separation is upgraded explicitly: make db-upgrade-roles (ADR-018). For an upgraded volume, restore the file from a backup, or set a new password: make db-rotate-password ROLE=$(role_of "$name")"
+      else
+        die $EX_SAFETY ".runtime/secrets/$name is missing, but the volume ${PROJECT}_$volume was initialised with it; a new secret would not match, so none was generated. Restore .runtime/secrets/$name from a backup, or reset the data deliberately as described in README.md (Data persistence and reset), which deletes it"
+      fi
     fi
     tmp=$(mktemp "$SECRETS_DIR/.$name.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in $SECRETS_DIR"
     TMP_FILE=$tmp
@@ -522,13 +557,18 @@ run_recorded() { # lock-dir token command...
 # FLOWCRM_LOCK_WAIT seconds, fail and keep the lock, so no other command can
 # start while they run.
 run_op() { # command...
-  local rc
+  local rc watchdog=''
   set -m
-  "$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" "$@" </dev/null &
+  "$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" "$@" <"${OP_STDIN:-/dev/null}" 8>&- 9>&- &
   OP_GROUP=$!
   set +m
+  if [ -n "$OP_TIMEOUT" ]; then
+    (sleep "$OP_TIMEOUT" && kill -TERM -- "-$OP_GROUP") >/dev/null 2>&1 8>&- 9>&- &
+    watchdog=$!
+  fi
   wait "$OP_GROUP"
   rc=$?
+  [ -z "$watchdog" ] || kill "$watchdog" 2>/dev/null
   finish_op
   return "$rc"
 }
@@ -547,14 +587,68 @@ finish_op() {
 }
 
 # Signals reach devenv but not the Docker process group: forward them, wait
-# for the group to end, then exit (the lock is released by on_exit).
+# for the group to end, then exit (the lock is released by on_exit). Ending
+# `docker compose exec` does not end the process inside the container, so
+# an interrupted database operation is cancelled explicitly, and the lock is
+# released only after it ended.
 on_signal() { # exit-code signal
   trap '' INT TERM HUP
+  # The signal may arrive inside a call whose output is redirected to a
+  # temporary file; report on the command's own stdout and stderr.
+  exec 1>&8 2>&9
   if [ -n "$OP_GROUP" ]; then
     kill -"$2" -- "-$OP_GROUP" 2>/dev/null
     finish_op
   fi
+  [ -z "$DB_OP_ID" ] || cancel_db_op
   exit "$1"
+}
+
+cancel_db_op() {
+  local id=$DB_OP_ID rc
+  DB_OP_ID=
+  OP_STDIN=
+  log "stopping the interrupted database operation; an open transaction is rolled back"
+  # Bounded: flowcrm-db-roles waits at most 30 s; the call itself at most 45 s.
+  OP_TIMEOUT=45 compose_op exec -T db flowcrm-db-roles cancel "$id" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    log "the interrupted database operation ended; nothing of it can commit any more"
+    return 0
+  fi
+  # Unconfirmed: the operation may still be alive (for example while the db
+  # container cannot be reached) and commit later. Fail closed until a
+  # make up has ended it, or found it finished, and passed every check.
+  local edge=''
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} >"$GATE_FILE" 2>/dev/null
+  log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
+    if compose_op stop "$EDGE" >/dev/null 2>&1; then
+      log "stopped the edge: an interrupted database operation may still be running"
+    else
+      log "WARNING: could not stop the edge of $PROJECT; stop the stack with make down"
+    fi
+  fi
+}
+
+# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill], used by
+# tests/app/stack.sh): stop with SIGTERM (or SIGKILL, which runs no handler)
+# at a named point, exactly as an interrupted or killed command would.
+# Points: rotate-after-pending, rotate-after-db, rotate-after-promote,
+# upgrade-after-backup, up-after-migrations; upgrade-corrupt-copy damages
+# the host copy of the backup instead.
+fault_point() { # name
+  case ${FLOWCRM_DEVENV_FAULT-} in
+    "$1")
+      log "test fault injection: SIGTERM at $1"
+      kill -TERM $$
+      ;;
+    "$1:kill")
+      log "test fault injection: SIGKILL at $1"
+      kill -KILL $$
+      ;;
+  esac
 }
 
 release_lock() {
@@ -719,9 +813,9 @@ start_internal() {
   TMP_FILE=
 }
 
-# Applies pending Doctrine migrations in the running api container, under
-# the lock and in a recorded process group like every other mutating call.
-# Sets MIGRATED=1 when migrations were applied.
+# Applies pending Doctrine migrations with the one-off migrate job (as
+# flowcrm_owner), under the lock and in a recorded process group like every
+# other mutating call. Sets MIGRATED=1 when migrations were applied.
 apply_migrations() {
   local rc
   MIGRATED=
@@ -730,12 +824,15 @@ apply_migrations() {
   compose_op exec -T api php bin/console doctrine:migrations:up-to-date --no-interaction >/dev/null 2>"$TMP_FILE"
   rc=$?
   if [ "$rc" -ne 0 ]; then
+    # Migrations may change tables and grants.
+    protect_for "applying database migrations"
     log "applying pending database migrations"
-    compose_op exec -T api php bin/console doctrine:migrations:migrate --no-interaction --allow-no-migration --all-or-nothing >/dev/null 2>"$TMP_FILE"
+    # The migrate job connects as the schema owner; the api never holds its password.
+    compose_op run --rm --no-deps migrate >/dev/null 2>"$TMP_FILE"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       tail -n 20 "$TMP_FILE" >&2
-      die $EX_DOCKER "applying the database migrations failed: $(compose_failure "$rc"); the saved state was not changed; see make logs SERVICE=api"
+      die $EX_DOCKER "applying the database migrations failed: $(compose_failure "$rc"); the saved state was not changed; the output of the migrate job is shown above"
     fi
     MIGRATED=1
   fi
@@ -744,6 +841,168 @@ apply_migrations() {
 }
 
 # "service=container-id" lines of this project, for change reports.
+# --- database roles (ADR-018) -------------------------------------------------
+
+start_db() {
+  local rc
+  [ -n "$ROLES" ] || return 0
+  new_tmp compose-err
+  compose_op up --detach --wait --wait-timeout "$WAIT_TIMEOUT" db >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    tail -n 20 "$TMP_FILE" >&2
+    die $EX_DOCKER "starting the database failed: $(compose_failure "$rc")"
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
+# flowcrm-db-roles in the db container as operation DB_OP_ID (its database
+# sessions are named after it, see docker/db/flowcrm-db-roles); output in
+# $TMP_FILE; standard input from OP_STDIN when set. A signal cancels it.
+db_roles() { # command...
+  local rc
+  new_tmp db-roles
+  DB_OP_ID=$(new_token)
+  compose_op exec -T -e "FLOWCRM_OP_ID=$DB_OP_ID" db flowcrm-db-roles "$@" >"$TMP_FILE" 2>&1
+  rc=$?
+  DB_OP_ID=
+  return "$rc"
+}
+
+# A failed security gate (database roles, runtime privileges): a stack that
+# was already running must not keep serving requests, so its edge is
+# stopped. The database, its volume, the other containers and the saved
+# port are kept for the recovery. The reason is recorded for make status
+# and make url; the next make up that passes every gate removes it.
+gate_failed() { # exit-code message
+  local id edge=''
+  id=$(compose ps --quiet "$EDGE" 2>/dev/null | head -n 1)
+  if [ -n "$id" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } >"$GATE_FILE" 2>/dev/null
+  if [ -n "$id" ]; then
+    if compose_op stop "$EDGE" >/dev/null 2>&1; then
+      log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"
+    else
+      log "WARNING: could not stop the edge of $PROJECT after a failed security gate; stop the stack with make down"
+    fi
+  fi
+  die "$1" "$2"
+}
+
+# Before anything changes roles, passwords, ownership or grants (role
+# corrections, migrations, the upgrade, a rotation): record the security
+# gate durably (atomic rename), then stop a running edge and make sure it
+# stopped. Only then does the change start, so a command that dies from
+# here on, even by SIGKILL, leaves the stack blocked: make status and make
+# url report it, and only a command that finished with every check passed
+# clears it (gate_clear). The first line is the reason; the line "edge"
+# records that the edge was serving, so a rotation can restore it.
+protect_for() { # reason
+  local tmp edge=''
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  tmp=$(mktemp "$RUNTIME_DIR/.security-gate.XXXXXX") || die $EX_SAFETY "could not record the security gate; nothing was changed"
+  if ! { printf '%s\n' "$1" ${edge:+"$edge"} >"$tmp" && mv -f "$tmp" "$GATE_FILE"; }; then
+    rm -f "$tmp"
+    die $EX_SAFETY "could not record the security gate; nothing was changed"
+  fi
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
+    compose_op stop "$EDGE" >/dev/null 2>&1
+    [ -z "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] ||
+      die $EX_SAFETY "the edge of $PROJECT could not be stopped, so the database was not changed; stop the stack with make down"
+    log "stopped the edge before changing the database (${1}); it serves again once every check passed"
+  fi
+}
+
+gate_clear() { rm -f "$GATE_FILE"; }
+
+# After a rotation or abort that passed every check: serve again on the saved
+# port if the gate had stopped a serving edge (make up does this itself).
+restore_edge() { # gate-had-edge
+  [ "$1" = edge ] && [ "$STATE_STATUS" = valid ] || return 0
+  if try_edge "$STATE_PORT" && wait_http "$STATE_PORT"; then
+    log "the edge serves again on port $STATE_PORT"
+  else
+    log "WARNING: the edge did not start again on port $STATE_PORT; run make up"
+  fi
+}
+
+sha256_of() { # file
+  { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi; } 2>/dev/null | cut -d' ' -f1
+}
+
+# Compose secrets are bind mounts of the host files. A running container
+# does not see a file that was replaced on the host (rotation, restore from
+# a backup): Docker Desktop shows it as missing, Linux keeps the replaced
+# file. A running db or api whose mounted secrets differ from the host files
+# is recreated. Compared by SHA-256 inside and outside; no value is shown.
+refresh_secret_mounts() {
+  local svc id name host inside stale rc
+  [ -n "$ROLES" ] || return 0
+  for svc in db api; do
+    id=$(compose ps --quiet "$svc" 2>/dev/null | head -n 1)
+    [ -n "$id" ] || continue
+    stale=
+    for name in $(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$id" 2>/dev/null | sed -n 's#^/run/secrets/##p'); do
+      host=$(sha256_of "$SECRETS_DIR/$name")
+      inside=$(docker exec "$id" sha256sum "/run/secrets/$name" 2>/dev/null | cut -d' ' -f1)
+      if [ -z "$host" ] || [ "$inside" != "$host" ]; then stale="$stale $name"; fi
+    done
+    [ -n "$stale" ] || continue
+    log "recreating $svc: its secret files changed on the host ($stale )"
+    new_tmp compose-err
+    compose_op up --detach --wait --wait-timeout "$WAIT_TIMEOUT" --no-deps --force-recreate "$svc" >/dev/null 2>"$TMP_FILE"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      tail -n 20 "$TMP_FILE" >&2
+      die $EX_DOCKER "recreating $svc with the current secret files failed: $(compose_failure "$rc"); run make up again after fixing the cause"
+    fi
+    rm -f "$TMP_FILE"
+    TMP_FILE=
+  done
+}
+
+# Fails closed unless the roles are complete; corrects role attributes and
+# database, schema and default privileges (never passwords or ownership).
+check_roles() {
+  local rc
+  [ -n "$ROLES" ] || return 0
+  # Read-only first: only a database that needs corrections is protected and changed.
+  db_roles check
+  rc=$?
+  if [ "$rc" -eq 20 ]; then
+    protect_for "correcting the database role attributes and privileges"
+    db_roles ensure
+    rc=$?
+  fi
+  case $rc in
+    0) ;;
+    10) gate_failed $EX_SAFETY "the database of $PROJECT was created before role separation and still uses one account for everything; the stack is not served. Upgrade it explicitly, with a verified backup first: make db-upgrade-roles (docs/architecture/adr/ADR-018-database-roles.md)" ;;
+    11) gate_failed $EX_SAFETY "the database roles of $PROJECT are inconsistent; nothing was changed and the stack is not served. See docs/architecture/adr/ADR-018-database-roles.md (Recovery): $(tail -n 2 "$TMP_FILE")" ;;
+    12) gate_failed $EX_SAFETY "a database role secret is missing or malformed in the db container: $(tail -n 1 "$TMP_FILE")" ;;
+    14) gate_failed $EX_SAFETY "an earlier database operation of $PROJECT could not be ended; nothing was changed: $(tail -n 1 "$TMP_FILE")" ;;
+    *) tail -n 10 "$TMP_FILE" >&2; gate_failed $EX_DOCKER "checking the database roles failed: $(compose_failure "$rc")" ;;
+  esac
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
+# The api's own connection must be flowcrm_app and the database must match
+# the runtime privilege manifest; otherwise the stack is not published.
+verify_privileges() {
+  local rc
+  [ -n "$ROLES" ] || return 0
+  new_tmp verify
+  compose_op exec -T api php bin/console app:database:verify-privileges --runtime >"$TMP_FILE" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    grep -E '^VIOLATION|password authentication|SQLSTATE' "$TMP_FILE" | head -n 20 | sed 's/^/  /' >&2
+    gate_failed $EX_SAFETY "the api's database role or privileges do not match config/database/runtime-privileges.yaml (shown above); the stack is not served. A failed login means .runtime/secrets/db_app_password does not match the database: make db-rotate-password ROLE=app"
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
 service_ids() {
   compose ps --all --format '{{.Service}}={{.ID}}' 2>/dev/null | sort
 }
@@ -815,8 +1074,14 @@ do_up() {
   ensure_secrets
   before=$(service_ids)
   build_images
+  start_db
+  check_roles
   start_internal
+  refresh_secret_mounts
   apply_migrations
+  fault_point up-after-migrations
+  verify_privileges
+  gate_clear
   edge_state
 
   if [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ] && eligible "$EDGE_PORT"; then
@@ -867,6 +1132,7 @@ do_up() {
     wait_http "$c" || die $EX_DOCKER "the edge on port $c does not answer $READY_PATH with 200; saved state not changed; see make status and make logs"
     write_state "$c"
     [ -z "$skipped" ] || log "ports in use, skipped:$skipped"
+    [ -z "$MIGRATED" ] || log "applied pending database migrations"
     report_url "$c"
     return 0
   done
@@ -969,6 +1235,11 @@ cmd_status() {
   if [ "$EDGE_RUNNING" = true ]; then
     printf 'mapping:    %s:%s -> %s\n' "$BIND" "${EDGE_PORT:-unknown}" "$EDGE_CONTAINER_PORT"
   fi
+  if [ -f "$GATE_FILE" ]; then
+    printf 'blocked:    %s\n' "$(head -n 1 "$GATE_FILE" | head -c 300)"
+    printf 'result:     blocked by the security gate (a database change is in progress, was interrupted, or a check failed); fix the cause and run make up\n'
+    return "$rc"
+  fi
   if [ "$EDGE_RUNNING" = true ] && [ "$EDGE_HEALTH" = healthy ] && [ "$STATE_STATUS" = valid ] &&
     [ "$EDGE_PORT" = "$STATE_PORT" ]; then
     printf 'result:     running\n'
@@ -986,6 +1257,7 @@ cmd_url() {
   read_state
   require_owned_project
   [ "$STATE_STATUS" = valid ] || die $EX_NOT_RUNNING "not started in this checkout (no verified port saved); run make up"
+  [ ! -f "$GATE_FILE" ] || die $EX_NOT_RUNNING "blocked by the security gate: $(head -n 1 "$GATE_FILE" | head -c 300)"
   COMPOSE_PORT=$STATE_PORT
   edge_state
   [ "$EDGE_RUNNING" = true ] || die $EX_NOT_RUNNING "the edge is not running; run make up"
@@ -1075,11 +1347,256 @@ cmd_doctor() {
   [ "$fail" -eq 0 ] || return $EX_PREREQ
 }
 
+# --- explicit database role operations (ADR-018) -----------------------------
+
+require_role_stack() {
+  [ -n "$ROLES" ] || die $EX_CONFIG "$1 applies to the application stack only (FLOWCRM_STACK=app)"
+  docker volume inspect "${PROJECT}_db-data" >/dev/null 2>&1 ||
+    die $EX_SAFETY "the volume ${PROJECT}_db-data does not exist; a new volume is set up with its roles by make up, nothing to $2"
+}
+
+# Prints the role state. Runs in a command substitution, i.e. a subshell
+# that does not share TMP_FILE with the caller, so it removes its own file.
+roles_state() {
+  if ! db_roles state; then
+    tail -n 5 "$TMP_FILE" >&2
+    rm -f "$TMP_FILE"
+    die $EX_DOCKER "could not read the database role state"
+  fi
+  tr -d '[:space:]' <"$TMP_FILE"
+  rm -f "$TMP_FILE"
+}
+
+# Explicit, owner-invoked upgrade of a volume created before role
+# separation: verified backup (dumped, restored into a scratch database and
+# compared), then the ownership change in one transaction, the migrations
+# as flowcrm_owner and the privilege check. Re-running after success, or
+# after an interruption, is safe.
+cmd_upgrade_roles() {
+  local state name dir dump sum host_sum rc
+  locked upgrade-roles
+  require_role_stack upgrade-roles "upgrade"
+  COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  ensure_secrets allow-new-role-secrets
+  build_images
+  protect_for "upgrading the database roles"
+  # A running api may still use an earlier configuration; stop it first.
+  compose_op stop api web edge >/dev/null 2>&1
+  start_db
+  # The conversion reads the role passwords from the db container's mounts.
+  refresh_secret_mounts
+  state=$(roles_state)
+  case $state in
+    complete)
+      log "the database roles are already separated; checking them"
+      check_roles
+      start_internal
+      refresh_secret_mounts
+      apply_migrations
+      verify_privileges
+      gate_clear
+      log "nothing to upgrade; run make up to publish the stack"
+      return 0
+      ;;
+    legacy) ;;
+    *) die $EX_SAFETY "the database roles are $state; nothing was changed. See docs/architecture/adr/ADR-018-database-roles.md (Recovery)" ;;
+  esac
+
+  name=roles_upgrade_$(date -u +%Y%m%d%H%M%S)_$$
+  dir=$RUNTIME_DIR/backups
+  dump=$dir/$name.dump
+  [ ! -L "$dir" ] || die $EX_SAFETY ".runtime/backups is a symbolic link; refusing to write through it"
+  if ! { (umask 077 && mkdir -p "$dir") && chmod 0700 "$dir"; }; then
+    die $EX_SAFETY "cannot create $dir; nothing was changed"
+  fi
+  [ ! -e "$dump" ] || die $EX_SAFETY "$dump already exists; nothing was changed"
+  log "backing up the database and verifying the backup by restoring it into a scratch database (schema, every table's contents, migration history, triggers)"
+  db_roles backup-verify "$name"
+  rc=$?
+  # On failure flowcrm-db-roles has already removed its unverified dump and the scratch database.
+  [ "$rc" -eq 0 ] || { tail -n 5 "$TMP_FILE" >&2; die $EX_SAFETY "the backup could not be verified (exit $rc); nothing was changed"; }
+  sum=$(tail -n 1 "$TMP_FILE" | tr -d '[:space:]')
+  if ! [[ $sum =~ ^[0-9a-f]{64}$ ]]; then
+    discard_dump "$name" ''
+    die $EX_SAFETY "the backup check returned no checksum; nothing was changed"
+  fi
+  if ! (umask 077 && compose_op exec -T db cat "/tmp/$name.dump" >"$dump"); then
+    discard_dump "$name" "$dump"
+    die $EX_SAFETY "could not copy the backup to .runtime/backups; the incomplete copy was removed; nothing was changed"
+  fi
+  # Test-only: damage the copy, so the checksum comparison must catch it.
+  [ "${FLOWCRM_DEVENV_FAULT-}" != upgrade-corrupt-copy ] || printf 'x' >>"$dump"
+  host_sum=$(sha256_of "$dump")
+  if [ "$host_sum" != "$sum" ]; then
+    discard_dump "$name" "$dump"
+    die $EX_SAFETY "the copied backup did not match the verified one (SHA-256) and was removed; nothing was changed"
+  fi
+  discard_dump "$name" ''
+  fault_point upgrade-after-backup
+  log "verified backup: .runtime/backups/$name.dump (sha256 $sum)"
+
+  db_roles upgrade
+  rc=$?
+  [ "$rc" -eq 0 ] || { tail -n 5 "$TMP_FILE" >&2; die $EX_SAFETY "the role upgrade failed (exit $rc) and was rolled back; the backup is .runtime/backups/$name.dump"; }
+  log "$(tail -n 1 "$TMP_FILE")"
+  start_internal
+  refresh_secret_mounts
+  apply_migrations
+  verify_privileges
+  gate_clear
+  log "upgraded to the database roles of ADR-018; run make up to publish the stack"
+}
+
+# Removes the dump of this upgrade from the db container's /tmp and, when
+# given, the host copy made in this run (never a verified backup).
+discard_dump() { # name [host copy]
+  compose_op exec -T db rm -f "/tmp/$1.dump" >/dev/null 2>&1 ||
+    log "WARNING: could not remove /tmp/$1.dump from the db container; it is removed by the next role operation or when the container is recreated"
+  [ -z "$2" ] || rm -f "$2"
+}
+
+# Development-only rotation of the owner or runtime password, as a state
+# machine whose state is the files in .runtime/secrets (ADR-018):
+#
+#   no pending file   the current file and the database agree (start state)
+#   1 pending         .db_<role>_password.pending (0600, never mounted) holds
+#                     the new password; the database may have either one
+#   2 database        the database has the pending password (set by the
+#                     superuser inside the db container, from standard input)
+#   3 login           a SCRAM login with the pending password succeeded
+#   4 promoted        the pending file replaced the current one (atomic mv)
+#   5 refreshed       containers that mount the secret were recreated
+#   6 verified        the api's own connection (app) or the migrate job
+#                     (owner) logged in and the privileges match
+#
+# An interruption or failure in states 1-3 leaves the pending file: running
+# the command again finishes the rotation with it, and
+# rotate-db-password-abort gives the database the current password back.
+# Both work whatever the database has, because the superuser sets the
+# password; neither needs the old one. After state 4, make up (or running
+# the command again) recreates the containers that still mount the replaced
+# file. Nothing ever falls back to another role; passwords are never printed.
+rotation_files() { # role -> sets ROT_CURRENT, ROT_PENDING
+  ROT_CURRENT=$SECRETS_DIR/db_$1_password
+  ROT_PENDING=$SECRETS_DIR/.db_$1_password.pending
+}
+
+rotation_role() {
+  ROT_ROLE=${ROLE-}
+  case $ROT_ROLE in
+    app | owner) ;;
+    *) die $EX_CONFIG "set ROLE=app or ROLE=owner (got $(show "$ROT_ROLE"))" ;;
+  esac
+}
+
+valid_secret_file() { # file
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && [[ $(cat "$1") =~ ^[0-9a-f]{48}$ ]]
+}
+
+# Login as flowcrm_<role> with the password in FILE, over SCRAM, inside the db container.
+check_login() { # role file
+  OP_STDIN=$2 db_roles check-login "$1"
+}
+
+# The role's own client proves the login: the api (app) or the migrate job (owner).
+verify_role_client() { # role
+  local rc
+  if [ "$1" = app ]; then
+    verify_privileges
+    return 0
+  fi
+  new_tmp compose-err
+  compose_op run --rm --no-deps -T migrate php bin/console app:database:verify-privileges >/dev/null 2>"$TMP_FILE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    grep -E '^VIOLATION|password authentication|SQLSTATE' "$TMP_FILE" | head -n 5 | sed 's/^/  /' >&2
+    die $EX_SAFETY "the migrate job could not log in as flowcrm_owner with .runtime/secrets/db_owner_password, or the privileges differ (shown above)"
+  fi
+  rm -f "$TMP_FILE"
+  TMP_FILE=
+}
+
+rotation_prepare() { # command
+  rotation_role
+  locked "$1"
+  require_role_stack "$1" "rotate"
+  COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
+  rotation_files "$ROT_ROLE"
+  ensure_secrets
+  start_db
+  [ "$(roles_state)" = complete ] || die $EX_SAFETY "the database roles are not complete; rotate only after make up or make db-upgrade-roles"
+  if [ -L "$ROT_PENDING" ] || { [ -e "$ROT_PENDING" ] && ! valid_secret_file "$ROT_PENDING"; }; then
+    die $EX_SAFETY ".runtime/secrets/${ROT_PENDING##*/} is not a valid pending password (regular file of yours, 48 lowercase hex characters); remove it, then run make db-rotate-password-abort ROLE=$ROT_ROLE"
+  fi
+}
+
+cmd_rotate_db_password() {
+  local tmp rc had_edge=''
+  rotation_prepare rotate-db-password
+  if [ -e "$ROT_PENDING" ]; then
+    log "resuming the unfinished rotation of flowcrm_$ROT_ROLE with its pending password"
+  else
+    tmp=$(mktemp "$SECRETS_DIR/.db_${ROT_ROLE}_password.XXXXXX") || die $EX_SAFETY "cannot create a temporary file in $SECRETS_DIR"
+    TMP_FILE=$tmp
+    if ! { chmod 0600 "$tmp" && od -An -N24 -tx1 /dev/urandom | tr -d ' \n' >"$tmp" && valid_secret_file "$tmp" && mv -f "$tmp" "$ROT_PENDING"; }; then
+      die $EX_SAFETY "could not create the pending password; nothing was changed"
+    fi
+    TMP_FILE=
+  fi
+  fault_point rotate-after-pending
+
+  protect_for "rotating the password of flowcrm_$ROT_ROLE"
+  grep -qx edge "$GATE_FILE" && had_edge=edge
+  OP_STDIN=$ROT_PENDING db_roles set-password "$ROT_ROLE"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    tail -n 3 "$TMP_FILE" >&2
+    die $EX_SAFETY "setting the new password failed (exit $rc); the rotation is unfinished: run make db-rotate-password ROLE=$ROT_ROLE again to finish it, or make db-rotate-password-abort ROLE=$ROT_ROLE to keep the current password"
+  fi
+  fault_point rotate-after-db
+  if ! check_login "$ROT_ROLE" "$ROT_PENDING"; then
+    tail -n 2 "$TMP_FILE" >&2
+    die $EX_SAFETY "flowcrm_$ROT_ROLE cannot log in with the new password; the rotation is unfinished: run make db-rotate-password ROLE=$ROT_ROLE again, or make db-rotate-password-abort ROLE=$ROT_ROLE"
+  fi
+  log "set a new password for flowcrm_$ROT_ROLE (SCRAM login checked)"
+
+  if ! { chmod 0444 "$ROT_PENDING" && mv -f "$ROT_PENDING" "$ROT_CURRENT"; }; then
+    die $EX_SAFETY "could not replace .runtime/secrets/db_${ROT_ROLE}_password with the pending password; run make db-rotate-password ROLE=$ROT_ROLE again"
+  fi
+  fault_point rotate-after-promote
+  refresh_secret_mounts
+  verify_role_client "$ROT_ROLE"
+  gate_clear
+  log "rotated the password of flowcrm_$ROT_ROLE"
+  restore_edge "$had_edge"
+}
+
+cmd_rotate_db_password_abort() {
+  local rc had_edge=''
+  rotation_prepare rotate-db-password-abort
+  [ -e "$ROT_PENDING" ] || { log "no unfinished rotation of flowcrm_$ROT_ROLE; nothing to abort"; return 0; }
+  valid_secret_file "$ROT_CURRENT" ||
+    die $EX_SAFETY ".runtime/secrets/db_${ROT_ROLE}_password is missing or malformed; restore it from a backup, or finish the rotation: make db-rotate-password ROLE=$ROT_ROLE"
+  protect_for "restoring the password of flowcrm_$ROT_ROLE"
+  grep -qx edge "$GATE_FILE" && had_edge=edge
+  OP_STDIN=$ROT_CURRENT db_roles set-password "$ROT_ROLE"
+  rc=$?
+  [ "$rc" -eq 0 ] || { tail -n 3 "$TMP_FILE" >&2; die $EX_SAFETY "restoring the current password failed (exit $rc); nothing else was changed; run the command again"; }
+  check_login "$ROT_ROLE" "$ROT_CURRENT" ||
+    { tail -n 2 "$TMP_FILE" >&2; die $EX_SAFETY "flowcrm_$ROT_ROLE cannot log in with the current password after the abort; run the command again"; }
+  rm -f "$ROT_PENDING"
+  refresh_secret_mounts
+  verify_role_client "$ROT_ROLE"
+  gate_clear
+  log "aborted the rotation of flowcrm_$ROT_ROLE; the database uses the current password again (SCRAM login checked)"
+  restore_edge "$had_edge"
+}
+
 main() {
   local cmd=${1:-help}
   [ $# -eq 0 ] || shift
   case $cmd in
-    up | down | restart | status | url | ports | logs | doctor) ;;
+    up | down | restart | status | url | ports | logs | doctor | upgrade-roles | rotate-db-password | rotate-db-password-abort) ;;
     __run-recorded)
       [ $# -ge 3 ] || die $EX_CONFIG "usage: bin/devenv __run-recorded LOCK_DIR TOKEN COMMAND..."
       run_recorded "$@"
@@ -1100,11 +1617,13 @@ main() {
     return
   fi
   load_config
+  # The command's own stdout and stderr, for on_signal.
+  exec 8>&1 9>&2
   trap on_exit EXIT
   trap 'on_signal 130 INT' INT
   trap 'on_signal 143 TERM' TERM
   trap 'on_signal 129 HUP' HUP
-  "cmd_$cmd"
+  "cmd_${cmd//-/_}"
 }
 
 # Tests source this file to reach the functions without running main.

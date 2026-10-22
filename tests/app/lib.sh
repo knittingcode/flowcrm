@@ -35,14 +35,16 @@ project_of() { printf 'flowcrm-%s' "$(sha6 "$1")"; }
 
 random_secret() { od -An -N24 -tx1 /dev/urandom | tr -d ' \n'; }
 
-# Writes the two application secrets into a new directory; prints its path.
+# Writes the application secrets (bootstrap, owner and runtime database
+# passwords, app secret) into a new directory; prints its path.
 make_secrets() {
-  local dir
+  local dir name
   dir=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-secrets.XXXXXX") || return 1
   chmod 0700 "$dir"
-  random_secret >"$dir/db_password"
-  random_secret >"$dir/app_secret"
-  chmod 0444 "$dir/db_password" "$dir/app_secret"
+  for name in db_password db_owner_password db_app_password app_secret; do
+    random_secret >"$dir/$name"
+    chmod 0444 "$dir/$name"
+  done
   printf '%s\n' "$dir"
 }
 

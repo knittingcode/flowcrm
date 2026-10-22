@@ -28,7 +28,10 @@ listener adds it to the expected schema, so `doctrine:schema:validate`
 (BE-07) fails if the migration and the handler differ.
 
 The handler uses its own connection, built from the same `DATABASE_*`
-settings and password file as Doctrine (no new credential). It is opened
+settings and password file as Doctrine (the runtime role `flowcrm_app`, no
+new credential; see [ADR-018](adr/ADR-018-database-roles.md)). That role
+holds `SELECT, INSERT, UPDATE, DELETE` on `sessions` and `cache_items` and
+cannot create, alter or drop tables. It is opened
 only when a session starts, gives up connecting after 5 seconds
 (`connect_timeout`), waits at most 5 seconds for a lock (`lock_timeout`,
 set on this connection only) and shows up as `flowcrm_sessions` in
@@ -128,8 +131,9 @@ connection attempt is abandoned after 5 seconds.
 
 A PHP-FPM worker opens at most three connections, each only when needed:
 Doctrine's default connection, the session connection and the cache
-connection. With `pm.max_children = 8`, the API uses at most 24 of
-PostgreSQL's default 100 connections (plus console commands).
+connection, all as `flowcrm_app`. With `pm.max_children = 8`, the API uses
+at most 24 of PostgreSQL's default 100 connections (plus console commands);
+the role's connection limit is 64.
 
 ### Logs
 
@@ -283,6 +287,9 @@ as it was. Recovery is a manual operator task:
    $ docker compose -p flowcrm-1d1ca1 exec db psql -U flowcrm -d flowcrm -c 'SELECT current_database(), current_schema()'
    ```
 
+   These commands run as the superuser `flowcrm` inside the `db` container
+   (local socket, no password); the API's role cannot do any of them.
+
 2. **Inspect** the relation (`\d+ cache_items`, row count) and decide whether
    its rows matter. Cache rows are disposable; session rows only keep users
    signed in.
@@ -298,15 +305,22 @@ as it was. Recovery is a manual operator task:
    The count must match the original. Keep the dump outside the database
    volume; `flowcrm_restore_check` is a separate scratch database that
    holds only the restored copy.
-4. **Rename, never drop**, the relation and its indexes, so the migration
-   can create fresh tables and the existing rows stay in place:
+4. **Rename, never drop**, the relation and its indexes, and move it out of
+   schema `public`, so the migration can create fresh tables and the
+   existing rows stay in place. As the superuser (the owner may not create
+   schemas):
 
    ```sql
    ALTER TABLE cache_items RENAME TO cache_items_preexisting;
    ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey;
+   CREATE SCHEMA preexisting;
+   ALTER TABLE cache_items_preexisting SET SCHEMA preexisting;
    ```
 
-   (for `sessions`: `sessions_pkey` and `sess_lifetime_idx`).
+   (for `sessions`: `sessions_pkey` and `sess_lifetime_idx`). Left in
+   `public`, the renamed table would stop `make up` with exit 6: it is not
+   in the runtime privilege manifest, and if another role owns it the
+   database roles are inconsistent (ADR-018).
 5. **Run `make up` again.** The migration creates the new tables.
 6. **Leave the renamed table until an operator decides.** Removing it, or
    the scratch restore database, is a separate, explicitly authorized step
