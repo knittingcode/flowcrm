@@ -19,9 +19,17 @@ use Symfony\Component\Routing\Attribute\Route;
  */
 final class SessionProbeController
 {
+    /**
+     * With ?other_cookie=1, an unrelated cookie is queued first (through
+     * PHP, like the session cookie), to show it survives a failing start.
+     */
     #[Route('/api/_test/session', methods: ['GET'])]
     public function read(Request $request): JsonResponse
     {
+        if ($request->query->getBoolean('other_cookie')) {
+            setcookie('probe_other', 'kept', ['path' => '/', 'httponly' => true, 'samesite' => 'Lax']);
+        }
+
         return new JsonResponse(['n' => $request->getSession()->get('n')]);
     }
 

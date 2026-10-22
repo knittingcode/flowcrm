@@ -227,10 +227,12 @@ final class FpmSessionTest extends KernelTestCase
     /**
      * A request that waits for a session locked by another request gives up
      * after the session connection's lock_timeout (5 s) with a problem
-     * document; its connection is closed, the lock holder is unaffected and
-     * the session works again afterwards.
+     * document; its connection is closed and the lock holder is unaffected.
+     * The session itself survives: Symfony keeps the ID when the read fails
+     * (AbstractSessionHandler::validateId), so the browser keeps its cookie.
+     * PHP may send the cookie again, but only with the same ID and flags.
      */
-    public function testWaitingForASessionLockIsBoundedAndFailsSafely(): void
+    public function testWaitingForASessionLockIsBoundedAndKeepsTheSession(): void
     {
         $id = $this->idFrom(self::$fpm->request('POST', '/api/_test/session/increment'));
         $holder = SeparateConnection::open();
@@ -238,17 +240,26 @@ final class FpmSessionTest extends KernelTestCase
         $holder->prepare('SELECT sess_data FROM sessions WHERE sess_id = ? FOR UPDATE')->execute([$id]);
         try {
             $start = microtime(true);
-            $response = self::$fpm->request('GET', '/api/_test/session', [self::COOKIE => $id]);
+            $response = self::$fpm->request('GET', '/api/_test/session?other_cookie=1', [self::COOKIE => $id]);
             $waited = microtime(true) - $start;
 
             self::assertGreaterThanOrEqual(4.5, $waited, 'it waited for the lock');
             self::assertLessThan(8.0, $waited, 'it gave up after lock_timeout');
             self::assertSame(500, $response->status);
             self::assertSame(['application/problem+json'], $response->header('Content-Type'));
-            self::assertSame([], $response->header('Set-Cookie'));
+            $problem = $response->json();
+            self::assertSame('/problems/internal-error', $problem['type']);
+            self::assertSame($response->header('X-Request-Id'), [$problem['requestId']]);
             foreach ([$id, 'SQLSTATE', '55P03', 'lock', 'sessions', 'pgsql', 'flowcrm_sessions'] as $detail) {
                 self::assertStringNotContainsString($detail, $response->body);
             }
+
+            // The session ID is not rotated, invalidated or cleared.
+            foreach ($response->setCookies(self::COOKIE) as $cookie) {
+                self::assertSame(self::COOKIE.'='.$id, explode(';', $cookie)[0], 'only the same ID may be sent again');
+                self::assertSame(['path=/', 'httponly', 'samesite=lax'], $this->attributes($cookie));
+            }
+            self::assertSame(['probe_other=kept; path=/; HttpOnly; SameSite=Lax'], $response->setCookies('probe_other'), 'other cookies are unaffected');
             self::assertSame(0, SeparateConnection::sessionConnectionsAfterRequests($holder), 'the waiting connection was closed');
 
             $holder->prepare('UPDATE sessions SET sess_time = sess_time WHERE sess_id = ?')->execute([$id]);
@@ -260,8 +271,11 @@ final class FpmSessionTest extends KernelTestCase
         }
 
         $start = microtime(true);
-        self::assertSame(['n' => 1], self::$fpm->request('GET', '/api/_test/session', [self::COOKIE => $id])->json());
+        $next = self::$fpm->request('GET', '/api/_test/session', [self::COOKIE => $id]);
         self::assertLessThan(1.0, microtime(true) - $start);
+        self::assertSame(['n' => 1], $next->json(), 'the session continues with its data');
+        self::assertSame([], $next->setCookies(self::COOKIE), 'and keeps its ID');
+        self::assertNotNull($this->row($id));
     }
 
     /**
