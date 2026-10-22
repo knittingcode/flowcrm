@@ -32,7 +32,7 @@ FlowCRM is designed around practical sales workflows, with a focus on data owner
 | CI/CD | GitHub Actions |
 | Testing | PHPUnit, PHPStan, PHP-CS-Fixer, Vitest, Testing Library, Playwright, ESLint |
 
-No cache server or message broker is part of the stack (ADR-007): sessions, rate limits and locks will use PostgreSQL. If background processing becomes necessary, Symfony Messenger will start with its Doctrine transport.
+No cache server or message broker is part of the stack (ADR-007): sessions and the application cache use PostgreSQL, and rate limits and locks will too. If background processing becomes necessary, Symfony Messenger will start with its Doctrine transport.
 
 ## Architecture
 
@@ -59,6 +59,7 @@ flowchart LR
 - Backend modules follow the FCRM-003 module plan; the foundation contains only the small `Shared` module (health checks, the API status endpoint, problem details and request IDs). Module boundaries and layers are enforced with Deptrac ([backend modules](docs/architecture/backend-modules.md)).
 - The core schema (users, organizations, memberships, pipeline, audit log) enforces its invariants in PostgreSQL, including composite tenant foreign keys and an append-only audit log ([data model](docs/architecture/data-model.md)).
 - The API writes structured JSON logs to stderr; the edge, the API's log records and problem documents share one request ID per request ([observability](docs/architecture/observability.md)).
+- Sessions and the application cache are stored in PostgreSQL (Symfony `PdoSessionHandler` and `DoctrineDbalAdapter`); sessions are lazy, so stateless routes set no cookie ([sessions and cache](docs/architecture/sessions-and-cache.md)). Login and authorization are not implemented yet.
 
 Details: [development lifecycle contract](docs/architecture/development-lifecycle-contract.md), [ADR-017 health endpoint routing](docs/architecture/adr/ADR-017-health-endpoint-routing.md).
 
@@ -167,7 +168,7 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 
 ## Known limitations
 
-- No CRM features, authentication, sessions or tenant isolation yet; they follow in later foundation tasks.
+- No CRM features, authentication or tenant isolation yet; they follow in later foundation tasks. Session storage exists, but nothing logs a user in.
 - The production-like configuration is tested locally and in CI only; there is no deployment.
 - The API image is rebuilt when PHP dependencies change; there is no hot reload of Composer packages.
 
