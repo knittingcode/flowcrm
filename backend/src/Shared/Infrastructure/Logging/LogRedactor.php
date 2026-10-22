@@ -19,7 +19,7 @@ final class LogRedactor
     /** Keys whose values are never logged, compared case-insensitively. */
     private const KEYS = [
         'password', 'passwd', 'pwd', 'secret', 'token', 'csrf', 'authorization',
-        'cookie', 'set-cookie', 'session', 'api_key', 'apikey',
+        'cookie', 'set-cookie', 'session', 'sid', 'sess_id', 'sess_data', 'api_key', 'apikey',
         'email', 'phone', 'first_name', 'last_name', 'display_name',
     ];
 

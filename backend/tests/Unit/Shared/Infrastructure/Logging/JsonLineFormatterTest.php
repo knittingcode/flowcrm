@@ -52,6 +52,8 @@ final class JsonLineFormatterTest extends TestCase
         yield 'contact e-mail' => ['contact created', ['email' => 'anna@example.com'], 'anna@example.com'];
         yield 'phone' => ['contact created', ['contact' => ['phone' => '+48 600 100 200']], '600 100 200'];
         yield 'session id' => ['session', ['session_id' => 'session-value'], 'session-value'];
+        yield 'session table columns' => ['session', ['sess_id' => 'session-row-id', 'sess_data' => 'session-row-data'], 'session-row-'];
+        yield 'sid' => ['session', ['sid' => 'sid-value'], 'sid-value'];
         yield 'credential in the message' => ['connect failed: password=hunter2-value host=db', [], 'hunter2-value'];
         yield 'quoted credential in a context string' => ['failed', ['detail' => 'config "secret": "s3cr3t-value"'], 's3cr3t-value'];
         yield 'bearer token in the message' => ['upstream said Authorization: Bearer abc.def-ghi', [], 'abc.def-ghi'];

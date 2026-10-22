@@ -23,3 +23,10 @@ services:
 
     # The migrations bundle registers its dependency factory only by id.
     Doctrine\Migrations\DependencyFactory: '@doctrine.migrations.dependency_factory'
+
+when@test:
+    services:
+        # Test-only HTTP entry points that use the session (FpmSessionTest).
+        App\Tests\Support\Session\SessionProbeController:
+            autoconfigure: true
+            tags: [controller.service_arguments]
