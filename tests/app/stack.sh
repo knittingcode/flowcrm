@@ -1123,6 +1123,18 @@ sleep 5
   [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/security-gate" ]
 v "ST-66 SIGKILL while ALTER TABLE OWNER waits: blocked (status, url); the next upgrade ends the old operation first and it never commits; the gate stays until an upgrade passes every check" $? "rc=$ck_rc old=$ck_old waited=$i"
 
+# The backup check requires an intact audit log once its migration is
+# recorded (FND-009U): a disabled or a dropped trigger stops the upgrade
+# before anything changes; the triggers are then restored exactly.
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c 'ALTER TABLE audit_events DISABLE TRIGGER audit_events_append_only' >/dev/null
+cupg c-upg-trgoff
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c 'ALTER TABLE audit_events ENABLE TRIGGER audit_events_append_only; DROP TRIGGER audit_events_no_truncate ON audit_events' >/dev/null
+cupg c-upg-trgdrop
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c 'CREATE TRIGGER audit_events_no_truncate BEFORE TRUNCATE ON audit_events FOR EACH STATEMENT EXECUTE FUNCTION audit_events_reject_change()' >/dev/null
+[ "$(rc_of c-upg-trgoff)" = 6 ] && err_has c-upg-trgoff 'the audit log is not intact \(audit_events_append_only:D' &&
+  [ "$(rc_of c-upg-trgdrop)" = 6 ] && err_has c-upg-trgdrop 'the audit log is not intact \(audit_events_append_only:O;' && legacy_same
+v "ST-67 a disabled or a dropped audit trigger stops the upgrade in the backup check (exit 6); nothing changed" $? "$(tail -n 1 "$work/out/c-upg-trgoff.err") | $(tail -n 1 "$work/out/c-upg-trgdrop.err")"
+
 dv c-upgrade "$C" upgrade-roles
 dump=$(find "$C/.runtime/backups" -name 'roles_upgrade_*.dump' -type f 2>/dev/null | head -n 1)
 psql_c() { docker exec "$(cid "$C" db)" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
@@ -1147,6 +1159,67 @@ dv c-upgrade2 "$C" upgrade-roles
   [ "$(docker exec "$(cid "$C" db)" flowcrm-db-roles state)" = complete ]
 v "ST-53 after the upgrade make up publishes the stack as flowcrm_app; a second upgrade changes nothing" $? "$(tail -n 2 "$work/out/c-up2.err")"
 dv c-down "$C" down
+
+# --- a volume from FND-004, before the audit log existed (FND-009U) -----------
+# Checkout D gets a volume as the stack created it at FND-004: one superuser,
+# only the baseline migration and its row, no audit_events. The backup check
+# must accept the missing audit log there, but not when the history records
+# the migration that creates it; the upgrade then runs every later migration
+# as flowcrm_owner and keeps the baseline row and its history.
+new_checkout d
+D=$CO
+pd=$(project_of "$D")
+ds=$D/.runtime/secrets
+(umask 077 && mkdir -p "$ds")
+for f in db_password app_secret; do random_secret >"$ds/$f" && chmod 0444 "$ds/$f"; done
+docker network create --label "$legacy_label" "$pd-legacy" >/dev/null
+docker volume create --label "com.docker.compose.project=$pd" --label com.docker.compose.volume=db-data "${pd}_db-data" >/dev/null
+docker run -d --name "$pd-legacy-db" --label "$legacy_label" --network "$pd-legacy" --network-alias db --user postgres \
+  -e POSTGRES_DB=flowcrm -e POSTGRES_USER=flowcrm -e POSTGRES_PASSWORD_FILE=/run/secrets/db_password \
+  -v "$ds/db_password:/run/secrets/db_password:ro" -v "${pd}_db-data:/var/lib/postgresql" "$legacy_image" >/dev/null
+i=0
+until docker logs "$pd-legacy-db" 2>&1 | grep -q 'init process complete' && docker exec "$pd-legacy-db" pg_isready -q -h 127.0.0.1 -U flowcrm -d flowcrm || [ "$i" -ge 90 ]; do sleep 1; i=$((i + 1)); done
+docker run --rm --network "$pd-legacy" --read-only --tmpfs /tmp --tmpfs /app/var:uid=82,gid=82 \
+  -e APP_ENV=dev -e DATABASE_USER=flowcrm -e DATABASE_PASSWORD_FILE=/run/secrets/db_password \
+  -v "$ds/db_password:/run/secrets/db_password:ro" -v "$ds/app_secret:/run/secrets/app_secret:ro" \
+  -v "$D/backend/src:/app/src:ro" -v "$D/backend/config:/app/config:ro" -v "$D/backend/migrations:/app/migrations:ro" \
+  "$(project_of "$A")-api" php bin/console doctrine:migrations:migrate --no-interaction 'DoctrineMigrations\Version20261021180000' >"$work/out/d-legacy-migrate.log" 2>&1
+d_legacy_rc=$?
+d_rows_sql="SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT b::text t FROM schema_baseline b UNION ALL SELECT v.version || ' ' || v.executed_at FROM doctrine_migration_versions v WHERE v.version = 'DoctrineMigrations\Version20261021180000') x"
+d_rows=$(docker exec "$pd-legacy-db" psql -U flowcrm -d flowcrm -tAq -c "$d_rows_sql")
+d_shape=$(docker exec "$pd-legacy-db" psql -U flowcrm -d flowcrm -tAq -c "SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'")
+docker rm -f "$pd-legacy-db" >/dev/null 2>&1
+docker network rm "$pd-legacy" >/dev/null 2>&1
+psql_d() { docker exec "$(cid "$D" db)" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
+
+dv d-up "$D" up
+# The history records the audit log's migration, but the table is missing:
+# the backup check fails closed.
+(cd "$D" && FLOWCRM_DEVENV_FAULT=upgrade-after-backup ./bin/devenv upgrade-roles) >/dev/null 2>&1
+psql_d "INSERT INTO doctrine_migration_versions (version, executed_at, execution_time) VALUES ('DoctrineMigrations\Version20261022000000', now(), 1)" >/dev/null
+dv d-upg-fake "$D" upgrade-roles
+psql_d "DELETE FROM doctrine_migration_versions WHERE version = 'DoctrineMigrations\Version20261022000000'" >/dev/null
+d_fake_state=$(docker exec "$(cid "$D" db)" flowcrm-db-roles state)
+dv d-upgrade "$D" upgrade-roles
+d_dump=$(find "$D/.runtime/backups" -name 'roles_upgrade_*.dump' -type f -newer "$work/out/d-upg-fake.rc" 2>/dev/null | head -n 1)
+[ "$d_legacy_rc" = 0 ] && [ "$d_shape" = doctrine_migration_versions,schema_baseline ] && [ -n "$d_rows" ] &&
+  [ "$(rc_of d-up)" = 6 ] && err_has d-up 'make db-upgrade-roles' &&
+  [ "$(rc_of d-upg-fake)" = 6 ] && err_has d-upg-fake 'audit_events missing although its migration is recorded' && [ "$d_fake_state" = legacy ] &&
+  [ "$(rc_of d-upgrade)" = 0 ] && err_has d-upgrade 'verified backup: .runtime/backups/roles_upgrade_' && [ -s "$d_dump" ] && [ "$(perm "$d_dump")" = 600 ] &&
+  [ "$(docker exec "$(cid "$D" db)" flowcrm-db-roles state)" = complete ] &&
+  [ "$(psql_d "SELECT string_agg(DISTINCT pg_get_userbyid(relowner), ',') FROM pg_class WHERE relnamespace = 'public'::regnamespace")" = flowcrm_owner ] &&
+  [ "$(psql_d "$d_rows_sql")" = "$d_rows" ] &&
+  [ "$(psql_d "SELECT count(*) FROM doctrine_migration_versions")" = "$(find "$D/backend/migrations" -name 'Version*.php' | wc -l | tr -d ' ')" ] &&
+  [ "$(psql_d "SELECT string_agg(tgname || ':' || tgenabled::text, ' ' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'audit_events'::regclass AND NOT tgisinternal")" = 'audit_events_append_only:O audit_events_no_truncate:O' ]
+v "ST-68 a volume from FND-004 (no audit log yet): a recorded audit migration without its table is refused; the upgrade then succeeds after a verified backup, runs every later migration as flowcrm_owner and keeps the baseline row and history" $? "legacy=$d_legacy_rc shape=$d_shape fake=$(rc_of d-upg-fake) upgrade=$(rc_of d-upgrade) $(tail -n 2 "$work/out/d-upgrade.err" | tr '\n' ' ')"
+dv d-up2 "$D" up
+d_ready=$(until_ready "$(saved_port "$D")" 200 30 && echo ready)
+d_verify=$(console_in "$D" app:database:verify-privileges --runtime && echo ok || tail -n 3 "$work/out/console.log" | tr '\n' ' ')
+dv d-upgrade2 "$D" upgrade-roles
+[ "$(rc_of d-up2)" = 0 ] && [ "$d_ready" = ready ] && [ "$d_verify" = ok ] &&
+  [ "$(rc_of d-upgrade2)" = 0 ] && err_has d-upgrade2 'nothing to upgrade' && ! err_has d-upgrade2 'verified backup' && [ "$(psql_d "$d_rows_sql")" = "$d_rows" ]
+v "ST-68 after the FND-004 upgrade make up serves as flowcrm_app (runtime manifest OK); a second upgrade changes nothing" $? "up=$(rc_of d-up2) ready=$d_ready verify=$d_verify upgrade2=$(rc_of d-upgrade2) $(tail -n 2 "$work/out/d-upgrade2.err" | tr '\n' ' ')"
+dv d-down "$D" down
 
 # --- one checkout, two stacks: the other stack's commands are refused --------
 
@@ -1190,7 +1263,7 @@ final_cleanup
 : >"$work/checkouts"
 : >"$work/holders"
 left=0
-for d in "$A" "$B" "$C"; do left=$((left + $(project_resources "$(project_of "$d")"))); done
+for d in "$A" "$B" "$C" "$D"; do left=$((left + $(project_resources "$(project_of "$d")"))); done
 [ "$left" = 0 ]; v "CLEAN no containers, volumes or networks of the test checkouts left" $?
 snapshot >"$work/after.containers"
 missing=$(comm -23 "$work/before.containers" "$work/after.containers")
