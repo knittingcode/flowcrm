@@ -100,13 +100,16 @@ Requests of different sessions do not wait for each other.
 Both sides of the wait are bounded:
 
 - **The waiting request** gives up after 5 seconds (`lock_timeout` of the
-  session connection). It gets a 500 problem document without details and
-  no `Set-Cookie` header: PHP's session module queues a cookie with a new ID
-  when the ID cannot be validated, and `FailedSessionStartListener` removes
-  it, so the browser keeps its valid session cookie. The connection closes
-  with the request, which rolls its transaction back. The next request of
-  the session works normally. PHP's own time limit does not help here: it
-  counts CPU time, not time spent waiting for PostgreSQL.
+  session connection). It gets a 500 problem document without details,
+  with its request ID. The session is kept: when the read fails while PHP
+  validates the ID, Symfony's `AbstractSessionHandler::validateId()` keeps
+  the ID (rather than reporting it invalid, which would make PHP issue a new
+  ID) and lets the failure surface from `read()`. PHP may send the session
+  cookie again, but only with the same ID and the same attributes, and other
+  cookies are unaffected. The connection closes with the request, which
+  rolls its transaction back. The next request of the session works
+  normally. PHP's own time limit does not help here: it counts CPU time,
+  not time spent waiting for PostgreSQL.
 - **The lock holder:** PHP-FPM kills a worker that is still busy after 60
   seconds (`request_terminate_timeout` in `docker/api/php-fpm.conf`). Its
   connections close, PostgreSQL rolls back its transaction and the lock is
@@ -164,8 +167,11 @@ cache is used. Two reasons:
   table is missing. The `RejectSchemaChanges` middleware, registered for
   the `cache` connection only, rejects `CREATE`, `ALTER`, `DROP` and
   `TRUNCATE` there, so the attempt fails (a logged miss) and the table
-  exists only once its migration has run. The middleware guards against the
-  adapter's own statements; it is not a defence against hostile SQL.
+  exists only once its migration has run. The guard is intentionally narrow:
+  it matches statements that start with those keywords, which covers the
+  adapter's own `CREATE TABLE`. Other forms (leading comments, several
+  statements in one string, `SELECT ... INTO`, `DO` blocks) pass; it is not
+  a defence against hostile SQL, which would need database privileges.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -234,7 +240,7 @@ the authentication work stores its counters in a cache pool).
 
 ## Migration
 
-`Version20261022100000` owns `sessions` (with `sess_lifetime_idx`) and
+`Version20261022100000` creates `sessions` (with `sess_lifetime_idx`) and
 `cache_items`; `down()` drops them. No other table, constraint or row is
 changed, and no credential changes. `make up` applies it to existing
 development databases (in development after the containers start, as every
@@ -242,20 +248,48 @@ migration; in the production-like stack before PHP-FPM starts). Because the
 cache cannot create its table (see above), the order does not matter: a
 cache write before the migration is a logged miss.
 
-If one of the tables already exists, the migration compares it with its
-own definition: every column (name, order, type, length, nullability, no
-default), the primary key and, for `sessions`, the index.
+### Existing tables
 
-- **Identical:** the table is adopted with its rows ("Adopting the existing
-  ... table"), and a missing `sess_lifetime_idx` is created.
-- **Different:** the migration aborts. Migrations run all-or-nothing in one
-  transaction, so nothing is created, dropped or altered, and the version is
-  not recorded. `make up` fails with exit 2 and keeps its saved state;
-  `/health/ready` stays 503.
+The migration only creates tables; it never adopts one. If a relation
+named `sessions`, `cache_items` or `sess_lifetime_idx` already exists in
+the schema (a table of any definition, a view, an index), it aborts before
+any change with:
 
-Reconciling a different table is a manual decision: inspect it (and back it
-up if it might hold something of value), then rename or drop it yourself
-and run `make up` again. Nothing does that automatically.
+```text
+Not migrating: cache_items already exist(s) in schema "public"; this migration only creates new tables. ...
+```
+
+Migrations run all-or-nothing in one transaction, so nothing is created,
+dropped or altered, the version is not recorded, `make up` fails with exit
+2 and keeps its saved state, and `/health/ready` stays 503 (pending
+migration).
+
+Such a table can only come from outside this project's code: created by
+hand, or by the cache adapter of a build before the cache connection
+refused schema changes. Comparing it with the expected definition reliably
+would mean checking columns, collations, constraints, indexes, triggers,
+ownership and persistence, so there is no automatic adoption. Recovery,
+which keeps the existing data:
+
+1. Look at the relation (`\d+ cache_items` in `psql`) and decide whether
+   its rows matter. Cache rows never do; session rows only log users out.
+2. Rename it, and its primary-key index:
+
+   ```sql
+   ALTER TABLE cache_items RENAME TO cache_items_preexisting;
+   ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey;
+   ```
+
+   (for `sessions`: `sessions_pkey` and `sess_lifetime_idx`).
+3. Run `make up` again. The migration creates fresh tables; the renamed one
+   stays for inspection.
+4. Once it is no longer needed (export it first with
+   `pg_dump -t cache_items_preexisting` if its rows matter), drop it by
+   hand. Until then `doctrine:schema:validate` reports it as a table the
+   mapping does not know; moving it to another schema of the same database
+   does not help, because Doctrine inspects every schema.
+
+Nothing in the project drops or rewrites such a table.
 
 An interrupted migration (process killed, connection lost) is rolled back
 by PostgreSQL and can simply be run again.
@@ -266,12 +300,17 @@ Tests:
   full down/up round trip (BE-08);
 - `SessionCacheMigrationTest`, each case in a throwaway database: core rows,
   including an audit event and the audit triggers, unchanged by up, down and
-  up; a cache write before the migration creates no table (and, as a
-  control, does without the middleware); a compatible table adopted with its
-  rows; six incompatible definitions rejected with nothing changed; a
-  migration killed while waiting inside its transaction leaves nothing and
-  runs again;
-- ST-45 and ST-46: the same through `make up` on the running stack.
+  up; a second run changes nothing; a cache write before the migration
+  creates no table (and, as a control, does without the middleware); twelve
+  existing relations (tables identical to the expected ones, and tables with
+  an extra CHECK, foreign key, user trigger, UNIQUE constraint or index, a
+  case-insensitive collation, UNLOGGED, another owner; a view; an index of
+  that name elsewhere), each stopping the migration with its own message
+  and leaving the whole catalog and the stored rows unchanged; the rename
+  recovery; a migration killed while waiting inside its transaction leaves
+  nothing and runs again;
+- ST-45 and ST-46: an existing table and the rename recovery through
+  `make up` on the running stack.
 
 ## Security boundaries
 
@@ -288,9 +327,9 @@ Tests:
 
 | Test | Proves |
 |---|---|
-| `backend/tests/Integration/Session/FpmSessionTest.php` | through a real PHP-FPM and the real database: stateless routes, with and without a session cookie, answer at once while the sessions table is exclusively locked, set no cookie and store nothing; the session ID has 128 bits and never appears in a body; cookie attributes over HTTP and HTTPS; idle expiry stored; data survives a PHP-FPM restart; unknown, malformed and expired IDs are replaced, never adopted; `migrate` deletes the old row; `invalidate` deletes the row and expires the cookie; two concurrent requests of one session do not lose an update; a request waiting for a locked session fails after 5 s with a problem document and no cookie, closes its connection, and the session works afterwards; a worker past `request_terminate_timeout` is killed and releases the lock; without the database only session routes fail, as problem documents without details; no session ID in PHP-FPM output |
+| `backend/tests/Integration/Session/FpmSessionTest.php` | through a real PHP-FPM and the real database: stateless routes, with and without a session cookie, answer at once while the sessions table is exclusively locked, set no cookie and store nothing; the session ID has 128 bits and never appears in a body; cookie attributes over HTTP and HTTPS; idle expiry stored; data survives a PHP-FPM restart; unknown, malformed and expired IDs are replaced, never adopted; `migrate` deletes the old row; `invalidate` deletes the row and expires the cookie; two concurrent requests of one session do not lose an update; a request waiting for a locked session fails after 5 s with a problem document and its request ID, keeps the session ID (any `Set-Cookie` repeats the same ID and attributes) and other cookies, closes its connection, and the session continues afterwards; a worker past `request_terminate_timeout` is killed and releases the lock; without the database only session routes fail, as problem documents without details; no session ID in PHP-FPM output |
 | `backend/tests/Integration/Session/PdoSessionHandlerTest.php` | the configured handler: transactional lock mode on its own connection; `lock_timeout` 5 s on the session connection only; write, read and destroy, including binary data; unknown and expired IDs invalid; garbage collection deletes only expired rows; a second request waits for the lock; **negative control:** without the lock an update is lost |
-| `backend/tests/Integration/Session/FpmServerTest.php` | the harness: a request without an answer fails at its deadline with diagnostics and its client process is killed; stopping ends the master and every worker |
+| `backend/tests/Integration/Session/FpmServerTest.php` | the harness: a request without an answer fails at its deadline with diagnostics and its client process is killed; stopping ends the master and every worker; the master leads a process group of its own; the workers of a master killed from outside are still found and stopped |
 | `backend/tests/Integration/Cache/DatabaseCacheTest.php` | `cache.app` is `DoctrineDbalAdapter`; items in `cache_items` with their TTL; hit, expiry, deletion; namespaces of two pools isolated; clearing touches no other table; prune removes only expired items; reserved key characters rejected; an unreachable database gives logged misses |
 | `backend/tests/Integration/Cache/CacheConnectionTest.php` | the cache's own lazy connection; it refuses `CREATE`, `ALTER`, `DROP` and `TRUNCATE`, the default connection does not; a cache failure leaves a business transaction intact; **negative control:** on the default connection it aborts it (25P02) |
 | `backend/tests/Integration/Configuration/SessionAndCacheConfigurationTest.php` | the session options of dev, test and prod |
@@ -298,7 +337,7 @@ Tests:
 | `tests/app/backend.sh` BE-14 | dev and prod use `PdoSessionHandler`, `DoctrineDbalAdapter` and the seed `flowcrm`; the test-only session routes exist in the test environment only |
 | `tests/app/backend.sh` BE-15 | the PHP-FPM configuration of the image ends requests after 60 s |
 | `tests/app/stack.sh` ST-44, `tests/app/prodlike.sh` PL-14 | through the edge, in development and production mode: stateless requests set no cookie and store no session; the tables exist after `make up` |
-| `tests/app/stack.sh` ST-45, ST-46 | `make up` with an incompatible `cache_items` fails, changes nothing and keeps its saved state; with a compatible one it adopts the table and its rows |
+| `tests/app/stack.sh` ST-45, ST-46 | `make up` with an existing `cache_items` (identical to the expected one) fails, changes nothing and keeps its saved state; after renaming it by hand, `make up` migrates and the renamed table keeps its rows; the schema is valid once it is dropped |
 
 The session tests use `SessionProbeController`
 (`backend/tests/Support/Session`), test-only routes under `/api/_test/session`
@@ -316,11 +355,12 @@ Each of these changes fails the tests named (run on copies of the code):
 | a filesystem `cache.app` | the cache tests |
 | the migration removed | BE-07 and the session and cache tests |
 | no `lock_timeout` on the session connection | the lock-wait test (fails at the harness deadline instead of hanging) and the lock-timeout scope test |
-| no removal of the cookie of a failed session start | the lock-wait test (a new session cookie is sent) |
+| a session handler that reports a failed read as an invalid ID (so PHP issues a new one) | the lock-wait test (the request then gets a new, empty session) |
 | no `request_terminate_timeout` | BE-15 |
 | the schema guard disabled | the guard and transaction-isolation tests |
 | the guard without its connection scope | the test that the default connection is not restricted |
-| the migration creating tables without checking existing ones, or adopting any existing table | the adoption and incompatible-table tests |
+| the migration without its existence check, silently skipping existing tables, or adopting tables whose columns match (the earlier version) | the existing-relation tests |
+| the harness finding workers by parent PID | the test for workers of a master killed from outside |
 | `cache.app` on the default connection | the dedicated-connection test |
 | no redaction of `*_sid` keys | the redaction tests for the cookie names |
 | a listener that starts the session on every request | the stateless-route test |
