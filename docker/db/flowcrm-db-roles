@@ -33,7 +33,8 @@
 #
 # Operation identity: bin/devenv passes FLOWCRM_OP_ID; every session of a
 # changing command is named flowcrm-db-roles:<id> (application_name) and
-# holds the advisory lock below inside its transaction. A changing command
+# holds the advisory lock below inside its transaction (no lock is waited
+# for longer than 120 s: the transaction then fails). A changing command
 # first ends operations of earlier runs that are still alive (bin/devenv
 # holds the checkout lock, so they belong to an interrupted command): their
 # transactions roll back before anything else happens.
@@ -85,6 +86,7 @@ run() {
 SET log_statement = 'none';
 SET log_min_duration_statement = -1;
 SET log_min_error_statement = panic;
+SET lock_timeout = '120s';
 BEGIN;
 SELECT pg_advisory_xact_lock($LOCK_KEY) \\g /dev/null
 SQL

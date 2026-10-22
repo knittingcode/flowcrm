@@ -48,6 +48,8 @@ TMP_FILE=
 DB_OP_ID=
 # Standard input of the next run_op call (default /dev/null).
 OP_STDIN=
+# Time limit in seconds of the next run_op call (default none).
+OP_TIMEOUT=
 
 log() { printf 'devenv: %s\n' "$*" >&2; }
 
@@ -555,13 +557,18 @@ run_recorded() { # lock-dir token command...
 # FLOWCRM_LOCK_WAIT seconds, fail and keep the lock, so no other command can
 # start while they run.
 run_op() { # command...
-  local rc
+  local rc watchdog=''
   set -m
   "$BASH" "$SELF" __run-recorded "$LOCK_DIR" "$LOCK_TOKEN" "$@" <"${OP_STDIN:-/dev/null}" 8>&- 9>&- &
   OP_GROUP=$!
   set +m
+  if [ -n "$OP_TIMEOUT" ]; then
+    (sleep "$OP_TIMEOUT" && kill -TERM -- "-$OP_GROUP") >/dev/null 2>&1 8>&- 9>&- &
+    watchdog=$!
+  fi
   wait "$OP_GROUP"
   rc=$?
+  [ -z "$watchdog" ] || kill "$watchdog" 2>/dev/null
   finish_op
   return "$rc"
 }
@@ -602,12 +609,24 @@ cancel_db_op() {
   DB_OP_ID=
   OP_STDIN=
   log "stopping the interrupted database operation; an open transaction is rolled back"
-  compose_op exec -T db flowcrm-db-roles cancel "$id" >/dev/null 2>&1
+  # Bounded: flowcrm-db-roles waits at most 30 s; the call itself at most 45 s.
+  OP_TIMEOUT=45 compose_op exec -T db flowcrm-db-roles cancel "$id" >/dev/null 2>&1
   rc=$?
   if [ "$rc" -eq 0 ]; then
     log "the interrupted database operation ended; nothing of it can commit any more"
-  else
-    log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the next make up, make db-upgrade-roles or make db-rotate-password ends it before it changes anything"
+    return 0
+  fi
+  # Unconfirmed: the operation may still be alive (for example while the db
+  # container cannot be reached) and commit later. Fail closed until a
+  # make up has ended it, or found it finished, and passed every check.
+  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" >"$GATE_FILE" 2>/dev/null
+  log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
+    if compose_op stop "$EDGE" >/dev/null 2>&1; then
+      log "stopped the edge: an interrupted database operation may still be running"
+    else
+      log "WARNING: could not stop the edge of $PROJECT; stop the stack with make down"
+    fi
   fi
 }
 

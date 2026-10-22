@@ -565,6 +565,113 @@ rot a-rot7a app '' rotate-db-password-abort
   [ "$(rc_of a-rot7a)" = 0 ] && login_ok app "$sd/db_app_password" && no_leftovers && until_ready "$PA" 200 30
 v "ST-50 rotation interrupted while its transaction waits on a PostgreSQL lock: the session is ended before exit, no delayed commit, the abort restores a clean state" $? "rc=$r7_rc left=$r7_left current=$r7_current $(tail -n 2 "$work/out/a-rot7.err")"
 
+# --- unconfirmed cancellation (FND-009G) --------------------------------------
+# The cancellation of an interrupted operation cannot always be confirmed
+# (here: the db container is paused, so nothing can be executed in it). The
+# stack must then stay blocked, and the next command must end the old
+# operation, or find it finished, before it changes anything.
+holder_up() { docker exec -d -e PGAPPNAME=st-holder "$(cid "$A" db)" psql -U flowcrm -d flowcrm -c 'SELECT pg_advisory_lock(1179796833)' -c 'SELECT pg_sleep(300)'; }
+holder_down() { psql_in "$A" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null; }
+waiting_op() { # seconds: until a role operation waits for the advisory lock
+  local i=0
+  until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event = 'advisory'")" = 1 ] || [ "$i" -ge $(($1 * 2)) ]; do sleep 0.5; i=$((i + 1)); done
+  [ "$i" -lt $(($1 * 2)) ]
+}
+db_healthy() { local i=0; until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cid "$A" db)" 2>/dev/null)" = healthy ] || [ "$i" -ge 120 ]; do sleep 1; i=$((i + 1)); done; }
+paused_interrupt() { # label: rotation blocked on the advisory lock, db paused, SIGTERM
+  holder_up
+  (cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  local p=$!
+  waiting_op 60
+  OLD_OP=$(psql_in "$A" "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+  docker pause "$(cid "$A" db)" >/dev/null
+  kill -TERM "$p"
+  wait "$p"
+  echo $? >"$work/out/$1.rc"
+  get "$PA" /health/live
+  PAUSED_EDGE=$CODE
+  dv "$1-status" "$A" status
+  dv "$1-url" "$A" url
+  docker unpause "$(cid "$A" db)" >/dev/null
+  db_healthy
+}
+
+# The new make up ends the old operation; it never commits.
+cp -p "$sd/db_app_password" "$work/app.5"
+paused_interrupt a-unconf
+u_old=$OLD_OP
+(cd "$A" && exec ./bin/devenv up) >"$work/out/a-unconf-up.out" 2>"$work/out/a-unconf-up.err" &
+upp=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $u_old")" = 0 ] || [ "$i" -ge 120 ]; do sleep 0.5; i=$((i + 1)); done
+u_ended=$i
+holder_down
+wait "$upp"
+u_up=$?
+[ "$(rc_of a-unconf)" = 143 ] && err_has a-unconf 'could not confirm that the interrupted database operation ended' &&
+  err_has a-unconf 'stopped the edge' && [ "$PAUSED_EDGE" = 000 ] && [ "$(rc_of a-unconf-status)" = 1 ] &&
+  grep -q '^blocked: .*could not be confirmed' "$work/out/a-unconf-status.out" && [ "$(rc_of a-unconf-url)" = 1 ] &&
+  [ "$u_ended" -lt 120 ] && [ "$u_up" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
+  cmp -s "$sd/db_app_password" "$work/app.5" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+v "ST-59 unconfirmed cancellation (db paused): the stack is blocked (edge stopped, status and url refuse); the next make up ends the old operation before changing anything, and it never commits" $? "rc=$(rc_of a-unconf) edge=$PAUSED_EDGE ended=$u_ended up=$u_up $(tail -n 1 "$work/out/a-unconf-up.err")"
+rot a-unconf-abort app '' rotate-db-password-abort
+
+# The old operation commits before any newer command runs: the next make up
+# finds the database and the files disagree and stays blocked; finishing the
+# rotation restores a consistent state.
+paused_interrupt a-unconf2
+holder_down
+sleep 3
+c_pending=$(login_ok app "$(pend app)" && echo committed)
+dv a-unconf2-up "$A" up
+get "$PA" /health/ready
+c_code=$CODE
+rot a-unconf2-finish app
+dv a-unconf2-up2 "$A" up
+[ "$(rc_of a-unconf2)" = 143 ] && [ "$c_pending" = committed ] && [ "$(rc_of a-unconf2-up)" = 6 ] && [ "$c_code" = 000 ] &&
+  [ "$(rc_of a-unconf2-finish)" = 0 ] && [ "$(rc_of a-unconf2-up2)" = 0 ] && login_ok app "$sd/db_app_password" &&
+  until_ready "$PA" 200 30 && no_leftovers
+v "ST-59 unconfirmed cancellation whose operation later commits: make up stays blocked (exit 6, edge stopped); finishing the rotation and make up restore a consistent, served stack" $? "pending=$c_pending up=$(rc_of a-unconf2-up) code=$c_code"
+
+# Cancellation times out although the database is reachable: the old
+# operation's psql client is stopped (SIGSTOP), so its script cannot end.
+# The command reports it, the stack is blocked, and a new rotation refuses
+# to change anything until the old operation ended.
+holder_up
+(cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/a-ctimeout.out" 2>"$work/out/a-ctimeout.err" &
+ctp=$!
+waiting_op 60
+cpid=$(docker exec "$(cid "$A" db)" sh -c 'for p in /proc/[0-9]*; do tr "\0" "\n" <"$p/environ" 2>/dev/null | grep -q "^PGAPPNAME=flowcrm-db-roles:" && tr "\0" " " <"$p/cmdline" | grep -q "^psql " && echo "${p#/proc/}"; done' | head -n 1)
+docker exec "$(cid "$A" db)" kill -STOP "$cpid"
+kill -TERM "$ctp"
+wait "$ctp"
+ct_rc=$?
+rot a-ctimeout-next app
+docker exec "$(cid "$A" db)" kill -CONT "$cpid"
+holder_down
+sleep 3
+ct_db=$(login_ok app "$sd/db_app_password" && echo current)
+rot a-ctimeout-abort app '' rotate-db-password-abort
+dv a-ctimeout-up "$A" up
+[ -n "$cpid" ] && [ "$ct_rc" = 143 ] && grep -q 'could not confirm .*(exit 14)' "$work/out/a-ctimeout.err" &&
+  [ "$(rc_of a-ctimeout-next)" = 6 ] && err_has a-ctimeout-next 'an earlier operation is still running' && [ "$ct_db" = current ] &&
+  [ "$(rc_of a-ctimeout-abort)" = 0 ] && [ "$(rc_of a-ctimeout-up)" = 0 ] && until_ready "$PA" 200 30 && no_leftovers
+v "ST-60 cancellation timeout with the database reachable: reported (exit 14), stack blocked; a new rotation refuses (earlier operation still running, nothing changed); recovery after the old one ended" $? "client=$cpid rc=$ct_rc next=$(rc_of a-ctimeout-next) $(tail -n 1 "$work/out/a-ctimeout-next.err")"
+
+# A session outside the role script holds the operations' advisory lock: the
+# role check does not wait forever; make up fails closed (edge stopped) and
+# serves again once the session ended.
+holder_up
+sleep 1
+dv a-holder-up "$A" up
+get "$PA" /health/ready
+h_code=$CODE
+holder_down
+dv a-holder-up2 "$A" up
+[ "$(rc_of a-holder-up)" != 0 ] && err_has a-holder-up 'lock timeout' && [ "$h_code" = 000 ] &&
+  [ "$(rc_of a-holder-up2)" = 0 ] && until_ready "$PA" 200 30
+v "ST-61 a foreign holder of the advisory lock: make up does not wait forever (lock timeout), stays blocked, and serves after the holder ended" $? "rc=$(rc_of a-holder-up) code=$h_code"
+
 dv a-up-rotated "$A" up
 [ "$(rc_of a-up-rotated)" = 0 ] && err_has a-up-rotated 'already running' && until_ready "$PA" 200 10
 v "ST-51 make up after the rotations publishes the stack as before and changes nothing" $? "$(tail -n 2 "$work/out/a-up-rotated.err")"
@@ -813,6 +920,37 @@ sleep 5
   [ "$lock_left" = 0 ] && legacy_same && [ "$(backups)" = 2 ]
 v "ST-55 upgrade interrupted while ALTER TABLE waits on a real lock (SIGTERM): the transaction is ended before exit and never commits later; the data are unchanged" $? "rc=$upg_rc waited=$lock_waited left=$lock_left $(tail -n 2 "$work/out/c-upg-lock.err")"
 
+# The same with SIGINT, delivered as in a terminal (job control on, so the
+# background command does not ignore it), and with the connection of the
+# operation cut from outside: both roll back, nothing commits later.
+cupg_blocked() { # label: upgrade in the background, waiting for ALTER TABLE on the held lock -> sets UPG
+  docker exec -d -e PGAPPNAME=st-holder "$cdb" psql -U flowcrm -d flowcrm -c 'BEGIN' -c 'LOCK TABLE audit_events IN ACCESS SHARE MODE' -c 'SELECT pg_sleep(180)' -c 'COMMIT'
+  sleep 1
+  set -m
+  (cd "$C" && exec ./bin/devenv upgrade-roles) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  UPG=$!
+  set +m
+  local i=0
+  until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event_type = 'Lock' AND query LIKE 'ALTER TABLE%'")" = 1 ] || [ "$i" -ge 240 ]; do sleep 0.5; i=$((i + 1)); done
+}
+holder_c_down() { docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null; }
+cupg_blocked c-upg-int
+kill -INT "$UPG"
+wait "$UPG"
+int_rc=$?
+holder_c_down
+sleep 5
+int_same=$(legacy_same && echo same)
+cupg_blocked c-upg-conn
+docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'" >/dev/null
+wait "$UPG"
+conn_rc=$?
+holder_c_down
+sleep 5
+[ "$int_rc" = 130 ] && grep -q 'the interrupted database operation ended' "$work/out/c-upg-int.err" && [ "$int_same" = same ] &&
+  [ "$conn_rc" = 6 ] && grep -q 'the role upgrade failed .* and was rolled back' "$work/out/c-upg-conn.err" && legacy_same
+v "ST-55 the same with SIGINT (exit 130) and with the operation's connection cut from outside (reported as failed and rolled back): nothing commits later" $? "int=$int_rc conn=$conn_rc $(tail -n 1 "$work/out/c-upg-conn.err")"
+
 # A backup that does not restore, a restored copy whose contents differ, and
 # a damaged host copy: each stops the upgrade with nothing changed, and no
 # unverified dump is kept (neither in the container nor on the host).
@@ -827,7 +965,7 @@ cupg c-upg-corrupt upgrade-corrupt-copy
 [ "$(rc_of c-upg-norestore)" = 6 ] && err_has c-upg-norestore 'the backup did not restore' &&
   [ "$(rc_of c-upg-differs)" = 6 ] && err_has c-upg-differs 'the restored copy differs in the contents of st_poison' &&
   [ "$(rc_of c-upg-corrupt)" = 6 ] && err_has c-upg-corrupt 'did not match the verified one' &&
-  [ "$(backups)" = 2 ] && legacy_same
+  [ "$(backups)" = 4 ] && legacy_same
 v "ST-56 a backup that does not restore, differs in its contents or is damaged on the host stops the upgrade (exit 6); nothing changed, no unverified dump kept" $? "$(tail -n 1 "$work/out/c-upg-norestore.err") | $(tail -n 1 "$work/out/c-upg-differs.err") | $(tail -n 1 "$work/out/c-upg-corrupt.err")"
 
 dv c-upgrade "$C" upgrade-roles
