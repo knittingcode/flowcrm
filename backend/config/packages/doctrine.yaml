@@ -1,18 +1,39 @@
 doctrine:
     dbal:
-        driver: pdo_pgsql
-        host: '%env(DATABASE_HOST)%'
-        port: '%env(int:DATABASE_PORT)%'
-        dbname: '%env(DATABASE_NAME)%'
-        user: '%env(DATABASE_USER)%'
-        password: '%env(trim:file:DATABASE_PASSWORD_FILE)%'
-        server_version: '18'
-        charset: utf8
-        profiling_collect_backtrace: '%kernel.debug%'
+        default_connection: default
         types:
             inet: App\Shared\Infrastructure\Persistence\InetType
-        mapping_types:
-            inet: inet
+        connections:
+            default:
+                driver: pdo_pgsql
+                host: '%env(DATABASE_HOST)%'
+                port: '%env(int:DATABASE_PORT)%'
+                dbname: '%env(DATABASE_NAME)%'
+                user: '%env(DATABASE_USER)%'
+                password: '%env(trim:file:DATABASE_PASSWORD_FILE)%'
+                server_version: '18'
+                charset: utf8
+                profiling_collect_backtrace: '%kernel.debug%'
+                mapping_types:
+                    inet: inet
+            # The application cache's own connection (config/packages/cache.yaml):
+            # same database and credentials, opened only when the cache is
+            # used. A failing cache query cannot abort a transaction of the
+            # default connection, and RejectSchemaChanges keeps the cache
+            # adapter from creating tables (migrations own the schema).
+            cache:
+                driver: pdo_pgsql
+                host: '%env(DATABASE_HOST)%'
+                port: '%env(int:DATABASE_PORT)%'
+                dbname: '%env(DATABASE_NAME)%'
+                user: '%env(DATABASE_USER)%'
+                password: '%env(trim:file:DATABASE_PASSWORD_FILE)%'
+                # Known version: the adapter needs no connection to detect the
+                # platform, so an outage only turns reads into misses.
+                server_version: '18'
+                charset: utf8
+                application_name: flowcrm_cache
+                profiling_collect_backtrace: '%kernel.debug%'
     orm:
         validate_xml_mapping: true
         naming_strategy: doctrine.orm.naming_strategy.underscore
