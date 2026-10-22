@@ -619,7 +619,9 @@ cancel_db_op() {
   # Unconfirmed: the operation may still be alive (for example while the db
   # container cannot be reached) and commit later. Fail closed until a
   # make up has ended it, or found it finished, and passed every check.
-  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" >"$GATE_FILE" 2>/dev/null
+  local edge=''
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} >"$GATE_FILE" 2>/dev/null
   log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
@@ -630,15 +632,23 @@ cancel_db_op() {
   fi
 }
 
-# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>, used by
-# tests/app/stack.sh): stop with SIGTERM at a named point, exactly as an
-# interrupted command would. Points: rotate-after-pending, rotate-after-db,
-# rotate-after-promote, upgrade-after-backup; upgrade-corrupt-copy damages
+# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill], used by
+# tests/app/stack.sh): stop with SIGTERM (or SIGKILL, which runs no handler)
+# at a named point, exactly as an interrupted or killed command would.
+# Points: rotate-after-pending, rotate-after-db, rotate-after-promote,
+# upgrade-after-backup, up-after-migrations; upgrade-corrupt-copy damages
 # the host copy of the backup instead.
 fault_point() { # name
-  [ "${FLOWCRM_DEVENV_FAULT-}" = "$1" ] || return 0
-  log "test fault injection: SIGTERM at $1"
-  kill -TERM $$
+  case ${FLOWCRM_DEVENV_FAULT-} in
+    "$1")
+      log "test fault injection: SIGTERM at $1"
+      kill -TERM $$
+      ;;
+    "$1:kill")
+      log "test fault injection: SIGKILL at $1"
+      kill -KILL $$
+      ;;
+  esac
 }
 
 release_lock() {
@@ -814,6 +824,8 @@ apply_migrations() {
   compose_op exec -T api php bin/console doctrine:migrations:up-to-date --no-interaction >/dev/null 2>"$TMP_FILE"
   rc=$?
   if [ "$rc" -ne 0 ]; then
+    # Migrations may change tables and grants.
+    protect_for "applying database migrations"
     log "applying pending database migrations"
     # The migrate job connects as the schema owner; the api never holds its password.
     compose_op run --rm --no-deps migrate >/dev/null 2>"$TMP_FILE"
@@ -864,9 +876,10 @@ db_roles() { # command...
 # port are kept for the recovery. The reason is recorded for make status
 # and make url; the next make up that passes every gate removes it.
 gate_failed() { # exit-code message
-  local id
-  printf '%s\n' "$2" | head -c 300 >"$GATE_FILE" 2>/dev/null
+  local id edge=''
   id=$(compose ps --quiet "$EDGE" 2>/dev/null | head -n 1)
+  if [ -n "$id" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } >"$GATE_FILE" 2>/dev/null
   if [ -n "$id" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
       log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"
@@ -875,6 +888,43 @@ gate_failed() { # exit-code message
     fi
   fi
   die "$1" "$2"
+}
+
+# Before anything changes roles, passwords, ownership or grants (role
+# corrections, migrations, the upgrade, a rotation): record the security
+# gate durably (atomic rename), then stop a running edge and make sure it
+# stopped. Only then does the change start, so a command that dies from
+# here on, even by SIGKILL, leaves the stack blocked: make status and make
+# url report it, and only a command that finished with every check passed
+# clears it (gate_clear). The first line is the reason; the line "edge"
+# records that the edge was serving, so a rotation can restore it.
+protect_for() { # reason
+  local tmp edge=''
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  tmp=$(mktemp "$RUNTIME_DIR/.security-gate.XXXXXX") || die $EX_SAFETY "could not record the security gate; nothing was changed"
+  if ! { printf '%s\n' "$1" ${edge:+"$edge"} >"$tmp" && mv -f "$tmp" "$GATE_FILE"; }; then
+    rm -f "$tmp"
+    die $EX_SAFETY "could not record the security gate; nothing was changed"
+  fi
+  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
+    compose_op stop "$EDGE" >/dev/null 2>&1
+    [ -z "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] ||
+      die $EX_SAFETY "the edge of $PROJECT could not be stopped, so the database was not changed; stop the stack with make down"
+    log "stopped the edge before changing the database (${1}); it serves again once every check passed"
+  fi
+}
+
+gate_clear() { rm -f "$GATE_FILE"; }
+
+# After a rotation or abort that passed every check: serve again on the saved
+# port if the gate had stopped a serving edge (make up does this itself).
+restore_edge() { # gate-had-edge
+  [ "$1" = edge ] && [ "$STATE_STATUS" = valid ] || return 0
+  if try_edge "$STATE_PORT" && wait_http "$STATE_PORT"; then
+    log "the edge serves again on port $STATE_PORT"
+  else
+    log "WARNING: the edge did not start again on port $STATE_PORT; run make up"
+  fi
 }
 
 sha256_of() { # file
@@ -917,8 +967,14 @@ refresh_secret_mounts() {
 check_roles() {
   local rc
   [ -n "$ROLES" ] || return 0
-  db_roles ensure
+  # Read-only first: only a database that needs corrections is protected and changed.
+  db_roles check
   rc=$?
+  if [ "$rc" -eq 20 ]; then
+    protect_for "correcting the database role attributes and privileges"
+    db_roles ensure
+    rc=$?
+  fi
   case $rc in
     0) ;;
     10) gate_failed $EX_SAFETY "the database of $PROJECT was created before role separation and still uses one account for everything; the stack is not served. Upgrade it explicitly, with a verified backup first: make db-upgrade-roles (docs/architecture/adr/ADR-018-database-roles.md)" ;;
@@ -943,7 +999,7 @@ verify_privileges() {
     grep -E '^VIOLATION|password authentication|SQLSTATE' "$TMP_FILE" | head -n 20 | sed 's/^/  /' >&2
     gate_failed $EX_SAFETY "the api's database role or privileges do not match config/database/runtime-privileges.yaml (shown above); the stack is not served. A failed login means .runtime/secrets/db_app_password does not match the database: make db-rotate-password ROLE=app"
   fi
-  rm -f "$TMP_FILE" "$GATE_FILE"
+  rm -f "$TMP_FILE"
   TMP_FILE=
 }
 
@@ -1023,7 +1079,9 @@ do_up() {
   start_internal
   refresh_secret_mounts
   apply_migrations
+  fault_point up-after-migrations
   verify_privileges
+  gate_clear
   edge_state
 
   if [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ] && eligible "$EDGE_PORT"; then
@@ -1074,6 +1132,7 @@ do_up() {
     wait_http "$c" || die $EX_DOCKER "the edge on port $c does not answer $READY_PATH with 200; saved state not changed; see make status and make logs"
     write_state "$c"
     [ -z "$skipped" ] || log "ports in use, skipped:$skipped"
+    [ -z "$MIGRATED" ] || log "applied pending database migrations"
     report_url "$c"
     return 0
   done
@@ -1177,8 +1236,8 @@ cmd_status() {
     printf 'mapping:    %s:%s -> %s\n' "$BIND" "${EDGE_PORT:-unknown}" "$EDGE_CONTAINER_PORT"
   fi
   if [ -f "$GATE_FILE" ]; then
-    printf 'blocked:    %s\n' "$(head -c 300 "$GATE_FILE")"
-    printf 'result:     blocked by a failed security gate; fix the cause and run make up\n'
+    printf 'blocked:    %s\n' "$(head -n 1 "$GATE_FILE" | head -c 300)"
+    printf 'result:     blocked by the security gate (a database change is in progress, was interrupted, or a check failed); fix the cause and run make up\n'
     return "$rc"
   fi
   if [ "$EDGE_RUNNING" = true ] && [ "$EDGE_HEALTH" = healthy ] && [ "$STATE_STATUS" = valid ] &&
@@ -1198,7 +1257,7 @@ cmd_url() {
   read_state
   require_owned_project
   [ "$STATE_STATUS" = valid ] || die $EX_NOT_RUNNING "not started in this checkout (no verified port saved); run make up"
-  [ ! -f "$GATE_FILE" ] || die $EX_NOT_RUNNING "blocked by a failed security gate: $(head -c 300 "$GATE_FILE")"
+  [ ! -f "$GATE_FILE" ] || die $EX_NOT_RUNNING "blocked by the security gate: $(head -n 1 "$GATE_FILE" | head -c 300)"
   COMPOSE_PORT=$STATE_PORT
   edge_state
   [ "$EDGE_RUNNING" = true ] || die $EX_NOT_RUNNING "the edge is not running; run make up"
@@ -1320,6 +1379,7 @@ cmd_upgrade_roles() {
   COMPOSE_PORT=${STATE_PORT:-$PORT_DEFAULT}
   ensure_secrets allow-new-role-secrets
   build_images
+  protect_for "upgrading the database roles"
   # A running api may still use an earlier configuration; stop it first.
   compose_op stop api web edge >/dev/null 2>&1
   start_db
@@ -1334,6 +1394,7 @@ cmd_upgrade_roles() {
       refresh_secret_mounts
       apply_migrations
       verify_privileges
+      gate_clear
       log "nothing to upgrade; run make up to publish the stack"
       return 0
       ;;
@@ -1382,6 +1443,7 @@ cmd_upgrade_roles() {
   refresh_secret_mounts
   apply_migrations
   verify_privileges
+  gate_clear
   log "upgraded to the database roles of ADR-018; run make up to publish the stack"
 }
 
@@ -1469,7 +1531,7 @@ rotation_prepare() { # command
 }
 
 cmd_rotate_db_password() {
-  local tmp rc
+  local tmp rc had_edge=''
   rotation_prepare rotate-db-password
   if [ -e "$ROT_PENDING" ]; then
     log "resuming the unfinished rotation of flowcrm_$ROT_ROLE with its pending password"
@@ -1483,6 +1545,8 @@ cmd_rotate_db_password() {
   fi
   fault_point rotate-after-pending
 
+  protect_for "rotating the password of flowcrm_$ROT_ROLE"
+  grep -qx edge "$GATE_FILE" && had_edge=edge
   OP_STDIN=$ROT_PENDING db_roles set-password "$ROT_ROLE"
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -1502,15 +1566,19 @@ cmd_rotate_db_password() {
   fault_point rotate-after-promote
   refresh_secret_mounts
   verify_role_client "$ROT_ROLE"
-  log "rotated the password of flowcrm_$ROT_ROLE; make up publishes the stack as before"
+  gate_clear
+  log "rotated the password of flowcrm_$ROT_ROLE"
+  restore_edge "$had_edge"
 }
 
 cmd_rotate_db_password_abort() {
-  local rc
+  local rc had_edge=''
   rotation_prepare rotate-db-password-abort
   [ -e "$ROT_PENDING" ] || { log "no unfinished rotation of flowcrm_$ROT_ROLE; nothing to abort"; return 0; }
   valid_secret_file "$ROT_CURRENT" ||
     die $EX_SAFETY ".runtime/secrets/db_${ROT_ROLE}_password is missing or malformed; restore it from a backup, or finish the rotation: make db-rotate-password ROLE=$ROT_ROLE"
+  protect_for "restoring the password of flowcrm_$ROT_ROLE"
+  grep -qx edge "$GATE_FILE" && had_edge=edge
   OP_STDIN=$ROT_CURRENT db_roles set-password "$ROT_ROLE"
   rc=$?
   [ "$rc" -eq 0 ] || { tail -n 3 "$TMP_FILE" >&2; die $EX_SAFETY "restoring the current password failed (exit $rc); nothing else was changed; run the command again"; }
@@ -1519,7 +1587,9 @@ cmd_rotate_db_password_abort() {
   rm -f "$ROT_PENDING"
   refresh_secret_mounts
   verify_role_client "$ROT_ROLE"
+  gate_clear
   log "aborted the rotation of flowcrm_$ROT_ROLE; the database uses the current password again (SCRAM login checked)"
+  restore_edge "$had_edge"
 }
 
 main() {

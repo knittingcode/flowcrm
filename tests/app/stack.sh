@@ -393,8 +393,8 @@ dv a-up-existing "$A" up
   err_has a-up-existing 'Not migrating: cache_items already exist' && [ "$(cat "$A/.runtime/dev.env")" = "$state0" ] &&
   [ "$(psql_in "$A" "SELECT count(*) FROM pg_tables WHERE tablename = 'sessions'")" = 0 ] &&
   [ "$(psql_in "$A" "SELECT count(*) FROM cache_items WHERE item_id = 'st45:kept'")" = 1 ] &&
-  until_ready "$PA" 503 5
-v "ST-45 an existing cache_items table stops make up without changes; the saved state is kept" $? "$(tail -n 3 "$work/out/a-up-existing.err")"
+  until_ready "$PA" 000 5 && dv a-status-existing "$A" status && grep -q '^blocked: *applying database migrations' "$work/out/a-status-existing.out"
+v "ST-45 an existing cache_items table stops make up without changes; the saved state is kept; the stack stays blocked (the migration phase is protected)" $? "$(tail -n 3 "$work/out/a-up-existing.err")"
 # The recovery of docs/architecture/sessions-and-cache.md: rename, then move
 # it out of schema public (make up accepts only known objects there).
 psql_in "$A" "ALTER TABLE cache_items RENAME TO cache_items_preexisting; ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey; CREATE SCHEMA preexisting; ALTER TABLE cache_items_preexisting SET SCHEMA preexisting" >/dev/null
@@ -436,7 +436,7 @@ dv a-up-nodrift "$A" up
 [ "$drift_before" = 200 ] && [ "$(rc_of a-up-drift)" = 6 ] && err_has a-up-drift 'VIOLATION: table users' &&
   err_has a-up-drift 'stopped the edge' && err_has a-up-drift 'the stack is not served' && [ "$drift_code" = 000 ] &&
   [ "$(rc_of a-status-drift)" = 1 ] && grep -q '^blocked: ' "$work/out/a-status-drift.out" &&
-  [ "$(rc_of a-url-drift)" = 1 ] && err_has a-url-drift 'blocked by a failed security gate' &&
+  [ "$(rc_of a-url-drift)" = 1 ] && err_has a-url-drift 'blocked by the security gate' &&
   [ "$drift_db" = true ] && [ "$(saved_port "$A")" = "$PA" ] &&
   [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10 && [ ! -e "$A/.runtime/security-gate" ]
 v "ST-48 privilege drift on a running stack: make up exits 6 and stops the edge (no request served, status and url blocked, db and port kept); after the fix make up serves again" $? "before=$drift_before during=$drift_code $(grep -m1 VIOLATION "$work/out/a-up-drift.err")"
@@ -671,6 +671,138 @@ dv a-holder-up2 "$A" up
 [ "$(rc_of a-holder-up)" != 0 ] && err_has a-holder-up 'lock timeout' && [ "$h_code" = 000 ] &&
   [ "$(rc_of a-holder-up2)" = 0 ] && until_ready "$PA" 200 30
 v "ST-61 a foreign holder of the advisory lock: make up does not wait forever (lock timeout), stays blocked, and serves after the holder ended" $? "rc=$(rc_of a-holder-up) code=$h_code"
+
+# --- SIGKILL of bin/devenv during privileged changes (FND-009G2) ---------------
+# A killed command runs no handler, so the stack must already be protected
+# when the change starts: the edge is stopped and the security gate is
+# recorded before any role, password, ownership or grant changes.
+blocked_now() { # label: make status and make url report the gate
+  dv "$1-status" "$A" status
+  dv "$1-url" "$A" url
+  [ "$(rc_of "$1-status")" = 1 ] && grep -q '^blocked: ' "$work/out/$1-status.out" && [ "$(rc_of "$1-url")" = 1 ] &&
+    err_has "$1-url" 'blocked by the security gate'
+}
+killed_rotation() { # label: rotation blocked on the advisory lock, then SIGKILL -> sets K_EDGE (while blocked), K_OLD (pid)
+  holder_up
+  (cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  local p=$!
+  waiting_op 60
+  K_OLD=$(psql_in "$A" "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+  get "$PA" /health/ready
+  K_EDGE=$CODE
+  kill -KILL "$p"
+  wait "$p"
+  echo $? >"$work/out/$1.rc"
+}
+
+# Killed while ALTER ROLE ... PASSWORD waits: the edge was already stopped.
+# The killed command's docker compose exec outlives it, so the checkout
+# lock stays held and the newer command (the abort) waits instead of
+# overlapping; the old operation ends by its lock timeout (rolled back,
+# never committed); then the abort runs and the edge serves again.
+get "$PA" /health/ready
+k_before=$CODE
+cp -p "$sd/db_app_password" "$work/app.6"
+killed_rotation a-kill1
+k1_edge=$K_EDGE
+k1_blocked=$(blocked_now a-kill1 && echo yes)
+k1_alive=$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $K_OLD")
+(cd "$A" && ROLE=app FLOWCRM_LOCK_WAIT=300 exec ./bin/devenv rotate-db-password-abort) >"$work/out/a-kill1-abort.out" 2>"$work/out/a-kill1-abort.err" &
+abp=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $K_OLD")" = 0 ] || [ "$i" -ge 400 ]; do sleep 0.5; i=$((i + 1)); done
+k1_waited=$(grep -c 'waiting for another devenv command' "$work/out/a-kill1-abort.err")
+holder_down
+wait "$abp"
+k1_abort=$?
+[ "$k_before" = 200 ] && [ "$k1_edge" = 000 ] && [ "$(rc_of a-kill1)" = 137 ] && [ "$k1_blocked" = yes ] && [ "$k1_alive" = 1 ] &&
+  [ "$i" -lt 400 ] && [ "$k1_waited" = 1 ] && [ "$k1_abort" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
+  cmp -s "$sd/db_app_password" "$work/app.6" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+v "ST-62 SIGKILL while ALTER ROLE PASSWORD waits: the edge was already stopped (200 -> 000), status and url blocked; the abort waits for the old operation (no overlap), which rolls back and never commits; the abort then serves again" $? "before=$k_before during=$k1_edge rc=$(rc_of a-kill1) blocked=$k1_blocked alive=$k1_alive waited=$k1_waited/$i abort=$k1_abort"
+
+# Killed, and the old operation commits before a newer command runs: the
+# stack stays blocked; finishing the rotation serves again.
+killed_rotation a-kill2
+holder_down
+sleep 3
+k2_committed=$(login_ok app "$(pend app)" && echo committed)
+get "$PA" /health/ready
+k2_code=$CODE
+k2_blocked=$(blocked_now a-kill2b && echo yes)
+rot a-kill2-finish app
+[ "$K_EDGE" = 000 ] && [ "$(rc_of a-kill2)" = 137 ] && [ "$k2_committed" = committed ] && [ "$k2_code" = 000 ] && [ "$k2_blocked" = yes ] &&
+  [ "$(rc_of a-kill2-finish)" = 0 ] && login_ok app "$sd/db_app_password" && until_ready "$PA" 200 30 && no_leftovers &&
+  [ ! -e "$A/.runtime/security-gate" ]
+v "ST-63 SIGKILL during a rotation whose password change commits later: no edge and blocked throughout; finishing the rotation serves again" $? "committed=$k2_committed code=$k2_code blocked=$k2_blocked"
+
+# Killed after the change committed, before it was verified: a rotation
+# (after the database change) and make up (after the migrations).
+rot a-kill3 app rotate-after-db:kill
+get "$PA" /health/ready
+k3_code=$CODE
+k3_blocked=$(blocked_now a-kill3 && echo yes)
+rot a-kill3-finish app
+cat >"$A/backend/migrations/Version20991231000002.php" <<'PHP'
+<?php
+
+declare(strict_types=1);
+
+namespace DoctrineMigrations;
+
+use Doctrine\DBAL\Schema\Schema;
+use Doctrine\Migrations\AbstractMigration;
+
+final class Version20991231000002 extends AbstractMigration
+{
+    public function up(Schema $schema): void
+    {
+        $this->addSql("COMMENT ON TABLE users IS 'stack test'");
+    }
+
+    public function down(Schema $schema): void
+    {
+        $this->addSql('COMMENT ON TABLE users IS NULL');
+    }
+}
+PHP
+(cd "$A" && FLOWCRM_DEVENV_FAULT=up-after-migrations:kill ./bin/devenv up) >"$work/out/a-kill4.out" 2>"$work/out/a-kill4.err"
+echo $? >"$work/out/a-kill4.rc"
+get "$PA" /health/ready
+k4_code=$CODE
+k4_blocked=$(blocked_now a-kill4 && echo yes)
+k4_migrated=$(psql_in "$A" "SELECT count(*) FROM doctrine_migration_versions WHERE version LIKE '%20991231000002'")
+dv a-kill4-up "$A" up
+[ "$(rc_of a-kill3)" = 137 ] && [ "$k3_code" = 000 ] && [ "$k3_blocked" = yes ] && [ "$(rc_of a-kill3-finish)" = 0 ] &&
+  [ "$(rc_of a-kill4)" = 137 ] && err_has a-kill4 'stopped the edge before changing the database' && [ "$k4_code" = 000 ] &&
+  [ "$k4_blocked" = yes ] && [ "$k4_migrated" = 1 ] && [ "$(rc_of a-kill4-up)" = 0 ] && until_ready "$PA" 200 30 &&
+  [ ! -e "$A/.runtime/security-gate" ]
+v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $? "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated"
+
+# Recovery while PostgreSQL is temporarily unreachable: make up fails and
+# the stack stays blocked; once the database is back, make up ends the old
+# operation (it never commits) and serves after every check.
+killed_rotation a-kill5
+docker pause "$(cid "$A" db)" >/dev/null
+(cd "$A" && FLOWCRM_WAIT_TIMEOUT=10 ./bin/devenv up) >"$work/out/a-kill5-up.out" 2>"$work/out/a-kill5-up.err"
+echo $? >"$work/out/a-kill5-up.rc"
+get "$PA" /health/ready
+k5_code=$CODE
+k5_blocked=$(blocked_now a-kill5 && echo yes)
+docker unpause "$(cid "$A" db)" >/dev/null
+db_healthy
+(cd "$A" && FLOWCRM_LOCK_WAIT=300 exec ./bin/devenv up) >"$work/out/a-kill5-up2.out" 2>"$work/out/a-kill5-up2.err" &
+upp=$!
+i=0
+until [ "$(psql_in "$A" "SELECT count(*) FROM pg_stat_activity WHERE pid = $K_OLD")" = 0 ] || [ "$i" -ge 400 ]; do sleep 0.5; i=$((i + 1)); done
+holder_down
+wait "$upp"
+k5_up=$?
+k5_pending=$(login_ok app "$(pend app)" && echo committed)
+rot a-kill5-abort app '' rotate-db-password-abort
+[ "$(rc_of a-kill5)" = 137 ] && [ "$(rc_of a-kill5-up)" != 0 ] && [ "$k5_code" = 000 ] && [ "$k5_blocked" = yes ] &&
+  [ "$i" -lt 400 ] && [ "$k5_up" = 0 ] && [ -z "$k5_pending" ] && [ "$(rc_of a-kill5-abort)" = 0 ] &&
+  until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ] && no_leftovers
+v "ST-65 after SIGKILL, recovery while PostgreSQL is paused fails and stays blocked; once reachable, make up ends the old operation (no commit) and serves" $? "up=$(rc_of a-kill5-up) code=$k5_code blocked=$k5_blocked up2=$k5_up pending=$k5_pending"
 
 dv a-up-rotated "$A" up
 [ "$(rc_of a-up-rotated)" = 0 ] && err_has a-up-rotated 'already running' && until_ready "$PA" 200 10
@@ -949,7 +1081,7 @@ holder_c_down
 sleep 5
 [ "$int_rc" = 130 ] && grep -q 'the interrupted database operation ended' "$work/out/c-upg-int.err" && [ "$int_same" = same ] &&
   [ "$conn_rc" = 6 ] && grep -q 'the role upgrade failed .* and was rolled back' "$work/out/c-upg-conn.err" && legacy_same
-v "ST-55 the same with SIGINT (exit 130) and with the operation's connection cut from outside (reported as failed and rolled back): nothing commits later" $? "int=$int_rc conn=$conn_rc $(tail -n 1 "$work/out/c-upg-conn.err")"
+v "ST-55 the same with SIGINT (exit 130) and with the operation's connection cut from outside (reported as failed and rolled back): nothing commits later" $? "int=$int_rc conn=$conn_rc | int: $(tail -n 3 "$work/out/c-upg-int.err" | tr '\n' ' ') | conn: $(tail -n 1 "$work/out/c-upg-conn.err")"
 
 # A backup that does not restore, a restored copy whose contents differ, and
 # a damaged host copy: each stops the upgrade with nothing changed, and no
@@ -967,6 +1099,29 @@ cupg c-upg-corrupt upgrade-corrupt-copy
   [ "$(rc_of c-upg-corrupt)" = 6 ] && err_has c-upg-corrupt 'did not match the verified one' &&
   [ "$(backups)" = 4 ] && legacy_same
 v "ST-56 a backup that does not restore, differs in its contents or is damaged on the host stops the upgrade (exit 6); nothing changed, no unverified dump kept" $? "$(tail -n 1 "$work/out/c-upg-norestore.err") | $(tail -n 1 "$work/out/c-upg-differs.err") | $(tail -n 1 "$work/out/c-upg-corrupt.err")"
+
+# SIGKILL while ALTER TABLE ... OWNER waits (FND-009G2): the security gate
+# was recorded before the conversion. The newer upgrade waits for the
+# checkout lock (the killed command's docker compose exec still runs) until
+# the old operation ended by its lock timeout, rolled back; it never
+# commits, also after the lock on audit_events is released.
+cupg_blocked c-upg-kill
+kill -KILL "$UPG"
+wait "$UPG"
+ck_rc=$?
+ck_old=$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pid FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%'")
+dv c-kill-status "$C" status
+dv c-kill-url "$C" url
+(cd "$C" && FLOWCRM_DEVENV_FAULT=upgrade-after-backup FLOWCRM_LOCK_WAIT=300 exec ./bin/devenv upgrade-roles) >"$work/out/c-upg-retry.out" 2>"$work/out/c-upg-retry.err" &
+retry=$!
+i=0
+until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE pid = ${ck_old:-0}")" = 0 ] || [ "$i" -ge 400 ]; do sleep 0.5; i=$((i + 1)); done
+holder_c_down
+wait "$retry"
+sleep 5
+[ "$ck_rc" = 137 ] && [ -n "$ck_old" ] && [ "$(rc_of c-kill-status)" = 1 ] && grep -q '^blocked: *upgrading the database roles' "$work/out/c-kill-status.out" &&
+  [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/security-gate" ]
+v "ST-66 SIGKILL while ALTER TABLE OWNER waits: blocked (status, url); the next upgrade ends the old operation first and it never commits; the gate stays until an upgrade passes every check" $? "rc=$ck_rc old=$ck_old waited=$i"
 
 dv c-upgrade "$C" upgrade-roles
 dump=$(find "$C/.runtime/backups" -name 'roles_upgrade_*.dump' -type f 2>/dev/null | head -n 1)

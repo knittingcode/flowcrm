@@ -8,6 +8,9 @@
 #   state          print legacy, complete or inconsistent (read-only)
 #   init           new database (initdb hook): create the roles and the
 #                  schema privileges, passwords from the secret files
+#   check          complete database: whether ensure would change anything
+#                  (exit 0: nothing, 20: it would); the corrections run in a
+#                  transaction that is always rolled back, nothing commits
 #   ensure         complete database: correct role attributes, memberships,
 #                  database, schema and default privileges (no passwords,
 #                  no ownership change); fails closed on any other state
@@ -47,7 +50,8 @@
 #
 # Exit codes: 0 ok, 1 error, 10 legacy database, 11 inconsistent database,
 # 12 missing or malformed secret, 13 backup did not restore identically,
-# 14 an operation could not be stopped, 15 login refused.
+# 14 an operation could not be stopped, 15 login refused, 20 ensure would
+# change role attributes or privileges.
 
 set -eu
 # Notices ("does not exist, skipping") are not errors.
@@ -76,7 +80,7 @@ q() { # sql: one value
 }
 
 # run: execute SQL from stdin with the hardening below, in one transaction
-# that holds the advisory lock.
+# that holds the advisory lock; it ends with COMMIT, or RUN_END.
 run() {
   {
     cat <<SQL
@@ -91,7 +95,7 @@ BEGIN;
 SELECT pg_advisory_xact_lock($LOCK_KEY) \\g /dev/null
 SQL
     cat
-    printf 'COMMIT;\n'
+    printf '%s;\n' "${RUN_END:-COMMIT}"
   } | psql -X -q -U "$ADMIN" -d "$DB"
 }
 
@@ -256,6 +260,22 @@ ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER IN SCHEMA public REVOKE ALL ON TABLES F
 ALTER DEFAULT PRIVILEGES FOR ROLE $OWNER IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC, $APP;
 "
 
+# Everything PRIVILEGES_SQL sets, independent of the order of ACL entries.
+ROLES_FINGERPRINT="
+SELECT md5(concat_ws('|',
+  (SELECT string_agg(rolname || rolsuper::text || rolinherit::text || rolcreaterole::text || rolcreatedb::text || rolcanlogin::text
+                     || rolreplication::text || rolbypassrls::text || rolconnlimit::text, ',' ORDER BY rolname)
+     FROM pg_roles WHERE rolname IN ('$OWNER', '$APP')),
+  (SELECT string_agg(a.roleid::regrole::text || '>' || a.member::regrole::text, ',' ORDER BY 1)
+     FROM pg_auth_members a WHERE a.member::regrole::text IN ('$OWNER', '$APP') OR a.roleid::regrole::text IN ('$OWNER', '$APP')),
+  (SELECT string_agg(datname || ':' || coalesce((SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(datacl) x), 'default'), ',' ORDER BY datname)
+     FROM pg_database WHERE datname IN ('$DB', 'postgres', 'template1')),
+  (SELECT coalesce((SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(nspacl) x), 'default') FROM pg_namespace WHERE nspname = 'public'),
+  (SELECT string_agg(p.oid::regprocedure::text || ':' || coalesce((SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(p.proacl) x), 'default'), ',' ORDER BY 1)
+     FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace),
+  (SELECT string_agg(d.defaclnamespace::text || d.defaclobjtype::text || ':' || (SELECT string_agg(x::text, ' ' ORDER BY x::text) FROM unnest(d.defaclacl) x), ',' ORDER BY 1)
+     FROM pg_default_acl d WHERE d.defaclrole = '$OWNER'::regrole)))"
+
 CREATE_ROLES_SQL="
 \\getenv owner_password FLOWCRM_OWNER_PASSWORD
 \\getenv app_password FLOWCRM_APP_PASSWORD
@@ -362,6 +382,19 @@ case $cmd in
     printf '%s\nALTER SCHEMA public OWNER TO %s;\n%s' "$CREATE_ROLES_SQL" "$OWNER" "$PRIVILEGES_SQL" | run
     require complete
     echo "initialised the roles $OWNER and $APP"
+    ;;
+  check)
+    begin_op
+    require complete
+    RUN_END=ROLLBACK
+    result=$(printf 'SELECT (%s) AS before \\gset\n%s\nSELECT (%s) AS after \\gset\n\\pset tuples_only on\n\\pset format unaligned\nSELECT CASE WHEN :%s = :%s THEN %s ELSE %s END;\n' \
+      "$ROLES_FINGERPRINT" "$PRIVILEGES_SQL" "$ROLES_FINGERPRINT" "'before'" "'after'" "'same'" "'drift'" | run | tr -d '[:space:]')
+    RUN_END=
+    case $result in
+      same) echo "role attributes and privileges are as required" ;;
+      drift) echo "role attributes or privileges differ; ensure corrects them"; exit 20 ;;
+      *) err "could not compare the role attributes and privileges"; exit 1 ;;
+    esac
     ;;
   ensure)
     begin_op
