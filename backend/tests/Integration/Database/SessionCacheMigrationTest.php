@@ -23,10 +23,11 @@ use Symfony\Component\Cache\Adapter\DoctrineDbalAdapter;
 
 /**
  * The FND-008 migration in throwaway databases of the test server: existing
- * core data survives it up and down; it owns its tables (a cache write
- * before it creates none, a compatible existing table is adopted, an
- * incompatible one stops it without changes); and an interrupted run
- * leaves nothing behind and can be repeated.
+ * core data survives it up and down; it only creates its tables (a cache
+ * write before it creates none, and any existing relation of the same name
+ * stops it without changes, even one identical to its own definition); the
+ * documented rename recovery works; and an interrupted run leaves nothing
+ * behind and can be repeated.
  */
 final class SessionCacheMigrationTest extends KernelTestCase
 {
@@ -34,6 +35,9 @@ final class SessionCacheMigrationTest extends KernelTestCase
 
     private const CORE = 'DoctrineMigrations\Version20261022000000';
     private const SESSIONS_AND_CACHE = 'DoctrineMigrations\Version20261022100000';
+    // Exactly the migration's own definitions.
+    private const CACHE_ITEMS = 'CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id))';
+    private const SESSIONS = 'CREATE TABLE sessions (sess_id VARCHAR(128) NOT NULL, sess_data BYTEA NOT NULL, sess_lifetime INT NOT NULL, sess_time INT NOT NULL, PRIMARY KEY (sess_id))';
 
     private string $database;
     private Connection $scratch;
@@ -102,54 +106,93 @@ final class SessionCacheMigrationTest extends KernelTestCase
         $cache->close();
     }
 
+    public function testRunningTheMigrationAgainChangesNothing(): void
+    {
+        [$exit, $output] = $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing');
+        self::assertSame(0, $exit, $output);
+        $before = $this->catalog();
+
+        [$exit, $output] = $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing', '--allow-no-migration');
+
+        self::assertSame(0, $exit, $output);
+        self::assertStringContainsString('Already at the latest version', $output);
+        self::assertSame($before, $this->catalog());
+    }
+
     /**
-     * A table that matches the migration's definition exactly (as an earlier
-     * build let the cache adapter create it) is adopted with its rows; the
-     * missing garbage-collection index is added.
+     * Every relation that takes one of the migration's names, including one
+     * that looks exactly like the expected table (as the cache adapter could
+     * create it), and the variants an adoption check could miss.
+     *
+     * @return iterable<string, array{string, string}> setup SQL, name reported
      */
-    public function testACompatibleExistingTableIsAdoptedWithItsRows(): void
+    public static function existingRelations(): iterable
+    {
+        $row = "; INSERT INTO cache_items VALUES ('ns:kept', 'stored', NULL, 1)";
+        yield 'cache_items exactly as the adapter creates it' => [self::CACHE_ITEMS.$row, 'cache_items'];
+        yield 'sessions exactly as expected' => [self::SESSIONS."; INSERT INTO sessions VALUES ('kept', 'stored', 2000000000, 1)", 'sessions'];
+        yield 'extra CHECK' => [self::CACHE_ITEMS.$row.'; ALTER TABLE cache_items ADD CONSTRAINT never CHECK (item_time > 0)', 'cache_items'];
+        yield 'extra foreign key' => ['CREATE TABLE fk_target (id VARCHAR(255) PRIMARY KEY); '.self::CACHE_ITEMS.'; ALTER TABLE cache_items ADD CONSTRAINT fk FOREIGN KEY (item_id) REFERENCES fk_target (id)', 'cache_items'];
+        yield 'extra user trigger' => ['CREATE FUNCTION drop_row() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$; '.self::CACHE_ITEMS.'; CREATE TRIGGER drop_it BEFORE INSERT ON cache_items FOR EACH ROW EXECUTE FUNCTION drop_row()', 'cache_items'];
+        yield 'extra UNIQUE' => [self::CACHE_ITEMS.$row.'; ALTER TABLE cache_items ADD CONSTRAINT data_uq UNIQUE (item_data)', 'cache_items'];
+        yield 'extra index' => [self::CACHE_ITEMS.$row.'; CREATE INDEX extra_idx ON cache_items (item_time)', 'cache_items'];
+        yield 'non-default collation' => ["CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); ".self::CACHE_ITEMS.'; ALTER TABLE cache_items ALTER COLUMN item_id TYPE VARCHAR(255) COLLATE ci', 'cache_items'];
+        yield 'UNLOGGED' => [str_replace('CREATE TABLE', 'CREATE UNLOGGED TABLE', self::CACHE_ITEMS).$row, 'cache_items'];
+        yield 'different owner' => ['CREATE ROLE migration_test_owner; '.self::CACHE_ITEMS.$row.'; ALTER TABLE cache_items OWNER TO migration_test_owner', 'cache_items'];
+        yield 'a view named cache_items' => ['CREATE VIEW cache_items AS SELECT 1 AS item_id', 'cache_items'];
+        yield 'an index named sess_lifetime_idx elsewhere' => ['CREATE TABLE other (x INT); CREATE INDEX sess_lifetime_idx ON other (x)', 'sess_lifetime_idx'];
+    }
+
+    /**
+     * Any existing relation stops the migration before it changes anything,
+     * with its own message (not an incidental SQL error); the catalog and
+     * the stored rows stay as they were and the version is not recorded.
+     */
+    #[DataProvider('existingRelations')]
+    public function testAnExistingRelationStopsTheMigrationWithoutChanges(string $setup, string $reported): void
     {
         $this->migrateTo(self::CORE);
-        $this->scratch->executeStatement('CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id))');
-        $this->scratch->executeStatement("INSERT INTO cache_items VALUES ('ns:kept', 'v', NULL, 1)");
-        $this->scratch->executeStatement('CREATE TABLE sessions (sess_id VARCHAR(128) NOT NULL, sess_data BYTEA NOT NULL, sess_lifetime INT NOT NULL, sess_time INT NOT NULL, PRIMARY KEY (sess_id))');
+        try {
+            $this->scratch->executeStatement($setup);
+            $before = $this->catalog();
+            $rows = $this->storedRows();
 
+            [$exit, $output] = $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing');
+
+            self::assertNotSame(0, $exit);
+            self::assertStringContainsString("Not migrating: {$reported} already exist(s) in schema \"public\"", $output);
+            self::assertStringNotContainsString('SQLSTATE', $output, 'the migration stopped itself, not on an SQL error');
+            self::assertSame($before, $this->catalog(), 'nothing was created, dropped or altered');
+            self::assertSame($rows, $this->storedRows(), 'stored rows are unchanged');
+            self::assertSame(0, self::int($this->scratch->fetchOne('SELECT count(*) FROM doctrine_migration_versions WHERE version = ?', [self::SESSIONS_AND_CACHE])));
+        } finally {
+            if (str_contains($setup, 'migration_test_owner')) {
+                $this->scratch->close();
+                $this->server()->executeStatement('DROP DATABASE IF EXISTS '.$this->database.' WITH (FORCE)');
+                $this->server()->executeStatement('DROP ROLE IF EXISTS migration_test_owner');
+                $this->server()->executeStatement('CREATE DATABASE '.$this->database);
+            }
+        }
+    }
+
+    /**
+     * The documented recovery: rename the existing table by hand, then
+     * migrate. The renamed table and its rows are kept for inspection.
+     */
+    public function testAfterRenamingAnExistingTableTheMigrationRuns(): void
+    {
+        $this->migrateTo(self::CORE);
+        $this->scratch->executeStatement(self::CACHE_ITEMS."; INSERT INTO cache_items VALUES ('ns:kept', 'stored', NULL, 1)");
+        self::assertNotSame(0, $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing')[0]);
+
+        $this->scratch->executeStatement('ALTER TABLE cache_items RENAME TO cache_items_preexisting');
+        $this->scratch->executeStatement('ALTER INDEX cache_items_pkey RENAME TO cache_items_preexisting_pkey');
         [$exit, $output] = $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing');
 
         self::assertSame(0, $exit, $output);
-        self::assertStringContainsString('Adopting the existing cache_items table', $output);
-        self::assertStringContainsString('Adopting the existing sessions table', $output);
-        self::assertSame(1, self::int($this->scratch->fetchOne("SELECT count(*) FROM cache_items WHERE item_id = 'ns:kept'")));
-        self::assertSame(1, self::int($this->scratch->fetchOne("SELECT count(*) FROM pg_indexes WHERE indexname = 'sess_lifetime_idx'")));
-        self::assertSame(0, $this->console('doctrine:schema:validate')[0]);
-    }
-
-    /**
-     * @return iterable<string, array{string}>
-     */
-    public static function incompatibleTables(): iterable
-    {
-        yield 'cache key of another type' => ['CREATE TABLE cache_items (item_id TEXT NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, PRIMARY KEY (item_id))'];
-        yield 'cache table with an extra column' => ['CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL, owner TEXT, PRIMARY KEY (item_id))'];
-        yield 'cache time nullable' => ['CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT, PRIMARY KEY (item_id))'];
-        yield 'cache table without a primary key' => ['CREATE TABLE cache_items (item_id VARCHAR(255) NOT NULL, item_data BYTEA NOT NULL, item_lifetime INT DEFAULT NULL, item_time INT NOT NULL)'];
-        yield 'session column with a default' => ['CREATE TABLE sessions (sess_id VARCHAR(128) NOT NULL, sess_data BYTEA NOT NULL, sess_lifetime INT NOT NULL DEFAULT 0, sess_time INT NOT NULL, PRIMARY KEY (sess_id))'];
-        yield 'session index on the wrong column' => ['CREATE TABLE sessions (sess_id VARCHAR(128) NOT NULL, sess_data BYTEA NOT NULL, sess_lifetime INT NOT NULL, sess_time INT NOT NULL, PRIMARY KEY (sess_id)); CREATE INDEX sess_lifetime_idx ON sessions (sess_time)'];
-    }
-
-    #[DataProvider('incompatibleTables')]
-    public function testAnIncompatibleExistingTableStopsTheMigrationWithoutChanges(string $ddl): void
-    {
-        $this->migrateTo(self::CORE);
-        $this->scratch->executeStatement($ddl);
-        $before = $this->definitions();
-
-        [$exit, $output] = $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing');
-
-        self::assertNotSame(0, $exit);
-        self::assertMatchesRegularExpression('/already exists with a different definition|is not on \\(sess_lifetime\\)/', $output);
-        self::assertSame($before, $this->definitions(), 'nothing was created, dropped or altered');
-        self::assertSame(0, self::int($this->scratch->fetchOne('SELECT count(*) FROM doctrine_migration_versions WHERE version = ?', [self::SESSIONS_AND_CACHE])));
+        self::assertSame(['cache_items', 'sessions'], $this->tables(['sessions', 'cache_items']));
+        self::assertSame(1, self::int($this->scratch->fetchOne("SELECT count(*) FROM cache_items_preexisting WHERE item_id = 'ns:kept'")));
+        self::assertSame(0, self::int($this->scratch->fetchOne('SELECT count(*) FROM cache_items')));
     }
 
     /**
@@ -237,20 +280,50 @@ final class SessionCacheMigrationTest extends KernelTestCase
         ];
     }
 
-    /** @return list<array<string, mixed>> columns, keys and indexes of sessions and cache_items */
-    private function definitions(): array
+    /**
+     * Everything an adoption check could miss, for every relation of the
+     * schema: kind, persistence, owner, columns (with collation and
+     * default), constraints, indexes and user triggers.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function catalog(): array
     {
-        return $this->scratch->fetchAllAssociative(
-            "SELECT 'column' AS kind, table_name::text AS t, column_name::text || ' ' || data_type || ' ' || is_nullable || ' ' || coalesce(column_default, '') AS d
-               FROM information_schema.columns WHERE table_name IN ('sessions', 'cache_items')
-             UNION ALL
-             SELECT 'index', tablename::text, indexdef FROM pg_indexes WHERE tablename IN ('sessions', 'cache_items')
-             ORDER BY 1, 2, 3",
-        );
+        return $this->scratch->fetchAllAssociative(<<<'SQL'
+            SELECT 'relation' AS kind, c.relname::text AS name, c.relkind::text || ' ' || c.relpersistence::text || ' ' || pg_get_userbyid(c.relowner) AS def
+              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'
+            UNION ALL
+            SELECT 'column', table_name || '.' || column_name, data_type || ' ' || is_nullable || ' ' || coalesce(collation_name, '') || ' ' || coalesce(column_default, '')
+              FROM information_schema.columns WHERE table_schema = 'public'
+            UNION ALL
+            SELECT 'constraint', conrelid::regclass::text || '.' || conname, pg_get_constraintdef(oid)
+              FROM pg_constraint WHERE connamespace = 'public'::regnamespace
+            UNION ALL
+            SELECT 'index', indexname, indexdef FROM pg_indexes WHERE schemaname = 'public'
+            UNION ALL
+            SELECT 'trigger', tgrelid::regclass::text || '.' || tgname, pg_get_triggerdef(oid)
+              FROM pg_trigger WHERE NOT tgisinternal
+            ORDER BY 1, 2, 3
+            SQL);
+    }
+
+    /** @return list<array<string, mixed>> rows of any existing sessions and cache_items tables */
+    private function storedRows(): array
+    {
+        $rows = [];
+        foreach ($this->tables(['sessions', 'cache_items']) as $table) {
+            foreach ($this->scratch->fetchAllAssociative("SELECT * FROM {$table} ORDER BY 1") as $row) {
+                $rows[] = ['table' => $table] + array_map(static fn (mixed $v): mixed => \is_resource($v) ? stream_get_contents($v) : $v, $row);
+            }
+        }
+
+        return $rows;
     }
 
     /**
      * Runs bin/console against the throwaway database.
+     *
+     * @phpstan-impure
      *
      * @return array{int, string} exit code and output
      */
