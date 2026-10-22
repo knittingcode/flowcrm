@@ -268,12 +268,38 @@ Such a table can only come from outside this project's code: created by
 hand, or by the cache adapter of a build before the cache connection
 refused schema changes. Comparing it with the expected definition reliably
 would mean checking columns, collations, constraints, indexes, triggers,
-ownership and persistence, so there is no automatic adoption. Recovery,
-which keeps the existing data:
+ownership and persistence, so there is no automatic adoption.
 
-1. Look at the relation (`\d+ cache_items` in `psql`) and decide whether
-   its rows matter. Cache rows never do; session rows only log users out.
-2. Rename it, and its primary-key index:
+Nothing in the project (migrations, `make up`, container start) adopts,
+deletes or rewrites such a relation, and a failed migration leaves its data
+as it was. Recovery is a manual operator task:
+
+1. **Identify the database.** Run every command against the database of
+   the environment that failed, and confirm it first. For a development
+   checkout, `make status` prints the Compose project (for example
+   `flowcrm-1d1ca1`); then, from the checkout directory:
+
+   ```console
+   $ docker compose -p flowcrm-1d1ca1 exec db psql -U flowcrm -d flowcrm -c 'SELECT current_database(), current_schema()'
+   ```
+
+2. **Inspect** the relation (`\d+ cache_items`, row count) and decide whether
+   its rows matter. Cache rows are disposable; session rows only keep users
+   signed in.
+3. **Back it up and prove the backup restores**, before any change:
+
+   ```console
+   $ docker compose -p flowcrm-1d1ca1 exec -T db pg_dump -U flowcrm -d flowcrm -Fc -t cache_items >cache_items.dump
+   $ docker compose -p flowcrm-1d1ca1 exec -T db createdb -U flowcrm flowcrm_restore_check
+   $ docker compose -p flowcrm-1d1ca1 exec -T db pg_restore -U flowcrm -d flowcrm_restore_check <cache_items.dump
+   $ docker compose -p flowcrm-1d1ca1 exec db psql -U flowcrm -d flowcrm_restore_check -c 'SELECT count(*) FROM cache_items'
+   ```
+
+   The count must match the original. Keep the dump outside the database
+   volume; `flowcrm_restore_check` is a separate scratch database that
+   holds only the restored copy.
+4. **Rename, never drop**, the relation and its indexes, so the migration
+   can create fresh tables and the existing rows stay in place:
 
    ```sql
    ALTER TABLE cache_items RENAME TO cache_items_preexisting;
@@ -281,15 +307,19 @@ which keeps the existing data:
    ```
 
    (for `sessions`: `sessions_pkey` and `sess_lifetime_idx`).
-3. Run `make up` again. The migration creates fresh tables; the renamed one
-   stays for inspection.
-4. Once it is no longer needed (export it first with
-   `pg_dump -t cache_items_preexisting` if its rows matter), drop it by
-   hand. Until then `doctrine:schema:validate` reports it as a table the
-   mapping does not know; moving it to another schema of the same database
-   does not help, because Doctrine inspects every schema.
+5. **Run `make up` again.** The migration creates the new tables.
+6. **Leave the renamed table until an operator decides.** Removing it, or
+   the scratch restore database, is a separate, explicitly authorized step
+   once its data is confirmed to be no longer needed and the backup is
+   verified. Until then `doctrine:schema:validate` reports it as a table
+   the mapping does not know: renaming does not make schema validation
+   pass, and neither does moving it to another schema of the same
+   database, because Doctrine inspects every schema.
 
-Nothing in the project drops or rewrites such a table.
+If any step cannot be done safely (the database is not certain, the backup
+does not restore, the data may matter), stop and ask the operator; never
+run `DROP TABLE` against persistent development or production data as
+part of a recovery script.
 
 An interrupted migration (process killed, connection lost) is rolled back
 by PostgreSQL and can simply be run again.
