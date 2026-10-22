@@ -60,6 +60,7 @@ flowchart LR
 - The core schema (users, organizations, memberships, pipeline, audit log) enforces its invariants in PostgreSQL, including composite tenant foreign keys and an append-only audit log ([data model](docs/architecture/data-model.md)).
 - The API writes structured JSON logs to stderr; the edge, the API's log records and problem documents share one request ID per request ([observability](docs/architecture/observability.md)).
 - Sessions and the application cache are stored in PostgreSQL (Symfony `PdoSessionHandler` and `DoctrineDbalAdapter`); sessions are lazy, so stateless routes set no cookie ([sessions and cache](docs/architecture/sessions-and-cache.md)). Login and authorization are not implemented yet.
+- The API connects as the least-privileged role `flowcrm_app` (explicit table privileges from `backend/config/database/runtime-privileges.yaml`, no DDL, append-only audit log); migrations run as the schema owner `flowcrm_owner` in a one-off `migrate` job; the PostgreSQL superuser is used only inside the database container ([ADR-018 database roles](docs/architecture/adr/ADR-018-database-roles.md)).
 
 Details: [development lifecycle contract](docs/architecture/development-lifecycle-contract.md), [ADR-017 health endpoint routing](docs/architecture/adr/ADR-017-health-endpoint-routing.md).
 
@@ -78,13 +79,15 @@ PHP, Composer, Node.js and PostgreSQL are **not** needed on the host; they run i
 $ make up
 devenv: generated the local secret .runtime/secrets/db_password
 devenv: generated the local secret .runtime/secrets/app_secret
+devenv: generated the local secret .runtime/secrets/db_owner_password
+devenv: generated the local secret .runtime/secrets/db_app_password
 devenv: building images (the first build can take several minutes)
 FlowCRM: http://127.0.0.1:8080
 ```
 
-`make up` builds the images, starts PostgreSQL, the API and the Vite dev server, applies pending database migrations, then starts Caddy on the first free port of 8080–8099. It reports success only after Docker's actual port mapping and `GET /health/ready` through the edge have been verified. Open the printed URL in a browser.
+`make up` builds the images, starts PostgreSQL and checks its roles, starts the API and the Vite dev server, applies pending database migrations as the schema owner, verifies the runtime privileges, then starts Caddy on the first free port of 8080–8099. It reports success only after Docker's actual port mapping and `GET /health/ready` through the edge have been verified. Open the printed URL in a browser.
 
-The database password and the Symfony secret are generated per checkout in `.runtime/secrets/` (git-ignored); no credentials are stored in the repository.
+The database passwords (superuser `db_password`, schema owner `db_owner_password`, runtime `db_app_password`) and the Symfony secret are generated per checkout in `.runtime/secrets/` (git-ignored); no credentials are stored in the repository. Each container receives only the secrets it needs; the API never receives the superuser or owner password.
 
 ### Developer commands
 
@@ -98,6 +101,8 @@ The database password and the Symfony secret are generated per checkout in `.run
 | `make ports` | Diagnose port use in the range |
 | `make logs` | Logs (JSON for `api` and `edge`); `SERVICE=edge\|web\|api\|db`, `TAIL=200`, `FOLLOW=1` |
 | `make doctor` | Check the prerequisites |
+| `make db-upgrade-roles` | Convert a database volume created before the role separation (verified backup first, see below) |
+| `make db-rotate-password ROLE=app\|owner` | Rotate the runtime or schema owner password (development only) |
 | `make test-devenv` | Port allocator unit and real-Docker tests (fixture stack) |
 | `make test-app` | Backend, frontend and application-stack tests |
 
@@ -123,11 +128,24 @@ All requests go through the URL printed by `make up`:
 
 ### Database migrations
 
-Migrations live in `backend/migrations` (Doctrine Migrations). Every `make up` applies pending migrations in the running API container (`doctrine:migrations:migrate --all-or-nothing`), also for a migration added while the stack runs; the command is idempotent, and a failing migration stops `make up` with exit 2. `/health/ready` reports `not-ready` while a migration is pending. To run a console command:
+Migrations live in `backend/migrations` (Doctrine Migrations). Every `make up` applies pending migrations in a one-off `migrate` container that connects as the schema owner `flowcrm_owner` (`doctrine:migrations:migrate --all-or-nothing`), also for a migration added while the stack runs; the command is idempotent, and a failing migration stops `make up` with exit 2. `/health/ready` reports `not-ready` while a migration is pending. To run a console command as the runtime role or as the owner:
 
 ```console
 $ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" exec api php bin/console doctrine:migrations:status
+$ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" run --rm --no-deps migrate php bin/console doctrine:migrations:status
 ```
+
+New tables are invisible to the API by default: the migration that creates an object must grant its runtime privileges explicitly, and `backend/config/database/runtime-privileges.yaml` must list it. `make up` runs `bin/console app:database:verify-privileges --runtime` after the migrations and stops with exit 6 on any difference ([ADR-018](docs/architecture/adr/ADR-018-database-roles.md)).
+
+### Upgrading a database created before the role separation
+
+A volume initialised before the role separation has only the superuser and is refused by `make up` (exit 6, nothing is started or converted). Upgrade it once, explicitly:
+
+```console
+$ make db-upgrade-roles
+```
+
+It generates the two role secrets, stops the API, web and edge, dumps the database and verifies the dump by restoring it into a scratch database (row counts, migration history, triggers), keeps the dump in `.runtime/backups/`, then moves the schema to `flowcrm_owner` in one transaction, runs the migrations and verifies the privileges. Data are not changed; running it again is safe. Then run `make up`.
 
 ### Data persistence and reset
 
@@ -139,7 +157,7 @@ $ docker volume rm "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)_db-
 $ make up
 ```
 
-Keep `.runtime/secrets/` as long as the volume exists: the database was initialised with that password. If it is lost, `make up` refuses to start rather than generating a non-matching password.
+Keep `.runtime/secrets/` (and `.runtime/backups/`) as long as the volume exists: the database was initialised with those passwords. If one is lost, `make up` refuses to start rather than generating a non-matching password.
 
 ## Tests
 
@@ -163,6 +181,10 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 | `does not answer /health/ready with 200` | the API is up but not ready: check `make logs SERVICE=api` for the logged reason |
 | A dependency or Dockerfile change has no effect | `make restart` rebuilds the images |
 | `.runtime/secrets/db_password is missing, but the volume … was initialised with it` (exit 6) | restore `.runtime/secrets` from a backup, or reset the database (see above); `make up` never generates a password that would not match |
+| `.runtime/secrets/db_owner_password is missing, but the volume … exists` or `… was created before role separation` (exit 6) | the volume predates the role separation: `make db-upgrade-roles`; for an already upgraded volume restore the file from a backup or run `make db-rotate-password ROLE=owner\|app` |
+| `… is malformed (expected 48 lowercase hex characters)` (exit 6) | restore the file from a backup, or `make db-rotate-password ROLE=owner\|app` |
+| `the api's database role or privileges do not match …; the stack was not published` (exit 6) | the violations are listed above the message: grant the privileges in a migration and list the object in `backend/config/database/runtime-privileges.yaml`; a failed login means a stale `db_app_password` (`make db-rotate-password ROLE=app`) |
+| `the database roles of … are inconsistent` (exit 6) | see the recovery table of [ADR-018](docs/architecture/adr/ADR-018-database-roles.md#recovery) |
 | `project … has containers of another stack` (exit 6) | `FLOWCRM_STACK=fixture` and the application share a checkout's project; stop the other one with the command shown |
 | More symptoms | see [docs/dev-environment.md](docs/dev-environment.md#failure-scenarios) |
 

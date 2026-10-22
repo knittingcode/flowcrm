@@ -49,6 +49,8 @@ Run `make doctor` to check all of this. It changes nothing.
 $ make up
 devenv: generated the local secret .runtime/secrets/db_password
 devenv: generated the local secret .runtime/secrets/app_secret
+devenv: generated the local secret .runtime/secrets/db_owner_password
+devenv: generated the local secret .runtime/secrets/db_app_password
 devenv: building images (the first build can take several minutes)
 FlowCRM: http://127.0.0.1:8080
 $ make url
@@ -65,15 +67,25 @@ and leaves `.runtime/dev.env` unchanged:
    below);
 4. build this project's images (`docker compose build`; source code is
    mounted, so editing it does not rebuild anything);
-5. start the internal services with `up --wait`: `db`, then `api` and `web`;
-   they publish no port, so a failure here is never retried on another port;
-6. apply pending database migrations in the running `api` container
-   (`doctrine:migrations:migrate --all-or-nothing`; application stack only);
-7. start the edge on the first usable port (`up --no-deps --wait edge`);
-8. verify Docker's actual mapping and `GET` of the stack's readiness path
+5. start the internal services with `up --wait`: `db` first; on the
+   application stack its database roles are then checked and corrected
+   (`flowcrm-db-roles ensure`; a database created before the role separation
+   or with inconsistent roles stops here with exit 6, see
+   [ADR-018](architecture/adr/ADR-018-database-roles.md)), then `api` and
+   `web`; they publish no port, so a failure here is never retried on another
+   port;
+6. apply pending database migrations in a one-off `migrate` container
+   (`docker compose run --rm`) that connects as the schema owner
+   `flowcrm_owner` (`doctrine:migrations:migrate --all-or-nothing`;
+   application stack only);
+7. verify the runtime role and privileges in the `api` container
+   (`app:database:verify-privileges --runtime`; exit 6 on any difference from
+   `backend/config/database/runtime-privileges.yaml`; application stack only);
+8. start the edge on the first usable port (`up --no-deps --wait edge`);
+9. verify Docker's actual mapping and `GET` of the stack's readiness path
    (`/health/ready`, which must answer 200 with the stack's own body) through
    the published edge;
-9. save the verified port and print the URL.
+10. save the verified port and print the URL.
 
 When the stack already runs, `make up` reports what it changed: `already
 running; nothing to change`, or `running; recreated: api (image or
@@ -91,6 +103,8 @@ configuration changed)` and/or `applied pending database migrations`.
 | `make ports` | Read-only: the candidate ports in order, whether something accepts connections on them, and the container or process using them (best effort). |
 | `make logs` | Recent logs of this project only. `SERVICE` is one of the stack's services (`edge`, `web`, `api`, `db`; fixture: `edge`, `state`), `TAIL=200`, `FOLLOW=1`. |
 | `make doctor` | Read-only prerequisite and configuration check. |
+| `make db-upgrade-roles` | Application stack only, explicit: convert a database created before the role separation. Creates the two role secrets, stops `api`, `web` and `edge`, takes a backup verified by a restore into a scratch database (`.runtime/backups/`), moves the schema to `flowcrm_owner` in one transaction, migrates and verifies. On a converted database it only re-checks. |
+| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: set a new password for `flowcrm_app` or `flowcrm_owner`, recreate `db` (and `api` for `app`) and prove the login. The previous secret is kept as `.runtime/secrets/.db_<role>_password.previous` until the new password is set. |
 | `make help` | List the targets. |
 | `make test-devenv` | Run the allocator tests on the fixture (see below). |
 | `make test-app` | Run the backend, frontend and application-stack tests (see below). |
@@ -106,7 +120,7 @@ When `bin/devenv` fails, `make` reports its own exit code 2; run
 | 3 | no usable port |
 | 4 | lock timeout |
 | 5 | missing prerequisite (for example the Docker daemon is not reachable) |
-| 6 | safety refusal (resources of another checkout) |
+| 6 | safety refusal (resources of another checkout, missing or malformed secrets, database roles not upgraded or inconsistent, runtime privileges that differ from the manifest) |
 | 64 | invalid configuration or usage |
 
 ## Port selection
@@ -186,11 +200,24 @@ FLOWCRM_HTTP_PORT=8080
   - The directory must be owned by you; `make up` sets it to `0700` and the
     files to `0444` (readable by the unprivileged container users, not by
     other local users). Symlinks and other file types are refused.
-  - A secret is generated once and never replaced.
-  - If `db_password` is missing while the volume `<project>_db-data` exists,
-    `make up` refuses with exit 6 and generates nothing: the database was
-    initialised with the old password. Restore the file from a backup, or
+  - The application stack has four: `db_password` (the PostgreSQL
+    superuser, used only inside the `db` container), `db_owner_password`
+    (`flowcrm_owner`, given to the `migrate` job), `db_app_password`
+    (`flowcrm_app`, given to the `api`) and `app_secret`. The two role
+    passwords must be 48 lowercase hex characters; anything else is refused
+    with exit 6.
+  - A secret is generated once and never replaced by `make up`.
+  - If a database secret is missing while the volume `<project>_db-data`
+    exists, `make up` refuses with exit 6 and generates nothing: the database
+    was initialised with the old password. Restore the file from a backup, or
     reset the database deliberately (README, "Data persistence and reset").
+    For a volume created before the role separation, `make db-upgrade-roles`
+    is the only command that creates the role secrets; for a converted one,
+    `make db-rotate-password ROLE=…` sets a new password.
+  - Compose mounts secret files as bind mounts: a container keeps seeing the
+    file it was started with. `make db-rotate-password` therefore recreates
+    the containers that read a rotated secret; do not replace secret files
+    by hand.
 
 ## Several checkouts and projects
 
@@ -292,7 +319,11 @@ shows this project's logs (`edge` logs each HTTP request).
 | `stopping project … failed: …` (exit 2) | `docker compose down` failed or was terminated |
 | `project … has containers of another stack` (exit 6) | the other `FLOWCRM_STACK` runs in this checkout; stop it with the command shown |
 | `.runtime/secrets/db_password is missing, but the volume … was initialised with it` (exit 6) | restore the secret, or reset the database (README) |
-| `applying the database migrations failed` (exit 2) | a migration failed; nothing was saved; see `make logs SERVICE=api` |
+| `applying the database migrations failed` (exit 2) | a migration failed; nothing was saved; the output of the `migrate` job is shown |
+| `… was created before role separation` / `.runtime/secrets/db_owner_password is missing, but the volume … exists` (exit 6) | the volume predates the role separation: `make db-upgrade-roles` |
+| `… is malformed (expected 48 lowercase hex characters)` (exit 6) | restore the role secret, or `make db-rotate-password ROLE=…` |
+| `the database roles of … are inconsistent` (exit 6) | nothing was changed; see the recovery table in [ADR-018](architecture/adr/ADR-018-database-roles.md#recovery) |
+| `the api's database role or privileges do not match …` (exit 6) | the violations are listed; grant the privileges in the migration and list the object in `backend/config/database/runtime-privileges.yaml`; a failed login means a stale `db_app_password` (`make db-rotate-password ROLE=app`) |
 | `the Compose configuration (…) is invalid` (exit 2) | the Compose file does not parse or validate; nothing was started |
 | `building the images failed: …` (exit 2) | a Dockerfile or dependency install failed; running containers were not changed |
 | `does not answer /health/ready with 200` (exit 2) | the stack runs but is not ready (database unreachable or a migration pending); `make logs SERVICE=api` shows the logged reason |
@@ -356,7 +387,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   Node packages), and control scans prove the gate fails on a vulnerable
   image and on an image without inventoried packages (see
   [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
-- `backend.sh` (BE-01 to BE-15): PHP 8.5 runtime, `composer validate` and
+- `backend.sh` (BE-01 to BE-17): PHP 8.5 runtime, `composer validate` and
   `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
   empty database, `doctrine:schema:validate`, a full down/up migration round
   trip, PHPUnit unit and integration suites against a real PostgreSQL
@@ -368,9 +399,14 @@ Application suites (`tests/app/`), each in its own Compose projects:
   the session and cache configuration of dev and prod, BE-15 the PHP-FPM
   request time limit (see
   [architecture/sessions-and-cache.md](architecture/sessions-and-cache.md)).
+  The suites connect as the runtime role `flowcrm_app`; migrations (BE-06 to
+  BE-08) run as `flowcrm_owner`. BE-16 verifies the privilege manifest as the
+  runtime role, BE-17 which secrets each service of the dev and prod Compose
+  configuration receives (see
+  [architecture/adr/ADR-018-database-roles.md](architecture/adr/ADR-018-database-roles.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-46): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-53): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -382,11 +418,17 @@ Application suites (`tests/app/`), each in its own Compose projects:
   structured logs (request ID in the api and edge logs, complete JSON
   records, no tokens in any log), lazy sessions (no cookie and no stored
   session for stateless requests) and the session and cache migration
-  through `make up` with an incompatible and a compatible existing table.
-- `prodlike.sh` (PL-01 to PL-14): the production images (`<project>-prod`,
+  through `make up` with an incompatible and a compatible existing table,
+  and the database roles: the api's role and secrets, privilege drift and
+  missing or malformed role secrets failing closed, rotation of both role
+  passwords, and a volume created as before the role separation being
+  refused, upgraded with a verified backup (rows, triggers and migration
+  history kept) and upgraded again without changes.
+- `prodlike.sh` (PL-01 to PL-15): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey
-  under the CSP and lazy sessions in production mode.
+  under the CSP, lazy sessions in production mode and the `migrate` job
+  completing as the owner before the api starts.
 
 Each application suite uses Compose project and image names unique to the
 run, so several runs from one checkout do not interfere.

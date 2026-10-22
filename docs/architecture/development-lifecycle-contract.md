@@ -180,14 +180,25 @@ The two stacks use different paths:
 
 **Migrations:** in development, `make up` applies them as its own phase,
 after the internal services are healthy and before the edge starts: it runs
-`doctrine:migrations:up-to-date` and, if migrations are pending,
+`doctrine:migrations:up-to-date` in the running `api` container and, if
+migrations are pending,
 `doctrine:migrations:migrate --no-interaction --allow-no-migration --all-or-nothing`
-in the running `api` container, under the lock and in a recorded process
+in the one-off `migrate` job (`docker compose run --rm --no-deps migrate`,
+Compose profile `migrate`), which connects as the schema owner
+`flowcrm_owner`; the `api` connects as the runtime role `flowcrm_app` and
+never receives the owner password. This runs under the lock and in a recorded process
 group like every other mutating call. A migration added while the stack runs
 is therefore applied by the next `make up` without recreating a container. A
-failed migration stops `make up` with exit 2 and keeps the saved state. The
-production-like images instead migrate in the container entrypoint
-(`FLOWCRM_MIGRATE_ON_START=1`). An existing database is never
+failed migration stops `make up` with exit 2 and keeps the saved state.
+Before the migrations, `make up` checks the database roles in the `db`
+container (`flowcrm-db-roles ensure`); after them it verifies the runtime
+privileges (`app:database:verify-privileges --runtime` in the `api`); both
+refuse with exit 6 and publish nothing on failure. A database created before
+the role separation is converted only by the explicit `make
+db-upgrade-roles` (ADR-018). The production-like stack runs the same
+`migrate` job (prod image) to completion before the `api` starts
+(`depends_on: service_completed_successfully`); no stack migrates in the
+`api` entrypoint (`FLOWCRM_MIGRATE_ON_START=0`). An existing database is never
 re-initialised. ADR-017 records why the two health paths are the only
 non-`/api` routes that reach Symfony, and how the edge matches them on the
 raw request URI.
@@ -250,11 +261,12 @@ project prefix (ADR-009). An invalid `FLOWCRM_STACK` is rejected with exit
 |---|---|---|
 | Compose file | `compose.fixture.yaml` | `compose.yaml` |
 | Internal services | `state` | `db api web` |
-| `COMPOSE_PROFILES` | (empty) | `dev` |
+| `COMPOSE_PROFILES` | (empty) | `dev,migrate` |
 | Readiness path and required body | `/health`, `ok` | `/health/ready`, `{"status":"ready"}` |
 | `logs` services (exact allow-list) | `edge`, `state` | `edge`, `web`, `api`, `db` |
-| Generated secrets | none | `db_password`, `app_secret` |
-| Secret bound to a volume | none | `db_password` ↔ `db-data` |
+| Generated secrets | none | `db_password`, `app_secret`, `db_owner_password`, `db_app_password` |
+| Secrets bound to a volume | none | all four ↔ `db-data` |
+| Database roles checked and privileges verified | no | yes |
 | Migration phase | no | yes |
 | URL label | `FlowCRM development fixture` | `FlowCRM` |
 
@@ -264,7 +276,9 @@ missing; an existing secret is never replaced, because the database volume
 was initialised with it. The directory and files must be owned by the user
 running `make`; their modes are enforced on every `make up`. A missing
 volume-bound secret is not regenerated while its volume exists (exit 6, unit
-tests U-16, ST-28).
+tests U-16, ST-28, ST-49); the two role secrets must be 48 lowercase hex
+characters. Only `make db-upgrade-roles` creates role secrets for an
+existing volume, and only `make db-rotate-password` replaces one.
 
 **Stack identity.** Both stacks share the project name of the checkout, so a
 checkout runs one stack at a time. Every command compares the Compose file

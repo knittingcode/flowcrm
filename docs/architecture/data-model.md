@@ -23,7 +23,7 @@ the `Domain` layer of their module (`docs/architecture/backend-modules.md`).
 | `memberships` | Organizations | FK → `organizations`, FK → `users`; `UNIQUE (organization_id, user_id)`; `UNIQUE (organization_id, id)`; `CHECK (role IN ('ADMIN','MANAGER','REP'))`; `CHECK (status IN ('ACTIVE','REMOVED'))`; `CHECK ((status = 'REMOVED') = (removed_at IS NOT NULL))`; index `(user_id) WHERE status = 'ACTIVE'` |
 | `pipelines` | Sales | FK → `organizations`; `UNIQUE (organization_id)` (one pipeline per organization); `UNIQUE (organization_id, id)` |
 | `pipeline_stages` | Sales | composite FK `(organization_id, pipeline_id)` → `pipelines (organization_id, id)`; `UNIQUE (organization_id, id)`; active names unique per pipeline regardless of case (`pipeline_stages_active_name_key`, `WHERE archived_at IS NULL`); `UNIQUE (pipeline_id, position) DEFERRABLE INITIALLY DEFERRED` (stages can be reordered in one transaction) |
-| `audit_events` | Audit | FK → `organizations` (nullable for platform events); `CHECK (actor_type IN ('user','platform_operator','system'))`; `changes jsonb`; `ip inet`; indexes `(organization_id, occurred_at DESC, id DESC)` and `(organization_id, entity_type, entity_id, occurred_at DESC)`; **append-only**: triggers reject `UPDATE`, `DELETE` and `TRUNCATE` for every role (SQLSTATE 42501) |
+| `audit_events` | Audit | FK → `organizations` (nullable for platform events); `CHECK (actor_type IN ('user','platform_operator','system'))`; `changes jsonb`; `ip inet`; indexes `(organization_id, occurred_at DESC, id DESC)` and `(organization_id, entity_type, entity_id, occurred_at DESC)`; **append-only**: the runtime role `flowcrm_app` holds only `SELECT, INSERT`, and triggers reject `UPDATE`, `DELETE` and `TRUNCATE` for every role (SQLSTATE 42501); the schema owner and the superuser can still disable the triggers and remain trusted ([ADR-018](adr/ADR-018-database-roles.md)) |
 
 `schema_baseline` (FND-004) remains.
 
@@ -58,17 +58,21 @@ by themselves:
   is written by the authentication work). Session storage exists
   ([sessions and cache](sessions-and-cache.md)) but is not authentication.
 
-## Not included yet
+## Database roles
 
-| Item (FCRM-003 FND-007) | Status |
-|---|---|
-| Separate owner (migrations) and application database roles, with the application role limited to `INSERT, SELECT` on `audit_events` | open: needs a decision on how the second database credential is created and rotated, including existing development volumes; the trigger already blocks changes for every role |
+The tables are owned by `flowcrm_owner`, which runs the migrations; the API
+connects as `flowcrm_app` with the explicit privileges listed in
+`backend/config/database/runtime-privileges.yaml` (no DDL, no TRUNCATE, only
+`SELECT, INSERT` on `audit_events`, nothing on `schema_baseline`). A
+migration that adds a table must grant its runtime privileges and list it in
+the manifest. See [ADR-018](adr/ADR-018-database-roles.md).
 
 ## Tests
 
 | Test | Proves |
 |---|---|
-| `backend/tests/Integration/Database/CoreSchemaTest.php` | with raw SQL on PostgreSQL: case-insensitive unique e-mail, e-mail length, currency allow-list, one membership per user and organization, role, status and `removed_at` checks, foreign keys, one pipeline per organization, **a stage cannot reference another organization's pipeline**, active stage names unique regardless of case (archived duplicates allowed), deferred position uniqueness (swap passes, duplicate fails), audit `UPDATE`/`DELETE`/`TRUNCATE` rejected, audit checks |
+| `backend/tests/Integration/Database/CoreSchemaTest.php` | with raw SQL on PostgreSQL: case-insensitive unique e-mail, e-mail length, currency allow-list, one membership per user and organization, role, status and `removed_at` checks, foreign keys, one pipeline per organization, **a stage cannot reference another organization's pipeline**, active stage names unique regardless of case (archived duplicates allowed), deferred position uniqueness (swap passes, duplicate fails), audit `UPDATE`/`DELETE`/`TRUNCATE` rejected for the runtime role by privilege and for the owner by the trigger, audit checks |
+| `backend/tests/Integration/Database/RuntimePrivilegesTest.php`, `OwnerRoleTest.php`, `RuntimePrivilegesVerifierTest.php` | what the runtime and owner roles may and may not do, and that each weakening of the privileges is reported (ADR-018) |
 | `backend/tests/Integration/Database/CoreEntitiesTest.php` | every entity is written and read back through the ORM |
 | `backend/tests/Unit/Domain/CoreEntityRulesTest.php` | e-mail format and length, IANA timezone, membership removal and stage archival once, IP address |
 | `tests/app/backend.sh` BE-06 to BE-08 | migration from empty, schema in sync with the mapping, full down/up round trip |
