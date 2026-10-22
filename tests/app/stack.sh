@@ -1055,14 +1055,18 @@ v "ST-55 upgrade interrupted while ALTER TABLE waits on a real lock (SIGTERM): t
 # The same with SIGINT, delivered as in a terminal (job control on, so the
 # background command does not ignore it), and with the connection of the
 # operation cut from outside: both roll back, nothing commits later.
-cupg_blocked() { # label: upgrade in the background, waiting for ALTER TABLE on the held lock -> sets UPG
-  docker exec -d -e PGAPPNAME=st-holder "$cdb" psql -U flowcrm -d flowcrm -c 'BEGIN' -c 'LOCK TABLE audit_events IN ACCESS SHARE MODE' -c 'SELECT pg_sleep(180)' -c 'COMMIT'
-  sleep 1
-  set -m
-  (cd "$C" && exec ./bin/devenv upgrade-roles) >"$work/out/$1.out" 2>"$work/out/$1.err" &
-  UPG=$!
-  set +m
+cupg_blocked() { # label: upgrade in the background, waiting for ALTER TABLE on the held lock -> sets UPG, UPG_T0
   local i=0
+  docker exec -d -e PGAPPNAME=st-holder "$cdb" psql -U flowcrm -d flowcrm -c 'BEGIN' -c 'LOCK TABLE audit_events IN ACCESS SHARE MODE' -c 'SELECT pg_sleep(180)' -c 'COMMIT'
+  # The upgrade starts only once the holder has its lock, so its ALTER TABLE
+  # is the one that waits.
+  until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid) WHERE a.application_name = 'st-holder' AND l.relation = 'audit_events'::regclass AND l.granted")" = 1 ] || [ "$i" -ge 60 ]; do sleep 0.5; i=$((i + 1)); done
+  # SIGINT at its default disposition, as from a terminal: a background job
+  # of a non-interactive shell would otherwise ignore it.
+  (cd "$C" && exec python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' ./bin/devenv upgrade-roles) >"$work/out/$1.out" 2>"$work/out/$1.err" &
+  UPG=$!
+  UPG_T0=$SECONDS
+  i=0
   until [ "$(docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'flowcrm-db-roles:%' AND wait_event_type = 'Lock' AND query LIKE 'ALTER TABLE%'")" = 1 ] || [ "$i" -ge 240 ]; do sleep 0.5; i=$((i + 1)); done
 }
 holder_c_down() { docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'st-holder'" >/dev/null; }
@@ -1070,6 +1074,7 @@ cupg_blocked c-upg-int
 kill -INT "$UPG"
 wait "$UPG"
 int_rc=$?
+int_secs=$((SECONDS - UPG_T0))
 holder_c_down
 sleep 5
 int_same=$(legacy_same && echo same)
@@ -1079,9 +1084,9 @@ wait "$UPG"
 conn_rc=$?
 holder_c_down
 sleep 5
-[ "$int_rc" = 130 ] && grep -q 'the interrupted database operation ended' "$work/out/c-upg-int.err" && [ "$int_same" = same ] &&
+[ "$int_rc" = 130 ] && [ "$int_secs" -lt 60 ] && grep -q 'the interrupted database operation ended' "$work/out/c-upg-int.err" && [ "$int_same" = same ] &&
   [ "$conn_rc" = 6 ] && grep -q 'the role upgrade failed .* and was rolled back' "$work/out/c-upg-conn.err" && legacy_same
-v "ST-55 the same with SIGINT (exit 130) and with the operation's connection cut from outside (reported as failed and rolled back): nothing commits later" $? "int=$int_rc conn=$conn_rc | int: $(tail -n 3 "$work/out/c-upg-int.err" | tr '\n' ' ') | conn: $(tail -n 1 "$work/out/c-upg-conn.err")"
+v "ST-55 the same with SIGINT (exit 130) and with the operation's connection cut from outside (reported as failed and rolled back): nothing commits later" $? "int=$int_rc after ${int_secs}s conn=$conn_rc | int: $(tail -n 3 "$work/out/c-upg-int.err" | tr '\n' ' ') | conn: $(tail -n 1 "$work/out/c-upg-conn.err")"
 
 # A backup that does not restore, a restored copy whose contents differ, and
 # a damaged host copy: each stops the upgrade with nothing changed, and no

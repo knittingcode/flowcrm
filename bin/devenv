@@ -472,8 +472,13 @@ lock_status() {
 reap_lock() {
   local guard=$RUNTIME_DIR/lock.reap observed=$OBSERVED_TOKEN
   if ! mkdir "$guard" 2>/dev/null; then
-    if older_than_a_minute "$guard"; then rm -rf "$guard"; fi
-    return 1
+    # A guard older than a minute belongs to a reaper that died: remove it
+    # and take the guard at once, so the stale lock is reaped in this
+    # attempt instead of only after the next pass of acquire_lock (which
+    # may come after its deadline).
+    if ! older_than_a_minute "$guard" || ! rm -rf "$guard" || ! mkdir "$guard" 2>/dev/null; then
+      return 1
+    fi
   fi
   lock_status
   if [ "$LOCK_STATE" = stale ] && [ "$OBSERVED_TOKEN" = "$observed" ]; then

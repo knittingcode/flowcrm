@@ -237,6 +237,18 @@ expect_eq "U-08 abandoned reap guard is cleared" 0 "$(lock_rc)"
 [ ! -e "$RUNTIME_DIR/lock.reap" ]
 result "U-08 reap guard removed" $?
 rm -rf "$LOCK_DIR"
+# Deterministic: with no time left before the deadline, the abandoned guard
+# and the stale lock behind it must still be cleared in the same attempt
+# (formerly the reap waited for a second pass, which a one-second deadline
+# could miss).
+owner "$(host_id)" "$dead" "x"
+mkdir "$RUNTIME_DIR/lock.reap"
+touch -t 202001010000 "$RUNTIME_DIR/lock.reap"
+LOCK_WAIT=0
+expect_eq "U-08 abandoned reap guard and stale lock are cleared in one attempt (no time left before the deadline)" 0 "$(lock_rc)"
+LOCK_WAIT=1
+[ ! -e "$RUNTIME_DIR/lock.reap" ] && [ ! -e "$LOCK_DIR" ]
+result "U-08 nothing left after the single-attempt reap" $?
 (
   acquire_lock test
   printf 'token=someone-else\n' >"$LOCK_DIR/owner"
