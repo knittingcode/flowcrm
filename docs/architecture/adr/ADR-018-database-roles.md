@@ -85,15 +85,28 @@ end the process inside the container, so every changing command runs as a
 named operation: `bin/devenv` passes an operation ID, the script records
 its process and names its sessions `flowcrm-db-roles:<id>`
 (`application_name`), and every transaction first takes one PostgreSQL
-advisory lock, so changes never interleave. On SIGINT or SIGTERM, `bin/devenv`
-cancels its operation (`flowcrm-db-roles cancel <id>`: the script is ended,
-its sessions are terminated, an open transaction rolls back) and waits, at
-most 30 s, until both are gone, before it releases the checkout lock; it
-reports whether that was confirmed. Every changing command first ends the
-leftovers of earlier operations the same way (it holds the checkout lock,
-so they belong to an interrupted command, for example one ended with
-SIGKILL) and removes an interrupted backup's dump and scratch database. No
-other session is touched.
+advisory lock, so changes never interleave; no lock is waited for longer
+than 120 s (`lock_timeout`: the transaction then fails and rolls back). On
+SIGINT or SIGTERM, `bin/devenv` cancels its operation (`flowcrm-db-roles
+cancel <id>`: the script is ended, its sessions are terminated, an open
+transaction rolls back) and waits, at most 30 s (the call at most 45 s),
+until both are gone, before it releases the checkout lock. Every changing
+command first ends the leftovers of earlier operations the same way and
+refuses to change anything (exit 14) while one cannot be ended within
+30 s; it holds the checkout lock, so they belong to an interrupted command,
+for example one ended with SIGKILL. It also removes an interrupted backup's
+dump and scratch database. No other session is touched.
+
+When the cancellation cannot be confirmed (the db container cannot be
+reached, or the old script does not end in time), the old operation may
+still commit later. The command then fails closed: it records the
+unresolved state for `make status` and `make url` (`blocked`) and stops a
+running edge. Only a `make up` that has ended the old operation, or found
+it finished (committed or rolled back), and passed the role and privilege
+checks serves the stack again. A rotation whose password change committed
+late is finished with `make db-rotate-password` (the pending file is
+still there); a late-committed upgrade is completed by `make up` (pending
+migrations, privilege check).
 
 - **New volume:** the image's initdb hook (`10-flowcrm-roles.sh`) runs
   `flowcrm-db-roles init`: the two roles with their passwords, schema
@@ -219,7 +232,7 @@ zero-downtime rotation.
 | runtime password does not match (stale file, or the role changed its own password) | exit 6 after the migrations (login fails in the privilege check), edge stopped | `make db-rotate-password ROLE=app` |
 | privileges differ from the manifest | exit 6, violations listed, edge stopped, `make status` reports `blocked` | fix the migration or the manifest; correct grants as `flowcrm_owner`; `make up` |
 | rotation interrupted or failed | depends on the state (see Rotation) | `make db-rotate-password ROLE=…` again, or `make db-rotate-password-abort ROLE=…`; after the file was replaced: `make up` |
-| interrupted database operation could not be confirmed as ended | warning from the interrupted command | the next `make up`, `make db-upgrade-roles` or `make db-rotate-password` ends it before it changes anything |
+| interrupted database operation could not be confirmed as ended | warning, edge stopped, `make status` reports `blocked` | `make up` once the db container is reachable: it ends the old operation (or finds it finished) before changing anything, and checks every gate; after a late password change, `make db-rotate-password ROLE=…` finishes the rotation |
 | `inconsistent` roles (for example an object in `public` owned by another role) | exit 6, nothing changed | inspect with `docker compose exec db flowcrm-db-roles state` and `psql`; move the object to `flowcrm_owner` or out of `public` by hand |
 | failed or interrupted upgrade | legacy: exit 6; converted: migrates | run `make db-upgrade-roles` again (an interrupted conversion was rolled back before the command exited); the backup in `.runtime/backups/` restores the previous state (`pg_restore` into a new database) |
 
@@ -290,7 +303,11 @@ example, hash-chained or off-host records).
   waits on a lock, then finished or aborted, for both roles, a failed api
   recreation, repeated rotations; a volume created exactly as before
   FND-009 is refused; an upgrade interrupted after the backup and while an
-  `ALTER TABLE` waits on a real lock leaves it unchanged (no later commit);
+  `ALTER TABLE` waits on a real lock (SIGTERM, SIGINT, a cut connection)
+  leaves it unchanged (no later commit); a cancellation that cannot be
+  confirmed (db container paused, old script not ending) blocks the stack,
+  and the next command ends the old operation first or refuses; a foreign
+  holder of the advisory lock cannot make `make up` wait forever;
   a backup that does not restore, differs in its contents or is damaged on
   the host stops the upgrade without leaving a dump; the upgrade keeps every
   row, the triggers and the history; an unreadable credential gives 503

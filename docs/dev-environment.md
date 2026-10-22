@@ -414,7 +414,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   [architecture/adr/ADR-018-database-roles.md](architecture/adr/ADR-018-database-roles.md)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-58): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-61): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -434,8 +434,11 @@ Application suites (`tests/app/`), each in its own Compose projects:
   volume created as before the role separation being refused, upgrades
   interrupted after the backup and while waiting on a lock, backups that do
   not restore, differ or are damaged, the upgrade itself (rows, triggers and
-  migration history kept) and a second upgrade without changes, and an
-  unreadable credential answering 503 through the edge.
+  migration history kept) and a second upgrade without changes, an
+  unreadable credential answering 503 through the edge, and cancellations
+  that cannot be confirmed (db container paused, old script not ending, a
+  foreign holder of the advisory lock) keeping the stack blocked until the
+  old operation has ended.
 - `prodlike.sh` (PL-01 to PL-15): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey
