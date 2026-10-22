@@ -1214,7 +1214,7 @@ d_dump=$(find "$D/.runtime/backups" -name 'roles_upgrade_*.dump' -type f -newer 
 v "ST-68 a volume from FND-004 (no audit log yet): a recorded audit migration without its table is refused; the upgrade then succeeds after a verified backup, runs every later migration as flowcrm_owner and keeps the baseline row and history" $? "legacy=$d_legacy_rc shape=$d_shape fake=$(rc_of d-upg-fake) upgrade=$(rc_of d-upgrade) $(tail -n 2 "$work/out/d-upgrade.err" | tr '\n' ' ')"
 dv d-up2 "$D" up
 d_ready=$(until_ready "$(saved_port "$D")" 200 30 && echo ready)
-d_verify=$(console_in "$D" app:database:verify-privileges --runtime && echo ok || tail -n 3 "$work/out/console.log" | tr '\n' ' ')
+if console_in "$D" app:database:verify-privileges --runtime; then d_verify=ok; else d_verify=$(tail -n 3 "$work/out/console.log" | tr '\n' ' '); fi
 dv d-upgrade2 "$D" upgrade-roles
 [ "$(rc_of d-up2)" = 0 ] && [ "$d_ready" = ready ] && [ "$d_verify" = ok ] &&
   [ "$(rc_of d-upgrade2)" = 0 ] && err_has d-upgrade2 'nothing to upgrade' && ! err_has d-upgrade2 'verified backup' && [ "$(psql_d "$d_rows_sql")" = "$d_rows" ]
