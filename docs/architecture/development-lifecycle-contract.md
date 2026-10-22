@@ -38,7 +38,8 @@ them:
 Implemented versions (FND-004): PHP 8.5.12 (FPM, Alpine), Symfony 7.4,
 Doctrine ORM 3.7 / DBAL 4 / Migrations bundle 4, PostgreSQL 18.6, Caddy
 2.11.7, Node 24.22, React 19.3, TypeScript 6.0.3, Vite 8.3. Base images are
-pinned by digest in `docker/*/Dockerfile` and `compose.yaml`. The FCRM-003
+pinned by digest in `docker/*/Dockerfile` and `compose.fixture.yaml`, and so is the
+Dockerfile frontend (`# syntax=` on line 1). The FCRM-003
 PHP 8.5 compatibility spike passed: the dependency set installs, and the
 full PHPUnit, PHPStan and migration checks pass on PHP 8.5.12.
 
@@ -233,7 +234,10 @@ apply unchanged to FND-004. Read-only commands (`status`, `url`, `ports`,
   reported ([container vulnerabilities](../security/container-vulnerabilities.md)).
   Every scan must also inventory the expected package sources of the image,
   so an unrecognised image cannot pass as "no findings".
-- Image references stay pinned by digest; actions stay pinned by commit.
+- Image references, including the Dockerfile `# syntax=` frontend, stay
+  pinned by digest (the frontend is enforced by
+  `scripts/ci/guard-dockerfile-frontend.sh` in `Repository guard`); actions
+  stay pinned by commit.
 
 ## 10. Stack configuration
 

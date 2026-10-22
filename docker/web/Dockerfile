@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # FlowCRM web: the React + TypeScript SPA with Vite, as the unprivileged node
 # user. Targets: dev (Vite dev server; src/, public/ and index.html come from
 # the mounts of compose.yaml, so editing them does not rebuild the image) and

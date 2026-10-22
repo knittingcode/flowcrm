@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 # FlowCRM API: Symfony 7.4 on PHP-FPM 8.5, running as www-data (uid 82).
 # Build context: the repository root. Targets: dev (dev dependencies; the
 # source comes from the read-only mounts of compose.yaml, so editing PHP code
