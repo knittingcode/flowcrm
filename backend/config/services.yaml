@@ -13,6 +13,12 @@ parameters:
     flowcrm.security.session_token_key: _security_api
     flowcrm.security.csrf_exempt_routes: [api_v1_auth_login]
 
+    # Rate limits (ADR-019): sliding windows; only failures are counted.
+    flowcrm.rate_limit.login_account_ip: { id: login_account_ip, policy: sliding_window, limit: 5, interval: '15 minutes' }
+    flowcrm.rate_limit.login_ip: { id: login_ip, policy: sliding_window, limit: 50, interval: '15 minutes' }
+    flowcrm.rate_limit.login_account: { id: login_account, policy: sliding_window, limit: 100, interval: '1 day' }
+    flowcrm.rate_limit.password_change: { id: password_change, policy: sliding_window, limit: 5, interval: '15 minutes' }
+
 services:
     # default configuration for services in *this* file
     _defaults:
@@ -26,8 +32,39 @@ services:
         # Entities, value objects and domain exceptions are not services.
         exclude: '../src/*/Domain/'
 
+    # Repository interfaces live in Domain, which is not scanned for services.
+    App\Identity\Domain\UserRepository: '@App\Identity\Infrastructure\Persistence\DoctrineUserRepository'
+    App\Organizations\Domain\OrganizationRepository: '@App\Organizations\Infrastructure\Persistence\DoctrineOrganizationRepository'
+    App\Organizations\Domain\MembershipRepository: '@App\Organizations\Infrastructure\Persistence\DoctrineMembershipRepository'
+
     # The migrations bundle registers its dependency factory only by id.
     Doctrine\Migrations\DependencyFactory: '@doctrine.migrations.dependency_factory'
+
+    # Rate limiters: state in the cache.rate_limits pool (cache_items, on the
+    # cache connection), serialised by PostgreSQL advisory locks on the same
+    # connection, so concurrent failures are all counted. No new table, no
+    # new connection and no extra privilege (advisory locks need none).
+    flowcrm.rate_limiter.lock_factory:
+        class: Symfony\Component\Lock\LockFactory
+        arguments:
+            - !service
+                class: Symfony\Component\Lock\Store\DoctrineDbalPostgreSqlStore
+                arguments: ['@doctrine.dbal.cache_connection']
+    flowcrm.rate_limiter.storage:
+        class: Symfony\Component\RateLimiter\Storage\CacheStorage
+        arguments: ['@cache.rate_limits']
+    flowcrm.rate_limiter.login_account_ip:
+        class: Symfony\Component\RateLimiter\RateLimiterFactory
+        arguments: ['%flowcrm.rate_limit.login_account_ip%', '@flowcrm.rate_limiter.storage', '@flowcrm.rate_limiter.lock_factory']
+    flowcrm.rate_limiter.login_ip:
+        class: Symfony\Component\RateLimiter\RateLimiterFactory
+        arguments: ['%flowcrm.rate_limit.login_ip%', '@flowcrm.rate_limiter.storage', '@flowcrm.rate_limiter.lock_factory']
+    flowcrm.rate_limiter.login_account:
+        class: Symfony\Component\RateLimiter\RateLimiterFactory
+        arguments: ['%flowcrm.rate_limit.login_account%', '@flowcrm.rate_limiter.storage', '@flowcrm.rate_limiter.lock_factory']
+    flowcrm.rate_limiter.password_change:
+        class: Symfony\Component\RateLimiter\RateLimiterFactory
+        arguments: ['%flowcrm.rate_limit.password_change%', '@flowcrm.rate_limiter.storage', '@flowcrm.rate_limiter.lock_factory']
 
 when@test:
     services:

@@ -143,6 +143,9 @@ final class CoreSchemaTest extends KernelTestCase
      */
     public function testTheRuntimeRoleCanOnlyAppendToTheAuditLog(): void
     {
+        // Other tests write audit events too, which can never be removed.
+        $before = $this->db->fetchOne('SELECT count(*) FROM audit_events');
+        self::assertIsInt($before);
         $id = $this->auditEvent($this->organization());
         $this->auditEvent(null);
 
@@ -150,7 +153,7 @@ final class CoreSchemaTest extends KernelTestCase
         $this->assertViolation(self::NOT_ALLOWED, $denied, fn () => $this->db->executeStatement("UPDATE audit_events SET action = 'changed' WHERE id = ?", [$id]));
         $this->assertViolation(self::NOT_ALLOWED, $denied, fn () => $this->db->executeStatement('DELETE FROM audit_events WHERE id = ?', [$id]));
         $this->assertViolation(self::NOT_ALLOWED, $denied, fn () => $this->db->executeStatement('TRUNCATE audit_events'));
-        self::assertEquals(2, $this->db->fetchOne('SELECT count(*) FROM audit_events'));
+        self::assertEquals($before + 2, $this->db->fetchOne('SELECT count(*) FROM audit_events'));
     }
 
     /**

@@ -11,8 +11,9 @@ use Symfony\Component\Uid\Uuid;
 /**
  * A person who can sign in (FCRM-003 section F). E-mail addresses are
  * unique regardless of case: the database enforces UNIQUE (lower(email)).
- * Authentication is not implemented yet (FND-008); the password hash is
- * produced by the password hasher there.
+ * The password hash comes from the configured password hasher (Argon2id,
+ * ADR-019); a user is global, not part of an organization, so only the
+ * user or the platform operator changes these attributes.
  */
 #[ORM\Entity]
 #[ORM\Table(name: 'users')]
@@ -59,6 +60,49 @@ class User
         $this->passwordHash = $passwordHash;
         $this->displayName = $displayName;
         $this->createdAt = $createdAt;
+    }
+
+    /**
+     * A new password: every other session of the user ends on its next
+     * request, because the credentials changed (ADR-019).
+     */
+    public function changePassword(string $passwordHash, \DateTimeImmutable $at): void
+    {
+        if ('' === $passwordHash) {
+            throw new \InvalidArgumentException('The password hash is empty.');
+        }
+        $this->passwordHash = $passwordHash;
+        $this->passwordChangedAt = $at;
+    }
+
+    /** The same password hashed with the current parameters; not a password change. */
+    public function rehashPassword(string $passwordHash): void
+    {
+        if ('' === $passwordHash) {
+            throw new \InvalidArgumentException('The password hash is empty.');
+        }
+        $this->passwordHash = $passwordHash;
+    }
+
+    public function disable(\DateTimeImmutable $at): void
+    {
+        if (null !== $this->disabledAt) {
+            throw new \LogicException('The user is already disabled.');
+        }
+        $this->disabledAt = $at;
+    }
+
+    public function enable(): void
+    {
+        if (null === $this->disabledAt) {
+            throw new \LogicException('The user is not disabled.');
+        }
+        $this->disabledAt = null;
+    }
+
+    public function isDisabled(): bool
+    {
+        return null !== $this->disabledAt;
     }
 
     public function id(): Uuid

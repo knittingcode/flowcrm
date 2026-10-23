@@ -10,6 +10,11 @@ framework:
         prefix_seed: flowcrm
         app: cache.adapter.doctrine_dbal
         default_doctrine_dbal_provider: doctrine.dbal.cache_connection
+        pools:
+            # Rate limiter state (login throttling, ADR-019); the keys are
+            # hashes, never an e-mail address or an IP address.
+            cache.rate_limits:
+                adapter: cache.app
 
 when@test:
     framework:

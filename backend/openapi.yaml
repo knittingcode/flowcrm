@@ -1,0 +1,606 @@
+openapi: 3.0.3
+info:
+  title: FlowCRM API
+  version: v1
+  description: |
+    The FlowCRM REST API (FCRM-003 section I, ADR-006, ADR-019). Served by the
+    same origin as the SPA (the Caddy edge); there is no CORS.
+
+    **Authentication.** A server-side session (PostgreSQL) identified by an
+    HttpOnly cookie: `flowcrm_sid` in local development (plain HTTP on
+    127.0.0.1), `__Host-flowcrm_sid` with `Secure` everywhere else.
+    `POST /api/v1/auth/login` creates it with a new session ID.
+
+    **Unsafe requests** (POST, PUT, PATCH, DELETE) must
+    - come from the same origin: `Origin` (or, without it, `Referer`) equal to
+      the API's origin, and no cross-site `Sec-Fetch-Site`; otherwise
+      403 `csrf-invalid`;
+    - send bodies as `application/json`; otherwise 415;
+    - when the session is logged in, send the session's CSRF token (from the
+      login, `/auth/session` or `/me` response) in `X-CSRF-Token`; otherwise
+      403 `csrf-invalid`.
+
+    **Organizations.** The organization is taken only from the path. An
+    organization the user has no active membership in returns the same 404 as
+    one that does not exist. A member without the permission gets 403.
+
+    **Errors** are RFC 9457 `application/problem+json` documents with the
+    request ID. Every response has `Cache-Control: no-store`.
+servers:
+  - url: /
+security:
+  - session: []
+
+tags:
+  - name: system
+  - name: auth
+  - name: me
+  - name: organizations
+
+paths:
+  /api/v1/system/status:
+    get:
+      tags: [system]
+      operationId: getSystemStatus
+      summary: API and database status (public)
+      security: []
+      responses:
+        '200':
+          description: The API answers with the database time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemStatus'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/auth/session:
+    get:
+      tags: [auth]
+      operationId: getSession
+      summary: The current session (public)
+      description: |
+        200 for anonymous visitors too, so a client can ask on every page load.
+        Without a session cookie no session is started and no cookie is set.
+      security: []
+      responses:
+        '200':
+          description: Whether the session is logged in, and if so the user.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/AnonymousSession'
+                  - $ref: '#/components/schemas/AuthenticatedSession'
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Log in with e-mail and password (public)
+      description: |
+        A successful login gets a new session ID (the previous session row is
+        deleted) and a new CSRF token. Every failure has the same answer.
+        Limits (failures only): 5 per account and client IP per 15 minutes,
+        50 per client IP per 15 minutes, 100 per account per day.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: Logged in.
+          headers:
+            Set-Cookie:
+              description: The session cookie (HttpOnly, SameSite=Lax, Path=/; Secure and __Host- outside development).
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticatedSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/InvalidCredentials'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: End the session (public)
+      description: The session row is deleted and the cookie expired. 204 also without a session.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfTokenWhenLoggedIn'
+      responses:
+        '204':
+          description: There is no session any more.
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+
+  /api/v1/me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: The logged-in user
+      responses:
+        '200':
+          description: Profile, active memberships and the CSRF token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /api/v1/me/password:
+    post:
+      tags: [me]
+      operationId: changeOwnPassword
+      summary: Change the own password
+      description: |
+        The current password is required. On success this session gets a new
+        ID and stays logged in; every other session of the user ends. Wrong
+        current passwords are limited to 5 per 15 minutes.
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordChange'
+      responses:
+        '204':
+          description: The password was changed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/organizations/{organizationId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [organizations]
+      operationId: getOrganization
+      summary: The organization profile (permission organization.view)
+      responses:
+        '200':
+          description: The organization and the user's membership in it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/organizations/{organizationId}/members:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [organizations]
+      operationId: listMembers
+      summary: The member directory (permission membership.list)
+      description: Active members, oldest membership first. `email` only with the permission membership.view_email.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: One page of members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/v1/organizations/{organizationId}/members/{membershipId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - name: membershipId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [organizations]
+      operationId: getMember
+      summary: One member (permission membership.list)
+      description: A membership of another organization is a 404, like an unknown one.
+      responses:
+        '200':
+          description: The member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    session:
+      type: apiKey
+      in: cookie
+      name: flowcrm_sid
+      description: Server-side session cookie (`__Host-flowcrm_sid` outside local development).
+
+  parameters:
+    OrganizationId:
+      name: organizationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CsrfToken:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      description: The CSRF token of this session.
+      schema:
+        type: string
+    CsrfTokenWhenLoggedIn:
+      name: X-CSRF-Token
+      in: header
+      required: false
+      description: Required when the session is logged in.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: The body is not a JSON object, or a login member is missing.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthenticated:
+      description: No valid session (anonymous, expired or ended); no details.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InvalidCredentials:
+      description: The login failed (the same answer for every reason).
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    CsrfInvalid:
+      description: The origin check or the CSRF token failed (type csrf-invalid).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: A member without the permission (type forbidden).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Unknown, of another organization or not visible; always the same.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: A body that is not application/json.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationError:
+      description: Invalid members or parameters, each with a stable code.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ValidationProblem'
+    TooManyRequests:
+      description: A limit is reached.
+      headers:
+        Retry-After:
+          description: Seconds until the next attempt can count.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: The database is not available.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, instance, requestId]
+      properties:
+        type:
+          type: string
+          example: /problems/not-found
+        title:
+          type: string
+        status:
+          type: integer
+        instance:
+          type: string
+        requestId:
+          type: string
+          format: uuid
+      additionalProperties: false
+    ValidationProblem:
+      type: object
+      required: [type, title, status, instance, requestId, errors]
+      properties:
+        type:
+          type: string
+          enum: [/problems/validation-error]
+        title:
+          type: string
+        status:
+          type: integer
+          enum: [422]
+        instance:
+          type: string
+        requestId:
+          type: string
+          format: uuid
+        errors:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [code]
+            properties:
+              pointer:
+                type: string
+                description: JSON Pointer (RFC 6901) to the body member.
+              parameter:
+                type: string
+                description: Name of the query parameter.
+              code:
+                type: string
+                example: UNKNOWN_FIELD
+            additionalProperties: false
+      additionalProperties: false
+    SystemStatus:
+      type: object
+      required: [service, apiVersion, databaseTime]
+      properties:
+        service:
+          type: string
+        apiVersion:
+          type: string
+        databaseTime:
+          type: string
+          format: date-time
+      additionalProperties: false
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+        password:
+          type: string
+          format: password
+    PasswordChange:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          format: password
+        newPassword:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 128
+      additionalProperties: false
+    User:
+      type: object
+      required: [id, email, displayName]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        displayName:
+          type: string
+      additionalProperties: false
+    Permission:
+      type: string
+      enum: [organization.view, membership.list, membership.view_email]
+    Role:
+      type: string
+      enum: [ADMIN, MANAGER, REP]
+    MembershipSummary:
+      type: object
+      required: [organizationId, organizationName, membershipId, role, permissions]
+      properties:
+        organizationId:
+          type: string
+          format: uuid
+        organizationName:
+          type: string
+        membershipId:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/Role'
+        permissions:
+          description: For showing controls only; the server decides every request.
+          type: array
+          items:
+            $ref: '#/components/schemas/Permission'
+      additionalProperties: false
+    Me:
+      type: object
+      required: [user, memberships, csrfToken]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        memberships:
+          type: array
+          items:
+            $ref: '#/components/schemas/MembershipSummary'
+        csrfToken:
+          type: string
+          description: Send it in X-CSRF-Token with unsafe requests; keep it in memory only.
+      additionalProperties: false
+    AnonymousSession:
+      type: object
+      required: [authenticated]
+      properties:
+        authenticated:
+          type: boolean
+          enum: [false]
+      additionalProperties: false
+    AuthenticatedSession:
+      type: object
+      required: [authenticated, user, memberships, csrfToken, expiresAt]
+      properties:
+        authenticated:
+          type: boolean
+          enum: [true]
+        user:
+          $ref: '#/components/schemas/User'
+        memberships:
+          type: array
+          items:
+            $ref: '#/components/schemas/MembershipSummary'
+        csrfToken:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+          description: The end of the absolute session lifetime (8 hours after the login).
+      additionalProperties: false
+    Organization:
+      type: object
+      required: [id, name, currency, timezone, membership]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        currency:
+          type: string
+        timezone:
+          type: string
+        membership:
+          type: object
+          required: [id, role, permissions]
+          properties:
+            id:
+              type: string
+              format: uuid
+            role:
+              $ref: '#/components/schemas/Role'
+            permissions:
+              type: array
+              items:
+                $ref: '#/components/schemas/Permission'
+          additionalProperties: false
+      additionalProperties: false
+    Member:
+      type: object
+      required: [membershipId, userId, displayName, role]
+      properties:
+        membershipId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+        displayName:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        email:
+          type: string
+          description: Only with the permission membership.view_email.
+      additionalProperties: false
+    MemberPage:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        meta:
+          type: object
+          required: [page, pageSize, total]
+          properties:
+            page:
+              type: integer
+            pageSize:
+              type: integer
+            total:
+              type: integer
+          additionalProperties: false
+      additionalProperties: false
