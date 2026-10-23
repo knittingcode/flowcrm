@@ -133,6 +133,7 @@ All requests go through the URL printed by `make up`:
 | `GET /api/v1/auth/session`, `POST /api/v1/auth/login`, `POST /api/v1/auth/logout` | Symfony | the session, login and logout ([authentication](docs/architecture/authentication.md#endpoints)) |
 | `GET /api/v1/me`, `POST /api/v1/me/password` | Symfony | the logged-in user, own password change |
 | `GET /api/v1/organizations/{id}`, `…/members`, `…/members/{membershipId}` | Symfony | an organization and its member directory, for its active members |
+| `POST …/members`, `PATCH` and `DELETE …/members/{membershipId}` | Symfony | add an existing user, change a role, remove a member: ADMIN only, one organization's changes at a time ([membership administration](docs/membership-administration.md), ADR-020 proposed) |
 | other `/api/…` paths | Symfony | RFC 9457 `application/problem+json` errors |
 | `GET /health/live` | Symfony | `200 {"status":"live"}` while PHP-FPM serves requests |
 | `GET /health/ready` | Symfony | `200 {"status":"ready"}`, or `503 {"status":"not-ready"}` when PostgreSQL is unreachable, its credential cannot be read or a migration is pending |
