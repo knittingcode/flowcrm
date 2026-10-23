@@ -247,6 +247,10 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertEquals(['roleFrom' => 'ADMIN', 'roleTo' => 'MANAGER'], $events[0]['changes'], 'jsonb does not keep the key order');
         self::assertSame($demoted->header('X-Request-Id'), $events[0]['request_id']);
         self::assertSame('ADMIN', $events[0]['actor_role']);
+        self::assertSame('user', $events[0]['actor_type']);
+        self::assertSame($this->adminA->id->toRfc4122(), $events[0]['actor_user_id']);
+        self::assertSame($this->a->toRfc4122(), $events[0]['organization_id']);
+        self::assertStringNotContainsString('@', json_encode($events, \JSON_THROW_ON_ERROR), 'no e-mail address in the audit log');
 
         $next = $secondClient->get('/api/v1/organizations/'.$this->a->toRfc4122());
         self::assertSame('MANAGER', $next->value('membership', 'role'));
@@ -424,6 +428,104 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertSame('/problems/forbidden', $response->problem());
         self::assertSame($before, $this->membership($this->repAMembership));
         self::assertSame([], $this->events($this->repAMembership));
+    }
+
+    /** API responses of the new routes carry member data: no cache may keep them (ApiCacheHeaders). */
+    public function testMembershipResponsesAreNotCached(): void
+    {
+        $client = $this->logIn($this->adminA);
+        $user = $this->fixtures->user('uncached');
+
+        $added = $client->post($this->members(), ['email' => $user->email, 'role' => 'REP']);
+        foreach ([
+            'POST 201' => $added,
+            'POST 409' => $client->post($this->members(), ['email' => $user->email, 'role' => 'REP']),
+            'PATCH 200' => $client->patch($this->members().'/'.$added->string('membershipId'), ['role' => 'MANAGER']),
+            'DELETE 204' => $client->delete($this->members().'/'.$added->string('membershipId')),
+        ] as $label => $response) {
+            self::assertSame((int) substr($label, -3), $response->status(), $label);
+            self::assertStringContainsString('no-store', (string) $response->header('Cache-Control'), $label);
+            self::assertStringContainsString('Cookie', (string) $response->header('Vary'), $label);
+        }
+    }
+
+    /** The role in another organization does not count here: an ADMIN of B who is a REP of A may not administer A. */
+    public function testAnAdminOfAnotherOrganizationHasOnlyTheirRoleHere(): void
+    {
+        $this->fixtures->member($this->a, $this->adminB, 'REP');
+        $client = $this->logIn($this->adminB);
+        $user = $this->fixtures->user('not-added');
+        $before = $this->snapshot();
+
+        foreach ([
+            'add' => $client->post($this->members(), ['email' => $user->email, 'role' => 'ADMIN']),
+            'promote' => $client->patch($this->member($this->repAMembership), ['role' => 'ADMIN']),
+            'remove' => $client->delete($this->member($this->managerAMembership)),
+        ] as $label => $response) {
+            self::assertSame(403, $response->status(), $label);
+            self::assertSame('/problems/forbidden', $response->problem(), $label);
+        }
+        self::assertSame($before, $this->snapshot());
+    }
+
+    /**
+     * Two ADMINs add the same user at the same time: the second sees the
+     * first membership under the organization lock and gets a 409, never a
+     * unique constraint error.
+     */
+    public function testConcurrentAddsOfOneUserCreateOneMembership(): void
+    {
+        $second = $this->fixtures->user('second-admin');
+        $this->fixtures->member($this->a, $second, 'ADMIN');
+        $first = $this->logIn($this->adminA);
+        $other = $this->logIn($second);
+        $user = $this->fixtures->user('added-twice');
+
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
+        try {
+            $pending = [
+                $first->dispatch('POST', $this->members(), ['email' => $user->email, 'role' => 'REP']),
+                $other->dispatch('POST', $this->members(), ['email' => $user->email, 'role' => 'MANAGER']),
+            ];
+            $waiting = $this->requestsWaitingForTheOrganizationLock($holder, 2);
+            $holder->rollBack();
+            $responses = ApiClient::collect(...$pending);
+        } finally {
+            if ($holder->inTransaction()) {
+                $holder->rollBack();
+            }
+        }
+
+        self::assertSame(2, $waiting, 'both requests waited for the organization lock');
+        $statuses = array_map(static fn (ApiResponse $r): int => $r->status(), $responses);
+        sort($statuses);
+        self::assertSame([201, 409], $statuses);
+        $conflict = 409 === $responses[0]->status() ? $responses[0] : $responses[1];
+        self::assertSame('/problems/conflict', $conflict->problem());
+        $errors = $conflict->value('errors');
+        self::assertIsArray($errors);
+        self::assertSame(['MEMBERSHIP_EXISTS'], array_column($errors, 'code'));
+        $ids = $this->fixtures->connection()->fetchFirstColumn('SELECT id FROM memberships WHERE organization_id = ? AND user_id = ?', [$this->a->toRfc4122(), $user->id->toRfc4122()]);
+        self::assertCount(1, $ids);
+        self::assertCount(1, $this->events(Uuid::fromString(self::string($ids[0]))));
+    }
+
+    /** Broken bodies and malformed IDs are refused before anything is read or written. */
+    public function testMalformedRequestsChangeNothing(): void
+    {
+        $client = $this->logIn($this->adminA);
+        $before = $this->snapshot();
+
+        self::assertSame(400, $client->post($this->members(), null, ['CONTENT_TYPE' => 'application/json'], '{"email":')->status(), 'broken JSON');
+        self::assertSame(400, $client->patch($this->member($this->repAMembership), null, ['CONTENT_TYPE' => 'application/json'], '["ADMIN"]')->status(), 'not an object');
+        foreach (['not-a-uuid', '00000000-0000-0000-0000-00000000000g', $this->repAMembership->toRfc4122().'x'] as $id) {
+            self::assertSame(404, $client->patch($this->members().'/'.$id, ['role' => 'ADMIN'])->status(), 'PATCH '.$id);
+            self::assertSame(404, $client->delete($this->members().'/'.$id)->status(), 'DELETE '.$id);
+        }
+
+        self::assertSame($before, $this->snapshot());
     }
 
     private function logIn(TestUser $user): ApiClient
