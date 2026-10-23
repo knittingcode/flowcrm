@@ -660,12 +660,13 @@ cancel_db_op() {
   fi
 }
 
-# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill], used by
-# tests/app/stack.sh): stop with SIGTERM (or SIGKILL, which runs no handler)
-# at a named point, exactly as an interrupted or killed command would.
-# Points: rotate-after-pending, rotate-after-db, rotate-after-promote,
-# upgrade-after-backup, up-after-migrations; upgrade-corrupt-copy damages
-# the host copy of the backup instead.
+# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill|:int], used
+# by tests/app/stack.sh): stop with SIGTERM (or SIGKILL, which runs no
+# handler, or SIGINT) at a named point, exactly as an interrupted or killed
+# command would. Points: rotate-after-pending, rotate-after-db,
+# rotate-after-promote, upgrade-after-backup, up-after-migrations,
+# restore-before-edge, edge-started; upgrade-corrupt-copy damages the host
+# copy of the backup instead.
 fault_point() { # name
   case ${FLOWCRM_DEVENV_FAULT-} in
     "$1")
@@ -947,7 +948,7 @@ protect_for() { # reason
 gate_clear() { rm -f "$GATE_FILE" "$RUNTIME_DIR/security-gate"; }
 
 # The recorded gate for read-only commands: also one an earlier version left
-# at .runtime/security-gate (moved by the next command that holds the lock).
+# at .runtime/security-gate (moved by the next command that prepares .runtime).
 gate_record() {
   if [ -f "$GATE_FILE" ]; then printf '%s' "$GATE_FILE"
   elif [ -f "$RUNTIME_DIR/security-gate" ]; then printf '%s' "$RUNTIME_DIR/security-gate"
@@ -972,6 +973,17 @@ gate_blocks() { # [port]
     case $body in *"blocked by its security gate"*) exit 0 ;; esac
     exit 1
   ) 2>/dev/null
+}
+
+# Before the edge is started while the gate is recorded: a one-off container
+# of the edge service (it publishes no port) must show that its Caddy
+# configuration has the gate rule and that the edge user can read the gate.
+# An image built before the rule (a rotation does not build) or a gate the
+# edge cannot read would let a started edge serve until the check after its
+# start, and an interruption in between would leave it serving.
+edge_sees_gate() {
+  compose_op run --rm --no-deps -T --entrypoint sh "$EDGE" -c \
+    'grep -q "blocked by its security gate" /etc/caddy/common.caddy && test -r /run/flowcrm-gate/security-gate' >/dev/null 2>&1
 }
 
 # Starts the edge on a port and accepts it only when it answers the
@@ -1025,6 +1037,9 @@ restore_edge() { # gate-had-edge what-was-done
     return 0
   fi
   fault_point restore-before-edge
+  if ! edge_sees_gate; then
+    gate_failed $EX_DOCKER "$2, but the edge was not started again: its image does not enforce the security gate or cannot read it (.runtime/gate); run make up, which rebuilds the images and serves once every check passed"
+  fi
   if serve_edge "$STATE_PORT"; then
     gate_clear
     log "the edge serves again on port $STATE_PORT"

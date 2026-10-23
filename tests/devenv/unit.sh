@@ -977,6 +977,7 @@ wait_http() { printf 'ready gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || ech
 edge_state() { EDGE_RUNNING=$(fake_running); }
 compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(fake_running)" = true ] && printf 'edge-id\n'; return 0; }
 compose_op() {
+  if [ "$1" = run ]; then printf 'preflight\n' >>"$work/u19-calls"; [ "${FAKE_SEES:-yes}" = yes ]; return; fi
   [ "$1" = stop ] || return 0
   printf 'stop %s\n' "$2" >>"$work/u19-calls"
   [ "$FAKE_STOP" = fails ] && return 1
@@ -996,7 +997,7 @@ u19() { # name start(created|failed|killed) try-rc blocks ready stop(ok|fails) e
   result "U-19 $1: exit $7" $? "(got $r: $out)"
 }
 u19 "the edge comes back, blocks while gated, then answers readiness" created 0 yes yes ok 0
-[ ! -e "$GATE_FILE" ] && [ "$U19_RUNNING" = true ] && [ "$U19_CALLS" = "try gate=yes;blocks gate=yes;ready gate=yes" ] &&
+[ ! -e "$GATE_FILE" ] && [ "$U19_RUNNING" = true ] && [ "$U19_CALLS" = "preflight;try gate=yes;blocks gate=yes;ready gate=yes" ] &&
   case $U19_OUT in *"serves again on port 18555"*) true ;; *) false ;; esac
 result "U-19 the gate stays recorded while the edge starts and is checked, and is cleared only after it is ready" $? "(calls [$U19_CALLS])"
 u19 "Compose cannot create the edge" failed 2 yes no ok "$EX_DOCKER"
@@ -1004,8 +1005,13 @@ u19 "Compose cannot create the edge" failed 2 yes no ok "$EX_DOCKER"
   case $U19_OUT in *"compose output"*) true ;; *) false ;; esac
 result "U-19 a failed creation keeps the gate (reason, edge line), keeps what was done and shows Compose's error" $? "(gate [$U19_GATE])"
 u19 "the saved port is taken by another program" conflict 1 yes no ok "$EX_DOCKER"
-[ "$U19_RUNNING" = false ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"port 18555 is in use"*) true ;; *) false ;; esac
-result "U-19 a port conflict on the saved port keeps the gate with the reason; make up then picks a port" $? "(gate [$U19_GATE])"
+[ "$U19_RUNNING" = false ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"did not serve again on port 18555 (port 18555 is in use"*) true ;; *) false ;; esac
+result "U-19 a port conflict (try_edge 1) is a failed return like any other: the gate is kept with try_edge's reason" $? "(gate [$U19_GATE])"
+FAKE_SEES=no
+u19 "the edge image does not enforce the gate (or cannot read it)" created 0 yes yes ok "$EX_DOCKER"
+FAKE_SEES=yes
+[ "$U19_RUNNING" = false ] && [ "$U19_CALLS" = preflight ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"its image does not enforce the security gate"*"run make up"*) true ;; *) false ;; esac
+result "U-19 an edge that would not see the gate is never started; the gate is kept and points to make up" $? "(calls [$U19_CALLS], gate [$U19_GATE])"
 u19 "the edge container runs but is not healthy" created 2 yes no ok "$EX_DOCKER"
 [ "$U19_RUNNING" = false ] && [ -n "$U19_GATE" ] && ! grep '^stop' "$work/u19-calls" | grep -vqx "stop $EDGE"
 result "U-19 an unhealthy started edge is stopped (only the edge) and the gate kept" $? "(calls [$U19_CALLS])"
@@ -1069,6 +1075,34 @@ gate_clear
 [ ! -e "$GATE_FILE" ] && ! gate_record >/dev/null
 result "U-20 gate_clear removes the record" $?
 RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
+
+# --- U-21 gate_blocks reads the edge's real answer (FND-009E)
+# Against one-shot local listeners: only the gate's own 503 counts as
+# blocked, not any other 503 and not a 200.
+cat >"$work/u21-serve.py" <<'PY'
+import socket, sys
+status, body = sys.argv[2], sys.argv[3]
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0)); s.listen(1)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+c, _ = s.accept(); c.recv(4096)
+c.sendall(("HTTP/1.1 %s\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s" % (status, body)).encode())
+c.close(); s.close()
+PY
+u21() { # name status body expected(0 blocked|1 not)
+  local pf=$work/u21.port i=0 r
+  rm -f "$pf"
+  python3 "$work/u21-serve.py" "$pf" "$2" "$3" &
+  bg_pids="$bg_pids $!"
+  while [ ! -s "$pf" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  BIND=127.0.0.1 gate_blocks "$(cat "$pf")"
+  r=$?
+  [ "$r" = "$4" ]
+  result "U-21 $1" $? "(gate_blocks returned $r)"
+}
+u21 "the gate's 503 is blocked" "503 Service Unavailable" "FlowCRM is blocked by its security gate: run make status" 0
+u21 "another 503 is not the gate" "503 Service Unavailable" "upstream unavailable" 1
+u21 "a 200 is not blocked" "200 OK" "<!doctype html>" 1
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
