@@ -47,16 +47,19 @@ by themselves:
 - The composite foreign keys guarantee that a stage cannot belong to another
   organization's pipeline, even if application code is wrong. Later tenant
   tables (accounts, contacts, opportunities, tasks) follow the same pattern.
-- Tenant isolation of reads and writes comes from the request path: the
-  tenant resolver (an `ACTIVE` membership for the current user), policies,
-  and repositories that always filter by `organization_id` (FCRM-003 section
-  G, FND-009). Row-Level Security is a later, separate decision (ADR-004,
+- Tenant isolation of reads and writes comes from the request path:
+  `TenantGuard` (an `ACTIVE` membership of the current user, read on every
+  request), the declared permission of each route, and queries that always
+  filter by `organization_id` (FCRM-003 section G; implemented in FND-010B,
+  see [authentication](authentication.md#tenant-authorization)). Row-Level Security is a later, separate decision (ADR-004,
   FND-016).
 - Rules across rows, such as the last-admin rule (BR-03) and the stage
   reorder and archive rules (BR-15), belong to the use cases.
-- Authentication and passwords are not implemented (`users.password_hash`
-  is written by the authentication work). Session storage exists
-  ([sessions and cache](sessions-and-cache.md)) but is not authentication.
+- Passwords are Argon2id hashes in `users.password_hash`;
+  `users.disabled_at` and `users.password_changed_at` end sessions
+  ([authentication](authentication.md)). Users are global: no organization
+  role can change them, only the user (own password) or the platform
+  operator (console).
 
 ## Database roles
 

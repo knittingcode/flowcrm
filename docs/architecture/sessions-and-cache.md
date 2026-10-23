@@ -2,9 +2,9 @@
 
 Server-side sessions and the application cache, both in the existing
 PostgreSQL service (FCRM-003 section F, ADR-005, ADR-007): no Redis and no
-other new service. This is infrastructure only. Login, logout, CSRF tokens,
-authorization and the `/me` endpoint are not implemented, and no production
-route uses a session yet.
+other new service. Login, logout, the CSRF token and the session lifetime
+rules built on these sessions are described in
+[authentication](authentication.md) (FND-010B, ADR-019).
 
 Configuration: `backend/config/packages/session.yaml` and
 `backend/config/packages/cache.yaml`. Migration:
@@ -89,7 +89,8 @@ accept a `__Host-` cookie only with `Secure`, `Path=/` and no `Domain`.
   deletes all expired rows after the request (`DELETE ... WHERE
   sess_lifetime < now`, using the index).
 - The **absolute timeout of 8 hours** from FCRM-003 counts from the login
-  time stored in the session, so it comes with the authentication work.
+  time stored with the security token; the firewall ends the session on the
+  first request after it ([authentication](authentication.md#login-and-sessions)).
 
 ### Concurrency
 
@@ -195,6 +196,8 @@ namespaces do not change with the installation path or between deploys.
 Pools never see each other's items, and clearing a pool deletes only its
 own prefix. Environments use separate databases. Pools today:
 
+- `cache.rate_limits`, based on `cache.app`: the login and password-change
+  limits (FND-010B).
 - `cache.app`. In prod, Doctrine's result cache pool is also based on
   `cache.app`; no query uses the result cache.
 - In the test environment only: `test.cache.pool_a` and `test.cache.pool_b`,
@@ -238,9 +241,12 @@ application needs the database anyway.
 FCRM-003 lists locks next to the rate limiter for `cache_items`. Symfony's
 Lock component does not store locks there: its `DoctrineDbalStore` uses its
 own table and its `PostgreSqlStore` uses advisory locks without a table.
-Neither the Lock component nor the rate limiter is installed yet; the
-choice is made with the feature that needs them (the login throttling of
-the authentication work stores its counters in a cache pool).
+The login throttling (FND-010B) uses the `DoctrineDbalPostgreSqlStore`, advisory
+locks on the `cache` connection: no table, no extra connection and no
+privilege beyond what `flowcrm_app` has. Its limiter state is in the pool
+`cache.rate_limits` (based on `cache.app`), under HMAC keys
+([authentication](authentication.md#login-throttling)). The framework's own
+lock factory is disabled (`framework.lock: false`).
 
 ## Migration
 
@@ -358,9 +364,9 @@ Tests:
 
 ## Security boundaries
 
-- A session is not authentication. It stores data for a browser; who the
-  user is, and whether a session counts as logged in, comes with the
-  authentication work (firewall, login, CSRF token and Origin check).
+- A session is not authentication by itself: the `api` firewall decides
+  whether it is logged in, the request-origin guard and the CSRF token
+  protect it ([authentication](authentication.md)).
 - Sessions carry no tenant: the organization is always taken from the URL
   path and checked against an active membership on every request (FCRM-003
   section G). Adding session storage does not isolate tenants.
@@ -410,10 +416,12 @@ Each of these changes fails the tests named (run on copies of the code):
 | a listener that starts the session on every request | the stateless-route test |
 | no deadline in the FastCGI harness | the harness deadline test |
 
-## Prerequisites for the authentication work
+## Rules for code that uses the session
 
-Login, logout, CSRF and throttling are not part of this infrastructure. When
-they are built:
+These were the prerequisites of the authentication work; FND-010B follows
+them (the firewall migrates at login, logout and every server-side end
+invalidate, the login time is stored, throttling uses `cache.rate_limits`,
+memberships are read on every request):
 
 - Start the session before migrating or invalidating it. `migrate()` and
   `invalidate()` silently do nothing on a session that has not started;
@@ -438,8 +446,6 @@ they are built:
   again stay until it runs.
 - Garbage collection of sessions is probabilistic. On a quiet system,
   expired rows stay longer, but they can never be used.
-- The 8-hour absolute timeout, login, logout, CSRF and login throttling come
-  with the authentication work.
 - Sessions and cache use the application's database role. Separate roles
   are an open decision (see [data model](data-model.md#not-included-yet)).
 - `sess_lifetime`, `sess_time`, `item_lifetime` and `item_time` are 32-bit
@@ -447,5 +453,5 @@ they are built:
   in January 2038. This follows the framework's schema and is tracked
   upstream.
 - How browsers treat the `Secure` `__Host-flowcrm_sid` cookie over HTTPS is
-  not verified end to end: the stacks here run over plain HTTP, and the
-  production-like stack does not use sessions.
+  not verified end to end: the stacks here run over plain HTTP. The
+  production-like stack checks the cookie's attributes with curl (PL-16).
