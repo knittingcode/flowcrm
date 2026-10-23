@@ -651,6 +651,33 @@ ev "rotation 5: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)'
 ev "rotation 6: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot6.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
 ev "api before/after 6: ${r6_before#* api=} -> ${r6_after#* api=}"
 
+# A rotation that passes every check, but whose edge cannot get ready again
+# (FND-009E): the owner rotation recreates only the db, so the api keeps the
+# broken index.php and the edge's health check through it fails. The
+# command fails (exit 2) instead of warning, the started edge is stopped, the
+# stack is blocked again, and make up serves once the cause is fixed.
+printf '<?php syntax error\n' >"$A/backend/public/index.php"
+(cd "$A" && ROLE=owner FLOWCRM_WAIT_TIMEOUT=20 ./bin/devenv rotate-db-password) >"$work/out/a-rot7.out" 2>"$work/out/a-rot7.err"
+echo $? >"$work/out/a-rot7.rc"
+r7_edge_ps=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+get "$PA" /
+r7_code=$CODE
+dv a-status-rot7 "$A" status
+cp -p "$work/index.php.kept" "$A/backend/public/index.php"
+# The api turned unhealthy while index.php was broken; make up's wait fails
+# fast on an unhealthy container, so give its health check time to recover.
+i=0
+until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cid "$A" api)" 2>/dev/null)" = healthy ] || [ "$i" -ge 60 ]; do sleep 1; i=$((i + 1)); done
+dv a-up-rot7 "$A" up
+[ "$(rc_of a-rot7)" = 2 ] && err_has a-rot7 'rotated the password of flowcrm_owner' &&
+  err_has a-rot7 'was rotated and verified, but the edge did not serve again' && [ -z "$r7_edge_ps" ] && [ "$r7_code" = 000 ] &&
+  [ "$(rc_of a-status-rot7)" = 1 ] && grep -q '^blocked: .*did not serve again' "$work/out/a-status-rot7.out" &&
+  [ "$(rc_of a-up-rot7)" = 0 ] && until_ready "$PA" 200 30 && no_leftovers
+v "ST-50 a verified rotation whose edge cannot get ready fails (exit 2): the started edge is stopped, nothing is served, the stack is blocked; make up serves once fixed" $? \
+  "rotation exit $(rc_of a-rot7), edge container [$r7_edge_ps], GET / $r7_code, make up exit $(rc_of a-up-rot7)
+$(sed 's/^/      | /' "$work/out/a-rot7.err" | tail -n 12)
+$(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)"
+
 # Interrupted while the password change waits inside PostgreSQL (another
 # session holds the operations' advisory lock): the interrupted transaction
 # is ended before the command exits, and nothing commits later.
