@@ -217,6 +217,49 @@ final class TenantAuthorizationTest extends FpmApiTestCase
         }
     }
 
+    /** Pages past the end are empty, out-of-range sizes are refused, and pages follow one stable order (oldest membership first). */
+    public function testPaginationEdgesAndOrder(): void
+    {
+        $client = $this->logIn($this->adminA);
+        $path = '/api/v1/organizations/'.$this->a->toRfc4122().'/members';
+
+        $beyond = $client->get($path.'?page=99&pageSize=2');
+        self::assertSame(200, $beyond->status());
+        self::assertSame([], $beyond->value('data'));
+        self::assertSame(['page' => 99, 'pageSize' => 2, 'total' => 4], $beyond->value('meta'));
+        foreach (['pageSize=0' => 'OUT_OF_RANGE', 'page=-1' => 'INVALID_TYPE'] as $query => $code) {
+            $response = $client->get($path.'?'.$query);
+            self::assertSame(422, $response->status(), $query);
+            self::assertSame($code, $response->value('errors', 0, 'code'), $query);
+        }
+
+        $all = self::ids($client->get($path.'?pageSize=100')->value('data'));
+        $paged = [...self::ids($client->get($path.'?page=1&pageSize=2')->value('data')), ...self::ids($client->get($path.'?page=2&pageSize=2')->value('data'))];
+        self::assertSame($all, $paged, 'the pages do not overlap and miss nothing');
+        self::assertSame($all, self::ids($client->get($path.'?pageSize=100')->value('data')), 'the order is stable');
+        $names = array_column(self::rows($client->get($path.'?pageSize=100')->value('data')), 'displayName');
+        self::assertSame([$this->adminA->displayName, $this->managerA->displayName, $this->repA->displayName, $this->both->displayName], $names, 'oldest membership first');
+    }
+
+    /** @return list<array<mixed>> */
+    private static function rows(mixed $data): array
+    {
+        self::assertIsArray($data);
+        $rows = [];
+        foreach ($data as $row) {
+            self::assertIsArray($row);
+            $rows[] = $row;
+        }
+
+        return $rows;
+    }
+
+    /** @return list<mixed> */
+    private static function ids(mixed $data): array
+    {
+        return array_column(self::rows($data), 'membershipId');
+    }
+
     private function logIn(TestUser $user): ApiClient
     {
         $client = $this->client();
