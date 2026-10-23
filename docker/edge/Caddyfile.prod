@@ -9,7 +9,9 @@
 
 import /etc/caddy/common.caddy
 
-:8080 {
+# The site itself, also used by the HTTPS test edge (tests/app/https), which
+# imports this file and serves the same site over TLS.
+(app) {
 	import baseline
 
 	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
@@ -30,4 +32,8 @@ import /etc/caddy/common.caddy
 		rewrite @spa /index.html
 		file_server
 	}
+}
+
+:8080 {
+	import app
 }

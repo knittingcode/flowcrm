@@ -23,6 +23,15 @@ x-hardening: &hardening
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
 
+# Request logs (edge access log, API security log) are short-lived
+# diagnostics: Docker keeps at most 3 x 10 MB per container, and they are
+# removed with the container (docs/architecture/authentication.md, retention).
+x-request-logs: &request-logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   edge:
     <<: *hardening
@@ -33,6 +42,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    logging: *request-logs
     ports:
       - "${FLOWCRM_HTTP_BIND:-127.0.0.1}:${FLOWCRM_HTTP_PORT:?is set by bin/devenv; run make up}:8080"
     networks: [front, back]
@@ -93,6 +103,11 @@ services:
       # of the container start, so a migration added while the stack runs is
       # applied too.
       FLOWCRM_MIGRATE_ON_START: "0"
+      # No TRUSTED_PROXIES: over FastCGI the edge passes the client's own
+      # address as REMOTE_ADDR and HTTPS=on for TLS requests, so the API
+      # needs no forwarding header and trusts none (ADR-019; PHP-FPM is
+      # reachable only from the edge, network back).
+    logging: *request-logs
     # The runtime role's password only: never the owner's or the superuser's.
     secrets: [db_app_password, app_secret]
     volumes:

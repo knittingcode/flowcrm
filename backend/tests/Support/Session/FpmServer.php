@@ -11,6 +11,10 @@ namespace App\Tests\Support\Session;
  * the native session storage, the cookie handling of PHP's session module
  * and PdoSessionHandler run exactly as behind the edge.
  *
+ * Unsafe requests (POST, PUT, PATCH, DELETE) carry the Origin header a
+ * same-origin browser sends (RequestOriginGuard, ADR-019); a test can
+ * replace it or, with null, leave it out. A request can have a body.
+ *
  * Every request has a deadline: a request still running then is killed
  * (only its own cgi-fcgi process) and reported with diagnostics, so a
  * locking regression fails the test instead of hanging the suite.
@@ -25,7 +29,6 @@ namespace App\Tests\Support\Session;
 final class FpmServer
 {
     public const DEFAULT_TIMEOUT = 15.0;
-    private const DOCUMENT_ROOT = '/app/public';
     // Signal numbers (Linux); the image has no pcntl extension for the constants.
     private const SIGQUIT = 3;
     private const SIGKILL = 9;
@@ -87,7 +90,7 @@ final class FpmServer
             ['setsid', 'php-fpm', '--nodaemonize', '--fpm-config', $this->dir.'/fpm.conf'],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', $this->dir.'/fpm.out', 'a'], 2 => ['file', $this->dir.'/fpm.out', 'a']],
             $pipes,
-            '/app',
+            self::projectDir(),
             $env,
         );
         if (!\is_resource($process)) {
@@ -214,14 +217,14 @@ final class FpmServer
     }
 
     /**
-     * @param array<string, string> $cookies
-     * @param array<string, string> $params  extra FastCGI parameters, such as HTTP_X_FORWARDED_PROTO
+     * @param array<string, string>      $cookies
+     * @param array<string, string|null> $params  extra FastCGI parameters, such as HTTP_X_FORWARDED_PROTO; null leaves one out
      *
      * @throws FastCgiTimeout when no response arrives within $timeout seconds
      */
-    public function request(string $method, string $uri, array $cookies = [], bool $https = false, float $timeout = self::DEFAULT_TIMEOUT, array $params = []): FastCgiResponse
+    public function request(string $method, string $uri, array $cookies = [], bool $https = false, float $timeout = self::DEFAULT_TIMEOUT, array $params = [], ?string $body = null): FastCgiResponse
     {
-        return $this->send([$this->begin($method, $uri, $cookies, $https, $params)], $timeout)[0];
+        return $this->send([$this->begin($method, $uri, $cookies, $https, $params, $body)], $timeout)[0];
     }
 
     /**
@@ -233,16 +236,16 @@ final class FpmServer
      */
     public function concurrently(array $requests, float $timeout = self::DEFAULT_TIMEOUT): array
     {
-        return $this->send(array_map(fn (array $r): array => $this->begin($r[0], $r[1], $r[2] ?? [], false, []), $requests), $timeout);
+        return $this->send(array_map(fn (array $r): array => $this->begin($r[0], $r[1], $r[2] ?? [], false, [], null), $requests), $timeout);
     }
 
     /**
-     * @param array<string, string> $cookies
-     * @param array<string, string> $extra
+     * @param array<string, string>      $cookies
+     * @param array<string, string|null> $extra
      *
      * @return array{process: resource, stdout: resource, label: string}
      */
-    private function begin(string $method, string $uri, array $cookies, bool $https, array $extra): array
+    private function begin(string $method, string $uri, array $cookies, bool $https, array $extra, ?string $body): array
     {
         $query = (string) parse_url($uri, \PHP_URL_QUERY);
         $params = [
@@ -255,12 +258,15 @@ final class FpmServer
             'REQUEST_URI' => $uri,
             'QUERY_STRING' => $query,
             'SCRIPT_NAME' => '/index.php',
-            'SCRIPT_FILENAME' => self::DOCUMENT_ROOT.'/index.php',
-            'DOCUMENT_ROOT' => self::DOCUMENT_ROOT,
-            'CONTENT_LENGTH' => '0',
+            'SCRIPT_FILENAME' => self::projectDir().'/public/index.php',
+            'DOCUMENT_ROOT' => self::projectDir().'/public',
+            'CONTENT_LENGTH' => (string) \strlen($body ?? ''),
             'HTTP_HOST' => 'localhost',
             'HTTP_ACCEPT' => 'application/json',
         ];
+        if (!\in_array($method, ['GET', 'HEAD', 'OPTIONS', 'TRACE'], true)) {
+            $params['HTTP_ORIGIN'] = ($https ? 'https' : 'http').'://localhost';
+        }
         if ($https) {
             $params['HTTPS'] = 'on';
         }
@@ -272,16 +278,21 @@ final class FpmServer
             ));
         }
 
-        // cgi-fcgi sends its whole environment as the FastCGI parameters.
+        // cgi-fcgi sends its whole environment as the FastCGI parameters and
+        // its standard input as the request body.
         $process = proc_open(
             ['cgi-fcgi', '-bind', '-connect', '127.0.0.1:'.$this->port],
-            [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']],
+            [0 => null === $body ? ['file', '/dev/null', 'r'] : ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']],
             $pipes,
             null,
-            array_merge($params, $extra),
+            array_filter(array_merge($params, $extra), static fn (?string $value): bool => null !== $value),
         );
         if (!\is_resource($process)) {
             throw new \RuntimeException('cgi-fcgi did not start');
+        }
+        if (null !== $body) {
+            fwrite($pipes[0], $body);
+            fclose($pipes[0]);
         }
         stream_set_blocking($pipes[1], false);
 
@@ -347,6 +358,12 @@ final class FpmServer
         }
 
         return $responses;
+    }
+
+    /** The backend this test code belongs to: /app, or a copy (tests/Mutation). */
+    private static function projectDir(): string
+    {
+        return \dirname(__DIR__, 3);
     }
 
     private static function isAlive(int $pid): bool

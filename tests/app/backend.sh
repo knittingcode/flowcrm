@@ -5,8 +5,10 @@
 # composer validate and audit, the coding standard, PHPStan, the Deptrac
 # architecture rules and their tests, migrations from an empty database
 # (with a full down/up round trip and a schema check) and PHPUnit (unit +
-# integration against the real PostgreSQL, including sessions through a real
-# PHP-FPM) and the session and cache configuration of dev and prod.
+# integration against the real PostgreSQL, including sessions and the API
+# security tests through a real PHP-FPM), the security negative controls
+# (mutations that must fail the tests) and the session and cache
+# configuration of dev and prod.
 # Removes only its own test project afterwards.
 #
 # Usage: tests/app/backend.sh
@@ -48,7 +50,7 @@ check() {
     bad "$label" "exit $?"
     sed 's/^/      | /' "$log" | tail -n 30
   fi
-  grep -E '^(OK|Tests:|PHPStan|\[OK\]|No security|Found|Loaded config| +Violations )' "$log" | sed 's/^/      /' | head -n 6
+  grep -E '^(OK|Tests:|PHPStan|\[OK\]|No security|Found|Loaded config| +Violations |[0-9]+ of [0-9]+ negative)' "$log" | sed 's/^/      /' | head -n 6
 }
 
 say "== backend checks in project $project"
@@ -79,6 +81,9 @@ check_owner "BE-08 migrations down to empty and up again" 'bin/console doctrine:
 check "BE-16 runtime privileges match the manifest (as flowcrm_app)" 'bin/console app:database:verify-privileges --runtime'
 check "BE-09 PHPUnit unit suite" 'vendor/bin/phpunit --colors=never --testsuite unit'
 check "BE-10 PHPUnit integration suite (real PostgreSQL)" 'vendor/bin/phpunit --colors=never --testsuite integration'
+# Each security control of FND-010B removed in a copy of the backend must make
+# its tests fail (tests/Mutation/controls.php); the checkout is not changed.
+check "BE-18 security negative controls: every removed protection fails its tests" 'php tests/Mutation/run-controls.php'
 check "BE-11 module boundaries (Deptrac, deptrac.modules.yaml)" 'vendor/bin/deptrac analyse --config-file=deptrac.modules.yaml --no-cache --no-progress'
 check "BE-12 layer rules (Deptrac, deptrac.layers.yaml)" 'vendor/bin/deptrac analyse --config-file=deptrac.layers.yaml --no-cache --no-progress'
 check "BE-13 architecture tests (rules on fixtures, source layout)" 'vendor/bin/phpunit --colors=never --testsuite architecture'
@@ -120,13 +125,15 @@ for name, secrets in got.items():
     assert secrets == expected, (sys.argv[1], name, secrets, expected)
 users = {n: s.get("environment", {}).get("DATABASE_USER") for n, s in services.items() if n in ("api", "migrate")}
 assert users == {"api": None, "migrate": "flowcrm_owner"}, users
+# The API trusts no proxy: forwarding headers could only come from the client (ADR-019).
+assert "TRUSTED_PROXIES" not in services["api"].get("environment", {}), "api trusts a proxy"
 print("OK", sys.argv[1], got)
 ' "$files" || exit 1
   done
 ) >"$log" 2>&1; then
-  ok "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own"
+  ok "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own and trusts no proxy"
 else
-  bad "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own" "see below"
+  bad "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own and trusts no proxy" "see below"
   sed 's/^/      | /' "$log" | tail -n 10
 fi
 grep '^OK' "$log" | sed 's/^/      /'

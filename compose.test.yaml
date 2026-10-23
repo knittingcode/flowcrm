@@ -24,6 +24,10 @@ services:
       # dev and prod api never get these secrets (BE-17).
       FLOWCRM_TEST_OWNER_PASSWORD_FILE: /run/secrets/db_owner_password
       FLOWCRM_TEST_ADMIN_PASSWORD_FILE: /run/secrets/db_password
+      # The PHP-FPM test harness plays the edge (REMOTE_ADDR 127.0.0.1) and
+      # gives each test client its own address in X-Forwarded-For
+      # (tests/Support/Session/FpmServer.php, ApiClient).
+      TRUSTED_PROXIES: 127.0.0.1
     secrets: !override [db_app_password, db_owner_password, db_password, app_secret]
     volumes: !reset []
     # Runs the checks given as the command, then exits.

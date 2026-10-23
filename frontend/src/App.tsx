@@ -1,20 +1,27 @@
-import { SystemStatusPanel } from './features/system-status/SystemStatusPanel.tsx';
+import { Route, Routes } from 'react-router';
+import { RequireAuth } from './auth/RequireAuth.tsx';
+import { OrganizationPage } from './features/organization/OrganizationPage.tsx';
+import { AppShell } from './pages/AppShell.tsx';
+import { HomePage } from './pages/HomePage.tsx';
+import { LoginPage } from './pages/LoginPage.tsx';
+import { NotFoundPage } from './pages/NotFoundPage.tsx';
 
+/** Every page except the login requires a session; unknown addresses are "not found" after the login. */
 export function App() {
   return (
-    <div className="shell">
-      <header className="shell-header">
-        <span className="brand">FlowCRM</span>
-        <span className="environment">development foundation</span>
-      </header>
-      <main className="shell-main">
-        <h1>Application shell</h1>
-        <p>
-          The CRM features are not built yet. This page checks that the frontend, the API and the
-          database work together through the edge.
-        </p>
-        <SystemStatusPanel />
-      </main>
-    </div>
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route
+        element={
+          <RequireAuth>
+            <AppShell />
+          </RequireAuth>
+        }
+      >
+        <Route index element={<HomePage />} />
+        <Route path="/o/:organizationId" element={<OrganizationPage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Route>
+    </Routes>
   );
 }

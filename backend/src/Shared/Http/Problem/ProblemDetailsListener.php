@@ -4,10 +4,7 @@ declare(strict_types=1);
 
 namespace App\Shared\Http\Problem;
 
-use App\Shared\Http\RequestId;
 use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
-use Symfony\Component\HttpFoundation\JsonResponse;
-use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
 use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 use Symfony\Component\HttpKernel\KernelEvents;
@@ -20,16 +17,6 @@ use Symfony\Component\HttpKernel\KernelEvents;
  */
 final readonly class ProblemDetailsListener
 {
-    private const TYPES = [
-        400 => 'bad-request',
-        404 => 'not-found',
-        405 => 'method-not-allowed',
-        406 => 'not-acceptable',
-        415 => 'unsupported-media-type',
-        500 => 'internal-error',
-        503 => 'service-unavailable',
-    ];
-
     #[AsEventListener(event: KernelEvents::EXCEPTION, priority: -64)]
     public function __invoke(ExceptionEvent $event): void
     {
@@ -40,26 +27,19 @@ final readonly class ProblemDetailsListener
         }
 
         $exception = $event->getThrowable();
-        $status = Response::HTTP_INTERNAL_SERVER_ERROR;
+        if ($exception instanceof ProblemException) {
+            $event->setResponse(ProblemResponse::of($request, $exception));
+
+            return;
+        }
+
+        $status = 500;
         $headers = [];
         if ($exception instanceof HttpExceptionInterface) {
             $status = $exception->getStatusCode();
             $headers = $exception->getHeaders();
         }
 
-        $requestId = RequestId::of($request);
-        $type = self::TYPES[$status] ?? null;
-        $body = [
-            'type' => null === $type ? 'about:blank' : '/problems/'.$type,
-            'title' => Response::$statusTexts[$status] ?? 'Error',
-            'status' => $status,
-            'instance' => $path,
-            'requestId' => $requestId,
-        ];
-
-        $response = new JsonResponse($body, $status, $headers);
-        $response->headers->set('Content-Type', 'application/problem+json');
-        $response->headers->set('Cache-Control', 'no-store');
-        $event->setResponse($response);
+        $event->setResponse(ProblemResponse::create($request, $status, headers: $headers));
     }
 }

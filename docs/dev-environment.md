@@ -397,7 +397,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   Node packages), and control scans prove the gate fails on a vulnerable
   image and on an image without inventoried packages (see
   [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
-- `backend.sh` (BE-01 to BE-17): PHP 8.5 runtime, `composer validate` and
+- `backend.sh` (BE-01 to BE-18): PHP 8.5 runtime, `composer validate` and
   `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
   empty database, `doctrine:schema:validate`, a full down/up migration round
   trip, PHPUnit unit and integration suites against a real PostgreSQL
@@ -414,9 +414,15 @@ Application suites (`tests/app/`), each in its own Compose projects:
   runtime role, BE-17 which secrets each service of the dev and prod Compose
   configuration receives (see
   [architecture/adr/ADR-018-database-roles.md](architecture/adr/ADR-018-database-roles.md)).
+  The integration suite includes the API security tests (login, sessions,
+  request forgery, throttling, tenant isolation) through a real PHP-FPM,
+  each response checked against `backend/openapi.yaml`; BE-18 runs the
+  security negative controls: 28 mutations of a copy of the backend, each
+  of which must make its tests fail (see
+  [architecture/authentication.md](architecture/authentication.md#tests)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
   without warnings, Vitest component tests and the production build.
-- `stack.sh` (ST-01 to ST-68): the real stack through `bin/devenv` in fresh
+- `stack.sh` (ST-01 to ST-73): the real stack through `bin/devenv` in fresh
   copies of the checkout on the 20 ports from `DEVENV_TEST_PORT_BASE`
   (default 18300): exposure, networks, non-root and read-only containers,
   routing through Caddy, API and health responses, readiness with a pending
@@ -444,12 +450,22 @@ Application suites (`tests/app/`), each in its own Compose projects:
   an ownership conversion and after a committed but unverified change, with
   the edge already stopped before the change began; and the upgrade of a
   volume from FND-004 (before the audit log existed) and of one whose audit
-  triggers were disabled or dropped (refused).
-- `prodlike.sh` (PL-01 to PL-15): the production images (`<project>-prod`,
+  triggers were disabled or dropped (refused); and authentication through
+  the edge with users created by the operator console: the session cookie's
+  attributes, logout with the CSRF token and a replayed cookie, logins from
+  another origin and with a form body, spoofed `X-Forwarded-For` that cannot
+  evade the login limit, no secrets in any log, and the logged-in browser
+  journeys (roles, two organizations, a foreign organization, CSRF).
+- `prodlike.sh` (PL-01 to PL-22): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey
-  under the CSP, lazy sessions in production mode and the `migrate` job
-  completing as the owner before the api starts.
+  under the CSP, lazy sessions in production mode, the `migrate` job
+  completing as the owner before the api starts, and the production session
+  cookie (`__Host-`, `Secure`) of a login. Then the edge is recreated with
+  the HTTPS test sites of `tests/app/https` (a throwaway certificate made
+  with `openssl` per run): the production cookie, the logged-in journeys and
+  cross-site forgeries in Chromium over TLS, spoofed forwarding headers, no
+  CORS, and a TLS proxy the edge does not trust failing closed.
 
 Each application suite uses Compose project and image names unique to the
 run, so several runs from one checkout do not interfere.

@@ -21,7 +21,7 @@ One JSON object per line on stderr (`backend/config/packages/monolog.yaml`,
 |---|---|
 | `ts` | UTC, milliseconds |
 | `level` | PSR-3 level (`debug` … `emergency`); handlers write `info` and above |
-| `channel` | `http` (request records), `health` (readiness failures), `request` and `php` (framework errors), `app` |
+| `channel` | `http` (request records), `health` (readiness failures), `security` (logins, rejected requests, tenant denials; see [authentication](authentication.md#audit-events-and-security-log)), `request` and `php` (framework errors), `app` |
 | `message` | placeholders filled in after redaction |
 | `request_id` | the request's ID, `null` outside a request (for example console commands) |
 | `context`, `extra` | remaining structured data, redacted |
@@ -35,6 +35,14 @@ split).
 
 JSON access log on stdout with the request, including the `X-Request-Id`
 request header that the edge generated (`docker/edge/common.caddy`).
+
+### Retention
+
+The api and edge logs are short-lived diagnostics: Docker keeps at most 3
+files of 10 MB per container (`compose.yaml`, `x-request-logs`) and removes
+them with the container. Security records use pseudonyms instead of e-mail
+and IP addresses; the edge's access log contains the client address. A
+deployment must enforce equivalent limits in its log pipeline.
 
 ## Request IDs
 

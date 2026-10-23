@@ -1,0 +1,28 @@
+# HTTPS test edge of tests/app/prodlike.sh (PL-17 to PL-22), never part of an
+# image or of make up. It imports the production edge configuration
+# unchanged (Caddyfile.prod: plain HTTP on :8080) and adds, with a throwaway
+# certificate made per run (FLOWCRM_HTTPS_DIR):
+#
+# - https://flowcrm.test:8443: the same site over TLS, terminated by the
+#   edge itself;
+# - https://attacker.test:8444: a page of another site that tries to forge
+#   requests (attacker/index.html);
+# - https://proxied.test:8445: TLS terminated by a proxy the edge does not
+#   trust (it forwards to :8080), to show that such a deployment fails closed.
+import /etc/caddy/Caddyfile
+
+https://flowcrm.test:8443 {
+	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key
+	import app
+}
+
+https://attacker.test:8444 {
+	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key
+	root * /srv/attacker
+	file_server
+}
+
+https://proxied.test:8445 {
+	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key
+	reverse_proxy 127.0.0.1:8080
+}
