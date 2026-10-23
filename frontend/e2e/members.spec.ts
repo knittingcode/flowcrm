@@ -3,9 +3,10 @@ import { expect, type Page, test } from '@playwright/test';
 /*
  * The member administration against the real API and PostgreSQL
  * (FCRM-FND-010C), with the synthetic users and organizations of the stack
- * test (tests/app/lib.sh seed_e2e). These journeys change nothing: other
- * specs rely on the seeded memberships (Alpha: Admin ADMIN, Rep REP, Multi
- * REP). Every change they try is one the server refuses.
+ * test (tests/app/lib.sh seed_e2e). Other specs rely on the seeded
+ * memberships (Alpha: Admin ADMIN, Rep REP, Multi REP): only the seeded user
+ * Spare, who has no membership, is added, changed and removed again; every
+ * other change tried here is one the server refuses.
  *
  * Like auth.spec.ts in the development stack (MODE=dev) and on the
  * production build over HTTPS (MODE=https).
@@ -101,6 +102,29 @@ test.describe('member administration', () => {
       expect(forged.status(), forged.url()).toBe(403);
       expect(((await forged.json()) as { type: string }).type).toBe('/problems/forbidden');
     }
+    expect(await membersOf(page)).toEqual(before);
+  });
+
+  test('an ADMIN adds a member, changes the role and removes the member again', async ({ page }) => {
+    await openMembers(page, env('E2E_ADMIN_EMAIL'));
+    const before = await membersOf(page);
+
+    await page.getByLabel('E-mail address of the user').fill(env('E2E_SPARE_EMAIL'));
+    await page.getByLabel('Role', { exact: true }).selectOption('REP');
+    await page.getByRole('button', { name: 'Add member' }).click();
+    const table = page.getByRole('table');
+    await expect(table).toContainText('Spare Tester');
+    const added = (await membersOf(page)).find((m) => m.displayName === 'Spare Tester');
+    expect(added).toMatchObject({ role: 'REP' });
+
+    await page.getByLabel('New role for Spare Tester').selectOption('MANAGER');
+    await page.getByRole('button', { name: 'Change role of Spare Tester' }).click();
+    await expect.poll(async () => (await membersOf(page)).find((m) => m.displayName === 'Spare Tester')?.role).toBe('MANAGER');
+    await expect(page.getByLabel('New role for Spare Tester')).toHaveValue('MANAGER');
+
+    await page.getByRole('button', { name: 'Remove Spare Tester' }).click();
+    await page.getByRole('button', { name: 'Yes, remove Spare Tester' }).click();
+    await expect(table).not.toContainText('Spare Tester');
     expect(await membersOf(page)).toEqual(before);
   });
 
