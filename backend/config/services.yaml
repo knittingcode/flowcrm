@@ -18,6 +18,9 @@ parameters:
     flowcrm.rate_limit.login_ip: { id: login_ip, policy: sliding_window, limit: 50, interval: '15 minutes' }
     flowcrm.rate_limit.login_account: { id: login_account, policy: sliding_window, limit: 100, interval: '1 day' }
     flowcrm.rate_limit.password_change: { id: password_change, policy: sliding_window, limit: 5, interval: '15 minutes' }
+    # Every request of a logged-in user to a route that requires a login
+    # (FCRM-002 NFR-007; App\Identity\Http\Security\UserRateLimitListener).
+    flowcrm.rate_limit.api_user: { id: api_user, policy: sliding_window, limit: 600, interval: '1 minute' }
 
 services:
     # default configuration for services in *this* file
@@ -65,6 +68,9 @@ services:
     flowcrm.rate_limiter.password_change:
         class: Symfony\Component\RateLimiter\RateLimiterFactory
         arguments: ['%flowcrm.rate_limit.password_change%', '@flowcrm.rate_limiter.storage', '@flowcrm.rate_limiter.lock_factory']
+    flowcrm.rate_limiter.api_user:
+        class: Symfony\Component\RateLimiter\RateLimiterFactory
+        arguments: ['%flowcrm.rate_limit.api_user%', '@flowcrm.rate_limiter.storage', '@flowcrm.rate_limiter.lock_factory']
 
 when@test:
     services:

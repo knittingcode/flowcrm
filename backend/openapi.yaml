@@ -24,6 +24,11 @@ info:
     organization the user has no active membership in returns the same 404 as
     one that does not exist. A member without the permission gets 403.
 
+    **Rate limits.** Failed logins are limited per account and client IP, per
+    client IP and per account; a logged-in user may make 600 requests per
+    minute to the routes that require a login (FCRM-002 NFR-007). Both answer
+    429 with `Retry-After`.
+
     **Errors** are RFC 9457 `application/problem+json` documents with the
     request ID. Every response has `Cache-Control: no-store`.
 servers:
@@ -144,6 +149,8 @@ paths:
                 $ref: '#/components/schemas/Me'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 
   /api/v1/me/password:
     post:
@@ -198,6 +205,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 
   /api/v1/organizations/{organizationId}/members:
     parameters:
@@ -236,6 +245,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '422':
           $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 
   /api/v1/organizations/{organizationId}/members/{membershipId}:
     parameters:
@@ -264,6 +275,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 
 components:
   securitySchemes:
