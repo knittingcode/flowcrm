@@ -44,10 +44,13 @@ Two things make a naive implementation unsafe:
      204; the membership becomes `REMOVED` (the row stays, C-11).
 3. **One transaction per change, serialised per organization**
    (`ManageMemberships`, inside `Transaction::run`):
-   1. `SELECT id FROM organizations WHERE id = ? FOR UPDATE` on the default
-      connection, which the entity manager and the audit trail share
+   1. `SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE` on the
+      default connection, which the entity manager and the audit trail share
       (`OrganizationLock`, implemented by `DbalOrganizationLock`; it refuses
-      to run outside a transaction). `flowcrm_app` already holds `UPDATE` on
+      to run outside a transaction). `NO KEY UPDATE` excludes a second
+      holder but not the `KEY SHARE` locks of foreign key checks, so rows
+      that reference the organization can be inserted meanwhile; the
+      operator's `flowcrm:membership:add` takes the same lock. `flowcrm_app` already holds `UPDATE` on
       `organizations` (ADR-018); no privilege and no schema change is needed.
    2. The actor's own membership is read again under the lock. No active
       membership any more: 404 (as `TenantGuard` would answer now). Its role
@@ -137,6 +140,9 @@ Two things make a naive implementation unsafe:
 
 ## Verification
 
+- `backend/tests/Integration/Database/OrganizationLockTest`: the lock
+  excludes a second holder but not a referencing insert, and the
+  operator's add waits for it.
 - `backend/tests/Integration/Security/MembershipAdministrationTest` over
   the real PHP-FPM and PostgreSQL: the role matrix of the new routes,
   foreign organizations and membership IDs, the last-admin rule, audit

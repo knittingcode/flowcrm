@@ -281,8 +281,10 @@ FCRM-FND-010C, [ADR-020](adr/ADR-020-membership-administration.md)
 add, role change and removal in one database transaction that
 
 1. locks the organization row (`SELECT id FROM organizations WHERE id = ?
-   FOR UPDATE`, `DbalOrganizationLock`), so the membership changes of one
-   organization run one after the other;
+   FOR NO KEY UPDATE`, `DbalOrganizationLock`), so the membership changes of
+   one organization, including the operator's `flowcrm:membership:add`, run
+   one after the other; inserts that only reference the organization do not
+   wait;
 2. reads the actor's own membership again under the lock: none any more is
    a 404, a role that no longer grants the permission a 403 (the check of
    `TenantGuard` before the lock is not trusted for the write);
@@ -404,7 +406,7 @@ time-based retention) before any real personal data is processed.
 | `RouteSecurityTest` | every tenant route has the UUID requirement and exactly one permission; every API route outside the public list needs a login; `/health` is outside the firewall; the specification matches the routes |
 | `AuditTrailTest`, `SecurityLoggingTest`, `ProvisioningCommandTest`, `SecurityConfigurationTest` | audit events without secrets or IP, none for failures; with the audit table failing (a test trigger): no login, no password or operator change, but the logout still ends the session; security log with pseudonyms and the request ID of the answer; console input rules; production hasher, lifetime, limits and trusted headers |
 | Unit tests | `SecurityUser`, `PasswordPolicy`, `UserProvider` (one hash for unknown e-mails), `LoginRateLimiter`, `RolePolicy` (the matrix as data), `TenantPermissionVoter`, `TenantGuard`, `RequestOriginGuard`, `JsonBody`, `Pagination`, problem documents, `ManageMemberships` (lock first, checks inside the transaction), `Membership::changeRole` and `LastAdminRule` |
-| `tests/app/backend.sh` BE-18 | 43 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
+| `tests/app/backend.sh` BE-18 | 45 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
 | `tests/app/stack.sh` ST-69 to ST-73, ST-16 | through the real edge: cookie attributes, logout with token and replay, cross-origin and form logins, spoofed `X-Forwarded-For` cannot evade the limit, no secrets in any log; Playwright journeys (login, logout, back button, roles, two organizations, foreign organization, CSRF) |
 | `tests/app/prodlike.sh` PL-16, PL-11 | the production cookie (`__Host-`, `Secure`) with curl; the login page under the production CSP |
 | `tests/app/prodlike.sh` PL-17 to PL-22, `frontend/e2e/https.spec.ts` | over HTTPS (see [HTTPS](#https-and-proxies)): the TLS site, spoofed forwarding headers, no CORS, an untrusted TLS proxy fails closed, the cookie and the logged-in journeys in Chromium, cross-site forgeries, the client IP behind the edge |
