@@ -141,7 +141,8 @@ final class AuthenticationTest extends FpmApiTestCase
         $client->login($user->email, $user->password);
         $id = (string) $client->sessionId();
 
-        $response = $client->post('/api/v1/auth/logout');
+        // As the edge forwards a bodyless POST: Caddy labels it as a form.
+        $response = $client->post('/api/v1/auth/logout', params: ['CONTENT_TYPE' => 'application/x-www-form-urlencoded']);
 
         self::assertSame(204, $response->status());
         self::assertNull($this->sessionData($id), 'the session row is deleted');

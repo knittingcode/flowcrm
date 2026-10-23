@@ -24,6 +24,7 @@ use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
  * 1. A request with a body must be application/json, otherwise 415: an
  *    HTML form or a text/plain "simple" request cannot carry one, and a
  *    cross-origin JSON request needs a CORS preflight, which fails (no CORS).
+ *    A request without a body (logout) needs no media type.
  * 2. Origin policy: the Origin header must equal the request's own origin.
  *    Without Origin, the origin of the Referer must; without both, the
  *    request is refused. A Sec-Fetch-Site other than same-origin is refused.
@@ -63,7 +64,9 @@ final readonly class RequestOriginGuard
             return;
         }
 
-        if (('' !== $request->getContent() || $request->headers->has('Content-Type')) && 'json' !== $request->getContentTypeFormat()) {
+        // Only a body needs a media type: Caddy's FastCGI transport labels
+        // every POST without a Content-Type as a form, also an empty one.
+        if (self::hasBody($request) && 'json' !== $request->getContentTypeFormat()) {
             $this->reject($request, 'content_type');
 
             throw ProblemException::unsupportedMediaType();
@@ -99,6 +102,18 @@ final readonly class RequestOriginGuard
 
             throw ProblemException::csrfInvalid();
         }
+    }
+
+    /**
+     * PHP parses form and multipart bodies itself (php://input is then
+     * empty), so the length and the parsed data count too.
+     */
+    private static function hasBody(Request $request): bool
+    {
+        return (int) $request->headers->get('Content-Length', '0') > 0
+            || '' !== $request->getContent()
+            || $request->request->count() > 0
+            || $request->files->count() > 0;
     }
 
     /** The origin (scheme://host[:port]) of a Referer, or null. */

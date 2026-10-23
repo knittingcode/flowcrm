@@ -40,6 +40,8 @@ final class RequestOriginGuardTest extends TestCase
         yield 'form body' => ['POST', '/api/v1/auth/login', ['HTTP_ORIGIN' => 'http://localhost', 'CONTENT_TYPE' => 'application/x-www-form-urlencoded'], 'a=b', 415];
         yield 'text body' => ['POST', '/api/v1/auth/login', ['HTTP_ORIGIN' => 'http://localhost', 'CONTENT_TYPE' => 'text/plain'], '{}', 415];
         yield 'body without type' => ['POST', '/api/v1/auth/login', ['HTTP_ORIGIN' => 'http://localhost'], '{}', 415];
+        yield 'no body, labelled as a form (as the edge sends it)' => ['POST', '/api/v1/auth/logout', ['HTTP_ORIGIN' => 'http://localhost', 'CONTENT_TYPE' => 'application/x-www-form-urlencoded'], '', null];
+        yield 'no body, labelled as a form, foreign origin' => ['POST', '/api/v1/auth/logout', ['HTTP_ORIGIN' => 'https://evil.example', 'CONTENT_TYPE' => 'application/x-www-form-urlencoded'], '', 403];
         yield 'empty body, no type' => ['POST', '/api/v1/auth/logout', ['HTTP_ORIGIN' => 'http://localhost'], '', null];
         yield 'DELETE is unsafe too' => ['DELETE', '/api/v1/x', ['HTTP_ORIGIN' => 'https://evil.example'], '', 403];
         yield 'https origin behind https' => ['POST', '/api/v1/auth/login', ['HTTP_ORIGIN' => 'https://localhost', 'HTTPS' => 'on'] + $json, '{}', null];

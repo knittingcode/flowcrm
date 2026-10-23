@@ -90,6 +90,10 @@ return [
         "&& 'json' !== \$request->getContentTypeFormat()) {", '&& false) {',
         'RequestForgeryTest::testBodiesMustBeJson'],
 
+    ['a request without a body needs a JSON type (breaks logout behind the edge)', 'src/Shared/Http/Security/RequestOriginGuard.php',
+        "if (self::hasBody(\$request) && 'json' !== \$request->getContentTypeFormat()) {", "if ((self::hasBody(\$request) || \$request->headers->has('Content-Type')) && 'json' !== \$request->getContentTypeFormat()) {",
+        'AuthenticationTest::testLogoutEndsTheSessionOnTheServer|RequestOriginGuardTest'],
+
     // Login throttling.
     ['no login throttling', 'config/packages/security.yaml',
         "            login_throttling:\n                limiter: App\\Identity\\Infrastructure\\Security\\LoginRateLimiter\n", '',
