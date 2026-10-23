@@ -29,7 +29,6 @@ namespace App\Tests\Support\Session;
 final class FpmServer
 {
     public const DEFAULT_TIMEOUT = 15.0;
-    private const DOCUMENT_ROOT = '/app/public';
     // Signal numbers (Linux); the image has no pcntl extension for the constants.
     private const SIGQUIT = 3;
     private const SIGKILL = 9;
@@ -91,7 +90,7 @@ final class FpmServer
             ['setsid', 'php-fpm', '--nodaemonize', '--fpm-config', $this->dir.'/fpm.conf'],
             [0 => ['file', '/dev/null', 'r'], 1 => ['file', $this->dir.'/fpm.out', 'a'], 2 => ['file', $this->dir.'/fpm.out', 'a']],
             $pipes,
-            '/app',
+            self::projectDir(),
             $env,
         );
         if (!\is_resource($process)) {
@@ -259,8 +258,8 @@ final class FpmServer
             'REQUEST_URI' => $uri,
             'QUERY_STRING' => $query,
             'SCRIPT_NAME' => '/index.php',
-            'SCRIPT_FILENAME' => self::DOCUMENT_ROOT.'/index.php',
-            'DOCUMENT_ROOT' => self::DOCUMENT_ROOT,
+            'SCRIPT_FILENAME' => self::projectDir().'/public/index.php',
+            'DOCUMENT_ROOT' => self::projectDir().'/public',
             'CONTENT_LENGTH' => (string) \strlen($body ?? ''),
             'HTTP_HOST' => 'localhost',
             'HTTP_ACCEPT' => 'application/json',
@@ -359,6 +358,12 @@ final class FpmServer
         }
 
         return $responses;
+    }
+
+    /** The backend this test code belongs to: /app, or a copy (tests/Mutation). */
+    private static function projectDir(): string
+    {
+        return \dirname(__DIR__, 3);
     }
 
     private static function isAlive(int $pid): bool
