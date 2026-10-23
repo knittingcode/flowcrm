@@ -373,7 +373,7 @@ final class MembershipAdministrationTest extends FpmApiTestCase
 
         $holder = SeparateConnection::open();
         $holder->beginTransaction();
-        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR UPDATE')->execute([$this->a->toRfc4122()]);
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
         try {
             $pending = [
                 $first->dispatch('PATCH', $this->member($secondMembership), ['role' => 'MANAGER']),
@@ -406,7 +406,7 @@ final class MembershipAdministrationTest extends FpmApiTestCase
 
         $holder = SeparateConnection::open();
         $holder->beginTransaction();
-        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR UPDATE')->execute([$this->a->toRfc4122()]);
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
         try {
             $pending = $client->dispatch('PATCH', $this->member($this->repAMembership), ['role' => 'ADMIN']);
             $waiting = $this->requestsWaitingForTheOrganizationLock($holder, 1);
@@ -501,7 +501,7 @@ final class MembershipAdministrationTest extends FpmApiTestCase
     private function requestsWaitingForTheOrganizationLock(\PDO $observer, int $expected): int
     {
         $clear = $observer->prepare('SELECT pg_stat_clear_snapshot()');
-        $statement = $observer->prepare("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE 'SELECT id FROM organizations WHERE id = % FOR UPDATE'");
+        $statement = $observer->prepare("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE 'SELECT id FROM organizations WHERE id = % FOR NO KEY UPDATE'");
         for ($i = 0;; ++$i) {
             $clear->execute();
             $statement->execute();
