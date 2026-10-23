@@ -542,6 +542,23 @@ login_ok() { # role password-file: SCRAM login as flowcrm_<role>
 }
 no_leftovers() { [ -z "$(find "$sd" -name '.*' -type f ! -name '.db_*_password.pending')" ]; }
 pend() { printf '%s/.db_%s_password.pending' "$sd" "$1"; }
+# Diagnostics for a failed check, never a secret value: container identity
+# (ID, start time, restart count) of db and api, and whether each mounted
+# role secret equals the host file (same, different or missing).
+lifecycle() { # -> one line
+  local svc id name host inside out=''
+  for svc in db api; do
+    id=$(cid "$A" "$svc")
+    if [ -z "$id" ]; then out="$out $svc=none"; continue; fi
+    out="$out $svc=$(docker inspect -f '{{printf "%.12s" .Id}}@{{.State.StartedAt}}/restarts={{.RestartCount}}/{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id")"
+    for name in db_app_password db_owner_password; do
+      host=$(sha256sum "$sd/$name" 2>/dev/null || shasum -a 256 "$sd/$name" 2>/dev/null)
+      inside=$(docker exec "$id" sha256sum "/run/secrets/$name" 2>/dev/null) || { out="$out:$name=missing"; continue; }
+      [ "${host%% *}" = "${inside%% *}" ] && out="$out:$name=same" || out="$out:$name=different"
+    done
+  done
+  printf '%s\n' "${out# }"
+}
 
 # Interrupted after the pending password was written: the database still
 # has the current one, the stack keeps serving; running the command again
@@ -596,19 +613,43 @@ v "ST-50 owner rotation interrupted after the database change and resumed: the m
 # Repeated rotations, and a failed recreation of the api (it does not get
 # healthy): the rotation reports it; after the cause is fixed, make up serves.
 cp -p "$sd/db_app_password" "$work/app.2"
+r5_before=$(lifecycle)
 rot a-rot5 app
+r5_after=$(lifecycle)
 cp -p "$sd/db_app_password" "$work/app.3"
 cp -p "$A/backend/public/index.php" "$work/index.php.kept"
 printf '<?php syntax error\n' >"$A/backend/public/index.php"
+r6_before=$(lifecycle)
+api_id() { printf '%s' "$1" | sed -n 's/.*api=\([0-9a-f]*\)@.*/\1/p'; }
 (cd "$A" && ROLE=app FLOWCRM_WAIT_TIMEOUT=20 ./bin/devenv rotate-db-password) >"$work/out/a-rot6.out" 2>"$work/out/a-rot6.err"
 echo $? >"$work/out/a-rot6.rc"
+r6_after=$(lifecycle)
+get "$PA" /health/live
+r6_edge=$CODE
+dv a-status-rot6 "$A" status
 cp -p "$work/index.php.kept" "$A/backend/public/index.php"
 dv a-up-rot6 "$A" up
+# The api was replaced (the recreation was attempted), but it never got
+# healthy: the rotation fails whatever Compose's exit status says, the stack
+# stays blocked and the edge does not serve until make up succeeds.
 [ "$(rc_of a-rot5)" = 0 ] && ! cmp -s "$work/app.2" "$work/app.3" && [ "$(rc_of a-rot6)" = 2 ] &&
   err_has a-rot6 'recreating api with the current secret files failed' && ! cmp -s "$work/app.3" "$sd/db_app_password" &&
+  [ -n "$(api_id "$r6_before")" ] && [ -n "$(api_id "$r6_after")" ] && [ "$(api_id "$r6_before")" != "$(api_id "$r6_after")" ] && [ "$r6_edge" = 000 ] &&
+  [ "$(rc_of a-status-rot6)" = 1 ] && grep -q '^blocked: ' "$work/out/a-status-rot6.out" &&
   login_ok app "$sd/db_app_password" && [ "$(rc_of a-up-rot6)" = 0 ] && until_ready "$PA" 200 30 &&
   console_in "$A" app:database:verify-privileges --runtime && no_leftovers
-v "ST-50 repeated rotations; a failed api recreation is reported (exit 2) and make up serves once the cause is fixed" $? "$(tail -n 2 "$work/out/a-rot6.err")"
+v "ST-50 repeated rotations; a failed api recreation is reported (exit 2) and make up serves once the cause is fixed" $? \
+  "rotation 5 exit $(rc_of a-rot5), rotation 6 exit $(rc_of a-rot6), make up exit $(rc_of a-up-rot6)
+      before 5: $r5_before
+      after 5:  $r5_after
+      before 6: $r6_before
+      after 6:  $r6_after
+$(sed 's/^/      | /' "$work/out/a-rot5.err" | tail -n 15)
+$(sed 's/^/      | /' "$work/out/a-rot6.err" | tail -n 25)"
+# Always recorded (no values): which containers each rotation recreated.
+ev "rotation 5: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot5.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
+ev "rotation 6: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot6.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
+ev "api before/after 6: ${r6_before#* api=} -> ${r6_after#* api=}"
 
 # Interrupted while the password change waits inside PostgreSQL (another
 # session holds the operations' advisory lock): the interrupted transaction

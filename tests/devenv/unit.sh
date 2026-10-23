@@ -856,6 +856,97 @@ select_stack
 RUNTIME_DIR=$work/rt
 SECRETS_DIR=$RUNTIME_DIR/secrets
 
+# --- U-17 a recreated container is checked, not only Compose's exit status (FND-009S)
+# Compose 2.38 was seen to exit 0 at its wait timeout while the new container
+# was still starting. Fake compose and docker describe the container that
+# runs after the recreation; recreated_ok must accept only a new, healthy
+# container whose mounted secrets equal the host files.
+saved_compose=$(declare -f compose)
+saved_secrets_dir=$SECRETS_DIR
+SECRETS_DIR=$work/u17-secrets
+mkdir -p "$SECRETS_DIR"
+printf 'new-password\n' >"$SECRETS_DIR/db_app_password"
+FAKE_ID=new FAKE_HEALTH=healthy FAKE_SECRET=new-password
+compose() { [ "$1 $2" = "ps --quiet" ] && [ -n "$FAKE_ID" ] && printf '%s\n' "$FAKE_ID"; return 0; }
+docker() {
+  case $1 in
+    inspect)
+      case $3 in
+        *Health*) printf '%s\n' "$FAKE_HEALTH" ;;
+        *Mounts*) printf '/app/var\n/run/secrets/db_app_password\n' ;;
+      esac ;;
+    exec)
+      printf '%s\n' "$FAKE_SECRET" >"$work/u17-inside"
+      printf '%s  /run/secrets/db_app_password\n' "$(sha256_of "$work/u17-inside")" ;;
+  esac
+}
+u17() { # name expect-ok(0|1) expected-state-fragment
+  local r=0
+  recreated_ok api old || r=1
+  if [ "$r" = "$2" ] && case $RECREATE_STATE in *"$3"*) true ;; *) false ;; esac; then
+    result "U-17 $1" 0
+  else
+    result "U-17 $1" 1 "(returned $r, state [$RECREATE_STATE])"
+  fi
+}
+u17 "a new healthy container with the current secret passes" 0 ""
+FAKE_HEALTH=starting
+u17 "a container still starting fails (the Compose false success)" 1 "not healthy (starting)"
+FAKE_HEALTH=unhealthy
+u17 "an unhealthy container fails" 1 "not healthy (unhealthy)"
+FAKE_HEALTH=none
+u17 "a container without a health check fails" 1 "not healthy (none)"
+FAKE_HEALTH=healthy FAKE_ID=old
+u17 "the previous container, not replaced, fails" 1 "was not replaced"
+FAKE_ID=''
+u17 "no running container fails" 1 "no api container is running"
+FAKE_ID=new FAKE_SECRET=old-password
+u17 "a container that mounts an old secret fails" 1 "does not mount the current db_app_password"
+unset -f docker
+eval "$saved_compose"
+SECRETS_DIR=$saved_secrets_dir
+
+# --- U-18 the rotation's refresh fails when Compose reports a false success
+# refresh_secret_mounts with fake Compose calls: the api mounts an old secret,
+# the recreation "succeeds" at once, and the new container is healthy or
+# still starting. Only the healthy one may pass; the other must stop the
+# command with EX_DOCKER before anything else runs.
+saved_compose_op=$(declare -f compose_op)
+saved_roles=$ROLES saved_runtime=$RUNTIME_DIR
+ROLES=1 RUNTIME_DIR=$work/u18-runtime WAIT_TIMEOUT=20 SECRETS_DIR=$work/u17-secrets
+mkdir -p "$RUNTIME_DIR"
+docker() {
+  case $1 in
+    inspect)
+      case $3 in
+        *Health*) printf '%s\n' "$FAKE_HEALTH" ;;
+        *Mounts*) printf '/run/secrets/db_app_password\n' ;;
+      esac ;;
+    exec)
+      if [ "$2" = old ]; then printf 'old-password\n' >"$work/u18-inside"; else printf 'new-password\n' >"$work/u18-inside"; fi
+      printf '%s  /run/secrets/db_app_password\n' "$(sha256_of "$work/u18-inside")" ;;
+  esac
+}
+compose() { [ "$1 $2 $3" = "ps --quiet api" ] && printf '%s\n' "$FAKE_ID"; return 0; }
+compose_op() { FAKE_ID=new; return 0; }
+u18() { # name health expected-exit message-fragment
+  local out r
+  FAKE_ID=old FAKE_HEALTH=$2
+  out=$( (refresh_secret_mounts) 2>&1)
+  r=$?
+  if [ "$r" = "$3" ] && case $out in *"$4"*) true ;; *) false ;; esac; then
+    result "U-18 $1" 0
+  else
+    result "U-18 $1" 1 "(exit $r: $out)"
+  fi
+}
+u18 "a recreated api that is healthy passes" healthy 0 "recreating api: its secret files changed"
+u18 "Compose reports success for an api still starting: the command fails" starting "$EX_DOCKER" "recreating api with the current secret files failed: docker compose reported success, but the new api container is not healthy (starting)"
+unset -f docker
+eval "$saved_compose_op"
+eval "$saved_compose"
+ROLES=$saved_roles RUNTIME_DIR=$saved_runtime SECRETS_DIR=$saved_secrets_dir
+
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
   "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1
