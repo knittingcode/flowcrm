@@ -6,6 +6,9 @@ const baseURL = process.env.BASE_URL;
 if (baseURL === undefined || baseURL === '') {
   throw new Error('Set BASE_URL to the edge URL, for example http://edge:8080.');
 }
+// HTTPS runs (tests/app/prodlike.sh): the edge's throwaway certificate is
+// trusted by its public key only; any other certificate error still fails.
+const trustedKey = process.env.HTTPS_SPKI;
 
 export default defineConfig({
   testDir: './e2e',
@@ -18,5 +21,13 @@ export default defineConfig({
     baseURL,
     trace: 'off',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [
+    {
+      name: 'chromium',
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: { args: trustedKey ? [`--ignore-certificate-errors-spki-list=${trustedKey}`] : [] },
+      },
+    },
+  ],
 });

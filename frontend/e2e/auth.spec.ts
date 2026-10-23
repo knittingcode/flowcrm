@@ -6,12 +6,13 @@ import { expect, type Page, test } from '@playwright/test';
  * the stack test with the operator console (tests/app/stack.sh); their
  * addresses and the shared password come from the environment.
  *
- * Only in the development stack: a session needs its cookie, and the
- * production-like edge serves plain HTTP, where browsers refuse the Secure
- * __Host-flowcrm_sid cookie (its attributes are checked there with curl,
- * tests/app/prodlike.sh PL-16).
+ * In the development stack (MODE=dev, plain HTTP, cookie flowcrm_sid) and
+ * on the production build over HTTPS (MODE=https, tests/app/prodlike.sh,
+ * cookie __Host-flowcrm_sid with Secure). Not over the production build's
+ * plain HTTP: browsers refuse the Secure cookie there.
  */
 const mode = process.env.MODE ?? 'prod';
+const cookieName = mode === 'https' ? '__Host-flowcrm_sid' : 'flowcrm_sid';
 
 function env(name: string): string {
   const value = process.env[name];
@@ -30,7 +31,7 @@ async function signIn(page: Page, email: string, path = '/') {
 }
 
 test.describe('logged in', () => {
-  test.skip(mode !== 'dev', 'needs the session cookie over plain HTTP (see above)');
+  test.skip(mode !== 'dev' && mode !== 'https', 'needs a session cookie the browser keeps (see above)');
 
   test('a deep link leads through the login back to the organization; logout ends the session', async ({ page, context }) => {
     const consoleErrors: string[] = [];
@@ -45,8 +46,8 @@ test.describe('logged in', () => {
     await expect(page).toHaveURL(new RegExp(`/o/${env('E2E_ORG_A')}$`));
     await expect(page.getByRole('heading', { name: env('E2E_ORG_A_NAME') })).toBeVisible();
     await expect(page.getByRole('table')).toContainText('Rep Tester');
-    const cookie = (await context.cookies()).find((c) => c.name === 'flowcrm_sid');
-    expect(cookie).toMatchObject({ httpOnly: true, sameSite: 'Lax', path: '/', secure: false });
+    const cookie = (await context.cookies()).find((c) => c.name === cookieName);
+    expect(cookie).toMatchObject({ httpOnly: true, sameSite: 'Lax', path: '/', secure: mode === 'https' });
     expect(consoleErrors).toEqual([]);
 
     await page.getByRole('button', { name: 'Sign out' }).click();

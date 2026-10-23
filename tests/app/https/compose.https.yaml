@@ -1,0 +1,17 @@
+# HTTPS test override for tests/app/prodlike.sh, applied on top of
+# compose.yaml and compose.prodlike.yaml to recreate only the edge of the
+# throwaway "<project>-prod" project: the production edge configuration plus
+# the TLS test sites of tests/app/https/Caddyfile, reachable on the front
+# network as flowcrm.test, attacker.test and proxied.test. No port is
+# published. FLOWCRM_HTTPS_DIR holds the per-run test certificate.
+services:
+  edge:
+    command: ["caddy", "run", "--config", "/etc/caddy/https/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ${FLOWCRM_HTTPS_DIR:?is set by tests/app/prodlike.sh}:/run/flowcrm-https:ro
+      - ./tests/app/https/Caddyfile:/etc/caddy/https/Caddyfile:ro
+      - ./tests/app/https/attacker:/srv/attacker:ro
+    networks:
+      front:
+        aliases: [flowcrm.test, attacker.test, proxied.test]
+      back: {}

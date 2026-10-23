@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Another site</title>
+</head>
+<body>
+  <!-- Cross-site request forgery attempts against https://flowcrm.test:8443
+       (tests/app/prodlike.sh, frontend/e2e/https.spec.ts). -->
+  <form id="logout" method="post" action="https://flowcrm.test:8443/api/v1/auth/logout"></form>
+  <form id="password" method="post" enctype="text/plain" action="https://flowcrm.test:8443/api/v1/me/password">
+    <input name='{"currentPassword":"x","newPassword":"' value='a forged new passphrase"}'>
+  </form>
+  <script>
+    window.forgedFetch = () =>
+      fetch('https://flowcrm.test:8443/api/v1/auth/logout', { method: 'POST', credentials: 'include', mode: 'no-cors' })
+        .then((response) => response.type, () => 'error');
+  </script>
+</body>
+</html>
