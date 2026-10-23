@@ -9,13 +9,20 @@ use App\Organizations\Domain\Permission;
 use App\Organizations\Domain\RolePolicy;
 use PHPUnit\Framework\TestCase;
 
-/** The provisional matrix of FND-010B as test data (FCRM-003 FND-009: "RBAC matrix definition as test data"). */
+/**
+ * The provisional matrix of FND-010B and the membership administration of
+ * FND-010C as test data (FCRM-003 FND-009: "RBAC matrix definition as test
+ * data").
+ */
 final class RolePolicyTest extends TestCase
 {
     private const MATRIX = [
         'organization.view' => ['ADMIN' => true, 'MANAGER' => true, 'REP' => true],
         'membership.list' => ['ADMIN' => true, 'MANAGER' => true, 'REP' => true],
         'membership.view_email' => ['ADMIN' => true, 'MANAGER' => true, 'REP' => false],
+        'membership.add' => ['ADMIN' => true, 'MANAGER' => false, 'REP' => false],
+        'membership.change_role' => ['ADMIN' => true, 'MANAGER' => false, 'REP' => false],
+        'membership.remove' => ['ADMIN' => true, 'MANAGER' => false, 'REP' => false],
     ];
 
     public function testEveryCellOfTheMatrix(): void
@@ -37,5 +44,20 @@ final class RolePolicyTest extends TestCase
             $granted = array_keys(array_filter(self::MATRIX, static fn (array $roles): bool => $roles[$role->value]));
             self::assertSame($granted, $listed, $role->value);
         }
+    }
+
+    /** The lists the API returns: MANAGER and REP keep exactly the read permissions of FND-010B. */
+    public function testTheListsPerRole(): void
+    {
+        $lists = [];
+        foreach (MembershipRole::cases() as $role) {
+            $lists[$role->value] = array_map(static fn (Permission $p): string => $p->value, RolePolicy::permissionsOf($role));
+        }
+
+        self::assertSame([
+            'ADMIN' => ['organization.view', 'membership.list', 'membership.view_email', 'membership.add', 'membership.change_role', 'membership.remove'],
+            'MANAGER' => ['organization.view', 'membership.list', 'membership.view_email'],
+            'REP' => ['organization.view', 'membership.list'],
+        ], $lists);
     }
 }
