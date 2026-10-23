@@ -40,3 +40,76 @@ body {
   margin: 0;
   font-variant-numeric: tabular-nums;
 }
+
+.shell-header .user {
+  margin-left: auto;
+}
+
+.organization-switcher {
+  display: flex;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.organization-switcher a[aria-current='page'] {
+  font-weight: 700;
+}
+
+.login form {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 24rem;
+  margin-bottom: 2rem;
+}
+
+.login input {
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+}
+
+.login button {
+  justify-self: start;
+  margin-top: 0.5rem;
+}
+
+.form-error {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid color-mix(in srgb, #c62828 70%, transparent);
+  border-radius: 0.25rem;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+
+.facts dd {
+  margin: 0;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  padding: 0.4rem 0.75rem 0.4rem 0;
+  text-align: left;
+  border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+}
+
+caption {
+  text-align: left;
+  padding-bottom: 0.5rem;
+}
+
+.pager {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-top: 1rem;
+}
