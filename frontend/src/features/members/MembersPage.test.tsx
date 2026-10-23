@@ -300,6 +300,7 @@ describe('MembersPage', () => {
 
   it.each([
     [problem(429, 'too-many-requests', { 'Retry-After': '30' }), 'Too many requests. Try again in 30 seconds.'],
+    [problem(429, 'too-many-requests', { 'Retry-After': '90' }), 'Too many requests. Try again in 2 minutes.'],
     [problem(500, 'internal-error'), 'The change could not be saved (request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c).'],
   ])('reports other failures inline (%#)', async (answer, message) => {
     const calls = fakeApi({

@@ -10,6 +10,11 @@ import { expect, type Page, test } from '@playwright/test';
  *
  * Like auth.spec.ts in the development stack (MODE=dev) and on the
  * production build over HTTPS (MODE=https).
+ *
+ * Each run needs a fresh seed: Spare's removed membership stays REMOVED and
+ * cannot be added again (no reactivation, 409 MEMBERSHIP_EXISTS), and a
+ * failure between the add and the removal leaves Spare ACTIVE. stack.sh and
+ * prodlike.sh seed new users for every run, and Playwright does not retry.
  */
 const mode = process.env.MODE ?? 'prod';
 
