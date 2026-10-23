@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace App\Tests\Integration\Security;
 
 use App\Tests\Support\Security\Fixtures;
+use Doctrine\DBAL\Connection;
 use Monolog\Handler\TestHandler;
+use Symfony\Bundle\FrameworkBundle\KernelBrowser;
 use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
 
 /**
@@ -32,6 +34,8 @@ final class SecurityLoggingTest extends WebTestCase
         $client->request('POST', '/api/v1/auth/logout', server: ['CONTENT_TYPE' => 'application/json', 'HTTP_ORIGIN' => 'https://evil.example']);
         self::assertResponseStatusCodeSame(403);
         $records = [...$records, ...$this->records()];
+        $this->disabled($client, $server);
+        $disabled = $this->records();
 
         $failed = $this->only($records, 'login failed');
         self::assertSame('security', $failed['channel']);
@@ -45,10 +49,23 @@ final class SecurityLoggingTest extends WebTestCase
         self::assertSame($user->id->toRfc4122(), ((array) $this->only($records, 'login succeeded')['context'])['user_id']);
         self::assertSame('origin_mismatch', ((array) $this->only($records, 'unsafe request rejected')['context'])['reason']);
 
-        $all = json_encode($records, \JSON_THROW_ON_ERROR);
+        self::assertSame('disabled', ((array) $this->only($disabled, 'login failed')['context'])['reason'], 'the log knows why; the answer does not');
+
+        $all = json_encode([...$records, ...$disabled], \JSON_THROW_ON_ERROR);
         foreach ([$user->email, strtolower($user->email), $user->password, 'a wrong password', '203.0.113.77'] as $secret) {
             self::assertStringNotContainsString($secret, $all);
         }
+    }
+
+    /** @param array<string, string> $server */
+    private function disabled(KernelBrowser $client, array $server): void
+    {
+        $user = Fixtures::from(self::getContainer())->user('disabled-logged');
+        $connection = self::getContainer()->get('doctrine.dbal.default_connection');
+        \assert($connection instanceof Connection);
+        $connection->executeStatement('UPDATE users SET disabled_at = now() WHERE id = ?', [$user->id->toRfc4122()]);
+        $client->request('POST', '/api/v1/auth/login', server: $server, content: json_encode(['email' => $user->email, 'password' => $user->password], \JSON_THROW_ON_ERROR));
+        self::assertResponseStatusCodeSame(401);
     }
 
     /** @return list<array<mixed>> */

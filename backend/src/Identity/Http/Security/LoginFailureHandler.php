@@ -50,8 +50,25 @@ final readonly class LoginFailureHandler implements AuthenticationFailureHandler
             return ProblemResponse::of($request, ProblemException::tooManyRequests(60 * (is_numeric($minutes) ? (int) $minutes : 1)));
         }
 
-        $this->logger->warning('login failed', $context + ['reason' => $exception instanceof DisabledException ? 'disabled' : 'invalid_credentials']);
+        $reason = self::reason($exception);
+        $this->logger->warning('login failed', $context + ['reason' => $reason]);
 
         return ProblemResponse::of($request, ProblemException::invalidCredentials());
+    }
+
+    /**
+     * For the log only. With expose_security_errors: none the firewall wraps
+     * account status and unknown-user errors in a BadCredentialsException;
+     * the original is its previous exception.
+     */
+    private static function reason(AuthenticationException $exception): string
+    {
+        for ($e = $exception; null !== $e; $e = $e->getPrevious()) {
+            if ($e instanceof DisabledException) {
+                return 'disabled';
+            }
+        }
+
+        return 'invalid_credentials';
     }
 }
