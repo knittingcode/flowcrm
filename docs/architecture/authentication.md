@@ -378,7 +378,18 @@ time-based retention) before any real personal data is processed.
   data; a 429 says how long to wait.
 - Routes: `/login`, `/` (straight to the only organization, or a choice),
   `/o/:organizationId` (profile and member directory; the e-mail column
-  only with `membership.view_email`).
+  only with `membership.view_email`), `/o/:organizationId/members?page=`
+  (member administration).
+- Member administration: the form to add a member, the role select with its
+  "Change role" button and "Remove" (with an inline confirmation) are shown
+  only when the user's own membership in that organization
+  (`GET /organizations/{id}`) has `membership.add`, `membership.change_role`
+  or `membership.remove`. Nothing in the page changes before the server has
+  answered: after every change, and after a 403, 404 or 409, the
+  organization and the member list are read again. A 409 `LAST_ADMIN` says
+  that an organization needs at least one admin, `MEMBERSHIP_EXISTS` that
+  the user has a membership already; 422 errors are shown at their inputs.
+  Removing oneself reads the session again and leads to `/`.
 
 ## Tests
 
@@ -397,7 +408,8 @@ time-based retention) before any real personal data is processed.
 | `tests/app/stack.sh` ST-69 to ST-73, ST-16 | through the real edge: cookie attributes, logout with token and replay, cross-origin and form logins, spoofed `X-Forwarded-For` cannot evade the limit, no secrets in any log; Playwright journeys (login, logout, back button, roles, two organizations, foreign organization, CSRF) |
 | `tests/app/prodlike.sh` PL-16, PL-11 | the production cookie (`__Host-`, `Secure`) with curl; the login page under the production CSP |
 | `tests/app/prodlike.sh` PL-17 to PL-22, `frontend/e2e/https.spec.ts` | over HTTPS (see [HTTPS](#https-and-proxies)): the TLS site, spoofed forwarding headers, no CORS, an untrusted TLS proxy fails closed, the cookie and the logged-in journeys in Chromium, cross-site forgeries, the client IP behind the edge |
-| `frontend/src/**/*.test.ts(x)` | `safeReturnTo`, the API client (CSRF header, problems, single retry, 401 handling) and the routes |
+| `frontend/src/**/*.test.ts(x)` | `safeReturnTo`, the API client (CSRF header, problems, single retry, 401 handling), the membership requests and the routes, including the member administration (controls by permission, field errors and focus, conflicts, 403/404 with reload, self-removal, confirmation focus, page in the address) |
+| `frontend/e2e/members.spec.ts` | through the real edge (dev and HTTPS): an ADMIN's controls with refused changes (existing membership, unknown user, last admin), a REP without controls and its forged changes answered 403; the seeded memberships are left unchanged |
 
 The API tests run against the real PHP-FPM, PdoSessionHandler and PostgreSQL
 (`App\Tests\Support\Http\ApiClient`), and every `/api/v1` response they get

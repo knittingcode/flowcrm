@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useParams } from 'react-router';
+import { Link, useParams } from 'react-router';
 import { ApiProblem } from '../../api/client.ts';
 import { getOrganization, listMembers, type MemberPage, type Organization } from '../../api/organizations.ts';
 import { NotFoundPage } from '../../pages/NotFoundPage.tsx';
@@ -87,6 +87,9 @@ function OrganizationView({ organizationId, page, onPage }: { organizationId: st
       </dl>
       <section aria-labelledby="members-heading">
         <h2 id="members-heading">Members</h2>
+        <p>
+          <Link to={`/o/${encodeURIComponent(organization.id)}/members`}>Open the members page</Link>
+        </p>
         <table>
           <caption>
             {members.meta.total} {members.meta.total === 1 ? 'member' : 'members'}

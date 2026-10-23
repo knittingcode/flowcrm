@@ -113,3 +113,72 @@ caption {
   align-items: center;
   margin-top: 1rem;
 }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.add-member {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 24rem;
+  margin-bottom: 2rem;
+}
+
+.add-member input,
+.add-member select {
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+}
+
+.add-member button {
+  justify-self: start;
+  margin-top: 0.5rem;
+}
+
+.field-error,
+.warning {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.field-error {
+  color: light-dark(#b71c1c, #ef9a9a);
+}
+
+.member-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.change-role {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.confirm {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem;
+  border: 1px solid color-mix(in srgb, #c62828 70%, transparent);
+  border-radius: 0.25rem;
+}
+
+.confirm p {
+  flex-basis: 100%;
+  margin: 0;
+}
