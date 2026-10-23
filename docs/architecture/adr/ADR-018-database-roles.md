@@ -249,7 +249,7 @@ A state machine whose state is the files in `.runtime/secrets`:
 | 4 promoted | pending replaced the current file (atomic `mv`, `0444`) | pending = current |
 | 5 refreshed | `db` and `api` recreated because they mount the replaced file; each new container checked: healthy and mounting the current file | |
 | 6 verified | the api's own connection (app) or the migrate job (owner) logged in; privileges match | |
-| 7 served | an edge that was serving before is started while the gate is still recorded; it must answer `/` with the gate's 503 and `/health/ready` with this stack's 200; only then is the gate cleared | |
+| 7 served | an edge that was serving before is started while the gate is still recorded: first a one-off container of the edge service (no published port) must show that its image has the gate rule and can read the gate; the started edge must answer `/` with the gate's 503 and `/health/ready` with this stack's 200; only then is the gate cleared | |
 
 - Interrupted (SIGINT, SIGTERM) or failed in states 1-3: the pending file
   is kept. `make db-rotate-password ROLE=…` finishes the rotation with it;
@@ -266,10 +266,13 @@ A state machine whose state is the files in `.runtime/secrets`:
   file, after the cause is fixed.
 - Interrupted in state 7, by any signal including SIGKILL: the gate is
   still recorded. Before the edge started, nothing listens; after it
-  started, it serves only its health paths. `make status` and `make url`
-  report `blocked`; `make up` checks everything again, clears the gate and
-  keeps (or starts) the edge once it answers readiness. Running it again is
-  safe at any point.
+  started, it serves only its health paths, because the pre-start check
+  proved that its image enforces the gate and can read it (a rotation does
+  not build images: an edge image from before the rule is refused, and
+  `make up` rebuilds it). `make status` and `make url` report `blocked`.
+  `make up` runs every check again, clears the gate once they passed, then
+  keeps or starts the edge and requires it to answer readiness (exit 2
+  otherwise). Running it again is safe at any point.
 - Verified, but the edge does not serve again (state 7; for example the api
   is not ready): the command exits 2, the edge it started is stopped (not
   removed), and the security gate is recorded again with the reason, so
