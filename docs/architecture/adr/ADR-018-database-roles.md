@@ -235,6 +235,7 @@ A state machine whose state is the files in `.runtime/secrets`:
 | 4 promoted | pending replaced the current file (atomic `mv`, `0444`) | pending = current |
 | 5 refreshed | `db` and `api` recreated because they mount the replaced file; each new container checked: healthy and mounting the current file | |
 | 6 verified | the api's own connection (app) or the migrate job (owner) logged in; privileges match | |
+| 7 served | the gate is cleared; an edge that was serving before is started again and must answer `/health/ready` with this stack's 200 | |
 
 - Interrupted (SIGINT, SIGTERM) or failed in states 1-3: the pending file
   is kept. `make db-rotate-password ROLE=…` finishes the rotation with it;
@@ -249,6 +250,12 @@ A state machine whose state is the files in `.runtime/secrets`:
   the stack stays blocked and the edge does not serve; the password and the
   file agree; `make up` recreates the containers that still mount the old
   file, after the cause is fixed.
+- Verified, but the edge does not serve again (state 7; for example the api
+  is not ready): the command exits 2, the edge it started is stopped (not
+  removed), and the security gate is recorded again with the reason, so
+  nothing is served and `make status` reports the stack as blocked. The
+  password change itself is complete and verified; `make up` serves once the
+  cause is fixed.
 - A password change waiting inside PostgreSQL when the command is
   interrupted is cancelled and rolled back (operation lifetime, above).
 - Passwords are never printed or passed on a command line; nothing falls
