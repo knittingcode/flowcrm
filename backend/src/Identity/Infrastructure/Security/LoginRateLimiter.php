@@ -21,8 +21,9 @@ use Symfony\Component\Security\Http\SecurityRequestAttributes;
  * - account: 100 per day from any IP (distributed attacks on one account).
  *
  * Unknown accounts count like known ones, so the limits reveal nothing. The
- * client IP is Request::getClientIp(), which trusts only the edge's
- * X-Forwarded-For (framework.yaml); a client cannot choose its own. Keys
+ * client IP is Request::getClientIp(): the address the edge passes as
+ * REMOTE_ADDR, with no proxy trusted (compose.yaml); a client cannot choose
+ * its own. Keys
  * are HMACs: neither an e-mail address nor an IP address is stored.
  *
  * A successful login clears only the account-and-IP limit: the IP limit

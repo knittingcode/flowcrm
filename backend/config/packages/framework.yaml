@@ -4,11 +4,12 @@ framework:
 
     # Sessions: config/packages/session.yaml.
 
-    # Never trust client-supplied forwarding headers beyond the edge. The
-    # edge (Caddy) is the only client of PHP-FPM and replaces any
-    # X-Forwarded-For a client sends, so compose.yaml trusts the direct peer
-    # (TRUSTED_PROXIES=REMOTE_ADDR). Only the client address and the scheme
-    # are taken from the edge; the host is the request's own Host header.
+    # No proxy is trusted in dev and prod (compose.yaml sets no
+    # TRUSTED_PROXIES): over FastCGI the edge (Caddy) passes the client's
+    # address as REMOTE_ADDR and the scheme as HTTPS, so no forwarding header
+    # is read. If a proxy is ever trusted (the test harness, which plays the
+    # edge, compose.test.yaml), only the client address and the scheme are
+    # taken from it; the host is always the request's own Host header.
     trusted_proxies: '%env(default::TRUSTED_PROXIES)%'
     trusted_headers: ['x-forwarded-for', 'x-forwarded-proto']
 

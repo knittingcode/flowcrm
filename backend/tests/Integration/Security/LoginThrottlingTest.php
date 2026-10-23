@@ -15,9 +15,11 @@ use Symfony\Component\Security\Http\EventListener\LoginThrottlingListener;
 /**
  * Layered login throttling (ADR-019) over the real PHP-FPM, with the state
  * in PostgreSQL: 5 failures per account and client IP per 15 minutes, 50 per
- * client IP, 100 per account and day. The client IP is the one the edge
- * forwards (X-Forwarded-For from the trusted peer); spoofing through the
- * real edge is covered by tests/app/stack.sh ST-74.
+ * client IP, 100 per account and day. The harness plays the edge and gives
+ * each client its own address (X-Forwarded-For from the trusted harness,
+ * compose.test.yaml); in dev and prod the edge passes the client's address
+ * as REMOTE_ADDR and no proxy is trusted. Spoofing through the real edge is
+ * covered by tests/app/stack.sh ST-72 and tests/app/prodlike.sh PL-22.
  */
 final class LoginThrottlingTest extends FpmApiTestCase
 {

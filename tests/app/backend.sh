@@ -125,13 +125,15 @@ for name, secrets in got.items():
     assert secrets == expected, (sys.argv[1], name, secrets, expected)
 users = {n: s.get("environment", {}).get("DATABASE_USER") for n, s in services.items() if n in ("api", "migrate")}
 assert users == {"api": None, "migrate": "flowcrm_owner"}, users
+# The API trusts no proxy: forwarding headers could only come from the client (ADR-019).
+assert "TRUSTED_PROXIES" not in services["api"].get("environment", {}), "api trusts a proxy"
 print("OK", sys.argv[1], got)
 ' "$files" || exit 1
   done
 ) >"$log" 2>&1; then
-  ok "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own"
+  ok "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own and trusts no proxy"
 else
-  bad "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own" "see below"
+  bad "BE-17 only db gets the superuser secret; only db and migrate the owner's; the api only its own and trusts no proxy" "see below"
   sed 's/^/      | /' "$log" | tail -n 10
 fi
 grep '^OK' "$log" | sed 's/^/      /'

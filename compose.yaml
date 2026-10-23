@@ -103,11 +103,10 @@ services:
       # of the container start, so a migration added while the stack runs is
       # applied too.
       FLOWCRM_MIGRATE_ON_START: "0"
-      # PHP-FPM is reachable only from the edge (network back), and the edge
-      # replaces any X-Forwarded-For a client sends: the direct peer is the
-      # only trusted proxy, so Request::getClientIp() is the edge's view of
-      # the client (login throttling, ADR-019).
-      TRUSTED_PROXIES: REMOTE_ADDR
+      # No TRUSTED_PROXIES: over FastCGI the edge passes the client's own
+      # address as REMOTE_ADDR and HTTPS=on for TLS requests, so the API
+      # needs no forwarding header and trusts none (ADR-019; PHP-FPM is
+      # reachable only from the edge, network back).
     logging: *request-logs
     # The runtime role's password only: never the owner's or the superuser's.
     secrets: [db_app_password, app_secret]

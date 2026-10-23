@@ -16,7 +16,7 @@ use PHPUnit\Framework\Assert;
  * against the OpenAPI specification.
  *
  * Each client has its own client IP, as the edge would forward it
- * (X-Forwarded-For from the trusted peer), so the IP-based login limits of
+ * (X-Forwarded-For from REMOTE_ADDR 127.0.0.1, which the test environment trusts), so the IP-based login limits of
  * different tests do not add up. Tests about the IP set it explicitly.
  */
 final class ApiClient
