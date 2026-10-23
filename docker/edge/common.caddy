@@ -35,6 +35,22 @@
 		}
 	}
 
+	# Security gate of bin/devenv (ADR-018): while the gate file exists, the
+	# edge answers every request with 503 except exactly /health/live and
+	# /health/ready (raw URI), so a stack that has not passed its checks
+	# serves nothing, and readiness can still be verified through it.
+	@gated {
+		file {
+			root /run/flowcrm-gate
+			try_files /security-gate
+		}
+		not expression `{http.request.orig_uri}.matches("^/health/(live|ready)([?].*)?$")`
+	}
+	handle @gated {
+		header Cache-Control no-store
+		respond "FlowCRM is blocked by its security gate: run make status" 503
+	}
+
 	# ADR-017: Symfony is reached only for /api, /api/... and exactly
 	# /health/live and /health/ready. The check uses the raw request URI,
 	# not Caddy's path matchers: those match case-insensitively on a

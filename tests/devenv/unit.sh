@@ -948,70 +948,127 @@ eval "$saved_compose"
 ROLES=$saved_roles RUNTIME_DIR=$saved_runtime SECRETS_DIR=$saved_secrets_dir
 
 # --- U-19 edge recovery after a rotation fails closed (FND-009E)
-# restore_edge with fake lower layers: try_edge (Compose), wait_http (the
-# readiness answer), the edge's running state and compose_op stop. Only an
-# edge that answers readiness may serve; otherwise the started edge is
-# stopped, the security gate is recorded again and the command fails.
-saved_fns=$(declare -f try_edge wait_http edge_state compose compose_op)
+# restore_edge with fake lower layers: try_edge (Compose), gate_blocks and
+# wait_http (what the edge answers), the edge's running state and compose_op
+# stop. The rotation has recorded the gate (with "edge": it was serving), as
+# protect_for does. The gate must stay recorded until the edge answers
+# readiness, the edge must be seen blocking while gated, and a failure must
+# leave the gate (with the reason), no running edge, and exit 2.
+saved_fns=$(declare -f try_edge wait_http gate_blocks edge_state compose compose_op)
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR saved_port=$STATE_PORT
 # shellcheck disable=SC2031 # read here, in the main shell
-saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_state=$STATE_STATUS saved_port=$STATE_PORT
-RUNTIME_DIR=$work/u19-runtime GATE_FILE=$work/u19-runtime/security-gate STATE_STATUS=valid STATE_PORT=18555
-mkdir -p "$RUNTIME_DIR"
-# The fake edge's running state is a file: restore_edge runs in a subshell.
+saved_state=$STATE_STATUS
+RUNTIME_DIR=$work/u19-runtime GATE_DIR=$work/u19-runtime/gate STATE_STATUS=valid STATE_PORT=18555
+GATE_FILE=$GATE_DIR/security-gate
+mkdir -p "$GATE_DIR"
+# The fake edge's state is in files: restore_edge runs in a subshell (it may exit).
 fake_running() { cat "$work/u19-running" 2>/dev/null || echo false; }
-try_edge() { printf 'try\n' >>"$work/u19-calls"; LAST_ERROR="compose output"; LAST_FAILURE="docker compose exited with status 1; its error is shown above"; [ "$FAKE_START" = created ] && echo true >"$work/u19-running"; [ "$FAKE_START" = failed ] && return 2; return "$FAKE_TRY"; }
-wait_http() { [ "$FAKE_READY" = yes ]; }
+try_edge() {
+  printf 'try gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u19-calls"
+  LAST_ERROR="compose output" LAST_FAILURE="docker compose exited with status 1; its error is shown above"
+  [ "$FAKE_START" = failed ] && return 2
+  [ "$FAKE_START" = conflict ] && { LAST_FAILURE="port 18555 is in use"; return 1; }
+  echo true >"$work/u19-running"
+  [ "$FAKE_START" = killed ] && exit 137 # interrupted right after the edge started
+  return "$FAKE_TRY"
+}
+gate_blocks() { printf 'blocks gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u19-calls"; [ "$FAKE_BLOCKS" = yes ]; }
+wait_http() { printf 'ready gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u19-calls"; [ "$FAKE_READY" = yes ]; }
 edge_state() { EDGE_RUNNING=$(fake_running); }
 compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(fake_running)" = true ] && printf 'edge-id\n'; return 0; }
-compose_op() { [ "$1" = stop ] && { echo false >"$work/u19-running"; printf 'stop %s\n' "$2" >>"$work/u19-calls"; }; return 0; }
-u19() { # name start(created|failed) try-rc ready expected-exit
+compose_op() {
+  [ "$1" = stop ] || return 0
+  printf 'stop %s\n' "$2" >>"$work/u19-calls"
+  [ "$FAKE_STOP" = fails ] && return 1
+  echo false >"$work/u19-running"
+}
+u19() { # name start(created|failed|killed) try-rc blocks ready stop(ok|fails) expected-exit
   local out r
-  rm -f "$GATE_FILE" "$work/u19-calls" "$work/u19-running"
-  FAKE_START=$2 FAKE_TRY=$3 FAKE_READY=$4
+  rm -f "$work/u19-calls" "$work/u19-running"
+  printf 'rotating the password of flowcrm_app\nedge\n' >"$GATE_FILE"
+  FAKE_START=$2 FAKE_TRY=$3 FAKE_BLOCKS=$4 FAKE_READY=$5 FAKE_STOP=$6
   out=$( (restore_edge edge "the password of flowcrm_app was rotated and verified") 2>&1)
   r=$?
   U19_OUT=$out U19_RUNNING=$(fake_running)
-  U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_STOPS=$(grep -c '^stop' "$work/u19-calls" 2>/dev/null)
-  U19_GATE_EDGE=$(grep -cx edge "$GATE_FILE" 2>/dev/null) U19_OTHER_STOPS=$(grep '^stop' "$work/u19-calls" 2>/dev/null | grep -vcx "stop $EDGE")
-  [ "$r" = "$5" ]
-  result "U-19 $1: exit $5" $? "(got $r: $out)"
+  U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_GATE_EDGE=$(grep -cx edge "$GATE_FILE" 2>/dev/null)
+  U19_CALLS=$(paste -sd ';' - <"$work/u19-calls" 2>/dev/null)
+  [ "$r" = "$7" ]
+  result "U-19 $1: exit $7" $? "(got $r: $out)"
 }
-u19 "the edge comes back and answers readiness" created 0 yes 0
-[ -z "$U19_GATE" ] && [ "$U19_RUNNING" = true ] && [ "${U19_STOPS:-0}" = 0 ] && case $U19_OUT in *"serves again on port 18555"*) true ;; *) false ;; esac
-result "U-19 a verified edge serves and no gate is recorded" $?
-u19 "Compose cannot create the edge" failed 2 no "$EX_DOCKER"
-case $U19_GATE in *"was rotated and verified, but the edge did not serve again on port 18555"*) r=0 ;; *) r=1 ;; esac
-[ "$r" = 0 ] && [ "$U19_RUNNING" = false ] && case $U19_OUT in *"compose output"*) true ;; *) false ;; esac
-result "U-19 a failed creation records the gate again, keeps what was done and shows Compose's error" $? "(gate [$U19_GATE])"
-u19 "the edge container runs but is not healthy" created 2 no "$EX_DOCKER"
-[ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && [ "$U19_OTHER_STOPS" = 0 ] && case $U19_GATE in *"did not serve again"*) true ;; *) false ;; esac
-result "U-19 an unhealthy started edge is stopped (only the edge) and the gate recorded" $? "(running $U19_RUNNING, stops $U19_STOPS, other $U19_OTHER_STOPS)"
-[ "$U19_GATE_EDGE" = 1 ]
-result "U-19 the gate keeps that the edge was serving, so the next rotation brings it back" $? "(edge lines $U19_GATE_EDGE)"
-u19 "Compose reports success before the edge is ready" created 0 no "$EX_DOCKER"
-[ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && case $U19_GATE in *"does not answer"*) true ;; *) false ;; esac
-result "U-19 an edge that Compose accepted but that does not answer readiness never serves" $? "(running $U19_RUNNING, gate [$U19_GATE])"
+u19 "the edge comes back, blocks while gated, then answers readiness" created 0 yes yes ok 0
+[ ! -e "$GATE_FILE" ] && [ "$U19_RUNNING" = true ] && [ "$U19_CALLS" = "try gate=yes;blocks gate=yes;ready gate=yes" ] &&
+  case $U19_OUT in *"serves again on port 18555"*) true ;; *) false ;; esac
+result "U-19 the gate stays recorded while the edge starts and is checked, and is cleared only after it is ready" $? "(calls [$U19_CALLS])"
+u19 "Compose cannot create the edge" failed 2 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"was rotated and verified, but the edge did not serve again on port 18555"*) true ;; *) false ;; esac &&
+  case $U19_OUT in *"compose output"*) true ;; *) false ;; esac
+result "U-19 a failed creation keeps the gate (reason, edge line), keeps what was done and shows Compose's error" $? "(gate [$U19_GATE])"
+u19 "the saved port is taken by another program" conflict 1 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"port 18555 is in use"*) true ;; *) false ;; esac
+result "U-19 a port conflict on the saved port keeps the gate with the reason; make up then picks a port" $? "(gate [$U19_GATE])"
+u19 "the edge container runs but is not healthy" created 2 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ -n "$U19_GATE" ] && ! grep '^stop' "$work/u19-calls" | grep -vqx "stop $EDGE"
+result "U-19 an unhealthy started edge is stopped (only the edge) and the gate kept" $? "(calls [$U19_CALLS])"
+u19 "Compose reports success before the edge is ready" created 0 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && case $U19_GATE in *"does not answer"*) true ;; *) false ;; esac
+result "U-19 an edge that Compose accepted but that does not answer readiness never serves" $? "(gate [$U19_GATE])"
+u19 "the edge does not block while gated" created 0 no yes ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && case $U19_CALLS in *ready*) false ;; *) true ;; esac && case $U19_GATE in *"does not block requests while the security gate is recorded"*) true ;; *) false ;; esac
+result "U-19 an edge not seen blocking while gated is stopped before readiness is trusted" $? "(calls [$U19_CALLS], gate [$U19_GATE])"
+u19 "the edge cannot be stopped, but the gate blocks it" created 0 yes no fails "$EX_DOCKER"
+[ "$U19_RUNNING" = true ] && [ -f "$GATE_FILE" ] && case $U19_OUT in *"does not answer"*"could not be stopped, but it answers only with the gate's 503 (checked)"*) true ;; *) false ;; esac
+result "U-19 a failed stop keeps the original failure, says the stop failed and that blocking was checked" $? "($U19_OUT)"
+u19 "the edge cannot be stopped and does not block" created 0 no no fails "$EX_DOCKER"
+[ -f "$GATE_FILE" ] && case $U19_OUT in *"WARNING: the started edge could not be stopped and was not seen blocking requests; stop the stack now: make down"*) true ;; *) false ;; esac
+result "U-19 a failed stop of an edge not seen blocking does not claim it is blocked" $? "($U19_OUT)"
+u19 "interrupted right after the edge started" killed 0 yes yes ok 137
+[ "$U19_RUNNING" = true ] && [ "$U19_GATE" = "rotating the password of flowcrm_app" ] && [ "$U19_GATE_EDGE" = 1 ]
+result "U-19 an interruption after the edge started leaves the gate recorded (so the edge serves only its health paths)" $? "(gate [$U19_GATE])"
+STATE_STATUS=invalid
+u19 "no saved port: nothing to restore" created 0 yes yes ok 0
+[ ! -e "$work/u19-calls" ] && [ ! -e "$GATE_FILE" ]
+result "U-19 without an edge to restore the gate is cleared and nothing is started" $?
+STATE_STATUS=valid
 # serve_edge alone (also used by make up to restore the previous edge after a
-# port failure, where no gate stops the edge): a started edge that does not
-# answer readiness is stopped by serve_edge itself.
-rm -f "$work/u19-calls" "$work/u19-running"
-FAKE_START=created FAKE_TRY=0 FAKE_READY=no
+# port failure, with no gate): a started edge that does not answer readiness
+# is stopped by serve_edge itself; no gate check without a gate.
+rm -f "$work/u19-calls" "$work/u19-running" "$GATE_FILE"
+FAKE_START=created FAKE_TRY=0 FAKE_BLOCKS=no FAKE_READY=no FAKE_STOP=ok
 serve_edge 18555 >/dev/null 2>&1
 r=$?
 [ "$r" = 1 ] && [ "$(fake_running)" = false ] && [ "$(grep -cx "stop $EDGE" "$work/u19-calls" 2>/dev/null)" = 1 ] &&
-  case $EDGE_FAILURE in *"does not answer"*"the started edge was stopped"*) true ;; *) false ;; esac
-result "U-19 serve_edge stops an edge that does not answer readiness and says so" $? "(r $r, failure [$EDGE_FAILURE])"
+  ! grep -q '^blocks' "$work/u19-calls" && case $EDGE_FAILURE in *"does not answer"*"the started edge was stopped"*) true ;; *) false ;; esac
+result "U-19 serve_edge without a gate stops an edge that does not answer readiness and says so" $? "(r $r, failure [$EDGE_FAILURE])"
 rm -f "$work/u19-calls" "$work/u19-running"
 FAKE_READY=yes
 serve_edge 18555 >/dev/null 2>&1 && [ "$(fake_running)" = true ] && ! grep -q '^stop' "$work/u19-calls"
 result "U-19 serve_edge keeps an edge that answers readiness" $?
-STATE_STATUS=invalid
-u19 "no saved port: nothing to restore" created 0 yes 0
-[ ! -e "$work/u19-calls" ] && [ ! -e "$GATE_FILE" ]
-result "U-19 without a saved port no edge is started and no gate written" $?
-STATE_STATUS=valid
 eval "$saved_fns"
-RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate STATE_STATUS=$saved_state STATE_PORT=$saved_port
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir STATE_STATUS=$saved_state STATE_PORT=$saved_port
+
+# --- U-20 the gate is stored where the edge can read it (FND-009E)
+# The edge's unprivileged user must see the gate or it would serve: the
+# directory is 0755 and every record 0644, written by rename; a gate left at
+# the old place (.runtime/security-gate) by an earlier version is moved, and
+# read-only commands see it until then.
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
+RUNTIME_DIR=$work/u20/.runtime GATE_DIR=$work/u20/.runtime/gate
+GATE_FILE=$GATE_DIR/security-gate
+mkdir -p "$RUNTIME_DIR"
+printf 'an older gate\nedge\n' >"$RUNTIME_DIR/security-gate"
+chmod 0600 "$RUNTIME_DIR/security-gate"
+[ "$(gate_record)" = "$RUNTIME_DIR/security-gate" ]
+result "U-20 a gate at the old place is still reported before it is moved" $?
+(ensure_runtime_dir) && [ "$(mode_of "$GATE_DIR")" = 755 ] && [ -f "$GATE_FILE" ] && [ ! -e "$RUNTIME_DIR/security-gate" ] &&
+  [ "$(mode_of "$GATE_FILE")" = 644 ] && [ "$(cat "$GATE_FILE")" = "$(printf 'an older gate\nedge')" ]
+result "U-20 the gate directory is 0755 and an old gate is moved into it, readable (0644)" $?
+printf 'a new reason\n' | write_gate && [ "$(mode_of "$GATE_FILE")" = 644 ] && [ "$(head -n 1 "$GATE_FILE")" = "a new reason" ] &&
+  [ -z "$(find "$GATE_DIR" -name '.security-gate.*')" ]
+result "U-20 write_gate replaces the record by rename, readable, with no temporary file left" $?
+gate_clear
+[ ! -e "$GATE_FILE" ] && ! gate_record >/dev/null
+result "U-20 gate_clear removes the record" $?
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
