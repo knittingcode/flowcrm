@@ -240,6 +240,35 @@ final class FpmServer
     }
 
     /**
+     * Starts a request and returns at once, so the test can act while it
+     * runs (for example while it waits for a database lock); collect()
+     * waits for the response.
+     *
+     * @param array<string, string>      $cookies
+     * @param array<string, string|null> $params  extra FastCGI parameters; null leaves one out
+     *
+     * @return array{process: resource, stdout: resource, label: string}
+     */
+    public function dispatch(string $method, string $uri, array $cookies = [], array $params = [], ?string $body = null): array
+    {
+        return $this->begin($method, $uri, $cookies, false, $params, $body);
+    }
+
+    /**
+     * Waits for requests started with dispatch(), with one deadline for all.
+     *
+     * @param list<array{process: resource, stdout: resource, label: string}> $started
+     *
+     * @return list<FastCgiResponse>
+     *
+     * @throws FastCgiTimeout when a response does not arrive within $timeout seconds
+     */
+    public function collect(array $started, float $timeout = self::DEFAULT_TIMEOUT): array
+    {
+        return $this->send($started, $timeout);
+    }
+
+    /**
      * @param array<string, string>      $cookies
      * @param array<string, string|null> $extra
      *

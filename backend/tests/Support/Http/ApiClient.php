@@ -48,12 +48,60 @@ final class ApiClient
      */
     public function post(string $uri, ?array $json = null, array $params = [], ?string $raw = null): ApiResponse
     {
-        $defaults = null === $raw && null !== $json ? ['CONTENT_TYPE' => 'application/json'] : [];
-        if (null !== $this->csrfToken) {
-            $defaults['HTTP_X_CSRF_TOKEN'] = $this->csrfToken;
+        return $this->unsafe('POST', $uri, $json, $params, $raw);
+    }
+
+    /**
+     * Like post().
+     *
+     * @param array<string, mixed>|null  $json
+     * @param array<string, string|null> $params
+     */
+    public function patch(string $uri, ?array $json = null, array $params = [], ?string $raw = null): ApiResponse
+    {
+        return $this->unsafe('PATCH', $uri, $json, $params, $raw);
+    }
+
+    /**
+     * Without a body; the CSRF token when known.
+     *
+     * @param array<string, string|null> $params
+     */
+    public function delete(string $uri, array $params = []): ApiResponse
+    {
+        return $this->unsafe('DELETE', $uri, null, $params, null);
+    }
+
+    /**
+     * Starts an unsafe request with the defaults of post() and returns at
+     * once; collect() waits for the responses.
+     *
+     * @param array<string, mixed>|null $json
+     */
+    public function dispatch(string $method, string $uri, ?array $json = null): PendingRequest
+    {
+        [$params, $body] = $this->unsafeRequest($json, [], null);
+
+        return new PendingRequest($this, $method, $uri, $this->fpm->dispatch($method, $uri, $this->cookies, $params + ['HTTP_X_FORWARDED_FOR' => $this->clientIp], $body));
+    }
+
+    /**
+     * Waits for requests that dispatch() started on the same server.
+     *
+     * @return list<ApiResponse>
+     */
+    public static function collect(PendingRequest ...$pending): array
+    {
+        if ([] === $pending) {
+            return [];
+        }
+        $raw = $pending[0]->client->fpm->collect(array_map(static fn (PendingRequest $p): array => $p->handle, array_values($pending)));
+        $responses = [];
+        foreach (array_values($pending) as $i => $request) {
+            $responses[] = $request->client->receive($request->method, $request->uri, $raw[$i]);
         }
 
-        return $this->send('POST', $uri, $params + $defaults, $raw ?? (null === $json ? null : json_encode($json, \JSON_THROW_ON_ERROR)));
+        return $responses;
     }
 
     public function login(string $email, string $password): ApiResponse
@@ -93,10 +141,41 @@ final class ApiClient
         return $this->clientIp;
     }
 
+    /**
+     * @param array<string, mixed>|null  $json
+     * @param array<string, string|null> $params
+     */
+    private function unsafe(string $method, string $uri, ?array $json, array $params, ?string $raw): ApiResponse
+    {
+        [$params, $body] = $this->unsafeRequest($json, $params, $raw);
+
+        return $this->send($method, $uri, $params, $body);
+    }
+
+    /**
+     * @param array<string, mixed>|null  $json
+     * @param array<string, string|null> $params
+     *
+     * @return array{array<string, string|null>, string|null}
+     */
+    private function unsafeRequest(?array $json, array $params, ?string $raw): array
+    {
+        $defaults = null === $raw && null !== $json ? ['CONTENT_TYPE' => 'application/json'] : [];
+        if (null !== $this->csrfToken) {
+            $defaults['HTTP_X_CSRF_TOKEN'] = $this->csrfToken;
+        }
+
+        return [$params + $defaults, $raw ?? (null === $json ? null : json_encode($json, \JSON_THROW_ON_ERROR))];
+    }
+
     /** @param array<string, string|null> $params */
     private function send(string $method, string $uri, array $params, ?string $body): ApiResponse
     {
-        $raw = $this->fpm->request($method, $uri, $this->cookies, params: $params + ['HTTP_X_FORWARDED_FOR' => $this->clientIp], body: $body);
+        return $this->receive($method, $uri, $this->fpm->request($method, $uri, $this->cookies, params: $params + ['HTTP_X_FORWARDED_FOR' => $this->clientIp], body: $body));
+    }
+
+    private function receive(string $method, string $uri, FastCgiResponse $raw): ApiResponse
+    {
         $this->keepCookies($raw);
         OpenApiContract::assertResponse($method, $uri, $raw);
         $response = new ApiResponse($raw);

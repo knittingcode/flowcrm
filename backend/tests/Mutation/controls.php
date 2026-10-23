@@ -3,7 +3,8 @@
 declare(strict_types=1);
 
 /*
- * Security negative controls of FCRM-FND-010B (run-controls.php): each entry
+ * Security negative controls of FCRM-FND-010B and FCRM-FND-010C
+ * (run-controls.php): each entry
  * removes or weakens one protection in a copy of the backend, and the named
  * tests must then fail. A control that still passes means the tests no
  * longer guard that protection.
@@ -129,4 +130,31 @@ return [
     ['forwarded host and port trusted', 'config/packages/framework.yaml',
         "trusted_headers: ['x-forwarded-for', 'x-forwarded-proto']", "trusted_headers: ['x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-forwarded-port']",
         'SecurityConfigurationTest::testOnlyTheClientAddressAndSchemeAreTakenFromTheEdge'],
+
+    // Membership administration (FCRM-FND-010C, ADR-020).
+    ['last-admin rule not applied', 'src/Organizations/Application/ManageMemberships.php',
+        'if (LastAdminRule::violatedBy($target, $newRole, $this->memberships->activeAdminCount($organizationId))) {', 'if (false) {',
+        'MembershipAdministrationTest::testTheLastAdminCannotBeDemotedOrRemoved|ManageMembershipsTest::testTheLastAdminCannotBeDemotedOrRemoved'],
+    ['membership changes without the organization lock', 'src/Organizations/Application/ManageMemberships.php',
+        'if (!$this->lock->lock($organizationId)) {', 'if (false) {',
+        'MembershipAdministrationTest::testConcurrentDemotionsLeaveExactlyOneAdmin|MembershipAdministrationTest::testTheActorIsCheckedAgainUnderTheLock|ManageMembershipsTest::testTheActorIsCheckedAgainUnderTheLock'],
+    ['actor not checked again under the lock', 'src/Organizations/Application/ManageMemberships.php',
+        'if (!RolePolicy::grants($actor->role(), $permission)) {', 'if (false) {',
+        'MembershipAdministrationTest::testTheActorIsCheckedAgainUnderTheLock|MembershipAdministrationTest::testConcurrentDemotionsLeaveExactlyOneAdmin|ManageMembershipsTest::testTheActorIsCheckedAgainUnderTheLock'],
+    ['MANAGER may change roles', 'src/Organizations/Domain/RolePolicy.php',
+        "'MANAGER' => [Permission::OrganizationView, Permission::MembershipList, Permission::MembershipViewEmail],", "'MANAGER' => [Permission::OrganizationView, Permission::MembershipList, Permission::MembershipViewEmail, Permission::MembershipChangeRole],",
+        'RolePolicyTest|MembershipAdministrationTest::testManagersAndRepsMayNotAdministerMemberships'],
+    ['target membership not scoped to the organization (IDOR)', 'src/Organizations/Infrastructure/Persistence/DoctrineMembershipRepository.php',
+        "findOneBy(['organizationId' => \$organizationId, 'id' => \$membershipId])", "findOneBy(['id' => \$membershipId])",
+        'MembershipAdministrationTest::testAMembershipOfAnotherOrganizationIsNotFound'],
+    ['membership audit event written after the commit', 'src/Organizations/Application/ManageMemberships.php',
+        "            if (null !== \$changed[1]) {\n                \$this->audit->record(\$changed[1]);\n            }\n\n            return \$changed;\n        });\n",
+        "            return \$changed;\n        });\n        if (null !== \$changed[1]) {\n            \$this->audit->record(\$changed[1]);\n        }\n",
+        'MembershipAdministrationTest::testAChangeWhoseAuditEventCannotBeWrittenChangesNothing|ManageMembershipsTest::testAnAdminAddsAnExistingUserUnderTheLock'],
+    ['membership route without a permission', 'src/Organizations/Http/Api/MembershipController.php',
+        "    #[TenantPermission(Permission::MembershipRemove)]\n", '',
+        'RouteSecurityTest::testEveryTenantRouteHasAValidatedOrganizationAndExactlyOnePermission|MembershipAdministrationTest::testManagersAndRepsMayNotAdministerMemberships'],
+    ['role from the body not validated', 'src/Organizations/Http/Api/MembershipController.php',
+        "return MembershipRole::tryFrom(\$value) ?? throw ProblemException::validation([['pointer' => '/role', 'code' => 'INVALID_ROLE']]);", 'return MembershipRole::tryFrom($value) ?? MembershipRole::Admin;',
+        'MembershipAdministrationTest::testInvalidRequestsAreValidationErrors'],
 ];
