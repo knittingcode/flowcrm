@@ -947,6 +947,67 @@ eval "$saved_compose_op"
 eval "$saved_compose"
 ROLES=$saved_roles RUNTIME_DIR=$saved_runtime SECRETS_DIR=$saved_secrets_dir
 
+# --- U-19 edge recovery after a rotation fails closed (FND-009E)
+# restore_edge with fake lower layers: try_edge (Compose), wait_http (the
+# readiness answer), the edge's running state and compose_op stop. Only an
+# edge that answers readiness may serve; otherwise the started edge is
+# stopped, the security gate is recorded again and the command fails.
+saved_fns=$(declare -f try_edge wait_http edge_state compose compose_op)
+# shellcheck disable=SC2031 # read here, in the main shell
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_state=$STATE_STATUS saved_port=$STATE_PORT
+RUNTIME_DIR=$work/u19-runtime GATE_FILE=$work/u19-runtime/security-gate STATE_STATUS=valid STATE_PORT=18555
+mkdir -p "$RUNTIME_DIR"
+# The fake edge's running state is a file: restore_edge runs in a subshell.
+fake_running() { cat "$work/u19-running" 2>/dev/null || echo false; }
+try_edge() { LAST_ERROR="compose output"; LAST_FAILURE="docker compose exited with status 1; its error is shown above"; [ "$FAKE_START" = created ] && echo true >"$work/u19-running"; [ "$FAKE_START" = failed ] && return 2; return "$FAKE_TRY"; }
+wait_http() { [ "$FAKE_READY" = yes ]; }
+edge_state() { EDGE_RUNNING=$(fake_running); }
+compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(fake_running)" = true ] && printf 'edge-id\n'; return 0; }
+compose_op() { [ "$1" = stop ] && { echo false >"$work/u19-running"; printf 'stop\n' >>"$work/u19-calls"; }; return 0; }
+u19() { # name start(created|failed) try-rc ready expected-exit
+  local out r
+  rm -f "$GATE_FILE" "$work/u19-calls" "$work/u19-running"
+  FAKE_START=$2 FAKE_TRY=$3 FAKE_READY=$4
+  out=$( (restore_edge edge "the password of flowcrm_app was rotated and verified") 2>&1)
+  r=$?
+  U19_OUT=$out U19_RUNNING=$(fake_running)
+  U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_STOPS=$(grep -c stop "$work/u19-calls" 2>/dev/null)
+  [ "$r" = "$5" ]
+  result "U-19 $1: exit $5" $? "(got $r: $out)"
+}
+u19 "the edge comes back and answers readiness" created 0 yes 0
+[ -z "$U19_GATE" ] && [ "$U19_RUNNING" = true ] && [ "${U19_STOPS:-0}" = 0 ] && case $U19_OUT in *"serves again on port 18555"*) true ;; *) false ;; esac
+result "U-19 a verified edge serves and no gate is recorded" $?
+u19 "Compose cannot create the edge" failed 2 no "$EX_DOCKER"
+case $U19_GATE in *"was rotated and verified, but the edge did not serve again on port 18555"*) r=0 ;; *) r=1 ;; esac
+[ "$r" = 0 ] && [ "$U19_RUNNING" = false ] && case $U19_OUT in *"compose output"*) true ;; *) false ;; esac
+result "U-19 a failed creation records the gate again, keeps what was done and shows Compose's error" $? "(gate [$U19_GATE])"
+u19 "the edge container runs but is not healthy" created 2 no "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && [ -n "$U19_GATE" ]
+result "U-19 an unhealthy started edge is stopped and the gate recorded" $? "(running $U19_RUNNING, stops $U19_STOPS)"
+u19 "Compose reports success before the edge is ready" created 0 no "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && case $U19_GATE in *"does not answer"*) true ;; *) false ;; esac
+result "U-19 an edge that Compose accepted but that does not answer readiness never serves" $? "(running $U19_RUNNING, gate [$U19_GATE])"
+# serve_edge alone (also used by make up to restore the previous edge after a
+# port failure, where no gate stops the edge): a started edge that does not
+# answer readiness is stopped by serve_edge itself.
+rm -f "$work/u19-calls" "$work/u19-running"
+FAKE_START=created FAKE_TRY=0 FAKE_READY=no
+serve_edge 18555 >/dev/null 2>&1
+r=$?
+[ "$r" = 1 ] && [ "$(fake_running)" = false ] && [ "$(grep -c stop "$work/u19-calls" 2>/dev/null)" = 1 ] &&
+  case $EDGE_FAILURE in *"does not answer"*"the started edge was stopped"*) true ;; *) false ;; esac
+result "U-19 serve_edge stops an edge that does not answer readiness and says so" $? "(r $r, failure [$EDGE_FAILURE])"
+rm -f "$work/u19-calls" "$work/u19-running"
+FAKE_READY=yes
+serve_edge 18555 >/dev/null 2>&1 && [ "$(fake_running)" = true ] && [ ! -e "$work/u19-calls" ]
+result "U-19 serve_edge keeps an edge that answers readiness" $?
+STATE_STATUS=invalid
+u19 "no saved port: nothing to restore" created 0 yes 0
+STATE_STATUS=valid
+eval "$saved_fns"
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate STATE_STATUS=$saved_state STATE_PORT=$saved_port
+
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
   "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1

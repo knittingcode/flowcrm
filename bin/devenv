@@ -921,15 +921,43 @@ protect_for() { # reason
 
 gate_clear() { rm -f "$GATE_FILE"; }
 
-# After a rotation or abort that passed every check: serve again on the saved
-# port if the gate had stopped a serving edge (make up does this itself).
-restore_edge() { # gate-had-edge
-  [ "$1" = edge ] && [ "$STATE_STATUS" = valid ] || return 0
-  if try_edge "$STATE_PORT" && wait_http "$STATE_PORT"; then
-    log "the edge serves again on port $STATE_PORT"
+# Starts the edge on a port and accepts it only when it answers the
+# readiness path with this stack's 200 (docker compose up --wait alone is not
+# proof, see refresh_secret_mounts). An edge that started but is not ready
+# is stopped again (not removed), so it never serves; EDGE_FAILURE says why.
+serve_edge() { # port
+  EDGE_FAILURE=
+  if try_edge "$1"; then
+    wait_http "$1" && return 0
+    EDGE_FAILURE="it does not answer $READY_PATH with 200"
+    LAST_ERROR=
   else
-    log "WARNING: the edge did not start again on port $STATE_PORT; run make up"
+    EDGE_FAILURE=$LAST_FAILURE
   fi
+  edge_state
+  if [ "$EDGE_RUNNING" = true ]; then
+    if compose_op stop "$EDGE" >/dev/null 2>&1; then
+      EDGE_FAILURE="$EDGE_FAILURE; the started edge was stopped"
+    else
+      EDGE_FAILURE="$EDGE_FAILURE; WARNING: the started edge could not be stopped, stop the stack with make down"
+    fi
+  fi
+  return 1
+}
+
+# After a rotation or abort that passed every check and cleared the gate:
+# serve again on the saved port if the gate had stopped a serving edge (make
+# up does this itself). If the edge does not get ready, the gate is recorded
+# again, the edge stays stopped and the command fails: the change itself is
+# complete and verified, and make up serves once the cause is fixed.
+restore_edge() { # gate-had-edge what-was-done
+  [ "$1" = edge ] && [ "$STATE_STATUS" = valid ] || return 0
+  if serve_edge "$STATE_PORT"; then
+    log "the edge serves again on port $STATE_PORT"
+    return 0
+  fi
+  [ -z "$LAST_ERROR" ] || printf '%s\n' "$LAST_ERROR" >&2
+  gate_failed $EX_DOCKER "$2, but the edge did not serve again on port $STATE_PORT (${EDGE_FAILURE:-unknown}); the stack is not served: run make up after fixing the cause (make logs edge api)"
 }
 
 sha256_of() { # file
@@ -1172,10 +1200,10 @@ do_up() {
     COMPOSE_PORT=$restore
     edge_state
     if [ "$EDGE_RUNNING" != true ] || [ "$EDGE_PORT" != "$restore" ]; then
-      if try_edge "$restore"; then
+      if serve_edge "$restore"; then
         log "the previous edge on port $restore was restored"
       else
-        log "WARNING: could not restore the previous edge on port $restore"
+        log "WARNING: could not restore the previous edge on port $restore ($EDGE_FAILURE)"
       fi
     else
       log "the running edge on port $restore was left unchanged"
@@ -1599,7 +1627,7 @@ cmd_rotate_db_password() {
   verify_role_client "$ROT_ROLE"
   gate_clear
   log "rotated the password of flowcrm_$ROT_ROLE"
-  restore_edge "$had_edge"
+  restore_edge "$had_edge" "the password of flowcrm_$ROT_ROLE was rotated and verified"
 }
 
 cmd_rotate_db_password_abort() {
@@ -1620,7 +1648,7 @@ cmd_rotate_db_password_abort() {
   verify_role_client "$ROT_ROLE"
   gate_clear
   log "aborted the rotation of flowcrm_$ROT_ROLE; the database uses the current password again (SCRAM login checked)"
-  restore_edge "$had_edge"
+  restore_edge "$had_edge" "the rotation of flowcrm_$ROT_ROLE was aborted and the current password verified"
 }
 
 main() {
