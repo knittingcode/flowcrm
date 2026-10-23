@@ -12,6 +12,8 @@ const trustedKey = process.env.HTTPS_SPKI;
 
 export default defineConfig({
   testDir: './e2e',
+  // The HTTPS tests need the HTTPS test edge (MODE=https); other runs do not list them.
+  testIgnore: process.env.MODE === 'https' ? [] : ['**/https.spec.ts'],
   forbidOnly: true,
   retries: 0,
   workers: 1,
