@@ -941,26 +941,52 @@ sha256_of() { # file
 # a backup): Docker Desktop shows it as missing, Linux keeps the replaced
 # file. A running db or api whose mounted secrets differ from the host files
 # is recreated. Compared by SHA-256 inside and outside; no value is shown.
+stale_secrets() { # container -> names of mounted secrets that differ from the host files
+  local name host inside stale=''
+  for name in $(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$1" 2>/dev/null | sed -n 's#^/run/secrets/##p'); do
+    host=$(sha256_of "$SECRETS_DIR/$name")
+    inside=$(docker exec "$1" sha256sum "/run/secrets/$name" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$host" ] || [ "$inside" != "$host" ]; then stale="$stale $name"; fi
+  done
+  printf '%s' "${stale# }"
+}
+
+# A recreated service is checked here, not only by docker compose up --wait:
+# Compose 2.38 on Linux was seen to exit 0 when the wait timeout expired
+# while the new container was still starting (FND-009S). Passes only for a
+# new container that is healthy and mounts the current secret files;
+# otherwise RECREATE_STATE says what was found.
+recreated_ok() { # service previous-container
+  local id health stale
+  RECREATE_STATE=
+  id=$(compose ps --quiet "$1" 2>/dev/null | head -n 1)
+  if [ -z "$id" ]; then RECREATE_STATE="no $1 container is running"; return 1; fi
+  if [ "$id" = "$2" ]; then RECREATE_STATE="the $1 container was not replaced"; return 1; fi
+  health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null)
+  if [ "$health" != healthy ]; then RECREATE_STATE="the new $1 container is not healthy (${health:-unknown})"; return 1; fi
+  stale=$(stale_secrets "$id")
+  if [ -n "$stale" ]; then RECREATE_STATE="the new $1 container does not mount the current $stale"; return 1; fi
+}
+
 refresh_secret_mounts() {
-  local svc id name host inside stale rc
+  local svc id stale rc
   [ -n "$ROLES" ] || return 0
   for svc in db api; do
     id=$(compose ps --quiet "$svc" 2>/dev/null | head -n 1)
     [ -n "$id" ] || continue
-    stale=
-    for name in $(docker inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$id" 2>/dev/null | sed -n 's#^/run/secrets/##p'); do
-      host=$(sha256_of "$SECRETS_DIR/$name")
-      inside=$(docker exec "$id" sha256sum "/run/secrets/$name" 2>/dev/null | cut -d' ' -f1)
-      if [ -z "$host" ] || [ "$inside" != "$host" ]; then stale="$stale $name"; fi
-    done
+    stale=$(stale_secrets "$id")
     [ -n "$stale" ] || continue
-    log "recreating $svc: its secret files changed on the host ($stale )"
+    log "recreating $svc: its secret files changed on the host ( $stale )"
     new_tmp compose-err
     compose_op up --detach --wait --wait-timeout "$WAIT_TIMEOUT" --no-deps --force-recreate "$svc" >/dev/null 2>"$TMP_FILE"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       tail -n 20 "$TMP_FILE" >&2
       die $EX_DOCKER "recreating $svc with the current secret files failed: $(compose_failure "$rc"); run make up again after fixing the cause"
+    fi
+    if ! recreated_ok "$svc" "$id"; then
+      tail -n 20 "$TMP_FILE" >&2
+      die $EX_DOCKER "recreating $svc with the current secret files failed: docker compose reported success, but $RECREATE_STATE; run make up again after fixing the cause"
     fi
     rm -f "$TMP_FILE"
     TMP_FILE=
