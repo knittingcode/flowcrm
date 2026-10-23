@@ -45,6 +45,7 @@ final class RequestForgeryTest extends FpmApiTestCase
         self::assertSame(403, $response->status());
         self::assertSame('/problems/csrf-invalid', $response->problem());
         self::assertNull($client->sessionId(), 'no session: the guard ran before json_login');
+        self::assertSame($response->header('X-Request-Id'), $response->value('requestId'), 'the refusal carries its request ID');
     }
 
     /**
@@ -128,6 +129,7 @@ final class RequestForgeryTest extends FpmApiTestCase
         $login = $client->post('/api/v1/auth/login', raw: 'email='.urlencode($user->email).'&password='.urlencode($user->password), params: ['CONTENT_TYPE' => $contentType]);
         self::assertSame(415, $login->status());
         self::assertSame('/problems/unsupported-media-type', $login->problem());
+        self::assertSame($login->header('X-Request-Id'), $login->value('requestId'));
         self::assertNull($client->sessionId());
 
         $client->login($user->email, $user->password);

@@ -31,8 +31,10 @@ final class SecurityLoggingTest extends WebTestCase
         $client->request('POST', '/api/v1/auth/login', server: $server, content: json_encode(['email' => $user->email, 'password' => $user->password], \JSON_THROW_ON_ERROR));
         self::assertResponseStatusCodeSame(200);
         $records = [...$records, ...$this->records()];
-        $client->request('POST', '/api/v1/auth/logout', server: ['CONTENT_TYPE' => 'application/json', 'HTTP_ORIGIN' => 'https://evil.example']);
+        $requestId = '0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c';
+        $client->request('POST', '/api/v1/auth/logout', server: ['CONTENT_TYPE' => 'application/json', 'HTTP_ORIGIN' => 'https://evil.example', 'HTTP_X_REQUEST_ID' => $requestId]);
         self::assertResponseStatusCodeSame(403);
+        self::assertSame($requestId, $client->getResponse()->headers->get('X-Request-Id'));
         $records = [...$records, ...$this->records()];
         $this->disabled($client, $server);
         $disabled = $this->records();
@@ -47,7 +49,9 @@ final class SecurityLoggingTest extends WebTestCase
         self::assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $context['account_ref']);
         self::assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $context['client_ref']);
         self::assertSame($user->id->toRfc4122(), ((array) $this->only($records, 'login succeeded')['context'])['user_id']);
-        self::assertSame('origin_mismatch', ((array) $this->only($records, 'unsafe request rejected')['context'])['reason']);
+        $rejected = $this->only($records, 'unsafe request rejected');
+        self::assertSame('origin_mismatch', ((array) $rejected['context'])['reason']);
+        self::assertSame($requestId, $rejected['request_id'], 'the log record and the answer share the request ID');
 
         self::assertSame('disabled', ((array) $this->only($disabled, 'login failed')['context'])['reason'], 'the log knows why; the answer does not');
 
