@@ -53,8 +53,9 @@ by themselves:
   filter by `organization_id` (FCRM-003 section G; implemented in FND-010B,
   see [authentication](authentication.md#tenant-authorization)). Row-Level Security is a later, separate decision (ADR-004,
   FND-016).
-- Rules across rows, such as the last-admin rule (BR-03) and the stage
-  reorder and archive rules (BR-15), belong to the use cases.
+- Rules across rows, such as the last-admin rule (BR-03; checked under a
+  row lock of the organization, ADR-020) and the stage reorder and archive
+  rules (BR-15), belong to the use cases.
 - Passwords are Argon2id hashes in `users.password_hash`;
   `users.disabled_at` and `users.password_changed_at` end sessions
   ([authentication](authentication.md)). Users are global: no organization
