@@ -184,7 +184,7 @@ $ make test-app       # all of the following
 $ tests/app/backend.sh    # composer validate/audit, PHP-CS-Fixer, PHPStan, migrations, PHPUnit (real PostgreSQL and PHP-FPM), security negative controls, Deptrac
 $ tests/app/frontend.sh   # npm audit, type check, ESLint, Vitest, production build
 $ tests/app/stack.sh      # real stack via bin/devenv: routing, health, persistence, isolation, browser
-$ tests/app/prodlike.sh   # production-like stack: built SPA, caching, CSP, browser
+$ tests/app/prodlike.sh   # production-like stack: built SPA, caching, CSP, browser, HTTPS in a real browser
 $ tests/app/scan.sh       # Trivy scan: runtime images must have no HIGH/CRITICAL findings
 ```
 

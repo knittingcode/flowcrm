@@ -437,8 +437,6 @@ memberships are read on every request):
   `DoctrineDbalAdapter` on that connection).
 - Never cache authorization or membership decisions across requests
   (FCRM-003: the tenant resolver checks the membership on every request).
-- Verify `Secure` and the `__Host-` prefix in a real browser over HTTPS (see
-  below); no environment here terminates TLS.
 
 ## Known limitations
 
@@ -452,6 +450,7 @@ memberships are read on every request):
   `INT` columns, as Symfony's components define them; Unix times exceed them
   in January 2038. This follows the framework's schema and is tracked
   upstream.
-- How browsers treat the `Secure` `__Host-flowcrm_sid` cookie over HTTPS is
-  not verified end to end: the stacks here run over plain HTTP. The
-  production-like stack checks the cookie's attributes with curl (PL-16).
+- The `Secure` `__Host-flowcrm_sid` cookie is verified in Chromium over
+  HTTPS with TLS terminated by the edge and a test certificate
+  (`tests/app/prodlike.sh` PL-21, [authentication](authentication.md#https-and-proxies));
+  a deployment's own TLS configuration does not exist yet.

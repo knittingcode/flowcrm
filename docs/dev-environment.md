@@ -456,12 +456,16 @@ Application suites (`tests/app/`), each in its own Compose projects:
   another origin and with a form body, spoofed `X-Forwarded-For` that cannot
   evade the login limit, no secrets in any log, and the logged-in browser
   journeys (roles, two organizations, a foreign organization, CSRF).
-- `prodlike.sh` (PL-01 to PL-16): the production images (`<project>-prod`,
+- `prodlike.sh` (PL-01 to PL-22): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey
   under the CSP, lazy sessions in production mode, the `migrate` job
   completing as the owner before the api starts, and the production session
-  cookie (`__Host-`, `Secure`) of a login.
+  cookie (`__Host-`, `Secure`) of a login. Then the edge is recreated with
+  the HTTPS test sites of `tests/app/https` (a throwaway certificate made
+  with `openssl` per run): the production cookie, the logged-in journeys and
+  cross-site forgeries in Chromium over TLS, spoofed forwarding headers, no
+  CORS, and a TLS proxy the edge does not trust failing closed.
 
 Each application suite uses Compose project and image names unique to the
 run, so several runs from one checkout do not interfere.
