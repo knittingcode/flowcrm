@@ -244,7 +244,7 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertSame($secondMembership->toRfc4122(), $demoted->value('membershipId'));
         $events = $this->events($secondMembership);
         self::assertSame(['membership.role_changed'], array_column($events, 'action'));
-        self::assertSame(['roleFrom' => 'ADMIN', 'roleTo' => 'MANAGER'], $events[0]['changes']);
+        self::assertEquals(['roleFrom' => 'ADMIN', 'roleTo' => 'MANAGER'], $events[0]['changes'], 'jsonb does not keep the key order');
         self::assertSame($demoted->header('X-Request-Id'), $events[0]['request_id']);
         self::assertSame('ADMIN', $events[0]['actor_role']);
 
@@ -494,12 +494,16 @@ final class MembershipAdministrationTest extends FpmApiTestCase
 
     /**
      * Polls for up to ten seconds until $expected backends wait for a row
-     * lock taken with the organization lock's statement.
+     * lock taken with the organization lock's statement. The observer is
+     * inside a transaction, which keeps one pg_stat_activity snapshot until
+     * it is cleared.
      */
     private function requestsWaitingForTheOrganizationLock(\PDO $observer, int $expected): int
     {
+        $clear = $observer->prepare('SELECT pg_stat_clear_snapshot()');
         $statement = $observer->prepare("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE 'SELECT id FROM organizations WHERE id = % FOR UPDATE'");
         for ($i = 0;; ++$i) {
+            $clear->execute();
             $statement->execute();
             $count = (int) $statement->fetchColumn();
             if ($count >= $expected || $i >= 100) {
