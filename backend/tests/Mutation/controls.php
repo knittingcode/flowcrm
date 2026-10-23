@@ -76,6 +76,10 @@ return [
         "        if (\$request->hasPreviousSession()) {\n            \$request->getSession()->invalidate();\n        }\n", '',
         'AuthenticationTest::testLogoutEndsTheSessionOnTheServer'],
 
+    ['a 401 stores a session (anonymous traffic fills the table)', 'src/Identity/Http/Security/ProblemEntryPoint.php',
+        '$this->removeTargetPath($request->getSession(), self::FIREWALL);', '',
+        'AuthenticationTest::testAnonymousSessionIntrospectionStartsNoSession|AuthenticationTest::testAnUnknownSessionIdIsAnsweredWithoutStoringASession'],
+
     // Request forgery.
     ['Origin not checked', 'src/Shared/Http/Security/RequestOriginGuard.php',
         'if ($origin !== $request->getSchemeAndHttpHost()) {', 'if (false) {',

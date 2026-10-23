@@ -8,6 +8,7 @@ use App\Tests\Support\Http\ApiClient;
 use App\Tests\Support\Http\FpmApiTestCase;
 use App\Tests\Support\Security\Fixtures;
 use App\Tests\Support\Session\FpmServer;
+use Symfony\Component\Uid\Uuid;
 
 /**
  * Login, logout, session lifetime and invalidation over the real PHP-FPM,
@@ -131,6 +132,26 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertSame(401, $me->status());
         self::assertSame('/problems/unauthenticated', $me->problem());
         self::assertSame(['type', 'title', 'status', 'instance', 'requestId'], array_keys($me->json()), 'no data in a 401');
+        self::assertSame([], $me->raw->header('Set-Cookie'), 'a 401 starts no session');
+        self::assertSame($sessions, $this->sessionCount(), 'a 401 stores no session');
+    }
+
+    /**
+     * An unknown, expired or ended session ID is no login: the 401 stores
+     * nothing (not even where the visitor wanted to go) and drops the cookie,
+     * so anonymous traffic cannot fill the sessions table.
+     */
+    public function testAnUnknownSessionIdIsAnsweredWithoutStoringASession(): void
+    {
+        $sessions = $this->sessionCount();
+        $client = $this->client();
+        $client->useSessionId(bin2hex(random_bytes(16)));
+
+        $me = $client->get('/api/v1/organizations/'.Uuid::v7()->toRfc4122().'/members');
+
+        self::assertSame(401, $me->status());
+        self::assertNull($client->sessionId(), 'the cookie is expired');
+        self::assertSame($sessions, $this->sessionCount());
     }
 
     /** FCRM-002 AC-27: a replayed cookie after logout is a 401. */
