@@ -100,14 +100,28 @@ dump and scratch database. No other session is touched.
 **Protection before every change.** Before `bin/devenv` changes roles,
 passwords, ownership or grants (role corrections, migrations, the upgrade,
 a rotation or its abort), it records the security gate in
-`.runtime/security-gate` (atomic rename), stops a running edge and checks
-that it stopped; only then does the change start. A command that dies from
+`.runtime/gate/security-gate` (atomic rename, readable by the edge), stops
+a running edge and checks that it stopped; only then does the change start. A command that dies from
 then on, even by SIGKILL, which runs no handler, leaves the stack blocked:
 no edge serves, `make status` and `make url` report `blocked`, and a change
 that commits later is still not served. The gate is removed only by a
 command that finished with every check passed (credentials, roles,
 migrations, runtime privileges); a rotation or abort then starts the edge
-it had stopped, `make up` does so itself. `make up` changes nothing
+it had stopped, `make up` does so itself.
+
+**The edge enforces the gate (FND-009E).** The gate directory is mounted
+read-only into the edge (`/run/flowcrm-gate`). While the gate file exists,
+the edge answers every request with 503 ("blocked by its security gate"),
+except exactly `/health/live` and `/health/ready` (raw request URI, as in
+ADR-017), so its own health check and the readiness check through it still
+work and the gate never deadlocks a recovery. The gate is therefore a
+runtime barrier, not only a record: an edge that runs while the gate is
+recorded serves nothing else, whoever started it and whatever happened to
+the command. Stacks that `bin/devenv` does not run (production-like, tests)
+mount the empty `docker/edge/no-gate` instead. The directory is 0755 and
+the record 0644: an edge that could not read the gate would serve, so
+`bin/devenv` checks, before it relies on the barrier, that the edge
+answers `/` with the gate's 503. `make up` changes nothing
 needlessly: it first checks, read-only, whether the role attributes and
 privileges need corrections (the corrections run in a transaction that is
 always rolled back, and catalog fingerprints are compared), and protects
@@ -235,7 +249,7 @@ A state machine whose state is the files in `.runtime/secrets`:
 | 4 promoted | pending replaced the current file (atomic `mv`, `0444`) | pending = current |
 | 5 refreshed | `db` and `api` recreated because they mount the replaced file; each new container checked: healthy and mounting the current file | |
 | 6 verified | the api's own connection (app) or the migrate job (owner) logged in; privileges match | |
-| 7 served | the gate is cleared; an edge that was serving before is started again and must answer `/health/ready` with this stack's 200 | |
+| 7 served | an edge that was serving before is started while the gate is still recorded; it must answer `/` with the gate's 503 and `/health/ready` with this stack's 200; only then is the gate cleared | |
 
 - Interrupted (SIGINT, SIGTERM) or failed in states 1-3: the pending file
   is kept. `make db-rotate-password ROLE=…` finishes the rotation with it;
@@ -250,12 +264,22 @@ A state machine whose state is the files in `.runtime/secrets`:
   the stack stays blocked and the edge does not serve; the password and the
   file agree; `make up` recreates the containers that still mount the old
   file, after the cause is fixed.
+- Interrupted in state 7, by any signal including SIGKILL: the gate is
+  still recorded. Before the edge started, nothing listens; after it
+  started, it serves only its health paths. `make status` and `make url`
+  report `blocked`; `make up` checks everything again, clears the gate and
+  keeps (or starts) the edge once it answers readiness. Running it again is
+  safe at any point.
 - Verified, but the edge does not serve again (state 7; for example the api
   is not ready): the command exits 2, the edge it started is stopped (not
   removed), and the security gate is recorded again with the reason, so
   nothing is served and `make status` reports the stack as blocked. The
   password change itself is complete and verified; `make up` serves once the
-  cause is fixed.
+  cause is fixed. If the started edge cannot be stopped either, the command
+  still fails with the original reason and says so; it says that the edge
+  is blocked only when it saw the edge answer with the gate's 503, and
+  otherwise asks to stop the stack with `make down` (which removes the
+  containers and keeps the volumes).
 - A password change waiting inside PostgreSQL when the command is
   interrupted is cancelled and rolled back (operation lifetime, above).
 - Passwords are never printed or passed on a command line; nothing falls
