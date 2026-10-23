@@ -957,7 +957,10 @@ restore_edge() { # gate-had-edge what-was-done
     return 0
   fi
   [ -z "$LAST_ERROR" ] || printf '%s\n' "$LAST_ERROR" >&2
-  gate_failed $EX_DOCKER "$2, but the edge did not serve again on port $STATE_PORT (${EDGE_FAILURE:-unknown}); the stack is not served: run make up after fixing the cause (make logs edge api)"
+  # The edge was serving before: keep that in the gate, so the next rotation
+  # or abort brings it back too (gate_failed keeps an existing "edge" line).
+  printf 'restoring the edge\nedge\n' >"$GATE_FILE" 2>/dev/null
+  gate_failed $EX_DOCKER "$2, but the edge did not serve again on port $STATE_PORT (${EDGE_FAILURE:-unknown}); the stack is not served: run make up once fixed (make logs edge api)"
 }
 
 sha256_of() { # file
@@ -1203,6 +1206,7 @@ do_up() {
       if serve_edge "$restore"; then
         log "the previous edge on port $restore was restored"
       else
+        [ -z "$LAST_ERROR" ] || printf '%s\n' "$LAST_ERROR" >&2
         log "WARNING: could not restore the previous edge on port $restore ($EDGE_FAILURE)"
       fi
     else

@@ -959,11 +959,11 @@ RUNTIME_DIR=$work/u19-runtime GATE_FILE=$work/u19-runtime/security-gate STATE_ST
 mkdir -p "$RUNTIME_DIR"
 # The fake edge's running state is a file: restore_edge runs in a subshell.
 fake_running() { cat "$work/u19-running" 2>/dev/null || echo false; }
-try_edge() { LAST_ERROR="compose output"; LAST_FAILURE="docker compose exited with status 1; its error is shown above"; [ "$FAKE_START" = created ] && echo true >"$work/u19-running"; [ "$FAKE_START" = failed ] && return 2; return "$FAKE_TRY"; }
+try_edge() { printf 'try\n' >>"$work/u19-calls"; LAST_ERROR="compose output"; LAST_FAILURE="docker compose exited with status 1; its error is shown above"; [ "$FAKE_START" = created ] && echo true >"$work/u19-running"; [ "$FAKE_START" = failed ] && return 2; return "$FAKE_TRY"; }
 wait_http() { [ "$FAKE_READY" = yes ]; }
 edge_state() { EDGE_RUNNING=$(fake_running); }
 compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(fake_running)" = true ] && printf 'edge-id\n'; return 0; }
-compose_op() { [ "$1" = stop ] && { echo false >"$work/u19-running"; printf 'stop\n' >>"$work/u19-calls"; }; return 0; }
+compose_op() { [ "$1" = stop ] && { echo false >"$work/u19-running"; printf 'stop %s\n' "$2" >>"$work/u19-calls"; }; return 0; }
 u19() { # name start(created|failed) try-rc ready expected-exit
   local out r
   rm -f "$GATE_FILE" "$work/u19-calls" "$work/u19-running"
@@ -971,7 +971,8 @@ u19() { # name start(created|failed) try-rc ready expected-exit
   out=$( (restore_edge edge "the password of flowcrm_app was rotated and verified") 2>&1)
   r=$?
   U19_OUT=$out U19_RUNNING=$(fake_running)
-  U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_STOPS=$(grep -c stop "$work/u19-calls" 2>/dev/null)
+  U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_STOPS=$(grep -c '^stop' "$work/u19-calls" 2>/dev/null)
+  U19_GATE_EDGE=$(grep -cx edge "$GATE_FILE" 2>/dev/null) U19_OTHER_STOPS=$(grep '^stop' "$work/u19-calls" 2>/dev/null | grep -vcx "stop $EDGE")
   [ "$r" = "$5" ]
   result "U-19 $1: exit $5" $? "(got $r: $out)"
 }
@@ -983,8 +984,10 @@ case $U19_GATE in *"was rotated and verified, but the edge did not serve again o
 [ "$r" = 0 ] && [ "$U19_RUNNING" = false ] && case $U19_OUT in *"compose output"*) true ;; *) false ;; esac
 result "U-19 a failed creation records the gate again, keeps what was done and shows Compose's error" $? "(gate [$U19_GATE])"
 u19 "the edge container runs but is not healthy" created 2 no "$EX_DOCKER"
-[ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && [ -n "$U19_GATE" ]
-result "U-19 an unhealthy started edge is stopped and the gate recorded" $? "(running $U19_RUNNING, stops $U19_STOPS)"
+[ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && [ "$U19_OTHER_STOPS" = 0 ] && case $U19_GATE in *"did not serve again"*) true ;; *) false ;; esac
+result "U-19 an unhealthy started edge is stopped (only the edge) and the gate recorded" $? "(running $U19_RUNNING, stops $U19_STOPS, other $U19_OTHER_STOPS)"
+[ "$U19_GATE_EDGE" = 1 ]
+result "U-19 the gate keeps that the edge was serving, so the next rotation brings it back" $? "(edge lines $U19_GATE_EDGE)"
 u19 "Compose reports success before the edge is ready" created 0 no "$EX_DOCKER"
 [ "$U19_RUNNING" = false ] && [ "$U19_STOPS" -ge 1 ] && case $U19_GATE in *"does not answer"*) true ;; *) false ;; esac
 result "U-19 an edge that Compose accepted but that does not answer readiness never serves" $? "(running $U19_RUNNING, gate [$U19_GATE])"
@@ -995,15 +998,17 @@ rm -f "$work/u19-calls" "$work/u19-running"
 FAKE_START=created FAKE_TRY=0 FAKE_READY=no
 serve_edge 18555 >/dev/null 2>&1
 r=$?
-[ "$r" = 1 ] && [ "$(fake_running)" = false ] && [ "$(grep -c stop "$work/u19-calls" 2>/dev/null)" = 1 ] &&
+[ "$r" = 1 ] && [ "$(fake_running)" = false ] && [ "$(grep -cx "stop $EDGE" "$work/u19-calls" 2>/dev/null)" = 1 ] &&
   case $EDGE_FAILURE in *"does not answer"*"the started edge was stopped"*) true ;; *) false ;; esac
 result "U-19 serve_edge stops an edge that does not answer readiness and says so" $? "(r $r, failure [$EDGE_FAILURE])"
 rm -f "$work/u19-calls" "$work/u19-running"
 FAKE_READY=yes
-serve_edge 18555 >/dev/null 2>&1 && [ "$(fake_running)" = true ] && [ ! -e "$work/u19-calls" ]
+serve_edge 18555 >/dev/null 2>&1 && [ "$(fake_running)" = true ] && ! grep -q '^stop' "$work/u19-calls"
 result "U-19 serve_edge keeps an edge that answers readiness" $?
 STATE_STATUS=invalid
 u19 "no saved port: nothing to restore" created 0 yes 0
+[ ! -e "$work/u19-calls" ] && [ ! -e "$GATE_FILE" ]
+result "U-19 without a saved port no edge is started and no gate written" $?
 STATE_STATUS=valid
 eval "$saved_fns"
 RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate STATE_STATUS=$saved_state STATE_PORT=$saved_port
