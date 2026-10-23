@@ -209,6 +209,14 @@ therefore compare the SHA-256 of every secret the running `db` and `api`
 mount with the host file and recreate a container whose mount differs (no
 value is printed). Restoring a secret from a backup is followed by `make up`.
 
+A recreation counts only when it is checked: `docker compose up --wait`
+alone is not proof. Compose 2.38 on Linux was seen to exit 0 when its wait
+timeout expired while the new container was still starting (FND-009S, about
+one in five recreations of an api that never got healthy). After Compose
+returns, devenv therefore requires a new container (another ID) that is
+`healthy` and mounts the current secret files; otherwise the command fails
+with exit 2 and the security gate stays, so the edge does not serve.
+
 ### Rotation (development only)
 
 ```console
@@ -225,7 +233,7 @@ A state machine whose state is the files in `.runtime/secrets`:
 | 2 database | pending | the pending password (set by the superuser from standard input) |
 | 3 login | pending | a SCRAM login with it succeeded (over TCP; a wrong password is refused first) |
 | 4 promoted | pending replaced the current file (atomic `mv`, `0444`) | pending = current |
-| 5 refreshed | `db` and `api` recreated because they mount the replaced file | |
+| 5 refreshed | `db` and `api` recreated because they mount the replaced file; each new container checked: healthy and mounting the current file | |
 | 6 verified | the api's own connection (app) or the migrate job (owner) logged in; privileges match | |
 
 - Interrupted (SIGINT, SIGTERM) or failed in states 1-3: the pending file
@@ -237,8 +245,10 @@ A state machine whose state is the files in `.runtime/secrets`:
   While the database has the pending password and the files the current
   one, the api cannot log in (readiness 503) until one of the two runs.
 - Interrupted or failed after state 4 (for example the api does not get
-  healthy again): the password and the file agree; `make up` recreates the
-  containers that still mount the old file, after the cause is fixed.
+  healthy again, whatever Compose's exit status says): the command exits 2,
+  the stack stays blocked and the edge does not serve; the password and the
+  file agree; `make up` recreates the containers that still mount the old
+  file, after the cause is fixed.
 - A password change waiting inside PostgreSQL when the command is
   interrupted is cancelled and rolled back (operation lifetime, above).
 - Passwords are never printed or passed on a command line; nothing falls

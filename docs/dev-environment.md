@@ -76,7 +76,9 @@ and leaves `.runtime/dev.env` unchanged:
    port;
 6. recreate a running `db` or `api` whose mounted secret files differ from
    the files in `.runtime/secrets` (a file replaced on the host is not seen
-   by a running container; application stack only), then apply pending
+   by a running container; application stack only), and check that each new
+   container is healthy and mounts the current files (Compose's own wait can
+   report success too early, ADR-018), then apply pending
    database migrations (when role corrections or migrations are needed, a
    running edge is stopped and the security gate recorded first, see
    ADR-018) in a one-off `migrate` container
@@ -475,7 +477,11 @@ run, so several runs from one checkout do not interfere.
   the lock (stale, reused-PID, foreign-host, reap-guard, legacy and
   malformed records; real lock holders in other locales and time zones; a
   recorded child that survives `SIGKILL` of its owner; a recorded leader
-  whose descendant outlives it; signal forwarding), the Makefile interface
+  whose descendant outlives it; signal forwarding), the check of a
+  recreated container after a secret change (with fake Compose and Docker:
+  a container still starting, unhealthy, without a health check, not
+  replaced or mounting an old secret is refused, also when Compose reported
+  success), the Makefile interface
   (targets and the commands they run) and checks that the result tally
   detects failed and lost results.
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
