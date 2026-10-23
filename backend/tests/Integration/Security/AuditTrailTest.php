@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Security;
 
+use App\Tests\Support\Database\TestDatabase;
 use App\Tests\Support\Http\FpmApiTestCase;
+use App\Tests\Support\Security\Fixtures;
+use App\Tests\Support\Security\TestUser;
 use Symfony\Component\Uid\Uuid;
 
 /**
@@ -77,6 +80,128 @@ final class AuditTrailTest extends FpmApiTestCase
         }
         self::assertSame('{"role": "ADMIN"}', $rows[2]['changes']);
         self::assertStringNotContainsString('a provisioned passphrase', json_encode($rows, \JSON_THROW_ON_ERROR));
+    }
+
+    /** Without its audit event there is no login: no session, no cookie that authenticates. */
+    public function testALoginWhoseAuditEventCannotBeWrittenFails(): void
+    {
+        $user = $this->fixtures->user('audit-down-login');
+        $sessions = $this->sessionCount();
+        $client = $this->client();
+
+        $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/auth/login', ['email' => $user->email, 'password' => $user->password]));
+
+        self::assertSame(500, $response->status());
+        self::assertSame($response->header('X-Request-Id'), $response->value('requestId'));
+        self::assertArrayNotHasKey('csrfToken', $response->json());
+        self::assertSame(401, $client->get('/api/v1/me')->status(), 'whatever cookie the client kept does not authenticate');
+        self::assertSame($sessions, $this->sessionCount(), 'no session is stored');
+        self::assertSame([], $this->events($user->id));
+        $this->client()->login($user->email, $user->password);
+    }
+
+    /** A logout ends the session even when its audit event cannot be written. */
+    public function testALogoutEndsTheSessionEvenWhenItsAuditEventCannotBeWritten(): void
+    {
+        $user = $this->fixtures->user('audit-down-logout');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $id = (string) $client->sessionId();
+
+        $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/auth/logout'));
+
+        self::assertSame(500, $response->status());
+        self::assertNull($this->sessionData($id), 'the session row is deleted');
+        $replay = $this->client();
+        $replay->useSessionId($id);
+        self::assertSame(401, $replay->get('/api/v1/me')->status());
+        self::assertSame(['auth.login_succeeded'], array_column($this->events($user->id), 'action'));
+    }
+
+    /** The password and its audit event are one transaction: without the event nothing changes. */
+    public function testAPasswordChangeWhoseAuditEventCannotBeWrittenChangesNothing(): void
+    {
+        $user = $this->fixtures->user('audit-down-password');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $other = $this->client();
+        $other->login($user->email, $user->password);
+        $id = (string) $client->sessionId();
+
+        $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/me/password', ['currentPassword' => $user->password, 'newPassword' => 'a never stored passphrase']));
+
+        self::assertSame(500, $response->status());
+        self::assertSame($id, $client->sessionId(), 'the session keeps its ID');
+        self::assertSame(200, $client->get('/api/v1/me')->status());
+        self::assertSame(200, $other->get('/api/v1/me')->status(), 'the other sessions continue: the credentials did not change');
+        self::assertSame(401, $this->client()->post('/api/v1/auth/login', ['email' => $user->email, 'password' => 'a never stored passphrase'])->status());
+        $this->client()->login($user->email, $user->password);
+        self::assertNotContains('auth.password_changed', array_column($this->events($user->id), 'action'));
+    }
+
+    /** Operator changes and their audit events are one transaction too. */
+    public function testOperatorChangesWhoseAuditEventCannotBeWrittenChangeNothing(): void
+    {
+        $user = $this->fixtures->user('audit-down-operator');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+
+        $this->whileAuditFailsFor($user, function () use ($user): void {
+            self::assertNotSame(0, $this->safeConsole('flowcrm:user:disable', ['email' => $user->email]));
+            self::assertNotSame(0, $this->safeConsole('flowcrm:user:reset-password', ['email' => $user->email], 'a never stored passphrase'));
+        });
+
+        self::assertNull($this->fixtures->connection()->fetchOne('SELECT disabled_at FROM users WHERE id = ?', [$user->id->toRfc4122()]));
+        self::assertSame(200, $client->get('/api/v1/me')->status(), 'neither disabled nor a new password');
+        self::assertSame(['auth.login_succeeded'], array_column($this->events($user->id), 'action'));
+    }
+
+    /**
+     * Runs $action while every audit event about $user fails to be written
+     * (a trigger of the schema owner, removed afterwards).
+     *
+     * @template T
+     *
+     * @param callable(): T $action
+     *
+     * @return T
+     */
+    private function whileAuditFailsFor(TestUser $user, callable $action): mixed
+    {
+        $owner = TestDatabase::owner();
+        $owner->executeStatement("CREATE OR REPLACE FUNCTION test_audit_unavailable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit storage unavailable (test)'; END $$");
+        $owner->executeStatement(\sprintf("CREATE TRIGGER test_audit_unavailable BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.entity_id = '%s') EXECUTE FUNCTION test_audit_unavailable()", $user->id->toRfc4122()));
+        try {
+            return $action();
+        } finally {
+            $owner->executeStatement('DROP TRIGGER test_audit_unavailable ON audit_events');
+            $owner->executeStatement('DROP FUNCTION test_audit_unavailable()');
+            $owner->close();
+        }
+    }
+
+    /**
+     * An operator command whose failure is an exception or an exit code.
+     *
+     * @param array<string, string> $input
+     */
+    private function safeConsole(string $name, array $input, ?string $stdin = null): int
+    {
+        try {
+            $status = $this->console($name, $input, $stdin)->getStatusCode();
+        } catch (\Throwable) {
+            $status = 1;
+        }
+        // The failed flush closed the kernel's entity manager.
+        self::bootKernel();
+        $this->fixtures = Fixtures::from(self::getContainer());
+
+        return $status;
+    }
+
+    private function sessionCount(): int
+    {
+        return self::int($this->fixtures->connection()->fetchOne('SELECT count(*) FROM sessions'));
     }
 
     /** @return list<array<string, mixed>> */

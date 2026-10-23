@@ -80,6 +80,17 @@ return [
         '$this->removeTargetPath($request->getSession(), self::FIREWALL);', '',
         'AuthenticationTest::testAnonymousSessionIntrospectionStartsNoSession|AuthenticationTest::testAnUnknownSessionIdIsAnsweredWithoutStoringASession'],
 
+    // Audit (transaction boundaries: no sensitive change without its event).
+    ['a login whose audit event failed keeps its session', 'src/Identity/Http/Security/LoginAuditListener.php',
+        "            \$this->tokens->setToken(null);\n            if (\$request->hasSession()) {\n                \$request->getSession()->invalidate();\n            }\n\n            throw \$e;", '            throw $e;',
+        'AuditTrailTest::testALoginWhoseAuditEventCannotBeWrittenFails'],
+    ['logout audited before the session ends', 'src/Identity/Http/Api/AuthController.php',
+        "        // The session ends first: a failing audit write must not keep it alive.\n", "        if (null !== \$userId) {\n            \$this->audit->record(new AuditRecord('auth.logout', 'user', \$userId, Actor::user(\$userId), requestId: Uuid::fromString(RequestId::of(\$request))));\n        }\n",
+        'AuditTrailTest::testALogoutEndsTheSessionEvenWhenItsAuditEventCannotBeWritten'],
+    ['password changed outside the audit transaction', 'src/Identity/Application/ChangeOwnPassword.php',
+        "        \$this->transaction->run(function () use (\$user, \$hash, \$requestId): void {\n            \$user->changePassword(\$hash, \$this->clock->now());\n", "        \$this->transaction->run(fn () => \$user->changePassword(\$hash, \$this->clock->now()));\n        \$this->transaction->run(function () use (\$user, \$requestId): void {\n",
+        'AuditTrailTest::testAPasswordChangeWhoseAuditEventCannotBeWrittenChangesNothing'],
+
     // Request forgery.
     ['Origin not checked', 'src/Shared/Http/Security/RequestOriginGuard.php',
         'if ($origin !== $request->getSchemeAndHttpHost()) {', 'if (false) {',
