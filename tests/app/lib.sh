@@ -82,3 +82,34 @@ net_curl() {
   shift
   docker run --rm --network "$net" "$APP_CURL_IMAGE" -sS --max-time 10 "$@"
 }
+
+# Synthetic demonstration data through the operator console of an api
+# container (FND-010B): users admin, rep, multi and other (.test addresses
+# with a random part), organization A (admin ADMIN, rep REP, multi REP) and
+# B (other ADMIN, multi MANAGER). Passwords go to the console's standard
+# input, never into an argument. Writes the E2E_* variables for the browser
+# tests into ENV-FILE (which holds the synthetic password: keep it in the
+# runner's work directory). Values have no spaces: the file is both sourced
+# by bash and read by docker --env-file.
+seed_e2e() { # env-file api-container
+  local env=$1 api=$2 password suffix who org_a org_b
+  password=$(random_secret)
+  suffix=$(random_secret | cut -c1-8)
+  console() { docker exec -i "$api" php bin/console --no-interaction "$@"; }
+  for who in Admin Rep Multi Other; do
+    printf '%s\n' "$password" |
+      console flowcrm:user:create --email="$(printf '%s' "$who" | tr '[:upper:]' '[:lower:]')-$suffix@example.test" --display-name="$who Tester" >/dev/null || return 1
+  done
+  org_a=$(console flowcrm:organization:create --name="Alpha-$suffix" --admin-email="admin-$suffix@example.test") || return 1
+  org_b=$(console flowcrm:organization:create --name="Beta-$suffix" --admin-email="other-$suffix@example.test") || return 1
+  console flowcrm:membership:add --organization="$org_a" --email="rep-$suffix@example.test" --role=REP >/dev/null &&
+    console flowcrm:membership:add --organization="$org_a" --email="multi-$suffix@example.test" --role=REP >/dev/null &&
+    console flowcrm:membership:add --organization="$org_b" --email="multi-$suffix@example.test" --role=MANAGER >/dev/null || return 1
+  (umask 077 && printf '%s\n' \
+    "E2E_PASSWORD=$password" \
+    "E2E_ADMIN_EMAIL=admin-$suffix@example.test" \
+    "E2E_REP_EMAIL=rep-$suffix@example.test" \
+    "E2E_MULTI_EMAIL=multi-$suffix@example.test" \
+    "E2E_ORG_A=$org_a" "E2E_ORG_A_NAME=Alpha-$suffix" \
+    "E2E_ORG_B=$org_b" "E2E_ORG_B_NAME=Beta-$suffix" >"$env")
+}

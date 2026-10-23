@@ -156,6 +156,27 @@ verify_rc=$?
 [ "$migrate_exit" = 0 ] && [[ $migrate_end < $api_start ]] && [ "$api_secrets" = "app_secret db_app_password " ] && [ "$verify_rc" = 0 ]
 v "PL-15 migrations ran as the owner before the api; the api runs as flowcrm_app with only its own secret" $? "migrate exit $migrate_exit at $migrate_end, api from $api_start, secrets: $api_secrets, verify: $(tail -n 1 "$work/verify.log")"
 
+# Production session cookie (FND-010B): __Host- prefix, Secure, HttpOnly,
+# SameSite=Lax, Path=/, no Domain. Checked with curl: over the plain HTTP of
+# this stack a browser would refuse the Secure cookie, so the logged-in
+# browser journeys run in the dev stack (stack.sh ST-16).
+need "seed synthetic users and organizations with the operator console" seed_e2e "$work/e2e.env" "$(dc ps -q api | head -n 1)" && {
+  # shellcheck disable=SC1091 # written by seed_e2e
+  . "$work/e2e.env"
+  printf '{"email":"%s","password":"%s"}' "$E2E_REP_EMAIL" "$E2E_PASSWORD" |
+    docker run --rm -i --network "$net" "$APP_CURL_IMAGE" -sS --max-time 10 -o /dev/null -D - -w 'status=%{http_code}\n' \
+      -H 'Content-Type: application/json' -H 'Origin: http://edge:8080' --data-binary @- http://edge:8080/api/v1/auth/login >"$work/login.headers" 2>&1
+  cookie=$(tr -d '\r' <"$work/login.headers" | sed -n 's/^set-cookie: //Ip' | tail -n 1 | tr '[:upper:]' '[:lower:]')
+  sid=${cookie#__host-flowcrm_sid=}
+  sid=${sid%%;*}
+  grep -q '^status=200$' "$work/login.headers" && case $cookie in __host-flowcrm_sid=*) true ;; *) false ;; esac &&
+    case $cookie in *'; path=/'*) true ;; *) false ;; esac && case $cookie in *'; secure'*) true ;; *) false ;; esac &&
+    case $cookie in *'; httponly'*) true ;; *) false ;; esac && case $cookie in *'; samesite=lax'*) true ;; *) false ;; esac &&
+    case $cookie in *domain=*) false ;; *) true ;; esac &&
+    [ "$(net_curl "$net" -o /dev/null -w '%{http_code}' -H "Cookie: __Host-flowcrm_sid=$sid" http://edge:8080/api/v1/me)" = 200 ]
+  v "PL-16 production login: __Host-flowcrm_sid with Secure, HttpOnly, SameSite=Lax, Path=/ and no Domain; the session authenticates" $? "$cookie"
+}
+
 need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2e/Dockerfile" -t "$e2e_image" "$APP_REPO" >/dev/null && {
   docker run --rm --network "$net" -e BASE_URL=http://edge:8080 -e MODE=prod "$e2e_image" >"$work/browser.out" 2>&1
   r=$?

@@ -176,10 +176,18 @@ hold_port() { # port -> sets HOLDER
   [ -e "$ready" ]
 }
 
-browser() { # dir mode label: Playwright in the project's front network
-  docker run --rm --network "$(project_of "$1")_front" -e BASE_URL=http://edge:8080 -e MODE="$2" "$e2e_image" \
+browser() { # dir mode label: Playwright in the project's front network, with the seeded E2E_* users
+  local seeded=()
+  [ ! -f "$work/e2e.env" ] || seeded=(--env-file "$work/e2e.env")
+  docker run --rm --network "$(project_of "$1")_front" -e BASE_URL=http://edge:8080 -e MODE="$2" "${seeded[@]}" "$e2e_image" \
     >"$work/out/$3.out" 2>&1
 }
+# The JSON body of a login (written to a private file: no password in argv).
+login_json() { # email password -> sets LOGIN (file)
+  LOGIN=$work/login.json
+  (umask 077 && printf '{"email":"%s","password":"%s"}' "$1" "$2" >"$LOGIN")
+}
+json_field() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$BODY" "$1" 2>/dev/null; }
 
 say "== application stack tests: range $LO-$HI, work dir $work"
 
@@ -357,13 +365,73 @@ dv a-url "$A" url
   [ "$(rc_of a-url)" = 0 ] && [ "$(cat "$work/out/a-url.out")" = "http://127.0.0.1:$PA" ]
 v "ST-15 make status and make url report the verified stack" $?
 
+# --- authentication through the edge (FND-010B, ADR-019) --------------------
+
+# Synthetic users and organizations, created with the operator console of
+# the api container (passwords on standard input).
+need "seed synthetic users and organizations with the operator console" seed_e2e "$work/e2e.env" "$(cid "$A" api)" && {
+  # shellcheck disable=SC1091 # written by seed_e2e
+  . "$work/e2e.env"
+  origin=http://127.0.0.1:$PA
+
+  login_json "$E2E_REP_EMAIL" "$E2E_PASSWORD"
+  get "$PA" /api/v1/auth/login -X POST -H 'Content-Type: application/json' -H "Origin: $origin" --data-binary @"$LOGIN"
+  cookie=$(header Set-Cookie)
+  sid=${cookie#flowcrm_sid=}
+  sid=${sid%%;*}
+  token=$(json_field csrfToken)
+  lc=$(printf '%s' "$cookie" | tr '[:upper:]' '[:lower:]')
+  [ "$CODE" = 200 ] && case $lc in flowcrm_sid=*) true ;; *) false ;; esac &&
+    case $lc in *'; path=/'*) true ;; *) false ;; esac && case $lc in *'; httponly'*) true ;; *) false ;; esac &&
+    case $lc in *'; samesite=lax'*) true ;; *) false ;; esac && case $lc in *secure* | *domain=*) false ;; *) true ;; esac &&
+    header Cache-Control | grep -q no-store && [ -n "$token" ] && [ "$(psql_in "$A" "SELECT count(*) FROM sessions WHERE sess_id = '$sid'")" = 1 ]
+  v "ST-69 login through the edge: HttpOnly, SameSite=Lax, Path=/ session cookie (no Secure over HTTP), no-store, session in PostgreSQL" $? "$CODE $cookie"
+
+  get "$PA" /api/v1/me -H "Cookie: flowcrm_sid=$sid"
+  me=$CODE
+  get "$PA" /api/v1/auth/logout -X POST -H "Cookie: flowcrm_sid=$sid" -H "Origin: $origin"
+  forged=$CODE
+  get "$PA" /api/v1/auth/logout -X POST -H "Cookie: flowcrm_sid=$sid" -H "Origin: $origin" -H "X-CSRF-Token: $token"
+  out=$CODE
+  get "$PA" /api/v1/me -H "Cookie: flowcrm_sid=$sid"
+  [ "$me" = 200 ] && [ "$forged" = 403 ] && [ "$out" = 204 ] && [ "$CODE" = 401 ] &&
+    [ "$(psql_in "$A" "SELECT count(*) FROM sessions WHERE sess_id = '$sid'")" = 0 ]
+  v "ST-70 the cookie authenticates; logout needs the CSRF token and ends the session on the server (replay: 401)" $? "me $me, logout without token $forged, with token $out, replay $CODE"
+
+  get "$PA" /api/v1/auth/login -X POST -H 'Content-Type: application/json' -H 'Origin: https://evil.example' --data-binary @"$LOGIN"
+  cross=$CODE
+  cross_cookie=$(header Set-Cookie)
+  get "$PA" /api/v1/auth/login -X POST -H "Origin: $origin" --data-urlencode "email=$E2E_REP_EMAIL" --data-urlencode 'password=x'
+  [ "$cross" = 403 ] && [ -z "$cross_cookie" ] && [ "$CODE" = 415 ]
+  v "ST-71 login from another origin is refused before authentication (403, no cookie); a form body is refused (415)" $? "cross-origin $cross, form $CODE"
+
+  # Through the real edge a client cannot pick its client IP: with a new
+  # spoofed X-Forwarded-For on every attempt, the sixth failure for one
+  # account is still refused (the edge replaces the header).
+  login_json "spoof-$(random_secret | cut -c1-8)@example.test" 'not the password'
+  codes=''
+  for i in 1 2 3 4 5 6; do
+    get "$PA" /api/v1/auth/login -X POST -H 'Content-Type: application/json' -H "Origin: $origin" -H "X-Forwarded-For: 203.0.113.$i" -H "X-Real-IP: 198.51.100.$i" --data-binary @"$LOGIN"
+    codes="$codes $CODE"
+  done
+  [ "$codes" = ' 401 401 401 401 401 429' ] && [ -n "$(header Retry-After)" ] && body_has 'too-many-requests'
+  v "ST-72 spoofed X-Forwarded-For through the edge does not evade the login limit (6th failure: 429 with Retry-After)" $? "codes:$codes"
+
+  api_log=$(docker logs "$(cid "$A" api)" 2>&1)
+  edge_log=$(docker logs "$(cid "$A" edge)" 2>&1)
+  ! printf '%s\n%s\n' "$api_log" "$edge_log" | grep -qF -e "$E2E_PASSWORD" -e "$E2E_REP_EMAIL" -e "$sid" -e "$token" &&
+    printf '%s\n' "$api_log" | grep -q '"event":"login_failed"' && printf '%s\n' "$api_log" | grep -q '"event":"login_succeeded"'
+  v "ST-73 the security log records the logins with pseudonyms; no password, e-mail address, session ID or CSRF token in any log" $?
+}
+
 need "build the browser test image" docker build --quiet -f "$APP_REPO/docker/e2e/Dockerfile" -t "$e2e_image" "$APP_REPO" >/dev/null && {
   browser "$A" dev a-browser
   r=$?
   [ "$r" = 0 ] || tail -n 25 "$work/out/a-browser.out" | sed 's/^/      | /'
   [ "$r" = 0 ] && grep -Eq '[0-9]+ passed' "$work/out/a-browser.out" && ! grep -Eq '[0-9]+ failed' "$work/out/a-browser.out" &&
-    grep -q 'Vite HMR connection is established' "$work/out/a-browser.out"
-  v "ST-16 browser journey through Caddy: SPA, API data, client route, HMR (dev)" $?
+    grep -q 'Vite HMR connection is established' "$work/out/a-browser.out" && grep -q 'logout ends the session' "$work/out/a-browser.out" &&
+    ! grep -Eq '[0-9]+ skipped' "$work/out/a-browser.out"
+  v "ST-16 browser journeys through Caddy: login page with API data, client route, login and logout, roles, two organizations, foreign organization, CSRF, HMR (dev)" $?
   ev "$(grep -E '[0-9]+ (passed|failed|skipped)' "$work/out/a-browser.out" | tr -s ' ' | tr '\n' ' ')"
 }
 
