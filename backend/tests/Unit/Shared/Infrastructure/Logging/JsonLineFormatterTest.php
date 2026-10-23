@@ -87,6 +87,26 @@ final class JsonLineFormatterTest extends TestCase
         }
     }
 
+    /** The router logs the full request URI: its query string is not logged (as at the edge). */
+    public function testQueryStringsOfUrlsAreRemoved(): void
+    {
+        $line = $this->format('Matched route "{route}".', [
+            'route' => 'api_v1_system_status',
+            'request_uri' => 'http://127.0.0.1:8083/api/v1/members?search=ada@example.test&page=2',
+            'route_parameters' => ['_route' => 'api_v1_system_status'],
+        ], channel: 'request');
+
+        self::assertStringNotContainsString('ada@example.test', $line);
+        self::assertStringNotContainsString('page=2', $line);
+        self::assertStringContainsString('http://127.0.0.1:8083/api/v1/members?[redacted]', $line);
+        self::assertStringContainsString('api_v1_system_status', $line);
+    }
+
+    public function testUrlsWithoutAQueryAreKept(): void
+    {
+        self::assertStringContainsString('"uri":"/api/v1/system/status"', $this->format('request', ['uri' => '/api/v1/system/status']));
+    }
+
     public function testPlaceholdersAreFilledFromTheRedactedContext(): void
     {
         $decoded = json_decode($this->format('{count} pending migrations, ready={ready}, reason {reason} {missing}', ['count' => 2, 'ready' => false, 'reason' => null]), true, flags: \JSON_THROW_ON_ERROR);
