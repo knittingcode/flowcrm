@@ -683,20 +683,28 @@ $(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)"
 # and /health/ready is answered with the gate's 503 (raw URI, as ADR-017).
 gate_probe() { # -> "path=code ..." for the paths that matter
   local out='' p
-  for p in / /api/v1/system/status /health/ready /HEALTH/READY //health/ready; do
+  for p in / /api/v1/system/status /health/live /health/ready /HEALTH/READY //health/ready; do
     out="$out $p=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --path-as-is "http://127.0.0.1:$PA$p")"
   done
   printf '%s' "${out# }"
 }
+GATED="/=503 /api/v1/system/status=503 /health/live=200 /health/ready=200 /HEALTH/READY=503 //health/ready=503"
+OPEN="/=200 /api/v1/system/status=200 /health/live=200 /health/ready=200 /HEALTH/READY=200 //health/ready=200"
+probe_until() { # expected [seconds]: poll (a bind mount can show a change a moment late)
+  local i=0
+  PROBE=$(gate_probe)
+  while [ "$PROBE" != "$1" ] && [ "$i" -lt "${2:-10}" ]; do sleep 1; i=$((i + 1)); PROBE=$(gate_probe); done
+  [ "$PROBE" = "$1" ]
+}
 printf 'a gate recorded by the test\n' >"$A/.runtime/gate/security-gate"
 chmod 0644 "$A/.runtime/gate/security-gate"
-g_on=$(gate_probe)
+probe_until "$GATED"
+g_on=$PROBE
 g_body=$(curl -s -m 5 "http://127.0.0.1:$PA/")
 rm -f "$A/.runtime/gate/security-gate"
-g_off=$(gate_probe)
-[ "$g_on" = "/=503 /api/v1/system/status=503 /health/ready=200 /HEALTH/READY=503 //health/ready=503" ] &&
-  case $g_body in *"blocked by its security gate"*) true ;; *) false ;; esac &&
-  [ "$g_off" = "/=200 /api/v1/system/status=200 /health/ready=200 /HEALTH/READY=200 //health/ready=200" ]
+probe_until "$OPEN"
+g_off=$PROBE
+[ "$g_on" = "$GATED" ] && case $g_body in *"blocked by its security gate"*) true ;; *) false ;; esac && [ "$g_off" = "$OPEN" ]
 v "ST-50 the running edge enforces the gate: only /health/live and /health/ready pass while it is recorded, everything serves once it is removed" $? "gated: $g_on; open: $g_off"
 
 # Interrupted while the edge comes back after a verified rotation: the gate
@@ -712,19 +720,19 @@ interrupted_restore() { # label fault expected-exit
   IR_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absent)
   dv "$1-up" "$A" up
   [ "$(rc_of "$1")" = "$3" ] && [ "$IR_GATE" = recorded ] && [ "$(rc_of "$1-status")" = 1 ] && grep -q '^blocked: ' "$work/out/$1-status.out" &&
-    [ "$(rc_of "$1-up")" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && [ "$(gate_probe)" = "$g_off" ]
+    [ "$(rc_of "$1-up")" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
 }
 interrupted_restore a-ir-kill edge-started:kill 137
 r=$?
-[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && case $IR_PROBE in "/=503 /api/v1/system/status=503 /health/ready=200 "*) true ;; *) false ;; esac
+[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
 v "ST-50 SIGKILL right after the edge started again: the gate stays recorded, the running edge serves only its health paths, make up serves" $? "exit $(rc_of a-ir-kill), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-kill-up)"
 interrupted_restore a-ir-int edge-started:int 130
 r=$?
-[ "$r" = 0 ] && case $IR_PROBE in "/=503 "* | "/=000 "*) true ;; *) false ;; esac
+[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
 v "ST-50 SIGINT right after the edge started again: the gate stays recorded, nothing but the health paths is served, make up serves" $? "exit $(rc_of a-ir-int), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-int-up)"
 interrupted_restore a-ir-term restore-before-edge 143
 r=$?
-[ "$r" = 0 ] && [ -z "$IR_EDGE" ] && case $IR_PROBE in "/=000 "*) true ;; *) false ;; esac
+[ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000" ]
 v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $? "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)"
 
 # Interrupted while the password change waits inside PostgreSQL (another
