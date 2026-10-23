@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace App\Tests\Unit\Shared\Http;
 
 use App\Shared\Http\Problem\ProblemDetailsListener;
+use App\Shared\Http\Problem\ProblemException;
 use App\Shared\Http\RequestId;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
@@ -51,6 +53,38 @@ final class ProblemDetailsListenerTest extends TestCase
         self::assertSame(500, $response->getStatusCode());
         self::assertStringNotContainsString('db:5432', (string) $response->getContent());
         self::assertStringNotContainsString('secret', (string) $response->getContent());
+    }
+
+    public function testAProblemExceptionKeepsItsTypeExtensionsAndHeaders(): void
+    {
+        $validation = $this->dispatch('/api/v1/me/password', ProblemException::validation([['pointer' => '/newPassword', 'code' => 'PASSWORD_TOO_SHORT']]))->getResponse();
+        self::assertNotNull($validation);
+        self::assertSame(422, $validation->getStatusCode());
+        self::assertSame([
+            'type' => '/problems/validation-error',
+            'title' => 'Unprocessable Content',
+            'status' => 422,
+            'instance' => '/api/v1/me/password',
+            'requestId' => '0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c',
+            'errors' => [['pointer' => '/newPassword', 'code' => 'PASSWORD_TOO_SHORT']],
+        ], json_decode((string) $validation->getContent(), true, flags: \JSON_THROW_ON_ERROR));
+
+        $limited = $this->dispatch('/api/v1/auth/login', ProblemException::tooManyRequests(300))->getResponse();
+        self::assertNotNull($limited);
+        self::assertSame('300', $limited->headers->get('Retry-After'));
+        $unauthenticated = $this->dispatch('/api/v1/me', ProblemException::unauthenticated())->getResponse();
+        self::assertNotNull($unauthenticated);
+        self::assertSame('Session realm="flowcrm"', $unauthenticated->headers->get('WWW-Authenticate'));
+        self::assertStringContainsString('"type":"\/problems\/unauthenticated"', (string) $unauthenticated->getContent());
+    }
+
+    public function testFrameworkErrorsGetTheirProblemType(): void
+    {
+        $response = $this->dispatch('/api/v1/me', new AccessDeniedHttpException('Access Denied.'))->getResponse();
+
+        self::assertNotNull($response);
+        self::assertStringContainsString('"type":"\/problems\/forbidden"', (string) $response->getContent());
+        self::assertStringNotContainsString('Access Denied', (string) $response->getContent());
     }
 
     /** @return iterable<string, array{string}> */
