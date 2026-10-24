@@ -419,7 +419,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   The integration suite includes the API security tests (login, sessions,
   request forgery, throttling, tenant isolation) through a real PHP-FPM,
   each response checked against `backend/openapi.yaml`; BE-18 runs the
-  security negative controls: 50 mutations of a copy of the backend, each
+  security negative controls: 59 mutations of a copy of the backend, each
   of which must make its tests fail (see
   [architecture/authentication.md](architecture/authentication.md#tests)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint

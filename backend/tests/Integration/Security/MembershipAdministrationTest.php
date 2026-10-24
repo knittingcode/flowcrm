@@ -12,6 +12,7 @@ use App\Tests\Support\Http\FpmApiTestCase;
 use App\Tests\Support\Http\PendingRequest;
 use App\Tests\Support\Security\TestUser;
 use App\Tests\Support\Session\SeparateConnection;
+use Symfony\Component\RateLimiter\RateLimiterFactoryInterface;
 use Symfony\Component\Uid\Uuid;
 
 /**
@@ -141,6 +142,74 @@ final class MembershipAdministrationTest extends FpmApiTestCase
 
         self::assertSame(404, $client->patch($this->member(Uuid::v7()), ['role' => 'OWNER'])->status());
         self::assertSame(404, $client->patch($this->member($this->removedAMembership), ['unknown' => 'x'])->status());
+    }
+
+    /**
+     * Memberships in another organization count neither for the actor nor
+     * for the duplicate check: an ADMIN of A who is only a REP of B (that
+     * membership is the older one) adds a user who is already a member of
+     * B. The re-check under A's lock reads the actor's membership in A.
+     */
+    public function testMembershipsInAnotherOrganizationDoNotCountHere(): void
+    {
+        $actor = $this->fixtures->user('rep-b-admin-a');
+        $this->fixtures->member($this->b, $actor, 'REP');
+        $this->fixtures->member($this->a, $actor, 'ADMIN');
+        $user = $this->fixtures->user('member-of-b');
+        $inB = $this->fixtures->member($this->b, $user, 'MANAGER');
+
+        $added = $this->logIn($actor)->post($this->members(), ['email' => $user->email, 'role' => 'REP']);
+
+        self::assertSame(201, $added->status(), $added->raw->body);
+        self::assertSame('REP', $added->value('role'));
+        $id = Uuid::fromString($added->string('membershipId'));
+        self::assertSame(['role' => 'REP', 'status' => 'ACTIVE', 'organization_id' => $this->a->toRfc4122(), 'user_id' => $user->id->toRfc4122()], $this->membership($id));
+        self::assertSame(['role' => 'MANAGER', 'status' => 'ACTIVE', 'organization_id' => $this->b->toRfc4122(), 'user_id' => $user->id->toRfc4122()], $this->membership($inB));
+        self::assertSame('ADMIN', $this->events($id)[0]['actor_role'] ?? null, 'the actor\'s role in A');
+    }
+
+    /** TI-04: a REP promoted to ADMIN has the ADMIN permissions on their next request, without logging in again. */
+    public function testAPromotionTakesEffectOnTheNextRequest(): void
+    {
+        $rep = $this->logIn($this->repA);
+        self::assertSame(403, $rep->patch($this->member($this->managerAMembership), ['role' => 'MANAGER'])->status(), 'still a REP');
+
+        self::assertSame(200, $this->logIn($this->adminA)->patch($this->member($this->repAMembership), ['role' => 'ADMIN'])->status());
+
+        self::assertSame(['organization.view', 'membership.list', 'membership.view_email', 'membership.add', 'membership.change_role', 'membership.remove'], $rep->get('/api/v1/organizations/'.$this->a->toRfc4122())->value('membership', 'permissions'));
+        $changed = $rep->patch($this->member($this->managerAMembership), ['role' => 'REP']);
+        self::assertSame(200, $changed->status(), $changed->raw->body);
+        self::assertSame($this->repA->id->toRfc4122(), $this->events($this->managerAMembership)[0]['actor_user_id'] ?? null);
+    }
+
+    /**
+     * ADR-019 on the new unsafe routes: without a session 401 (before any
+     * tenant lookup); with the per-user limit used up 429 with Retry-After.
+     * Nothing changes either way.
+     */
+    public function testAnonymousAndRateLimitedChangesAreRefused(): void
+    {
+        $user = $this->fixtures->user('not-added');
+        $before = $this->snapshot();
+        $anonymous = $this->client();
+        $limited = $this->logIn($this->adminA);
+        $factory = self::getContainer()->get('flowcrm.rate_limiter.api_user');
+        self::assertInstanceOf(RateLimiterFactoryInterface::class, $factory);
+        $limiter = $factory->create($this->adminA->id->toRfc4122());
+        self::assertTrue($limiter->consume($limiter->consume(0)->getRemainingTokens())->isAccepted());
+
+        foreach (['anonymous' => [$anonymous, 401, '/problems/unauthenticated'], 'limited' => [$limited, 429, '/problems/too-many-requests']] as $label => [$client, $status, $type]) {
+            foreach ([
+                'POST' => $client->post($this->members(), ['email' => $user->email, 'role' => 'ADMIN']),
+                'PATCH' => $client->patch($this->member($this->repAMembership), ['role' => 'ADMIN']),
+                'DELETE' => $client->delete($this->member($this->repAMembership)),
+            ] as $method => $response) {
+                self::assertSame($status, $response->status(), $label.' '.$method);
+                self::assertSame($type, $response->problem(), $label.' '.$method);
+                self::assertNotNull($response->header(401 === $status ? 'WWW-Authenticate' : 'Retry-After'), $label.' '.$method);
+            }
+        }
+        self::assertSame($before, $this->snapshot());
     }
 
     /** Only ADMIN may add, change or remove; MANAGER and REP get 403 and nothing changes. */
