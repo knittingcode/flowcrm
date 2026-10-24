@@ -267,6 +267,28 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertSame(['ADMIN'], $this->activeAdmins(), 'the other ADMIN remains');
     }
 
+    /**
+     * Current behaviour, pinned for ADR-020's open decision on disabled
+     * ADMINs: the last-admin rule counts active memberships whatever the
+     * account state, so the only enabled ADMIN may step down while a
+     * disabled ADMIN remains, leaving only the disabled one.
+     */
+    public function testADisabledAdminCountsForTheLastAdminRule(): void
+    {
+        $disabled = $this->fixtures->user('disabled-admin');
+        $disabledMembership = $this->fixtures->member($this->a, $disabled, 'ADMIN');
+        $this->fixtures->connection()->executeStatement('UPDATE users SET disabled_at = now() WHERE id = ?', [$disabled->id->toRfc4122()]);
+        $client = $this->logIn($this->adminA);
+
+        $demoted = $client->patch($this->member($this->adminAMembership), ['role' => 'MANAGER']);
+
+        self::assertSame(200, $demoted->status(), $demoted->raw->body);
+        self::assertSame('MANAGER', $demoted->value('role'));
+        self::assertSame(['membership.role_changed'], array_column($this->events($this->adminAMembership), 'action'));
+        self::assertSame(['role' => 'ADMIN', 'status' => 'ACTIVE', 'organization_id' => $this->a->toRfc4122(), 'user_id' => $disabled->id->toRfc4122()], $this->membership($disabledMembership));
+        self::assertSame(['ADMIN'], $this->activeAdmins(), 'only the disabled ADMIN is left');
+    }
+
     /** With two ADMINs one may be removed, also by themselves; the removed user's next request is a 404 (TI-04). */
     public function testWithTwoAdminsOneMayBeRemoved(): void
     {
@@ -593,6 +615,64 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertContains($winner->status(), [200, 204], $winner->raw->body);
         self::assertSame(['ADMIN'], $this->activeAdmins());
         self::assertCount(1, [...$this->events($secondMembership), ...$this->events($this->adminAMembership)], 'one change, one audit event');
+    }
+
+    /**
+     * Two ADMINs remove the same member at the same time: the second finds
+     * the membership removed under the lock and gets the 404 of a repeated
+     * DELETE. The member is removed once, with one audit event.
+     */
+    public function testConcurrentRemovalsOfOneMemberRemoveItOnce(): void
+    {
+        $second = $this->fixtures->user('second-admin');
+        $this->fixtures->member($this->a, $second, 'ADMIN');
+        $first = $this->logIn($this->adminA);
+        $other = $this->logIn($second);
+
+        [$waiting, $responses] = $this->releasedTogether(fn (): array => [
+            $first->dispatch('DELETE', $this->member($this->repAMembership)),
+            $other->dispatch('DELETE', $this->member($this->repAMembership)),
+        ], 2);
+
+        self::assertSame(2, $waiting, 'both requests waited for the organization lock');
+        $statuses = array_map(static fn (ApiResponse $r): int => $r->status(), $responses);
+        sort($statuses);
+        self::assertSame([204, 404], $statuses);
+        $notFound = 404 === $responses[0]->status() ? $responses[0] : $responses[1];
+        self::assertSame('/problems/not-found', $notFound->problem());
+        self::assertSame('REMOVED', $this->membership($this->repAMembership)['status'] ?? null);
+        self::assertSame(['membership.removed'], array_column($this->events($this->repAMembership), 'action'));
+    }
+
+    /**
+     * Two ADMINs give the same member different roles at the same time: the
+     * changes run one after the other, the second starts from the role the
+     * first set, and the audit events form one chain that ends with the
+     * stored role (no lost update).
+     */
+    public function testConflictingRoleChangesAreAppliedOneAfterTheOther(): void
+    {
+        $second = $this->fixtures->user('second-admin');
+        $this->fixtures->member($this->a, $second, 'ADMIN');
+        $first = $this->logIn($this->adminA);
+        $other = $this->logIn($second);
+
+        [$waiting, $responses] = $this->releasedTogether(fn (): array => [
+            $first->dispatch('PATCH', $this->member($this->repAMembership), ['role' => 'MANAGER']),
+            $other->dispatch('PATCH', $this->member($this->repAMembership), ['role' => 'ADMIN']),
+        ], 2);
+
+        self::assertSame(2, $waiting, 'both requests waited for the organization lock');
+        self::assertSame([200, 200], array_map(static fn (ApiResponse $r): int => $r->status(), $responses));
+        self::assertSame(['MANAGER', 'ADMIN'], array_map(static fn (ApiResponse $r): mixed => $r->value('role'), $responses));
+        $changes = array_column($this->events($this->repAMembership), 'changes');
+        self::assertCount(2, $changes);
+        $start = array_values(array_filter($changes, static fn (mixed $c): bool => \is_array($c) && 'REP' === ($c['roleFrom'] ?? null)));
+        self::assertCount(1, $start, 'only the first change starts from REP');
+        $next = $start[0] === $changes[0] ? $changes[1] : $changes[0];
+        self::assertIsArray($next);
+        self::assertSame($start[0]['roleTo'], $next['roleFrom'], 'the second change starts from the first one\'s role');
+        self::assertSame($next['roleTo'], $this->membership($this->repAMembership)['role'] ?? null, 'the stored role is the last change\'s');
     }
 
     /** An ADMIN removed while their request waits for the lock gets a 404, as their next request would. */

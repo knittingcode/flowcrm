@@ -133,9 +133,11 @@ Recorded for the owner's decision; not approved.
   new membership row after a removal: today both are refused with
   `MEMBERSHIP_EXISTS`.
 - **Disabled ADMINs:** the last-admin rule counts active memberships whatever
-  the user's account state, so an organization whose only other ADMIN is
-  disabled cannot demote its last enabled ADMIN, but could be left with only
-  a disabled ADMIN. Whether disabled users should count is not specified.
+  the user's account state, so the enabled ADMIN of an organization whose
+  only other ADMIN is disabled can still demote or remove themselves, which
+  leaves the organization with only a disabled ADMIN (pinned by
+  `MembershipAdministrationTest::testADisabledAdminCountsForTheLastAdminRule`).
+  Whether disabled users should count is not specified.
   Disabled users can also be added.
 - **Account discovery and consent (privacy):** an ADMIN of any organization
   can learn whether an e-mail address has a FlowCRM account (422
@@ -180,7 +182,10 @@ Recorded for the owner's decision; not approved.
   demotions and mutual removals leave exactly one ADMIN; the last two
   ADMINs stepping down at once (one demotion, one removal) leave one, the
   second getting 409 `LAST_ADMIN`; two adds of one user create one
-  membership and a 409 `MEMBERSHIP_EXISTS`; an ADMIN demoted (403) or
+  membership and a 409 `MEMBERSHIP_EXISTS`; two removals of one member
+  remove it once (204 and 404, one event); two different role changes of
+  one member apply one after the other, the second starting from the
+  first's role (one chain of events, no lost update); an ADMIN demoted (403) or
   removed (404) while their request waits is refused; another
   organization's changes and refusals do not wait for the lock.
 - Unit tests: `RolePolicyTest` (the matrix), `MembershipRulesTest`

@@ -148,7 +148,7 @@ return [
         'MembershipAdministrationTest::testTheLastAdminCannotBeDemotedOrRemoved|MembershipAdministrationTest::testTheLastTwoAdminsSteppingDownAtOnceLeaveOne|ManageMembershipsTest::testTheLastAdminCannotBeDemotedOrRemoved'],
     ['membership changes without the organization lock', 'src/Organizations/Application/ManageMemberships.php',
         'if (!$this->lock->lock($organizationId)) {', 'if (false) {',
-        'MembershipAdministrationTest::testConcurrentDemotionsLeaveExactlyOneAdmin|MembershipAdministrationTest::testTheActorIsCheckedAgainUnderTheLock|MembershipAdministrationTest::testTheLastTwoAdminsSteppingDownAtOnceLeaveOne|ManageMembershipsTest::testTheActorIsCheckedAgainUnderTheLock'],
+        'MembershipAdministrationTest::testConcurrentDemotionsLeaveExactlyOneAdmin|MembershipAdministrationTest::testTheActorIsCheckedAgainUnderTheLock|MembershipAdministrationTest::testTheLastTwoAdminsSteppingDownAtOnceLeaveOne|MembershipAdministrationTest::testConcurrentRemovalsOfOneMemberRemoveItOnce|MembershipAdministrationTest::testConflictingRoleChangesAreAppliedOneAfterTheOther|ManageMembershipsTest::testTheActorIsCheckedAgainUnderTheLock'],
     ['removed actor accepted under the lock', 'src/Organizations/Application/ManageMemberships.php',
         'if (null === $actor || MembershipStatus::Active !== $actor->status()) {', 'if (null === $actor) {',
         'MembershipAdministrationTest::testAnActorRemovedWhileWaitingIsNotFound|MembershipAdministrationTest::testConcurrentMutualRemovalsLeaveExactlyOneAdmin'],
