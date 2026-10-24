@@ -395,7 +395,7 @@ describe('MembersPage', () => {
     expect(count(calls, 'GET', MEMBERS)).toBe(1);
   });
 
-  it('reloads the list when the API could not be reached, as the change may have been saved', async () => {
+  it('reloads the list when no answer arrived, as the change may have been saved', async () => {
     const calls = fakeApi({
       'GET /api/v1/auth/session': adminSession(),
       [`GET ${ORG}`]: organization(ADMIN),
@@ -412,7 +412,7 @@ describe('MembersPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(
-      'The API could not be reached, so it is not known whether the change was saved. The list was reloaded to show the current state.',
+      'The connection to the API failed before an answer arrived, so it is not known whether the change was saved. The list is read again to show the current state.',
     );
     await waitFor(() => {
       expect(screen.queryByRole('rowheader', { name: 'Grace Tester' })).not.toBeInTheDocument();
@@ -439,7 +439,7 @@ describe('MembersPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(
-      'The answer of the API could not be read, so it is not known whether the change was saved. The list was reloaded to show the current state.',
+      'The answer of the API could not be read, so it is not known whether the change was saved. The list is read again to show the current state.',
     );
     expect(alert).not.toHaveTextContent('could not be saved');
     expect(await screen.findByRole('rowheader', { name: 'Grace Tester' })).toBeInTheDocument();
@@ -463,7 +463,7 @@ describe('MembersPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(
-      `The API did not answer properly (status ${String(code)}), so it is not known whether the change was saved. The list was reloaded to show the current state.`,
+      `The API did not answer properly (status ${String(code)}), so it is not known whether the change was saved. The list is read again to show the current state.`,
     );
     expect(alert).not.toHaveTextContent('could not be saved');
     await waitFor(() => {
@@ -495,7 +495,7 @@ describe('MembersPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent(
-      'The API reported an error (status 500, request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c), so it is not known whether the change was saved. The list was reloaded to show the current state.',
+      'The API reported an error (status 500, request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c), so it is not known whether the change was saved. The list is read again to show the current state.',
     );
     expect(alert).not.toHaveTextContent('could not be saved');
     await waitFor(() => {
@@ -692,5 +692,122 @@ describe('MembersPage', () => {
 
     expect(await screen.findByRole('table')).toBeInTheDocument();
     expect(calls.filter((c) => c.path.includes('/members')).map((c) => c.path)).toEqual([MEMBERS]);
+  });
+});
+
+describe('MembersPage: unclear answers, repeated clicks and changed access', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** Starts the change `method` on Grace Tester (or adds x@example.test). */
+  async function change(method: string, click: (element: Element) => Promise<void> = (e) => userEvent.click(e)) {
+    if (method === 'POST') {
+      await userEvent.type(await screen.findByLabelText('E-mail address of the user'), 'x@example.test');
+      await click(screen.getByRole('button', { name: 'Add member' }));
+    } else if (method === 'PATCH') {
+      await userEvent.selectOptions(await screen.findByLabelText('New role for Grace Tester'), 'MANAGER');
+      await click(screen.getByRole('button', { name: 'Change role of Grace Tester' }));
+    } else {
+      await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+      await click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+    }
+  }
+
+  const target = (method: string) => (method === 'POST' ? `${ORG}/members` : `${ORG}/members/m-2`);
+
+  it.each(['AbortError', 'TimeoutError'])('treats a change whose request ended with %s as an unknown outcome and reads the list again', async (name) => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), members([ada])],
+    });
+    const fake = globalThis.fetch;
+    let deletes = 0;
+    vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        deletes += 1;
+        return Promise.reject(new DOMException('The operation was aborted.', name));
+      }
+      return fake(input, init);
+    });
+    renderAt('/o/org-a/members');
+
+    await change('DELETE');
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('so it is not known whether the change was saved');
+    expect(alert).not.toHaveTextContent('could not be saved');
+    await waitFor(() => {
+      expect(screen.queryByRole('rowheader', { name: 'Grace Tester' })).not.toBeInTheDocument();
+    });
+    expect(count(calls, 'GET', MEMBERS)).toBe(2);
+    expect(deletes).toBe(1);
+  });
+
+  it.each(['POST', 'PATCH', 'DELETE'])('sends %s once when its button is clicked twice', async (method) => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`POST ${ORG}/members`]: json(201, { ...grace, membershipId: 'm-3', userId: 'u-3', email: 'x@example.test' }),
+      [`PATCH ${ORG}/members/m-2`]: json(200, { ...grace, userId: 'u-2', role: 'MANAGER' }),
+      [`DELETE ${ORG}/members/m-2`]: new Response(null, { status: 204 }),
+    });
+    const held = hold(method, target(method), 1);
+    renderAt('/o/org-a/members');
+
+    await change(method, (element) => userEvent.dblClick(element));
+    if (method === 'POST') {
+      // Enter in the e-mail input submits the form too.
+      await userEvent.type(screen.getByLabelText('E-mail address of the user'), '{Enter}');
+    }
+    // The first request is held before the fake API records it: a second one would be recorded now.
+    expect(count(calls, method, target(method))).toBe(0);
+
+    held.release();
+    expect(await screen.findByRole('status')).not.toBeEmptyDOMElement();
+    expect(count(calls, method, target(method))).toBe(1);
+  });
+
+  it('keeps an unknown outcome in view, with the focus, when the list cannot be read again', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), problem(500, 'internal-error')],
+      [`PATCH ${ORG}/members/m-2`]: new Response('', { status: 502 }),
+    });
+    renderAt('/o/org-a/members');
+
+    await change('PATCH');
+
+    await waitFor(() => {
+      expect(screen.getByText(/The members could not be loaded/)).toBeInTheDocument();
+    });
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('so it is not known whether the change was saved');
+    expect(alert).toHaveTextContent('The members could not be loaded (request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c).');
+    expect(alert).toHaveFocus();
+    // Nothing is shown as the current list.
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+  });
+
+  it('keeps the confirmation of a change in view when the list cannot be read again', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), () => new Response('', { status: 503 })],
+      [`DELETE ${ORG}/members/m-2`]: new Response(null, { status: 204 }),
+    });
+    renderAt('/o/org-a/members');
+
+    await change('DELETE');
+
+    await waitFor(() => {
+      expect(screen.getByText(/The members could not be loaded/)).toBeInTheDocument();
+    });
+    expect(screen.getByRole('status')).toHaveTextContent('Grace Tester was removed.');
+    expect(screen.getByRole('alert')).toHaveTextContent('The members could not be loaded');
+    expect(screen.getByRole('alert')).toHaveFocus();
   });
 });

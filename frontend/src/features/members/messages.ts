@@ -15,10 +15,10 @@ function serverError(error: ApiProblem): boolean {
 }
 
 /**
- * Whether it is unknown if the change was saved: the API could not be reached
- * (the request may have been processed before the connection failed), it
- * answered with success but a body that could not be read, or it answered
- * with a server error.
+ * Whether it is unknown if the change was saved: no answer arrived (the
+ * connection failed, timed out or was aborted, possibly after the request had
+ * been processed), the API answered with success but a body that could not
+ * be read, or it answered with a server error.
  */
 function outcomeUnknown(error: unknown): boolean {
   return !(error instanceof ApiProblem) || (error.status >= 200 && error.status < 300) || serverError(error);
@@ -70,16 +70,16 @@ export function fieldMessage(detail: ProblemDetail): string {
 /** The message for a failed membership change; nothing is ever shown as changed that the server refused. */
 export function failureMessage(error: unknown): string {
   if (!(error instanceof ApiProblem)) {
-    return 'The API could not be reached, so it is not known whether the change was saved. The list was reloaded to show the current state.';
+    return 'The connection to the API failed before an answer arrived, so it is not known whether the change was saved. The list is read again to show the current state.';
   }
   if (serverError(error) && error.type === 'about:blank') {
-    return `The API did not answer properly (status ${String(error.status)}), so it is not known whether the change was saved. The list was reloaded to show the current state.`;
+    return `The API did not answer properly (status ${String(error.status)}), so it is not known whether the change was saved. The list is read again to show the current state.`;
   }
   if (serverError(error)) {
-    return `The API reported an error (status ${String(error.status)}, request ${error.requestId ?? 'unknown'}), so it is not known whether the change was saved. The list was reloaded to show the current state.`;
+    return `The API reported an error (status ${String(error.status)}, request ${error.requestId ?? 'unknown'}), so it is not known whether the change was saved. The list is read again to show the current state.`;
   }
   if (outcomeUnknown(error)) {
-    return 'The answer of the API could not be read, so it is not known whether the change was saved. The list was reloaded to show the current state.';
+    return 'The answer of the API could not be read, so it is not known whether the change was saved. The list is read again to show the current state.';
   }
   if (error.status === 403 && error.type === CSRF_INVALID) {
     return 'The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again.';

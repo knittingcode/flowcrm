@@ -46,12 +46,13 @@ function pageOf(value: string | null): number {
  * when the user's own membership in this organization has the permission;
  * the API decides every change. After every change, after every refusal
  * that may mean the list is stale (403 other than csrf-invalid, 404, 409),
- * and whenever it is unknown whether a change was saved (the API could not be
- * reached, its success answer could not be read, or a server error did not
- * come from the API), the organization and the members are read again:
- * nothing is changed in the page before the server has confirmed it. While
- * the list shown is older than the one requested (after a change or another
- * page), its controls are disabled and the table is marked busy.
+ * and whenever it is unknown whether a change was saved (no answer arrived,
+ * its success answer could not be read, or it was a server error), the
+ * organization and the members are read again: nothing is changed in the page
+ * before the server has confirmed it. While the list shown
+ * is older than the one requested (after a change or another page), its
+ * controls are disabled and the table is marked busy. If the list cannot be
+ * read again, the answer to the change stays in view next to the load error.
  */
 export function MembersPage() {
   const { organizationId = '' } = useParams();
@@ -79,6 +80,9 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
   const restoreFocus = useRef<string | null>(null);
   const statusRef = useRef<HTMLDivElement>(null);
   const alertRef = useRef<HTMLDivElement>(null);
+  const loadErrorRef = useRef<HTMLDivElement>(null);
+  /** Whether a list has been shown: a load error after it takes the focus, which was in the list. */
+  const shownBefore = useRef(false);
   const removeButtons = useRef(new Map<string, HTMLButtonElement>());
 
   useEffect(() => {
@@ -99,6 +103,14 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
       controller.abort();
     };
   }, [organizationId, page, version]);
+
+  useEffect(() => {
+    if (load.kind === 'ready') {
+      shownBefore.current = true;
+    } else if (load.kind === 'error' && shownBefore.current) {
+      loadErrorRef.current?.focus();
+    }
+  }, [load]);
 
   useEffect(() => {
     if (feedback?.focus === true) {
@@ -169,7 +181,19 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
     return <p role="alert">You do not have permission to see this.</p>;
   }
   if (load.kind === 'error') {
-    return <p role="alert">{load.message}</p>;
+    // The answer to a change stays in view when the list cannot be read
+    // afterwards: an unknown outcome must not disappear behind the load error.
+    return (
+      <>
+        <div role="status" tabIndex={-1} ref={statusRef}>
+          {feedback?.kind === 'success' ? feedback.message : ''}
+        </div>
+        <div className="form-error" role="alert" tabIndex={-1} ref={loadErrorRef}>
+          {feedback?.kind === 'error' && <p>{feedback.message}</p>}
+          <p>{load.message}</p>
+        </div>
+      </>
+    );
   }
 
   const { organization, members } = load;

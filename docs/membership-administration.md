@@ -417,23 +417,32 @@ role with an unknown address is only `INVALID_ROLE`.
 | 422 | `validation-error`, `REQUIRED`, `INVALID_TYPE` | `/email`: "Enter an e-mail address." (`REQUIRED`) or "Enter a valid e-mail address."; `/role`: "Choose one of the roles ADMIN, MANAGER or REP." |
 | 422 | `validation-error`, `UNKNOWN_FIELD` | "The request was refused (`<pointer>`: UNKNOWN_FIELD)." |
 | 429 | `too-many-requests` | "Too many requests. Try again in … seconds." (or minutes, from `Retry-After`) |
-| 500 | `internal-error` | "The API reported an error (status 500, request …), so it is not known whether the change was saved. The list was reloaded to show the current state." (a 500 can follow a saved change, see above) |
+| 500 | `internal-error` | "The API reported an error (status 500, request …), so it is not known whether the change was saved. The list is read again to show the current state." (a 500 can follow a saved change, see above) |
 
-When the API cannot be reached at all the SPA shows "The API could not be
-reached, so it is not known whether the change was saved. The list was
-reloaded to show the current state." When a success answer (2xx) has a body
-that cannot be read or does not have the expected shape, it shows "The answer
-of the API could not be read, so it is not known whether the change was
-saved. The list was reloaded to show the current state." Every server error
+When no answer arrives (the connection fails, or the browser aborts the
+request or gives up waiting, possibly after the server has processed it) the
+SPA shows "The connection to the API failed before an answer arrived, so it
+is not known whether the change was saved. The list is read again to show
+the current state." When a success answer (2xx) has a body that cannot be
+read or does not have the expected shape, it shows "The answer of the API
+could not be read, so it is not known whether the change was saved. The list
+is read again to show the current state." Every server error
 (5xx) may come after the change was committed: the API's own 500 problem (see
 "A 500 does not always mean that nothing changed" above) shows the message in
 the table, and a 5xx that is not a problem document of the API (for example a
 502 or 504 of the edge when PHP-FPM failed or timed out) shows "The API did
 not answer properly (status …), so it is not known whether the change was
-saved. The list was reloaded to show the current state." In these cases, and after a 403 (other than `csrf-invalid`), 404 or
-409, it reads the organization and the list again. Until that list (or
-another page of it) has arrived, the table is marked busy and its controls
-are disabled, so no change is made on rows the server may no longer have.
+saved. The list is read again to show the current state." In these cases,
+and after a 403 (other than `csrf-invalid`), 404 or 409, it reads the
+organization and the list again. Until that list (or another page of it) has
+arrived, the table is marked busy and its controls are disabled, so no change
+is made on rows the server may no longer have. While a change runs, its
+button and the other controls are disabled, so a double click or a second
+Enter sends it once. If the list cannot be read again, no list is shown: the
+answer to the change (the success status or the error message) stays in view
+next to "The members could not be loaded (request …)." or "The API could not
+be reached.", and the error message receives the focus; reloading the page
+reads the list again.
 
 ## Operational notes and limitations
 
