@@ -1,5 +1,6 @@
 import { Route, Routes } from 'react-router';
 import { RequireAuth } from './auth/RequireAuth.tsx';
+import { MembersPage } from './features/members/MembersPage.tsx';
 import { OrganizationPage } from './features/organization/OrganizationPage.tsx';
 import { AppShell } from './pages/AppShell.tsx';
 import { HomePage } from './pages/HomePage.tsx';
@@ -20,6 +21,7 @@ export function App() {
       >
         <Route index element={<HomePage />} />
         <Route path="/o/:organizationId" element={<OrganizationPage />} />
+        <Route path="/o/:organizationId/members" element={<MembersPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>

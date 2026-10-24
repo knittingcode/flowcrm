@@ -58,7 +58,7 @@ function readOrganization(body: unknown): Organization {
   return unexpected();
 }
 
-function readMember(value: unknown): Member {
+export function readMember(value: unknown): Member {
   if (
     isRecord(value) &&
     typeof value.membershipId === 'string' &&

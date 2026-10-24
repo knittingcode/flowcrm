@@ -57,6 +57,19 @@ describe('apiRequest', () => {
     expect(calls.map((c) => c.headers['X-CSRF-Token'])).toEqual(['stale', 'fresh']);
   });
 
+  it('does not resend, and throws the csrf-invalid problem, when the token cannot be refreshed', async () => {
+    const calls = fakeApi({ 'POST /api/v1/auth/logout': [problem(403, 'csrf-invalid'), new Response(null, { status: 204 })] });
+    setCsrfToken('stale');
+    setCsrfRefresher(() => Promise.reject(new TypeError('Failed to fetch')));
+
+    await expect(apiRequest('/api/v1/auth/logout', { method: 'POST' }, () => null)).rejects.toMatchObject({
+      status: 403,
+      type: '/problems/csrf-invalid',
+    });
+
+    expect(calls).toHaveLength(1);
+  });
+
   it('does not retry anything else', async () => {
     const calls = fakeApi({ 'POST /api/v1/auth/logout': problem(403, 'forbidden'), 'GET /api/v1/me': problem(403, 'csrf-invalid') });
     const refresher = vi.fn(() => Promise.resolve());

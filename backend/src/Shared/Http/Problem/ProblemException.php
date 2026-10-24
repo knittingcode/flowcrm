@@ -69,6 +69,12 @@ final class ProblemException extends HttpException
         return new self(422, 'validation-error', ['errors' => $errors]);
     }
 
+    /** The request conflicts with the current state; the stable code says how (such as LAST_ADMIN). */
+    public static function conflict(string $code): self
+    {
+        return new self(409, 'conflict', ['errors' => [['code' => $code]]]);
+    }
+
     public static function tooManyRequests(int $retryAfterSeconds): self
     {
         return new self(429, 'too-many-requests', headers: ['Retry-After' => (string) max(1, $retryAfterSeconds)]);

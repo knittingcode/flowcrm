@@ -44,7 +44,7 @@ final class RouteSecurityTest extends KernelTestCase
             self::assertSame(Requirement::UUID, $route->getRequirement('organizationId'), $name);
             self::assertCount(1, $this->permissions($route), "$name must declare exactly one TenantPermission");
         }
-        self::assertGreaterThanOrEqual(3, $tenantRoutes);
+        self::assertGreaterThanOrEqual(6, $tenantRoutes);
     }
 
     public function testEveryApiRouteOutsideThePublicListNeedsALogin(): void
