@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Tests\Unit\Identity;
 
 use App\Identity\Infrastructure\Security\LoginRateLimiter;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\RateLimiter\RateLimiterFactory;
@@ -53,6 +54,33 @@ final class LoginRateLimiterTest extends TestCase
         }
 
         self::assertFalse($limiter->consume($this->request('a@Example.Test', '203.0.113.9'))->isAccepted());
+    }
+
+    /**
+     * Spellings that PostgreSQL lower() folds to the same address (the user
+     * lookup) share one key: U+0130 is "i" there, a final capital sigma is
+     * U+03C3.
+     *
+     * @return iterable<string, array{string, string}>
+     */
+    public static function spellingsOfOneAccount(): iterable
+    {
+        yield 'dotted capital I' => ['admin@example.test', "adm\u{130}n@example.test"];
+        yield 'dotted capital I, upper case' => ['ADMIN@EXAMPLE.TEST', "ADM\u{130}N@EXAMPLE.TEST"];
+        yield 'final capital sigma' => ["a\u{3C3}@example.test", "a\u{3A3}@example.test"];
+        yield 'final capital sigma, upper case' => ["\u{3A3}\u{3A3}@example.test", "\u{3C3}\u{3C3}@example.test"];
+    }
+
+    #[DataProvider('spellingsOfOneAccount')]
+    public function testSpellingsThatTheLookupFoldsTogetherShareTheAccountWindow(string $first, string $second): void
+    {
+        $limiter = $this->limiter(new InMemoryStorage());
+        for ($i = 0; $i < 5; ++$i) {
+            $limiter->consume($this->request($i % 2 ? $second : $first, '203.0.113.9'));
+        }
+
+        self::assertFalse($limiter->consume($this->request($first, '203.0.113.9'))->isAccepted());
+        self::assertFalse($limiter->consume($this->request($second, '203.0.113.9'))->isAccepted());
     }
 
     private function limiter(InMemoryStorage $storage): LoginRateLimiter
