@@ -318,6 +318,81 @@ describe('MembersPage', () => {
     expect(count(calls, 'GET', MEMBERS)).toBe(1);
   });
 
+  it('explains a CSRF token refused again after the retry, without reporting a missing permission', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`POST ${ORG}/members`]: problem(403, 'csrf-invalid'),
+    });
+    renderAt('/o/org-a/members');
+
+    await userEvent.type(await screen.findByLabelText('E-mail address of the user'), 'x@example.test');
+    await userEvent.click(screen.getByRole('button', { name: 'Add member' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again.',
+    );
+    expect(alert).not.toHaveTextContent('permission');
+    expect(alert).toHaveFocus();
+    expect(count(calls, 'POST', `${ORG}/members`)).toBe(2);
+    expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
+    expect(count(calls, 'GET', MEMBERS)).toBe(1);
+    expect(screen.getByRole('form', { name: 'Add a member' })).toBeInTheDocument();
+  });
+
+  it('reloads the list when the API could not be reached, as the change may have been saved', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), members([ada])],
+    });
+    const fake = globalThis.fetch;
+    vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) =>
+      init?.method === 'DELETE' ? Promise.reject(new TypeError('Failed to fetch')) : fake(input, init),
+    );
+    renderAt('/o/org-a/members');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'The API could not be reached, so it is not known whether the change was saved. The list was reloaded to show the current state.',
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole('rowheader', { name: 'Grace Tester' })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole('alert')).toHaveFocus();
+    expect(count(calls, 'GET', MEMBERS)).toBe(2);
+    expect(count(calls, 'GET', ORG)).toBe(2);
+  });
+
+  it.each([
+    ['a body that is not JSON', () => new Response('<html>', { status: 201, headers: { 'Content-Type': 'text/html' } })],
+    ['JSON of an unexpected shape', () => json(201, { unexpected: true })],
+  ])('reloads the list after a success answer with %s, as the outcome is unknown', async (_, answer) => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada]), members([ada, grace])],
+      [`POST ${ORG}/members`]: answer,
+    });
+    renderAt('/o/org-a/members');
+
+    await userEvent.type(await screen.findByLabelText('E-mail address of the user'), 'grace@example.test');
+    await userEvent.click(screen.getByRole('button', { name: 'Add member' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'The answer of the API could not be read, so it is not known whether the change was saved. The list was reloaded to show the current state.',
+    );
+    expect(alert).not.toHaveTextContent('could not be saved');
+    expect(await screen.findByRole('rowheader', { name: 'Grace Tester' })).toBeInTheDocument();
+    expect(count(calls, 'GET', MEMBERS)).toBe(2);
+  });
+
   it('returns to the login when the session has ended', async () => {
     fakeApi({
       'GET /api/v1/auth/session': adminSession(),

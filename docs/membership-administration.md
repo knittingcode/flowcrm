@@ -367,7 +367,7 @@ role with an unknown address is only `INVALID_ROLE`.
 |---|---|---|---|---|
 | 400 | `bad-request` | none | the body is not a JSON object | "The change could not be saved (request …)." (the SPA always sends JSON objects) |
 | 401 | `unauthenticated` | none | no valid session (logged out, expired, disabled user, password changed elsewhere) | the login page with "Your session has ended" |
-| 403 | `csrf-invalid` | none | origin, `Sec-Fetch-Site` or CSRF token check failed | retried once after reading the session again; if refused again: "You do not have permission to do this. The list was reloaded." |
+| 403 | `csrf-invalid` | none | origin, `Sec-Fetch-Site` or CSRF token check failed | retried once after reading the session again; if refused again: "The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again." The list is not reloaded (the request was not processed) |
 | 403 | `forbidden` | none | the actor's role has no such permission, also when the actor was demoted while the request waited for the lock | "You do not have permission to do this. The list was reloaded." |
 | 404 | `not-found` | none | organization unknown or not the actor's; target membership unknown, of another organization or removed; the actor's own membership removed meanwhile | "This member was changed or removed by someone else; the list was reloaded." If the organization itself is gone, the reload shows the "Not found" page |
 | 409 | `conflict` | `LAST_ADMIN` | demoting or removing the only active ADMIN, also oneself | "An organization needs at least one admin. Make another member an admin first. Nothing was changed." |
@@ -384,8 +384,13 @@ role with an unknown address is only `INVALID_ROLE`.
 <!-- no-store and Vary: Cookie on every answer verified by MembershipAdministrationTest::testMembershipResponsesAreNotCached -->
 
 When the API cannot be reached at all the SPA shows "The API could not be
-reached. The change may not have been saved." After a 403, 404 or 409 it
-reads the organization and the list again.
+reached, so it is not known whether the change was saved. The list was
+reloaded to show the current state." When a success answer (2xx) has a body
+that cannot be read or does not have the expected shape, it shows "The answer
+of the API could not be read, so it is not known whether the change was
+saved. The list was reloaded to show the current state." In both cases, and
+after a 403 (other than `csrf-invalid`), 404 or 409, it reads the
+organization and the list again.
 
 ## Operational notes and limitations
 

@@ -44,10 +44,12 @@ function pageOf(value: string | null): number {
 /**
  * The member administration of one organization. Controls are shown only
  * when the user's own membership in this organization has the permission;
- * the API decides every change. After every change, and after every refusal
- * that may mean the list is stale (403, 404, 409), the organization and the
- * members are read again: nothing is changed in the page before the server
- * has confirmed it.
+ * the API decides every change. After every change, after every refusal
+ * that may mean the list is stale (403 other than csrf-invalid, 404, 409),
+ * and whenever it is unknown whether a change was saved (the API could not be
+ * reached, or its success answer could not be read), the organization and
+ * the members are read again: nothing is changed in the page before the
+ * server has confirmed it.
  */
 export function MembersPage() {
   const { organizationId = '' } = useParams();
