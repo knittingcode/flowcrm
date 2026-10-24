@@ -297,12 +297,16 @@ v "ST-12 the edge replaces client request IDs and hides server details" $?
 # Structured logs (FCRM-003 section Q): the request ID of a response is in
 # the api's JSON record of that request and in the edge access log; tokens
 # sent in the query, headers or cookies are in neither, and neither is any
-# other query value (search=, whose key does not look sensitive).
+# other query value (search=, whose key does not look sensitive), nor the
+# query of the Referer that the framework quotes for an unknown route.
+get "$PA" '/api/v1/does-not-exist' -H 'Referer: https://crm.example.test/accounts?search=st40-referer-secret'
+rid_nf=$(header X-Request-Id) code_nf=$CODE
 get "$PA" '/api/v1/system/status?token=st40-query-secret&search=st40-search-secret' -H 'Authorization: Bearer st40-header-secret' \
   -H 'Cookie: sid=st40-cookie-secret' -H 'X-CSRF-Token: st40-csrf-secret'
 rid=$(header X-Request-Id)
 i=0
-until docker logs "$(cid "$A" api)" 2>&1 | grep -qF "\"request_id\":\"$rid\"" || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
+until { docker logs "$(cid "$A" api)" 2>&1 | grep -qF "\"request_id\":\"$rid\"" &&
+  docker logs "$(cid "$A" api)" 2>&1 | grep -qF "\"request_id\":\"$rid_nf\""; } || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
 api_log=$work/api.log edge_log=$work/edge.log
 docker logs "$(cid "$A" api)" >"$api_log" 2>&1
 docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
@@ -321,8 +325,10 @@ json_check=$(grep '^{' "$api_log" | docker exec -i "$(cid "$A" api)" php -r '
   echo "$n $bad";')
 [ "${json_check%% *}" -gt 0 ] && [ "${json_check#* }" = 0 ]
 v "ST-42 api log lines are complete JSON records (lines, invalid: $json_check)" $?
-! grep -qE 'st40-(query|search|header|cookie|csrf)-secret' "$api_log" "$edge_log"
-v "ST-43 query (token and search), Authorization, Cookie and CSRF values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3)"
+! grep -qE 'st40-(query|search|header|cookie|csrf|referer)-secret' "$api_log" "$edge_log" && [ "$code_nf" = 404 ] &&
+  grep -F "\"request_id\":\"$rid_nf\"" "$api_log" | grep -qF 'https://crm.example.test/accounts?[redacted]' &&
+  grep -F "$rid_nf" "$edge_log" | grep -qF 'https://crm.example.test/accounts?[redacted]'
+v "ST-43 query (token and search), Authorization, Cookie, CSRF and Referer query values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3; grep -F "$rid_nf" "$api_log" | head -c 600)"
 
 # Sessions are lazy (FND-008): stateless routes neither start a session nor
 # set a cookie, even when a session cookie is sent; the migration that runs
