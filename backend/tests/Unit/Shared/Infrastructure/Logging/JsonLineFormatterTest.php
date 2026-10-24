@@ -102,6 +102,24 @@ final class JsonLineFormatterTest extends TestCase
         self::assertStringContainsString('api_v1_system_status', $line);
     }
 
+    #[DataProvider('urlKeys')]
+    public function testEveryUrlKeyLosesItsQueryString(string $key): void
+    {
+        $line = $this->format('redirect', [$key => 'https://app.example.test/accounts?search=ada@example.test#row-2']);
+
+        self::assertStringNotContainsString('ada@example.test', $line);
+        self::assertStringNotContainsString('row-2', $line);
+        self::assertStringContainsString('"'.$key.'":"https://app.example.test/accounts?[redacted]"', $line);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function urlKeys(): iterable
+    {
+        foreach (['request_uri', 'uri', 'url', 'referer', 'referrer', 'redirect_uri', 'location', 'target_path', 'href', 'return_to', 'Location'] as $key) {
+            yield $key => [$key];
+        }
+    }
+
     public function testUrlsWithoutAQueryAreKept(): void
     {
         self::assertStringContainsString('"uri":"/api/v1/system/status"', $this->format('request', ['uri' => '/api/v1/system/status']));

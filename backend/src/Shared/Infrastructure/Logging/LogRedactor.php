@@ -35,9 +35,10 @@ final class LogRedactor
     /**
      * Keys whose values are URLs: their query string is removed, as the
      * edge's access log does (for example the router's "Matched route"
-     * record carries the full request URI).
+     * record carries the full request URI, and redirect targets carry the
+     * page to return to).
      */
-    private const URL_KEYS = ['request_uri', 'uri', 'url', 'referer', 'referrer'];
+    private const URL_KEYS = ['request_uri', 'uri', 'url', 'referer', 'referrer', 'redirect_uri', 'location', 'target_path', 'href', 'return_to'];
 
     private const MAX_DEPTH = 8;
 
