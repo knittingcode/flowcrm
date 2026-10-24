@@ -346,6 +346,142 @@ shows this project's logs (`edge` logs each HTTP request).
 | `… still running …; .runtime/lock is kept until they end` (exit 4) | Docker Compose processes outlived the Docker CLI for `FLOWCRM_LOCK_WAIT` seconds; the next command proceeds once they have ended |
 | refused with exit 6 | resources of another checkout; see the message |
 
+## Backup and restore of the development database
+
+A procedure for the development database of one checkout; it is not a
+production backup concept. A backup is trusted only after it was restored
+into a **separate, disposable project** and verified there; the database you
+work with is changed only after that rehearsal passed. Two kinds of backup:
+
+- **Logical dump** (`pg_dump -Fc`): schema, data, ownership and grants, but
+  no role passwords. It restores into any FlowCRM database that has the
+  roles of ADR-018, so the rehearsal project keeps its own secrets.
+- **Volume archive** (a `tar` of the stopped `db-data` volume): an exact
+  copy of the PostgreSQL cluster, including the role passwords. It works
+  only together with a copy of `.runtime/secrets` from the same checkout
+  and the same PostgreSQL major version.
+
+Keep backups outside the checkout and outside any Docker volume, readable
+only by you; they contain all application data. The commands below run in
+the checkout directory unless said otherwise; database commands run as the
+superuser `flowcrm` inside the `db` container (local socket, no password).
+
+### 1. Name the project and define the check
+
+```console
+$ src=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)
+$ echo "$src"                      # flowcrm- and six hex characters; also shown by make status
+$ backups=~/flowcrm-backups && mkdir -p -m 700 "$backups"
+$ fingerprint() { docker exec -i "$(docker ps -q --filter "label=com.docker.compose.project=$1" --filter label=com.docker.compose.service=db)" \
+    psql -X -q -At -U flowcrm -d flowcrm <<'SQL'
+SELECT 'migrations|' || count(*) FROM doctrine_migration_versions;
+SELECT format('SELECT %L || count(*) FROM %I.%I', 'rows ' || c.relname || '|', n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') ORDER BY c.relname \gexec
+SQL
+}
+```
+
+`fingerprint <project>` prints the number of applied migrations and the row
+count of every table in schema `public`; the verification compares these
+lines. `.runtime/dev.env` exists after the first verified `make up`.
+
+### 2a. Take a logical dump
+
+```console
+$ ts=$(date -u +%Y%m%dT%H%M%SZ)
+$ fingerprint "$src" >"$backups/flowcrm-$ts.fingerprint"
+$ docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$src" --filter label=com.docker.compose.service=db)" \
+    pg_dump -U flowcrm -d flowcrm -Fc >"$backups/flowcrm-$ts.dump"
+$ fingerprint "$src" | diff "$backups/flowcrm-$ts.fingerprint" - && echo unchanged
+```
+
+`pg_dump` reads one consistent snapshot. If the second fingerprint differs
+(the stack was used meanwhile), take the dump again.
+
+### 2b. Or take a volume archive
+
+The database must be stopped, so the files are consistent:
+
+```console
+$ ts=$(date -u +%Y%m%dT%H%M%SZ)
+$ fingerprint "$src" >"$backups/flowcrm-volume-$ts.fingerprint"
+$ make down
+$ docker run --rm --network none -v "${src}_db-data:/data:ro" -v "$backups:/backup" \
+    busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e \
+    tar -C /data -cf "/backup/flowcrm-volume-$ts.tar" .
+$ cp -Rp .runtime/secrets "$backups/flowcrm-volume-$ts.secrets"
+$ make up
+```
+
+### 3. Rehearse the restore in a new, disposable project
+
+A second checkout has its own project name, volume, secrets and port, so
+nothing here touches the original stack:
+
+```console
+$ git worktree add --detach ../flowcrm-restore-check HEAD
+$ cd ../flowcrm-restore-check
+$ chk=$(./bin/devenv doctor | sed -n 's/^project \(flowcrm-[0-9a-f]*\) for .*/\1/p')
+$ echo "$chk"                      # must differ from $src
+```
+
+For a **logical dump**: start the new project (a new, empty, migrated
+database with its own secrets), restore the dump over it, then let
+`make up` check the roles, the migrations and the runtime privileges:
+
+```console
+$ make up
+$ docker exec -i "$(docker ps -q --filter "label=com.docker.compose.project=$chk" --filter label=com.docker.compose.service=db)" \
+    pg_restore -U flowcrm -d flowcrm --clean --if-exists --single-transaction --exit-on-error <"$backups/flowcrm-$ts.dump"
+$ make up
+$ fingerprint "$chk" | diff "$backups/flowcrm-$ts.fingerprint" - && echo identical
+```
+
+For a **volume archive**: give the new project the archived secrets and a
+volume with the archived files before its first start:
+
+```console
+$ mkdir -p -m 755 .runtime && cp -Rp "$backups/flowcrm-volume-$ts.secrets" .runtime/secrets
+$ docker volume create --label com.docker.compose.project="$chk" --label com.docker.compose.volume=db-data "${chk}_db-data"
+$ docker run --rm --network none -v "${chk}_db-data:/data" -v "$backups:/backup:ro" \
+    busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e \
+    tar -C /data -xpf "/backup/flowcrm-volume-$ts.tar"
+$ make up
+$ fingerprint "$chk" | diff "$backups/flowcrm-volume-$ts.fingerprint" - && echo identical
+```
+
+The rehearsal passed when `make up` exits 0 (it refuses a database whose
+roles, migrations or runtime privileges do not match, exit 6) and `diff`
+prints nothing. Then remove the rehearsal project and its volume:
+
+```console
+$ make down
+$ docker volume rm "${chk}_db-data"
+$ cd - && git worktree remove --force ../flowcrm-restore-check
+```
+
+### 4. Switch: restore into the project you work with
+
+Only after a rehearsal of the same backup passed. First take a new logical
+dump of the current state (step 2a, it is your way back), then restore and
+verify exactly as in the rehearsal, in the original checkout:
+
+```console
+$ docker exec -i "$(docker ps -q --filter "label=com.docker.compose.project=$src" --filter label=com.docker.compose.service=db)" \
+    pg_restore -U flowcrm -d flowcrm --clean --if-exists --single-transaction --exit-on-error <"$backups/flowcrm-$ts.dump"
+$ make up
+$ fingerprint "$src" | diff "$backups/flowcrm-$ts.fingerprint" - && echo identical
+```
+
+`--single-transaction` makes the restore all or nothing. Requests that
+arrive during it may fail; sessions in the restored data are those of the
+backup. To switch to a volume archive instead, stop the stack
+(`make down`), restore `.runtime/secrets` from the archived copy and the
+volume as in step 3 (remove the old volume first:
+`docker volume rm "${src}_db-data"`, only after the new dump of step 2a
+exists and a rehearsal of the archive passed), then `make up`.
+
 ## Image pinning
 
 Base images are pinned by tag and digest in `docker/*/Dockerfile` and

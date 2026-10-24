@@ -286,11 +286,13 @@ as it was. Recovery is a manual operator task:
 
 1. **Identify the database.** Run every command against the database of
    the environment that failed, and confirm it first. For a development
-   checkout, `make status` prints the Compose project (for example
-   `flowcrm-1d1ca1`); then, from the checkout directory:
+   checkout, take the Compose project from `.runtime/dev.env` (`make status`
+   prints it too) and check it; then, from the checkout directory:
 
    ```console
-   $ docker compose -p flowcrm-1d1ca1 exec db psql -U flowcrm -d flowcrm -c 'SELECT current_database(), current_schema()'
+   $ project=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)
+   $ echo "$project"
+   $ docker compose -p "$project" exec db psql -U flowcrm -d flowcrm -c 'SELECT current_database(), current_schema()'
    ```
 
    These commands run as the superuser `flowcrm` inside the `db` container
@@ -302,10 +304,10 @@ as it was. Recovery is a manual operator task:
 3. **Back it up and prove the backup restores**, before any change:
 
    ```console
-   $ docker compose -p flowcrm-1d1ca1 exec -T db pg_dump -U flowcrm -d flowcrm -Fc -t cache_items >cache_items.dump
-   $ docker compose -p flowcrm-1d1ca1 exec -T db createdb -U flowcrm flowcrm_restore_check
-   $ docker compose -p flowcrm-1d1ca1 exec -T db pg_restore -U flowcrm -d flowcrm_restore_check <cache_items.dump
-   $ docker compose -p flowcrm-1d1ca1 exec db psql -U flowcrm -d flowcrm_restore_check -c 'SELECT count(*) FROM cache_items'
+   $ docker compose -p "$project" exec -T db pg_dump -U flowcrm -d flowcrm -Fc -t cache_items >cache_items.dump
+   $ docker compose -p "$project" exec -T db createdb -U flowcrm flowcrm_restore_check
+   $ docker compose -p "$project" exec -T db pg_restore -U flowcrm -d flowcrm_restore_check <cache_items.dump
+   $ docker compose -p "$project" exec db psql -U flowcrm -d flowcrm_restore_check -c 'SELECT count(*) FROM cache_items'
    ```
 
    The count must match the original. Keep the dump outside the database
