@@ -115,10 +115,16 @@ the edge answers every request with 503 ("blocked by its security gate"),
 except exactly `/health/live` and `/health/ready` (raw request URI, as in
 ADR-017), so its own health check and the readiness check through it still
 work and the gate never deadlocks a recovery. The gate is therefore a
-runtime barrier, not only a record: an edge that runs while the gate is
-recorded serves nothing else, whoever started it and whatever happened to
-the command. Stacks that `bin/devenv` does not run (production-like, tests)
-mount the empty `docker/edge/no-gate` instead. The directory is 0755 and
+runtime barrier, not only a record: an edge that mounts `.runtime/gate`
+serves nothing else while the gate is recorded, whatever happened to the
+command that recorded it. Only `bin/devenv` mounts it: every Compose call
+it makes sets `FLOWCRM_GATE_DIR` to `.runtime/gate`. Without that variable
+the edge mounts the empty `docker/edge/no-gate` (the production-like and
+test stacks, which `bin/devenv` does not run), so an edge of the
+development stack started directly with `docker compose up`, outside
+`bin/devenv`, does not see the gate and does not enforce it. The
+development stack is therefore started and recovered only through `make`
+(`bin/devenv`). The directory is 0755 and
 the record 0644: an edge that could not read the gate would serve, so
 `bin/devenv` checks, before it relies on the barrier, that the edge
 answers `/` with the gate's 503. `make up` changes nothing

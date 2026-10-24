@@ -91,10 +91,13 @@ and leaves `.runtime/dev.env` unchanged:
    When this check or the role check of phase 5 fails, a running edge is
    stopped, so the stack is not served; the database and the saved port are
    kept, `make status` reports `blocked` and `make url` fails until a
-   `make up` passes. The gate is the file `.runtime/gate/security-gate`; the
-   edge mounts that directory and, while the file exists, answers everything
-   but `/health/live` and `/health/ready` with 503, so a stack that has not
-   passed its checks serves nothing even if an edge is running (ADR-018);
+   `make up` passes. The gate is the file `.runtime/gate/security-gate`; an
+   edge started by `bin/devenv` mounts that directory (`FLOWCRM_GATE_DIR`)
+   and, while the file exists, answers everything but `/health/live` and
+   `/health/ready` with 503, so a stack that has not passed its checks
+   serves nothing even if such an edge is running. An edge started directly
+   with `docker compose up` mounts the empty `docker/edge/no-gate` instead
+   and does not enforce the gate; use `make` (ADR-018);
 8. start the edge on the first usable port (`up --no-deps --wait edge`);
 9. verify Docker's actual mapping and `GET` of the stack's readiness path
    (`/health/ready`, which must answer 200 with the stack's own body) through
