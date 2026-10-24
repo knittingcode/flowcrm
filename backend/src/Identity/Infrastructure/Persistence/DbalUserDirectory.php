@@ -39,6 +39,11 @@ final readonly class DbalUserDirectory implements UserDirectory
 
     public function idOfEmail(string $email): ?Uuid
     {
+        // PostgreSQL text holds no NUL, and pdo_pgsql would cut the bound
+        // value at the first one, so such an address could match another.
+        if (str_contains($email, "\0")) {
+            return null;
+        }
         $id = $this->connection->fetchOne('SELECT id FROM users WHERE lower(email) = lower(?)', [$email]);
 
         return \is_string($id) ? Uuid::fromString($id) : null;
