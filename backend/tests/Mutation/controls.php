@@ -93,6 +93,12 @@ return [
     ['password changed outside the audit transaction', 'src/Identity/Application/ChangeOwnPassword.php',
         "        \$this->transaction->run(function () use (\$user, \$hash, \$requestId): void {\n            \$user->changePassword(\$hash, \$this->clock->now());\n", "        \$this->transaction->run(fn () => \$user->changePassword(\$hash, \$this->clock->now()));\n        \$this->transaction->run(function () use (\$user, \$requestId): void {\n",
         'AuditTrailTest::testAPasswordChangeWhoseAuditEventCannotBeWrittenChangesNothing'],
+    ['enabling a user is not audited', 'src/Identity/Application/ManageUsers.php',
+        "            \$this->audit->record(new AuditRecord('user.enabled', 'user', \$user->id(), Actor::operator()));\n", '',
+        'AuditTrailTest::testOperatorUserChangesAreAuditedWithTheirAction'],
+    ['user enabled outside the audit transaction', 'src/Identity/Application/ManageUsers.php',
+        "        \$this->transaction->run(function () use (\$user): void {\n            \$user->enable();\n", "        \$this->transaction->run(fn () => \$user->enable());\n        \$this->transaction->run(function () use (\$user): void {\n",
+        'AuditTrailTest::testOperatorEnableAndProvisioningWhoseAuditEventCannotBeWrittenChangeNothing'],
 
     // Request forgery.
     ['Origin not checked', 'src/Shared/Http/Security/RequestOriginGuard.php',
