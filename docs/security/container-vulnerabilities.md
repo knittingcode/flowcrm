@@ -165,23 +165,37 @@ closes the connection early. Affected: 6.23.0 to 6.29.0, 7.18.0 to 7.30.0,
 | Same path, npm 11.19.1 bundled with Node 24.22.1 | edge `spa-build` stage only | 6.28.0 | open, build stage |
 
 **Reachability:** inside npm, only the bundled `node-gyp` (12.4.0) uses
-undici, to download Node.js headers when it compiles a native addon. Both
-Dockerfiles install with `npm ci --ignore-scripts`, so `node-gyp` does not
-run; the Vite dev server, the Vite build, Vitest, `tsc` and ESLint do not
-load npm's modules and use the fixed core or project undici. The
+undici (`node-gyp/lib/download.js`, checked in the 11.21.1 and 12.2.1
+tarballs), to download Node.js headers when it compiles a native addon.
+The Dockerfiles install with `npm ci --ignore-scripts`, so `node-gyp` does
+not run; even without the flag it would not, because the only frontend
+package with an install script is `fsevents` (macOS only, never installed
+in the Alpine images). `npm audit` and `npm run` (tests/app/frontend.sh)
+load npm but not its undici; the Vite dev server, the Vite build, Vitest,
+`tsc` and ESLint do not load npm's modules and use the fixed core or
+project undici. The
 production-like images are not affected: the edge `prod` target contains
 only the Caddy base and the built SPA (`/srv/www`), the `spa-build` stage is
 discarded, and api and db contain no Node.js. The scan reports 0
 HIGH/CRITICAL for every runtime image.
 
 **Remediation:** none available. As of 2026-10-24 no npm release bundles
-undici 6.29.1 or later (the newest, 11.21.1 and 12.2.1, both bundle
-6.29.0), and no Node.js release bundles such an npm (the newest Node.js 24
-release, 24.22.1, bundles npm 11.19.1). The finding stays reported for the
-web image; no exception was added. When an npm release with undici >=
-6.29.1 exists, update `NPM_VERSION` and `NPM_SHA256` in
-`docker/web/Dockerfile`; when a Node.js 24 image bundles it, update
-`NODE_IMAGE` as well.
+a fixed undici (the newest, 11.21.1 and 12.2.1 of 2026-10-15, both bundle
+6.29.0, required by their `node-gyp` 12.4.0 and 13.0.0 as `^6.25.0`), and
+no Node.js release bundles a fixed npm (Node.js 24.22.1 bundles npm
+11.19.1, Node.js 26.12.1 npm 11.20.0). The finding stays reported for the
+web image; no exception was added.
+
+**Re-evaluation trigger:** the next npm release, and every change of
+`NPM_VERSION` or `NODE_IMAGE`. Check the undici version inside the npm
+tarball (`package/node_modules/undici/package.json`), not only npm's
+version: it is fixed only if it is 6.29.1 or later in 6.x, 7.30.1 or later
+in 7.x, or 8.12.2 or later in 8.x. The likely path is an npm release that
+bundles `node-gyp` 13.1.0 (published 2026-10-02), which requires undici
+`^8.4.1` instead of `^6.25.0`. Then update `NPM_VERSION` and `NPM_SHA256`
+in `docker/web/Dockerfile`, check that the web scan no longer reports
+CVE-2026-109869, and update this section; update `NODE_IMAGE` once a
+Node.js 24 image bundles such an npm (the edge `spa-build` stage).
 
 ## Deferred hardening items
 
