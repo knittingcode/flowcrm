@@ -121,6 +121,17 @@ limits in `backend/config/services.yaml`):
 | 50 per client IP | 15 minutes | password spraying over many accounts |
 | 100 per account | 1 day | distributed guessing against one account |
 
+The account part of a key folds case at least as far as the user lookup
+(PostgreSQL `lower()`, simple one-to-one Unicode mapping), so every spelling
+that loads an account shares its windows; with the full mapping, a spelling
+with `İ` (U+0130) would have got windows of its own. This was checked for
+every code point under the database locale (libc, `en_US.utf8`): no two
+spellings that `lower()` folds together get different keys. For 124 code
+points (circled letters such as `Ⓐ`, for example) the key folds and `lower()`
+does not; those spellings share an account's windows without loading it,
+which only makes the limit stricter. The check must be repeated if the
+locale, the collation provider, the C library or PHP's Unicode tables change.
+
 A successful login clears only the account-and-IP window. The state is in
 `cache_items` (pool `cache.rate_limits`) under HMAC keys; PostgreSQL
 advisory locks on the cache connection make concurrent failures all count.
@@ -348,12 +359,12 @@ time-based retention) before any real personal data is processed.
 | `backend/tests/Integration/Security/AuthenticationTest` | login answer and cookie, fixation (existing and planted IDs), identical failures, case-insensitive e-mail, anonymous introspection and 401s without a stored session or cookie (also with an unknown session ID), logout and replay (AC-27), logout CSRF, absolute and idle expiry, invalidation by disable, operator reset and own password change, no credentials or tenant in the session, hash upgrade, token rotation |
 | `RequestForgeryTest` | eight foreign-origin variants refused before authentication and with a valid token (with the request ID), Referer fallback, token missing, empty, forged or of another session, safe methods, form and text bodies (415), anonymous unsafe requests (401), malformed JSON |
 | `ApiRateLimitTest` | the 601st request in a minute is a 429 with `Retry-After`; per user; the session probe and logout stay available; login, public routes, anonymous and refused requests are not counted |
-| `LoginThrottlingTest` | the three limits, unknown accounts alike, case-insensitive accounts, reset of the account-and-IP window only, keyed by the forwarded client IP, throttle before the password check |
+| `LoginThrottlingTest` | the three limits, unknown accounts alike, case-insensitive accounts (including Unicode spellings that the lookup folds together), reset of the account-and-IP window only, keyed by the forwarded client IP, throttle before the password check |
 | `TenantAuthorizationTest` | anonymous 401, foreign organization identical to an unknown one, no memberships, the role in the answer, e-mail by permission, a user in two organizations, IDOR with guessed and malformed IDs, client-supplied organization IDs, removal and demotion on the next request, pagination |
 | `RouteSecurityTest` | every tenant route has the UUID requirement and exactly one permission; every API route outside the public list needs a login; `/health` is outside the firewall; the specification matches the routes |
 | `AuditTrailTest`, `SecurityLoggingTest`, `ProvisioningCommandTest`, `SecurityConfigurationTest` | audit events without secrets or IP, none for failures; with the audit table failing (a test trigger): no login, no password or operator change, but the logout still ends the session; security log with pseudonyms and the request ID of the answer; console input rules; production hasher, lifetime, limits and trusted headers |
 | Unit tests | `SecurityUser`, `PasswordPolicy`, `UserProvider` (one hash for unknown e-mails), `LoginRateLimiter`, `RolePolicy` (the matrix as data), `TenantPermissionVoter`, `TenantGuard`, `RequestOriginGuard`, `JsonBody`, `Pagination`, problem documents |
-| `tests/app/backend.sh` BE-18 | 35 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
+| `tests/app/backend.sh` BE-18 | 38 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
 | `tests/app/stack.sh` ST-69 to ST-73, ST-16 | through the real edge: cookie attributes, logout with token and replay, cross-origin and form logins, spoofed `X-Forwarded-For` cannot evade the limit, no secrets in any log; Playwright journeys (login, logout, back button, roles, two organizations, foreign organization, CSRF) |
 | `tests/app/prodlike.sh` PL-16, PL-11 | the production cookie (`__Host-`, `Secure`) with curl; the login page under the production CSP |
 | `tests/app/prodlike.sh` PL-17 to PL-22, `frontend/e2e/https.spec.ts` | over HTTPS (see [HTTPS](#https-and-proxies)): the TLS site, spoofed forwarding headers, no CORS, an untrusted TLS proxy fails closed, the cookie and the logged-in journeys in Chromium, cross-site forgeries, the client IP behind the edge |

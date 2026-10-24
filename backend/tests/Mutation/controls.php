@@ -91,6 +91,14 @@ return [
         "        \$this->transaction->run(function () use (\$user, \$hash, \$requestId): void {\n            \$user->changePassword(\$hash, \$this->clock->now());\n", "        \$this->transaction->run(fn () => \$user->changePassword(\$hash, \$this->clock->now()));\n        \$this->transaction->run(function () use (\$user, \$requestId): void {\n",
         'AuditTrailTest::testAPasswordChangeWhoseAuditEventCannotBeWrittenChangesNothing'],
 
+    // Log redaction (FCRM-003 section Q).
+    ['URL queries kept in log text', 'src/Shared/Infrastructure/Logging/LogRedactor.php',
+        "return (string) preg_replace('~\\b([a-z][a-z0-9+.-]*://", "return \$text; (string) preg_replace('~\\b([a-z][a-z0-9+.-]*://",
+        'JsonLineFormatterTest::testQueriesOfUrlsInTextAreRemoved|LoggingTest::testTheQueryOfAReferrerIsNotLogged'],
+    ['URL keys keep their query', 'src/Shared/Infrastructure/Logging/LogRedactor.php',
+        '$result[$key] = self::scrub(self::withoutQuery($value));', '$result[$key] = self::scrub($value);',
+        'JsonLineFormatterTest::testEveryUrlKeyLosesTheQueryOfARelativeUrl'],
+
     // Request forgery.
     ['Origin not checked', 'src/Shared/Http/Security/RequestOriginGuard.php',
         'if ($origin !== $request->getSchemeAndHttpHost()) {', 'if (false) {',
@@ -116,6 +124,9 @@ return [
     ['a success resets every window', 'src/Identity/Infrastructure/Security/LoginRateLimiter.php',
         "        \$this->accountAndIpLimiter(\$request)->reset();\n", "        foreach (\$this->getLimiters(\$request) as \$limiter) {\n            \$limiter->reset();\n        }\n",
         'LoginThrottlingTest::testOneClientIpIsLimitedAcrossAccounts|LoginRateLimiterTest'],
+    ['login key folds case unlike the user lookup', 'src/Identity/Infrastructure/Security/LoginRateLimiter.php',
+        "mb_convert_case(\$email, \\MB_CASE_LOWER_SIMPLE, 'UTF-8')", "mb_strtolower(\$email, 'UTF-8')",
+        'LoginThrottlingTest::testEveryVariantThatResolvesToTheAccountSharesItsWindow|LoginRateLimiterTest'],
     // Per-user API limit (FCRM-002 NFR-007).
     ['no per-user API limit', 'src/Identity/Http/Security/UserRateLimitListener.php',
         'if (!$limit->isAccepted()) {', 'if (false) {',
