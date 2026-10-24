@@ -124,7 +124,9 @@ test stacks, which `bin/devenv` does not run), so an edge of the
 development stack started directly with `docker compose up`, outside
 `bin/devenv`, does not see the gate and does not enforce it. The
 development stack is therefore started and recovered only through `make`
-(`bin/devenv`). The directory is 0755 and
+(`bin/devenv`); `make up` recreates a running edge that does not mount
+`.runtime/gate` (for example one created before this mount existed)
+instead of reporting it as running. The directory is 0755 and
 the record 0644: an edge that could not read the gate would serve, so
 `bin/devenv` checks, before it relies on the barrier, that the edge
 answers `/` with the gate's 503. `make up` changes nothing

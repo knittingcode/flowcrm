@@ -106,7 +106,11 @@ and leaves `.runtime/dev.env` unchanged:
 
 When the stack already runs, `make up` reports what it changed: `already
 running; nothing to change`, or `running; recreated: api (image or
-configuration changed)` and/or `applied pending database migrations`.
+configuration changed)` and/or `applied pending database migrations`. A
+running edge that does not mount `.runtime/gate` (created before the gate
+mount existed, or by a plain `docker compose up`) would not enforce the
+security gate; `make up` recreates it on its port instead of reporting it
+as running.
 
 ## Commands
 

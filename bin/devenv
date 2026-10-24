@@ -788,6 +788,20 @@ edge_state() {
   valid_port "$EDGE_PORT" || EDGE_PORT=
 }
 
+# The running edge (EDGE_ID) enforces the security gate: it mounts this
+# checkout's gate directory at /run/flowcrm-gate (compose.yaml,
+# FLOWCRM_GATE_DIR). An edge created before the gate mount existed, or by a
+# plain docker compose up (docker/edge/no-gate), does not, and is never
+# reported as running unchanged. Docker Desktop may show the source with a
+# prefix. Only the application stack has a gate.
+edge_mounts_gate() {
+  local src
+  [ "$STACK" = app ] || return 0
+  src=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/run/flowcrm-gate"}}{{.Source}}{{end}}{{end}}' "$EDGE_ID" 2>/dev/null) || return 1
+  case $src in *"$GATE_DIR") return 0 ;; esac
+  return 1
+}
+
 # A hint only: something accepts connections on the port.
 port_in_use() {
   (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0
@@ -1260,7 +1274,9 @@ do_up() {
   edge_state
 
   if [ "$EDGE_RUNNING" = true ] && [ -n "$EDGE_PORT" ] && eligible "$EDGE_PORT"; then
-    if [ "$EDGE_HEALTH" = healthy ] && wait_http "$EDGE_PORT"; then
+    if ! edge_mounts_gate; then
+      log "recreating the edge on port $EDGE_PORT: it does not mount .runtime/gate, so it would not enforce the security gate (created before FND-009E or outside make)"
+    elif [ "$EDGE_HEALTH" = healthy ] && wait_http "$EDGE_PORT"; then
       if [ "$STATE_STATUS" != valid ] || [ "$STATE_PORT" != "$EDGE_PORT" ]; then
         [ "$STATE_STATUS" != valid ] ||
           log "saved port $STATE_PORT did not match the running edge ($EDGE_PORT); saved state updated"

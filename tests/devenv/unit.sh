@@ -1269,6 +1269,34 @@ result "U-23 edge_sees_gate: one-off edge container with the gate directory, no 
 eval "$saved_fns"
 RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 
+# --- U-24 make up recognises an edge that does not enforce the gate (FND-009E)
+# edge_mounts_gate with a fake docker inspect: only an edge that mounts this
+# checkout's .runtime/gate at /run/flowcrm-gate enforces the gate (Docker
+# Desktop may show the source with a prefix); an edge with the empty
+# docker/edge/no-gate or without the mount (created before FND-009E or by a
+# plain docker compose up) does not, and make up must recreate it. The
+# fixture stack has no gate.
+saved_fns=$(declare -f docker)
+saved_stack=$STACK
+docker() { [ "$1" = inspect ] && printf '%s\n' "$U24_SRC"; }
+u24() { # name stack source expected(0|1)
+  local r
+  STACK=$2 U24_SRC=$3 EDGE_ID=edge-id
+  edge_mounts_gate
+  r=$?
+  [ "$r" = "$4" ]
+  result "U-24 $1" $? "(got $r)"
+}
+u24 "the edge mounts .runtime/gate: it enforces the gate" app "$GATE_DIR" 0
+u24 "the same with a Docker Desktop prefix" app "/host_mnt$GATE_DIR" 0
+u24 "the edge mounts docker/edge/no-gate: recreate it" app "$ROOT/docker/edge/no-gate" 1
+u24 "the edge has no gate mount: recreate it" app "" 1
+u24 "another checkout's gate directory: recreate it" app "$GATE_DIR-other" 1
+u24 "the fixture stack has no gate" fixture "" 0
+STACK=$saved_stack
+unset -f docker
+[ -z "$saved_fns" ] || eval "$saved_fns"
+
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
   "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1

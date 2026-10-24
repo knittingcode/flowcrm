@@ -690,13 +690,13 @@ $(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)"
 # and /health/ready is answered with the gate's 503 (raw URI, as ADR-017).
 gate_probe() { # -> "path=code ..." for the paths that matter
   local out='' p
-  for p in / /api/v1/system/status /health/live /health/ready /HEALTH/READY //health/ready; do
+  for p in / /api/v1/system/status /health/live /health/ready /HEALTH/READY //health/ready /health/readyz /health/ready/x; do
     out="$out $p=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --path-as-is "http://127.0.0.1:$PA$p")"
   done
   printf '%s' "${out# }"
 }
-GATED="/=503 /api/v1/system/status=503 /health/live=200 /health/ready=200 /HEALTH/READY=503 //health/ready=503"
-OPEN="/=200 /api/v1/system/status=200 /health/live=200 /health/ready=200 /HEALTH/READY=200 //health/ready=200"
+GATED="/=503 /api/v1/system/status=503 /health/live=200 /health/ready=200 /HEALTH/READY=503 //health/ready=503 /health/readyz=503 /health/ready/x=503"
+OPEN="/=200 /api/v1/system/status=200 /health/live=200 /health/ready=200 /HEALTH/READY=200 //health/ready=200 /health/readyz=200 /health/ready/x=200"
 probe_until() { # expected [seconds]: poll (a bind mount can show a change a moment late)
   local i=0
   PROBE=$(gate_probe)
@@ -739,8 +739,29 @@ r=$?
 v "ST-50 SIGINT right after the edge started again: the gate stays recorded, nothing but the health paths is served, make up serves" $? "exit $(rc_of a-ir-int), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-int-up)"
 interrupted_restore a-ir-term restore-before-edge 143
 r=$?
-[ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000" ]
+[ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000 /health/readyz=000 /health/ready/x=000" ]
 v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $? "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)"
+
+# An edge created without the gate directory (by bin/devenv before
+# FND-009E, or by a plain docker compose up) does not enforce the gate:
+# make up recreates it instead of reporting it as already running.
+gate_src() { docker inspect -f '{{range .Mounts}}{{if eq .Destination "/run/flowcrm-gate"}}{{.Source}}{{end}}{{end}}' "$(cid "$A" edge)" 2>/dev/null; }
+(cd "$A" && FLOWCRM_HTTP_PORT=$PA COMPOSE_PROFILES=dev,migrate docker compose --project-name "$(project_of "$A")" up --detach --no-deps --force-recreate edge) >"$work/out/a-legacy-edge.out" 2>&1
+until_ready "$PA" 200 30
+legacy_src=$(gate_src)
+dv a-up-legacy "$A" up
+new_src=$(gate_src)
+printf 'a gate recorded by the test\n' >"$A/.runtime/gate/security-gate"
+chmod 0644 "$A/.runtime/gate/security-gate"
+probe_until "$GATED"
+legacy_probe=$PROBE
+rm -f "$A/.runtime/gate/security-gate"
+probe_until "$OPEN"
+[ "$(rc_of a-up-legacy)" = 0 ] && case $legacy_src in */docker/edge/no-gate) true ;; *) false ;; esac &&
+  case $new_src in *"$A/.runtime/gate") true ;; *) false ;; esac && err_has a-up-legacy 'does not mount .runtime/gate' &&
+  [ "$legacy_probe" = "$GATED" ] && [ "$PROBE" = "$OPEN" ] && [ "$(saved_port "$A")" = "$PA" ]
+v "ST-50 an edge created without the gate directory is recreated by make up and then enforces the gate" $? "make up $(rc_of a-up-legacy), mount before [$legacy_src] after [$new_src], gated probe: $legacy_probe; open: $PROBE
+$(sed 's/^/      | /' "$work/out/a-up-legacy.err" | tail -n 5)"
 
 # Interrupted while the password change waits inside PostgreSQL (another
 # session holds the operations' advisory lock): the interrupted transaction
