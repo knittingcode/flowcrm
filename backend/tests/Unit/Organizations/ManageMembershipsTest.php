@@ -7,13 +7,19 @@ namespace App\Tests\Unit\Organizations;
 use App\Audit\Api\AuditRecord;
 use App\Audit\Api\AuditTrail;
 use App\Identity\Api\UserDirectory;
+use App\Identity\Api\UserProfile;
+use App\Organizations\Api\TenantContext;
 use App\Organizations\Application\ActorNotMember;
 use App\Organizations\Application\ActorNotPermitted;
 use App\Organizations\Application\LastAdmin;
 use App\Organizations\Application\ManageMemberships;
+use App\Organizations\Application\MemberDirectory;
+use App\Organizations\Application\MemberRow;
 use App\Organizations\Application\MembershipExists;
 use App\Organizations\Application\MembershipNotFound;
 use App\Organizations\Application\OrganizationLock;
+use App\Organizations\Application\OrganizationReadModel;
+use App\Organizations\Application\OrganizationView;
 use App\Organizations\Application\UnknownUser;
 use App\Organizations\Domain\Membership;
 use App\Organizations\Domain\MembershipRepository;
@@ -41,6 +47,7 @@ final class ManageMembershipsTest extends TestCase
     private array $memberships = [];
     /** @var array<string, Uuid> */
     private array $users = [];
+    private bool $profilesFail = false;
     private Uuid $organization;
     private Uuid $admin;
 
@@ -59,7 +66,8 @@ final class ManageMembershipsTest extends TestCase
 
         self::assertSame('MANAGER', $row->role);
         self::assertTrue($row->userId->equals($user));
-        self::assertSame(['begin', 'lock', 'actor', 'actor', 'add', 'audit', 'commit'], $this->journal, 'the actor, then the duplicate check');
+        self::assertSame('new@example.test', $row->email);
+        self::assertSame(['begin', 'lock', 'actor', 'actor', 'add', 'audit', 'profile', 'commit'], $this->journal, 'the actor, then the duplicate check; the response is read before the commit');
         self::assertCount(1, $this->events);
         $event = $this->events[0];
         self::assertSame('membership.added', $event->action);
@@ -136,7 +144,7 @@ final class ManageMembershipsTest extends TestCase
 
         self::assertSame('MANAGER', $row->role);
         self::assertSame(MembershipRole::Manager, $target->role());
-        self::assertSame(['begin', 'lock', 'actor', 'target', 'count', 'audit', 'commit'], $this->journal);
+        self::assertSame(['begin', 'lock', 'actor', 'target', 'count', 'audit', 'profile', 'commit'], $this->journal);
         self::assertSame('membership.role_changed', $this->events[0]->action);
         self::assertSame(['roleFrom' => 'REP', 'roleTo' => 'MANAGER'], $this->events[0]->changes);
     }
@@ -149,6 +157,27 @@ final class ManageMembershipsTest extends TestCase
 
         self::assertSame('REP', $row->role);
         self::assertSame([], $this->events);
+    }
+
+    /** The member for the response is read inside the transaction: when that fails, the change is rolled back. */
+    public function testAFailingResponseReadRollsTheChangeBack(): void
+    {
+        $this->user('new@example.test');
+        $target = $this->membership($this->organization, $this->user('rep@example.test'), MembershipRole::Rep);
+        $this->profilesFail = true;
+
+        foreach ([
+            'add' => [fn () => $this->useCase()->add($this->organization, $this->admin, 'new@example.test', MembershipRole::Rep, null), ['add', 'audit', 'profile', 'rollback']],
+            'change role' => [fn () => $this->useCase()->changeRole($this->organization, $this->admin, $target->id(), static fn (): MembershipRole => MembershipRole::Manager, null), ['count', 'audit', 'profile', 'rollback']],
+        ] as $label => [$call, $end]) {
+            try {
+                $call();
+                self::fail($label.': no failure');
+            } catch (\RuntimeException $e) {
+                self::assertSame('profile unavailable', $e->getMessage(), $label);
+            }
+            self::assertSame($end, \array_slice($this->journal(), -4), $label);
+        }
     }
 
     public function testTheLastAdminCannotBeDemotedOrRemoved(): void
@@ -209,7 +238,9 @@ final class ManageMembershipsTest extends TestCase
     {
         $this->journal = [];
 
-        return new ManageMemberships($this->lock(), $this->repository(), $this->directory(), $this->transaction(), $this->audit(), new MockClock('@1761210000'));
+        $directory = $this->directory();
+
+        return new ManageMemberships($this->lock(), $this->repository(), $directory, $this->transaction(), $this->audit(), new MockClock('@1761210000'), new MemberDirectory($this->readModel(), $directory));
     }
 
     private function user(string $email): Uuid
@@ -315,6 +346,29 @@ final class ManageMembershipsTest extends TestCase
         return $this->organization;
     }
 
+    /**
+     * @internal for the fakes
+     *
+     * @param list<Uuid> $ids
+     *
+     * @return array<string, UserProfile>
+     */
+    public function profiles(array $ids): array
+    {
+        $this->inside('profile');
+        if ($this->profilesFail) {
+            throw new \RuntimeException('profile unavailable');
+        }
+        $profiles = [];
+        foreach ($this->users as $email => $id) {
+            if ([] !== array_filter($ids, static fn (Uuid $wanted): bool => $wanted->equals($id))) {
+                $profiles[$id->toRfc4122()] = new UserProfile($id, $email, 'Name of '.$email);
+            }
+        }
+
+        return $profiles;
+    }
+
     private function lock(): OrganizationLock
     {
         return new class($this) implements OrganizationLock {
@@ -354,12 +408,38 @@ final class ManageMembershipsTest extends TestCase
 
             public function profiles(array $ids): array
             {
-                return [];
+                return $this->test->profiles($ids);
             }
 
             public function idOfEmail(string $email): ?Uuid
             {
                 return $this->test->knownUsers()[strtolower($email)] ?? null;
+            }
+        };
+    }
+
+    /** ManageMemberships reads single members through MemberDirectory::view(), which needs no read model. */
+    private function readModel(): OrganizationReadModel
+    {
+        return new class implements OrganizationReadModel {
+            public function activeMembership(Uuid $organizationId, Uuid $userId): ?TenantContext
+            {
+                throw new \LogicException('not used');
+            }
+
+            public function organization(Uuid $organizationId): ?OrganizationView
+            {
+                throw new \LogicException('not used');
+            }
+
+            public function members(Uuid $organizationId, int $offset, int $limit): array
+            {
+                throw new \LogicException('not used');
+            }
+
+            public function member(Uuid $organizationId, Uuid $membershipId): ?MemberRow
+            {
+                throw new \LogicException('not used');
             }
         };
     }

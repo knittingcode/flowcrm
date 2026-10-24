@@ -63,10 +63,14 @@ Two things make a naive implementation unsafe:
       including an ADMIN demoting or removing themselves.
    5. The change and its audit event are written and committed together
       (BR-31). If the event cannot be written the transaction rolls back
-      and the answer is a 500. The answer is built after the commit (for
-      `POST` and `PATCH` the member's profile is read then), so a 500 can
-      also follow a committed change and its event; clients re-read the
-      list instead of assuming a rollback.
+      and the answer is a 500. The member for the answer of `POST` and
+      `PATCH` (the user's profile) is read in the same transaction, before
+      the commit, so a failure there also rolls back. Only a commit
+      without a known result (the connection is lost after `COMMIT` was
+      sent) or a failure after the commit while the response is finished
+      (for example the session write) can answer 500 for a saved change;
+      clients that must know the outcome re-read the list instead of
+      assuming a rollback.
 
    Every membership change of an organization takes the same row lock, so
    two concurrent changes run one after the other and the second sees the
@@ -170,7 +174,8 @@ Recorded for the owner's decision; not approved.
 - `backend/tests/Integration/Security/MembershipAdministrationTest` over
   the real PHP-FPM and PostgreSQL: the role matrix of the new routes,
   foreign organizations and membership IDs, the last-admin rule, audit
-  events and their rollback, CSRF on the new routes, and lock tests that
+  events and their rollback, the rollback of a change whose answer cannot
+  be read, CSRF on the new routes, and lock tests that
   hold the organization row from a separate connection: concurrent mutual
   demotions and mutual removals leave exactly one ADMIN; the last two
   ADMINs stepping down at once (one demotion, one removal) leave one, the
@@ -180,12 +185,13 @@ Recorded for the owner's decision; not approved.
   organization's changes and refusals do not wait for the lock.
 - Unit tests: `RolePolicyTest` (the matrix), `MembershipRulesTest`
   (`Membership::changeRole`, `LastAdminRule`), `ManageMembershipsTest` (the
-  lock comes first; every check and the audit event are inside the
-  transaction).
-- `tests/app/backend.sh` BE-18: eleven new negative controls (last-admin
+  lock comes first; every check, the audit event and the read of the member
+  for the answer are inside the transaction).
+- `tests/app/backend.sh` BE-18: twelve new negative controls (last-admin
   rule, lock, actor re-check of the role and of a removed membership,
   MANAGER granted `membership.change_role`,
-  unscoped target lookup, audit event after the commit, a route without
+  unscoped target lookup, audit event after the commit, the member for
+  the answer read after the commit, a route without
   `TenantPermission`, an unvalidated role, a lock that blocks foreign key
   checks, the operator's add without the lock).
 

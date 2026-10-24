@@ -32,7 +32,9 @@ use Symfony\Component\Uid\Uuid;
  *    the permission: ActorNotPermitted);
  * 3. reads the target membership by organization and ID;
  * 4. counts the active ADMINs under the lock for the last-admin rule;
- * 5. writes the change and its audit event, which commit together.
+ * 5. writes the change and its audit event, which commit together;
+ * 6. reads the member for the response, so a failure there rolls the
+ *    change back instead of following a commit.
  */
 final readonly class ManageMemberships
 {
@@ -43,6 +45,7 @@ final readonly class ManageMemberships
         private Transaction $transaction,
         private AuditTrail $audit,
         private ClockInterface $clock,
+        private MemberDirectory $members,
     ) {
     }
 
@@ -54,9 +57,9 @@ final readonly class ManageMemberships
      * @throws UnknownUser
      * @throws MembershipExists  also for a removed membership (there is no reactivation)
      */
-    public function add(Uuid $organizationId, Uuid $actorUserId, string $email, MembershipRole $role, ?Uuid $requestId): MemberRow
+    public function add(Uuid $organizationId, Uuid $actorUserId, string $email, MembershipRole $role, ?Uuid $requestId): MemberView
     {
-        return $this->asAdministrator($organizationId, $actorUserId, Permission::MembershipAdd, function (Actor $actor) use ($organizationId, $email, $role, $requestId): array {
+        return $this->asAdministrator($organizationId, $actorUserId, Permission::MembershipAdd, $this->view(...), function (Actor $actor) use ($organizationId, $email, $role, $requestId): array {
             $userId = $this->users->idOfEmail($email) ?? throw new UnknownUser();
             if (null !== $this->memberships->ofOrganizationAndUser($organizationId, $userId)) {
                 throw new MembershipExists();
@@ -81,9 +84,9 @@ final readonly class ManageMemberships
      * @throws MembershipNotFound
      * @throws LastAdmin
      */
-    public function changeRole(Uuid $organizationId, Uuid $actorUserId, Uuid $membershipId, callable $newRole, ?Uuid $requestId): MemberRow
+    public function changeRole(Uuid $organizationId, Uuid $actorUserId, Uuid $membershipId, callable $newRole, ?Uuid $requestId): MemberView
     {
-        return $this->asAdministrator($organizationId, $actorUserId, Permission::MembershipChangeRole, function (Actor $actor) use ($organizationId, $membershipId, $newRole, $requestId): array {
+        return $this->asAdministrator($organizationId, $actorUserId, Permission::MembershipChangeRole, $this->view(...), function (Actor $actor) use ($organizationId, $membershipId, $newRole, $requestId): array {
             $target = $this->activeTarget($organizationId, $membershipId);
             $from = $target->role();
             $to = $newRole();
@@ -107,7 +110,7 @@ final readonly class ManageMemberships
      */
     public function remove(Uuid $organizationId, Uuid $actorUserId, Uuid $membershipId, ?Uuid $requestId): void
     {
-        $this->asAdministrator($organizationId, $actorUserId, Permission::MembershipRemove, function (Actor $actor) use ($organizationId, $membershipId, $requestId): array {
+        $this->asAdministrator($organizationId, $actorUserId, Permission::MembershipRemove, static fn (): null => null, function (Actor $actor) use ($organizationId, $membershipId, $requestId): array {
             $target = $this->activeTarget($organizationId, $membershipId);
             $this->keepAnAdmin($organizationId, $target, null);
             $target->remove($this->clock->now());
@@ -118,14 +121,20 @@ final readonly class ManageMemberships
 
     /**
      * Runs $change in one transaction, under the organization lock, for an
-     * actor whose active membership grants $permission under that lock, and
-     * writes the audit event it returns (if any) in the same transaction.
+     * actor whose active membership grants $permission under that lock,
+     * writes the audit event it returns (if any) and builds the $result of
+     * the changed membership, all in the same transaction.
      *
+     * @template T
+     *
+     * @param callable(Membership): T                          $result
      * @param callable(Actor): array{Membership, ?AuditRecord} $change
+     *
+     * @return T
      */
-    private function asAdministrator(Uuid $organizationId, Uuid $actorUserId, Permission $permission, callable $change): MemberRow
+    private function asAdministrator(Uuid $organizationId, Uuid $actorUserId, Permission $permission, callable $result, callable $change): mixed
     {
-        $changed = $this->transaction->run(function () use ($organizationId, $actorUserId, $permission, $change): array {
+        return $this->transaction->run(function () use ($organizationId, $actorUserId, $permission, $result, $change): mixed {
             if (!$this->lock->lock($organizationId)) {
                 throw new ActorNotMember();
             }
@@ -137,16 +146,20 @@ final readonly class ManageMemberships
                 throw new ActorNotPermitted($permission, $actor->role()->value);
             }
 
-            $changed = $change(Actor::user($actorUserId, $actor->role()->value));
-            if (null !== $changed[1]) {
-                $this->audit->record($changed[1]);
+            [$membership, $record] = $change(Actor::user($actorUserId, $actor->role()->value));
+            if (null !== $record) {
+                $this->audit->record($record);
             }
 
-            return $changed;
+            return $result($membership);
         });
-        $membership = $changed[0];
+    }
 
-        return new MemberRow($membership->id(), $membership->userId(), $membership->role()->value);
+    /** The member with the user's profile, for the response. */
+    private function view(Membership $membership): MemberView
+    {
+        return $this->members->view(new MemberRow($membership->id(), $membership->userId(), $membership->role()->value))
+            ?? throw new \LogicException('A member without a user account.');
     }
 
     private function activeTarget(Uuid $organizationId, Uuid $membershipId): Membership

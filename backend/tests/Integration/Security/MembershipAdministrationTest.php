@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Tests\Integration\Security;
 
 use App\Tests\Support\Database\FailingAudit;
+use App\Tests\Support\Database\TestDatabase;
 use App\Tests\Support\Http\ApiClient;
 use App\Tests\Support\Http\ApiResponse;
 use App\Tests\Support\Http\FpmApiTestCase;
@@ -341,6 +342,32 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertSame(200, $client->patch($this->member($this->repAMembership), ['role' => 'MANAGER'])->status(), 'the lock was released');
     }
 
+    /**
+     * The response is built from data read inside the change's transaction:
+     * when that read fails, the change and its audit event are rolled back,
+     * so the 500 means that nothing was changed and the request can be
+     * repeated.
+     */
+    public function testAChangeWhoseResponseCannotBeBuiltChangesNothing(): void
+    {
+        $client = $this->logIn($this->adminA);
+        $user = $this->fixtures->user('response-fails');
+        $before = $this->snapshot();
+
+        $post = $this->whileTheProfileCannotBeRead($user->id, fn (): ApiResponse => $client->post($this->members(), ['email' => $user->email, 'role' => 'REP']));
+        $patch = $this->whileTheProfileCannotBeRead($this->repA->id, fn (): ApiResponse => $client->patch($this->member($this->repAMembership), ['role' => 'MANAGER']));
+
+        foreach (['POST' => $post, 'PATCH' => $patch] as $label => $response) {
+            self::assertSame(500, $response->status(), $label.' '.$response->raw->body);
+            self::assertSame('/problems/internal-error', $response->problem(), $label);
+            self::assertSame($response->header('X-Request-Id'), $response->value('requestId'), $label);
+        }
+        self::assertSame($before, $this->snapshot(), 'neither change nor its audit event was saved');
+        self::assertSame(201, $client->post($this->members(), ['email' => $user->email, 'role' => 'REP'])->status(), 'the add can be repeated');
+        self::assertSame(200, $client->patch($this->member($this->repAMembership), ['role' => 'MANAGER'])->status(), 'the lock was released');
+        self::assertSame(['membership.role_changed'], array_column($this->events($this->repAMembership), 'action'));
+    }
+
     /** ADR-019: the new unsafe routes need the session's CSRF token and the same origin. */
     public function testTheNewRoutesNeedTheCsrfTokenAndTheSameOrigin(): void
     {
@@ -645,6 +672,34 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         }
 
         self::assertSame($before, $this->snapshot());
+    }
+
+    /**
+     * Runs $action while the profile read of the member responses
+     * (DbalUserDirectory::profiles) fails for $userId: a restrictive row
+     * security policy of the schema owner that raises for that statement and
+     * that user, removed afterwards. Other reads of the user, such as the
+     * address lookup of an add, are not affected.
+     *
+     * @param callable(): ApiResponse $action
+     */
+    private function whileTheProfileCannotBeRead(Uuid $userId, callable $action): ApiResponse
+    {
+        $owner = TestDatabase::owner();
+        $owner->executeStatement("CREATE FUNCTION test_profile_unavailable() RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'profile unavailable (test)'; END $$");
+        $owner->executeStatement('GRANT EXECUTE ON FUNCTION test_profile_unavailable() TO flowcrm_app');
+        $owner->executeStatement('CREATE POLICY test_any ON users USING (true) WITH CHECK (true)');
+        $owner->executeStatement(\sprintf("CREATE POLICY test_profile_unavailable ON users AS RESTRICTIVE FOR SELECT USING (id <> '%s' OR strpos(current_query(), 'display_name FROM users WHERE id IN') = 0 OR test_profile_unavailable())", $userId->toRfc4122()));
+        $owner->executeStatement('ALTER TABLE users ENABLE ROW LEVEL SECURITY');
+        try {
+            return $action();
+        } finally {
+            $owner->executeStatement('ALTER TABLE users DISABLE ROW LEVEL SECURITY');
+            $owner->executeStatement('DROP POLICY test_profile_unavailable ON users');
+            $owner->executeStatement('DROP POLICY test_any ON users');
+            $owner->executeStatement('DROP FUNCTION test_profile_unavailable()');
+            $owner->close();
+        }
     }
 
     private function logIn(TestUser $user): ApiClient
