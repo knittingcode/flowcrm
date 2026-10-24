@@ -210,7 +210,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
       )}
       <section aria-labelledby="member-list-heading">
         <h2 id="member-list-heading">Members</h2>
-        <table aria-busy={busy}>
+        <table className="member-table" aria-busy={busy}>
           <caption>
             {members.meta.total} {members.meta.total === 1 ? 'member' : 'members'}
             {pages > 1 && `, page ${String(shown)} of ${String(pages)}`}

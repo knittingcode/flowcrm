@@ -182,3 +182,9 @@ caption {
   flex-basis: 100%;
   margin: 0;
 }
+
+/* Long names and e-mail addresses wrap anywhere, so the table fits a narrow screen (WCAG 1.4.10). */
+.member-table th,
+.member-table td {
+  overflow-wrap: anywhere;
+}
