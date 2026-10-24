@@ -296,8 +296,9 @@ v "ST-12 the edge replaces client request IDs and hides server details" $?
 
 # Structured logs (FCRM-003 section Q): the request ID of a response is in
 # the api's JSON record of that request and in the edge access log; tokens
-# sent in the query, headers or cookies are in neither.
-get "$PA" '/api/v1/system/status?token=st40-query-secret' -H 'Authorization: Bearer st40-header-secret' \
+# sent in the query, headers or cookies are in neither, and neither is any
+# other query value (search=, whose key does not look sensitive).
+get "$PA" '/api/v1/system/status?token=st40-query-secret&search=st40-search-secret' -H 'Authorization: Bearer st40-header-secret' \
   -H 'Cookie: sid=st40-cookie-secret' -H 'X-CSRF-Token: st40-csrf-secret'
 rid=$(header X-Request-Id)
 i=0
@@ -320,8 +321,8 @@ json_check=$(grep '^{' "$api_log" | docker exec -i "$(cid "$A" api)" php -r '
   echo "$n $bad";')
 [ "${json_check%% *}" -gt 0 ] && [ "${json_check#* }" = 0 ]
 v "ST-42 api log lines are complete JSON records (lines, invalid: $json_check)" $?
-! grep -qE 'st40-(query|header|cookie|csrf)-secret' "$api_log" "$edge_log"
-v "ST-43 query, Authorization, Cookie and CSRF values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3)"
+! grep -qE 'st40-(query|search|header|cookie|csrf)-secret' "$api_log" "$edge_log"
+v "ST-43 query (token and search), Authorization, Cookie and CSRF values are in no log" $? "$(grep -ohE '.{60}st40-[a-z]+-secret' "$api_log" "$edge_log" | head -n 3)"
 
 # Sessions are lazy (FND-008): stateless routes neither start a session nor
 # set a cookie, even when a session cookie is sent; the migration that runs
