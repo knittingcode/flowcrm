@@ -180,7 +180,10 @@ Recorded for the owner's decision; not approved.
   demotions and mutual removals leave exactly one ADMIN; the last two
   ADMINs stepping down at once (one demotion, one removal) leave one, the
   second getting 409 `LAST_ADMIN`; two adds of one user create one
-  membership and a 409 `MEMBERSHIP_EXISTS`; an ADMIN demoted (403) or
+  membership and a 409 `MEMBERSHIP_EXISTS`; two removals of one member
+  remove it once (204 and 404, one event); two different role changes of
+  one member apply one after the other, the second starting from the
+  first's role (one chain of events, no lost update); an ADMIN demoted (403) or
   removed (404) while their request waits is refused; another
   organization's changes and refusals do not wait for the lock.
 - Unit tests: `RolePolicyTest` (the matrix), `MembershipRulesTest`
