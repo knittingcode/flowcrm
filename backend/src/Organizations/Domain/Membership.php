@@ -12,8 +12,8 @@ use Symfony\Component\Uid\Uuid;
  * A user's membership in an organization, with one role (FCRM-003 section
  * F). The user is referenced by ID only: users belong to the Identity
  * module. A removed membership keeps its row (status REMOVED, removed_at).
- * Rules across memberships, such as the last-admin rule (BR-03), belong to
- * the use cases that change memberships.
+ * Rules across memberships, such as the last-admin rule (BR-03,
+ * LastAdminRule), are applied by the use cases that change memberships.
  */
 #[ORM\Entity]
 #[ORM\Table(name: 'memberships')]
@@ -51,6 +51,15 @@ class Membership
         $this->userId = $userId;
         $this->role = $role;
         $this->createdAt = $createdAt;
+    }
+
+    /** Only an active membership has a role that can change. */
+    public function changeRole(MembershipRole $role): void
+    {
+        if (MembershipStatus::Removed === $this->status) {
+            throw new \LogicException('A removed membership has no role to change.');
+        }
+        $this->role = $role;
     }
 
     public function remove(\DateTimeImmutable $at): void

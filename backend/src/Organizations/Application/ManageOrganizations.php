@@ -27,6 +27,7 @@ final readonly class ManageOrganizations
 {
     public function __construct(
         private OrganizationRepository $organizations,
+        private OrganizationLock $lock,
         private MembershipRepository $memberships,
         private UserDirectory $users,
         private Transaction $transaction,
@@ -65,16 +66,19 @@ final readonly class ManageOrganizations
      */
     public function addMember(Uuid $organizationId, string $email, MembershipRole $role): Uuid
     {
-        if (null === $this->organizations->ofId($organizationId)) {
-            throw new \InvalidArgumentException('No organization with this ID exists.');
-        }
         $userId = $this->users->idOfEmail($email) ?? throw new \InvalidArgumentException('No user with this e-mail address exists.');
-        if (null !== $this->memberships->ofOrganizationAndUser($organizationId, $userId)) {
-            throw new \InvalidArgumentException('The user already has a membership in this organization (also a removed one).');
-        }
         $membership = new Membership(Uuid::v7(), $organizationId, $userId, $role, $this->clock->now());
 
-        $this->transaction->run(function () use ($membership, $organizationId): void {
+        // Under the organization lock (ADR-020), like the API's changes: a
+        // concurrent add of the same user is refused here, not by the
+        // unique constraint.
+        $this->transaction->run(function () use ($membership, $organizationId, $userId): void {
+            if (!$this->lock->lock($organizationId)) {
+                throw new \InvalidArgumentException('No organization with this ID exists.');
+            }
+            if (null !== $this->memberships->ofOrganizationAndUser($organizationId, $userId)) {
+                throw new \InvalidArgumentException('The user already has a membership in this organization (also a removed one).');
+            }
             $this->memberships->add($membership);
             $this->audit->record(new AuditRecord('membership.added', 'membership', $membership->id(), Actor::operator(), $organizationId, ['role' => $membership->role()->value]));
         });

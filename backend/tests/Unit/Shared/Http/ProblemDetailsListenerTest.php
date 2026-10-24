@@ -69,6 +69,18 @@ final class ProblemDetailsListenerTest extends TestCase
             'errors' => [['pointer' => '/newPassword', 'code' => 'PASSWORD_TOO_SHORT']],
         ], json_decode((string) $validation->getContent(), true, flags: \JSON_THROW_ON_ERROR));
 
+        $conflict = $this->dispatch('/api/v1/organizations/x/members', ProblemException::conflict('LAST_ADMIN'))->getResponse();
+        self::assertNotNull($conflict);
+        self::assertSame(409, $conflict->getStatusCode());
+        self::assertSame([
+            'type' => '/problems/conflict',
+            'title' => 'Conflict',
+            'status' => 409,
+            'instance' => '/api/v1/organizations/x/members',
+            'requestId' => '0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c',
+            'errors' => [['code' => 'LAST_ADMIN']],
+        ], json_decode((string) $conflict->getContent(), true, flags: \JSON_THROW_ON_ERROR));
+
         $limited = $this->dispatch('/api/v1/auth/login', ProblemException::tooManyRequests(300))->getResponse();
         self::assertNotNull($limited);
         self::assertSame('300', $limited->headers->get('Retry-After'));

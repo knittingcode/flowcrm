@@ -1,9 +1,12 @@
 # Authentication and tenant authorization
 
 How users log in, how sessions are protected and how access to an
-organization is decided (FCRM-FND-010B). The decisions and their reasons are
-in [ADR-019](adr/ADR-019-authentication-and-tenant-authorization.md)
-(amended by the FCRM-FND-010V security gate); sessions and their storage in
+organization is decided (FCRM-FND-010B), and how an organization's ADMIN
+administers its memberships (FCRM-FND-010C). The decisions and their reasons
+are in [ADR-019](adr/ADR-019-authentication-and-tenant-authorization.md)
+(amended by the FCRM-FND-010V security gate) and, for membership
+administration, [ADR-020](adr/ADR-020-membership-administration.md)
+(proposed); sessions and their storage in
 [sessions and cache](sessions-and-cache.md).
 
 ## Endpoints
@@ -21,6 +24,9 @@ All under the edge's single origin; the contract is
 | `GET /api/v1/organizations/{organizationId}` | member, `organization.view` | the organization and the own membership |
 | `GET /api/v1/organizations/{organizationId}/members` | member, `membership.list` | active members, paginated (`page`, `pageSize` up to 100) |
 | `GET /api/v1/organizations/{organizationId}/members/{membershipId}` | member, `membership.list` | one member |
+| `POST /api/v1/organizations/{organizationId}/members` | member, `membership.add` | body `{"email", "role"}`: 201 the new member and `Location`; 422 `UNKNOWN_USER` (`/email`), `INVALID_ROLE` (`/role`); 409 `MEMBERSHIP_EXISTS` (also for a removed membership) |
+| `PATCH /api/v1/organizations/{organizationId}/members/{membershipId}` | member, `membership.change_role` | body `{"role"}`: 200 the member (the same role again: no change, no audit event); 404 unknown, foreign or removed; 422 `INVALID_ROLE`; 409 `LAST_ADMIN` |
+| `DELETE /api/v1/organizations/{organizationId}/members/{membershipId}` | member, `membership.remove` | 204, the membership becomes `REMOVED`; 404 unknown, foreign or already removed; 409 `LAST_ADMIN` |
 
 `GET /api/v1/system/status` and `/health/{live,ready}` stay public and never
 read a session (`/health` is outside the firewall).
@@ -36,12 +42,14 @@ read a session (`/health` is outside the firewall).
 | 403 | `forbidden` | a member without the permission |
 | 404 | `not-found` | unknown route, unknown or foreign organization, removed membership, a resource of another organization: all the same |
 | 415 | `unsupported-media-type` | an unsafe request with a body that is not JSON |
-| 422 | `validation-error` | `errors[]` with `pointer` (body) or `parameter` (query) and a stable `code`, such as `UNKNOWN_FIELD`, `UNKNOWN_PARAMETER`, `PASSWORD_TOO_SHORT`, `INVALID_CURRENT_PASSWORD` |
+| 409 | `conflict` | a membership change conflicts with the organization's memberships: `errors: [{"code": "MEMBERSHIP_EXISTS"}]` or `[{"code": "LAST_ADMIN"}]`; nothing was changed |
+| 422 | `validation-error` | `errors[]` with `pointer` (body) or `parameter` (query) and a stable `code`, such as `UNKNOWN_FIELD`, `UNKNOWN_PARAMETER`, `PASSWORD_TOO_SHORT`, `INVALID_CURRENT_PASSWORD`, `INVALID_ROLE`, `UNKNOWN_USER` |
 | 429 | `too-many-requests` | a login limit or the per-user API limit is reached; `Retry-After` in seconds |
 
 The order: unsafe-request checks (415, 403 `csrf-invalid`), then the
 firewall (401), then the per-user API limit (429), then the organization
-(404), then the permission (403).
+(404), then the permission (403); for membership changes then the target
+membership (404), the body (422) and conflicts (409).
 Every API response has `Cache-Control: no-store` and `Vary: Cookie`.
 
 ## Login and sessions
@@ -270,9 +278,39 @@ sessions of that user end then (the credentials fingerprint changes).
 | `organization.view` | yes | yes | yes |
 | `membership.list` (name, role) | yes | yes | yes |
 | `membership.view_email` | yes | yes | no (provisional) |
+| `membership.add` | yes | no | no |
+| `membership.change_role` | yes | no | no |
+| `membership.remove` | yes | no | no |
 
 Everything else is denied. The API returns each role's permissions with the
 memberships for showing controls; it decides every request itself.
+
+### Membership administration
+
+FCRM-FND-010C, [ADR-020](adr/ADR-020-membership-administration.md)
+(proposed): `App\Organizations\Application\ManageMemberships` runs every
+add, role change and removal in one database transaction that
+
+1. locks the organization row (`SELECT id FROM organizations WHERE id = ?
+   FOR NO KEY UPDATE`, `DbalOrganizationLock`), so the membership changes of
+   one organization, including the operator's `flowcrm:membership:add`, run
+   one after the other; inserts that only reference the organization do not
+   wait;
+2. reads the actor's own membership again under the lock: none any more is
+   a 404, a role that no longer grants the permission a 403 (the check of
+   `TenantGuard` before the lock is not trusted for the write);
+3. reads the target membership by organization and ID (`REMOVED` counts as
+   not found);
+4. for a demotion or removal of an active ADMIN counts the active ADMINs
+   under the lock: fewer than two is a 409 `LAST_ADMIN`
+   (`App\Organizations\Domain\LastAdminRule`, FCRM-002 BR-03); this also
+   applies to an ADMIN demoting or removing themselves;
+5. writes the change and its audit event, which commit together.
+
+Members are added by the e-mail address of an existing user
+(case-insensitive); there is no invitation and no reactivation of a removed
+membership (409 `MEMBERSHIP_EXISTS`). A removed or demoted user's next
+request sees the change (TI-04).
 
 ## Operator console
 
@@ -301,12 +339,14 @@ OQ-10); it ends every session of the user.
 | `auth.login_succeeded`, `auth.logout`, `auth.password_changed` | the user | the user (no organization) |
 | `user.created`, `user.password_reset`, `user.disabled`, `user.enabled` | `platform_operator` | the user |
 | `organization.created`, `membership.added` (`changes: {"role": …}`) | `platform_operator` | organization, membership |
+| `membership.added` (`{"role": …}`), `membership.role_changed` (`{"roleFrom": …, "roleTo": …}`), `membership.removed` (`{"role": …}`) | the user, actor role `ADMIN` | the membership, with the organization |
 
 Audit events carry the request ID and never an IP address, password, hash,
 token, session ID or e-mail address. **No sensitive change without its
 event:** a login whose event cannot be written fails (500) and leaves no
-session; a password change, an operator change and their events are one
-database transaction, so nothing changes without the event; a logout ends
+session; a password change, an operator change, a membership change and
+their events are one database transaction, so nothing changes without the
+event; a logout ends
 the session before it writes its event, and answers 500 if the event cannot
 be written (the session has ended either way). **Failures are not audited** (failed
 logins, CSRF rejections, 403 and 404): anonymous traffic must not be able
@@ -318,7 +358,8 @@ channel instead:
 | `login_failed` | `reason` (`invalid_credentials` or `disabled`), `account_ref`, `client_ref` |
 | `login_succeeded`, `logout`, `session_ended`, `password_changed`, `password_change_failed` | `user_id` |
 | `request_rejected` | `reason` (`content_type`, `fetch_site`, `origin_missing`, `origin_mismatch`, `token_missing`, `token_invalid`), `method`, `route` |
-| `tenant_not_found`, `authorization_denied` | `user_id`, `route`, and for denials `permission`, `role`, `organization_id` |
+| `tenant_not_found`, `authorization_denied` | `user_id`, `route`, and for denials `permission`, `role`, `organization_id` (also when the re-check of a membership change under the organization lock refuses) |
+| `membership_change_refused` | `reason` (`membership_not_found`, `unknown_user`, `membership_exists`, `last_admin`), `user_id`, `organization_id`, `route`; never the e-mail address |
 | `api_rate_limited` | `user_id` |
 
 `account_ref` and `client_ref` are HMAC-SHA256 pseudonyms (application
@@ -361,10 +402,11 @@ time-based retention) before any real personal data is processed.
 | `ApiRateLimitTest` | the 601st request in a minute is a 429 with `Retry-After`; per user; the session probe and logout stay available; login, public routes, anonymous and refused requests are not counted |
 | `LoginThrottlingTest` | the three limits, unknown accounts alike, case-insensitive accounts (including Unicode spellings that the lookup folds together), reset of the account-and-IP window only, keyed by the forwarded client IP, throttle before the password check |
 | `TenantAuthorizationTest` | anonymous 401, foreign organization identical to an unknown one, no memberships, the role in the answer, e-mail by permission, a user in two organizations, IDOR with guessed and malformed IDs, client-supplied organization IDs, removal and demotion on the next request, pagination |
+| `MembershipAdministrationTest` | an ADMIN adds an existing user (201, `Location`, audit event with the request ID, AC-09); `MEMBERSHIP_EXISTS` also for a removed membership; `UNKNOWN_USER`, `INVALID_ROLE`, unknown members; MANAGER and REP get 403 on all three routes; foreign organization and foreign membership IDs 404 with nothing changed; the last ADMIN can neither demote nor remove themselves (409, no audit event); with two ADMINs either is possible, also for oneself, and applies on the next request; repeated DELETE 404; the same role without an audit event; a failing audit write changes nothing (500); CSRF and origin on the new routes; two ADMINs demoting or removing each other concurrently leave one ADMIN; the last two ADMINs stepping down at once leave one (409 `LAST_ADMIN`); two concurrent adds of one user give 201 and 409 `MEMBERSHIP_EXISTS`; an ADMIN demoted (403) or removed (404) while their request waits for the lock is refused; another organization does not wait for the lock |
 | `RouteSecurityTest` | every tenant route has the UUID requirement and exactly one permission; every API route outside the public list needs a login; `/health` is outside the firewall; the specification matches the routes |
 | `AuditTrailTest`, `SecurityLoggingTest`, `ProvisioningCommandTest`, `SecurityConfigurationTest` | audit events without secrets or IP, none for failures; with the audit table failing (a test trigger): no login, no password or operator change, but the logout still ends the session; security log with pseudonyms and the request ID of the answer; console input rules; production hasher, lifetime, limits and trusted headers |
-| Unit tests | `SecurityUser`, `PasswordPolicy`, `UserProvider` (one hash for unknown e-mails), `LoginRateLimiter`, `RolePolicy` (the matrix as data), `TenantPermissionVoter`, `TenantGuard`, `RequestOriginGuard`, `JsonBody`, `Pagination`, problem documents |
-| `tests/app/backend.sh` BE-18 | 38 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
+| Unit tests | `SecurityUser`, `PasswordPolicy`, `UserProvider` (one hash for unknown e-mails), `LoginRateLimiter`, `RolePolicy` (the matrix as data), `TenantPermissionVoter`, `TenantGuard`, `RequestOriginGuard`, `JsonBody`, `Pagination`, problem documents, `ManageMemberships` (lock first, checks inside the transaction), `Membership::changeRole` and `LastAdminRule` |
+| `tests/app/backend.sh` BE-18 | 49 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
 | `tests/app/stack.sh` ST-69 to ST-73, ST-16 | through the real edge: cookie attributes, logout with token and replay, cross-origin and form logins, spoofed `X-Forwarded-For` cannot evade the limit, no secrets in any log; Playwright journeys (login, logout, back button, roles, two organizations, foreign organization, CSRF) |
 | `tests/app/prodlike.sh` PL-16, PL-11 | the production cookie (`__Host-`, `Secure`) with curl; the login page under the production CSP |
 | `tests/app/prodlike.sh` PL-17 to PL-22, `frontend/e2e/https.spec.ts` | over HTTPS (see [HTTPS](#https-and-proxies)): the TLS site, spoofed forwarding headers, no CORS, an untrusted TLS proxy fails closed, the cookie and the logged-in journeys in Chromium, cross-site forgeries, the client IP behind the edge |
@@ -376,8 +418,14 @@ is checked against `backend/openapi.yaml`.
 
 ## Known limitations
 
-- The role matrix is provisional; tenant mutations and membership
-  management through the API come later.
+- The role matrix is provisional. Membership administration (ADMIN only)
+  is the only tenant mutation; ADR-020 is proposed and lists its
+  [open decisions](adr/ADR-020-membership-administration.md#open-decisions):
+  reactivation of removed members, whether disabled ADMINs count, account
+  discovery and consent when adding by e-mail (including a dedicated
+  limit), the code name `LAST_ADMIN`, and a bound on the lock wait.
+- A removed member cannot be added again (409 `MEMBERSHIP_EXISTS`): there is
+  no reactivation yet.
 - No self-service password reset (no e-mail delivery exists); recovery is
   the operator's `flowcrm:user:reset-password`.
 - No list of a user's sessions: the `sessions` table has no user column.
