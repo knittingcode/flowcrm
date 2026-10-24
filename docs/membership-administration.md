@@ -364,17 +364,24 @@ a 500 with type `/problems/internal-error` and the `requestId` of the
 `X-Request-Id` header.
 <!-- verified by MembershipAdministrationTest::testAChangeWhoseAuditEventCannotBeWrittenChangesNothing -->
 
-**A 500 does not always mean that nothing changed.** The change and its
-audit event are committed together, so either both are saved or neither
-is; only a failed audit write (or any other error before the commit)
-guarantees the rollback. The answer is prepared after the commit: for
-`POST` and `PATCH` the member's name and e-mail address are read from the
-user account then, and any request can still fail while its response is
-finished. A 500 to `POST`, `PATCH` or `DELETE` can therefore follow a
-saved change. A client must read the member list again before it retries;
-a retried add of a saved member is a 409 `MEMBERSHIP_EXISTS`, a retried
-removal a 404. The audit log (`membership.*` events with the `requestId`)
-shows whether the change was saved.
+**The member for the answer cannot be read:** for `POST` and `PATCH` the
+member's name and e-mail address are read from the user account in the
+same transaction as the change, before the commit. If that read fails, the
+change and its audit event are rolled back and the answer is the same 500.
+<!-- verified by MembershipAdministrationTest::testAChangeWhoseResponseCannotBeBuiltChangesNothing -->
+
+**A 500 after the commit.** Everything a change reads and writes, including
+its audit event and the data of the answer, happens before the commit, so
+an error in any of these steps leaves nothing changed. A 500 can still
+follow a saved change in two rare cases: the commit itself ends without a
+known result (for example the database connection is lost after `COMMIT`
+was sent and before its result arrived), or a step after the commit fails
+while the response is finished (for example writing the session at the end
+of the request). A client that must know the outcome of a 500 reads the
+member list again before it retries; a retried add of a saved member is a
+409 `MEMBERSHIP_EXISTS`, a retried removal a 404. The audit log
+(`membership.*` events with the `requestId`) shows whether the change was
+saved.
 
 ## Errors
 
@@ -399,7 +406,7 @@ role with an unknown address is only `INVALID_ROLE`.
 | 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string |
 | 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) |
 | 429 | `too-many-requests` | none | the per-user API limit (600 requests per minute) |
-| 500 | `internal-error` | none | the change or its audit event could not be written (nothing was changed), or an error after the commit (the change and its audit event were saved); read the list again |
+| 500 | `internal-error` | none | the change, its audit event or the member for the answer could not be written or read (nothing was changed); rarely, a commit without a known result or an error after the commit (the change and its audit event may be saved); read the list again |
 
 <!-- 400 and malformed membership IDs (404) verified by MembershipAdministrationTest::testMalformedRequestsChangeNothing -->
 <!-- no-store and Vary: Cookie on every answer verified by MembershipAdministrationTest::testMembershipResponsesAreNotCached -->

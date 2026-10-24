@@ -9,10 +9,9 @@ use App\Organizations\Application\ActorNotMember;
 use App\Organizations\Application\ActorNotPermitted;
 use App\Organizations\Application\LastAdmin;
 use App\Organizations\Application\ManageMemberships;
-use App\Organizations\Application\MemberDirectory;
-use App\Organizations\Application\MemberRow;
 use App\Organizations\Application\MembershipExists;
 use App\Organizations\Application\MembershipNotFound;
+use App\Organizations\Application\MemberView;
 use App\Organizations\Application\UnknownUser;
 use App\Organizations\Domain\MembershipRole;
 use App\Organizations\Domain\Permission;
@@ -47,7 +46,6 @@ final readonly class MembershipController
 
     public function __construct(
         private ManageMemberships $memberships,
-        private MemberDirectory $members,
         private AuthorizationCheckerInterface $authorization,
         private LoggerInterface $logger,
     ) {
@@ -60,10 +58,10 @@ final readonly class MembershipController
     {
         $body = JsonBody::strings($request, ['email', 'role']);
         $role = self::role($body['role']);
-        $row = $this->refusals($request, $tenant, fn (): MemberRow => $this->memberships->add($tenant->organizationId, $tenant->userId, $body['email'], $role, self::requestId($request)));
+        $member = $this->refusals($request, $tenant, fn (): MemberView => $this->memberships->add($tenant->organizationId, $tenant->userId, $body['email'], $role, self::requestId($request)));
 
-        $response = $this->member($row, $tenant, Response::HTTP_CREATED);
-        $response->headers->set('Location', \sprintf('/api/v1/organizations/%s/members/%s', $tenant->organizationId->toRfc4122(), $row->membershipId->toRfc4122()));
+        $response = $this->member($member, $tenant, Response::HTTP_CREATED);
+        $response->headers->set('Location', \sprintf('/api/v1/organizations/%s/members/%s', $tenant->organizationId->toRfc4122(), $member->membershipId->toRfc4122()));
 
         return $response;
     }
@@ -75,9 +73,9 @@ final readonly class MembershipController
     {
         // The body is read once the membership is known: an unknown one is a 404 before any 422.
         $newRole = static fn (): MembershipRole => self::role(JsonBody::strings($request, ['role'])['role']);
-        $row = $this->refusals($request, $tenant, fn (): MemberRow => $this->memberships->changeRole($tenant->organizationId, $tenant->userId, Uuid::fromString($membershipId), $newRole, self::requestId($request)));
+        $member = $this->refusals($request, $tenant, fn (): MemberView => $this->memberships->changeRole($tenant->organizationId, $tenant->userId, Uuid::fromString($membershipId), $newRole, self::requestId($request)));
 
-        return $this->member($row, $tenant, Response::HTTP_OK);
+        return $this->member($member, $tenant, Response::HTTP_OK);
     }
 
     /** The membership becomes REMOVED; a repeated DELETE is a 404. */
@@ -100,10 +98,9 @@ final readonly class MembershipController
         return Uuid::fromString(RequestId::of($request));
     }
 
-    private function member(MemberRow $row, TenantContext $tenant, int $status): JsonResponse
+    /** The member was read inside the change's transaction; nothing here reads the database. */
+    private function member(MemberView $member, TenantContext $tenant, int $status): JsonResponse
     {
-        $member = $this->members->view($row) ?? throw new \LogicException('A member without a user account.');
-
         return new JsonResponse(MemberJson::of($member, $this->authorization->isGranted(Permission::MembershipViewEmail->value, $tenant)), $status);
     }
 
