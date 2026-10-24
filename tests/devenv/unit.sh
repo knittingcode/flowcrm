@@ -1085,8 +1085,23 @@ status, body = sys.argv[2], sys.argv[3]
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 0)); s.listen(1)
 open(sys.argv[1], "w").write(str(s.getsockname()[1]))
-c, _ = s.accept(); c.recv(4096)
+c, _ = s.accept(); c.settimeout(5)
+# Read the whole request and close gracefully: closing with unread data
+# makes the kernel send a reset, which can discard the answer before the
+# client reads it.
+request = b""
+while b"\r\n\r\n" not in request:
+    chunk = c.recv(4096)
+    if not chunk:
+        break
+    request += chunk
 c.sendall(("HTTP/1.1 %s\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s" % (status, body)).encode())
+c.shutdown(socket.SHUT_WR)
+try:
+    while c.recv(4096):
+        pass
+except OSError:
+    pass
 c.close(); s.close()
 PY
 u21() { # name status body expected(0 blocked|1 not)
@@ -1095,7 +1110,7 @@ u21() { # name status body expected(0 blocked|1 not)
   python3 "$work/u21-serve.py" "$pf" "$2" "$3" &
   bg_pids="$bg_pids $!"
   while [ ! -s "$pf" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-  BIND=127.0.0.1 gate_blocks "$(cat "$pf")"
+  gate_blocks "$(cat "$pf")"
   r=$?
   [ "$r" = "$4" ]
   result "U-21 $1" $? "(gate_blocks returned $r)"
