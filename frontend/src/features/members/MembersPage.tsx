@@ -11,7 +11,7 @@ import { failureMessage, needsReload } from './messages.ts';
 
 type Load =
   | { kind: 'loading' }
-  | { kind: 'ready'; organization: Organization; members: MemberPage; version: number }
+  | { kind: 'ready'; organization: Organization; members: MemberPage; version: number; page: number }
   | { kind: 'not-found' }
   | { kind: 'forbidden' }
   | { kind: 'error'; message: string };
@@ -47,9 +47,11 @@ function pageOf(value: string | null): number {
  * the API decides every change. After every change, after every refusal
  * that may mean the list is stale (403 other than csrf-invalid, 404, 409),
  * and whenever it is unknown whether a change was saved (the API could not be
- * reached, or its success answer could not be read), the organization and
- * the members are read again: nothing is changed in the page before the
- * server has confirmed it.
+ * reached, its success answer could not be read, or a server error did not
+ * come from the API), the organization and the members are read again:
+ * nothing is changed in the page before the server has confirmed it. While
+ * the list shown is older than the one requested (after a change or another
+ * page), its controls are disabled and the table is marked busy.
  */
 export function MembersPage() {
   const { organizationId = '' } = useParams();
@@ -84,7 +86,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
     Promise.all([getOrganization(organizationId, controller.signal), listMembers(organizationId, page, controller.signal)]).then(
       ([organization, members]) => {
         if (!controller.signal.aborted) {
-          setLoad({ kind: 'ready', organization, members, version });
+          setLoad({ kind: 'ready', organization, members, version, page });
         }
       },
       (error: unknown) => {
@@ -178,6 +180,10 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
   const canRemove = permissions.includes('membership.remove');
   const pages = Math.max(1, Math.ceil(members.meta.total / members.meta.pageSize));
   const ownId = organization.membership.id;
+  /** The page shown, which lags behind `page` while another one is read. */
+  const shown = load.page;
+  /** No change while one is pending or the rows shown are not the latest requested. */
+  const busy = pending || load.version !== version || shown !== page;
 
   return (
     <>
@@ -204,10 +210,10 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
       )}
       <section aria-labelledby="member-list-heading">
         <h2 id="member-list-heading">Members</h2>
-        <table aria-busy={pending}>
+        <table aria-busy={busy}>
           <caption>
             {members.meta.total} {members.meta.total === 1 ? 'member' : 'members'}
-            {pages > 1 && `, page ${String(page)} of ${String(pages)}`}
+            {pages > 1 && `, page ${String(shown)} of ${String(pages)}`}
           </caption>
           <thead>
             <tr>
@@ -228,7 +234,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
                 withEmail={withEmail}
                 canChange={canChange}
                 canRemove={canRemove}
-                pending={pending}
+                pending={busy}
                 confirming={confirming === member.membershipId}
                 registerRemoveButton={(button) => {
                   if (button === null) {
@@ -261,7 +267,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
             ))}
           </tbody>
         </table>
-        {members.data.length === 0 && page > 1 && (
+        {members.data.length === 0 && shown > 1 && (
           <p>
             This page has no members.{' '}
             <button
@@ -286,7 +292,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
               Previous
             </button>
             <span>
-              Page {page} of {pages}
+              Page {shown} of {pages}
             </span>
             <button
               type="button"

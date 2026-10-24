@@ -56,6 +56,33 @@ function renderAt(path: string) {
 
 const count = (calls: Call[], method: string, path: string) => calls.filter((c) => c.method === method && c.path === path).length;
 
+/**
+ * Holds the n-th GET of `path` (1-based) until `release` is called; every
+ * other request is answered by the fake API at once.
+ */
+function holdGet(path: string, n: number): { release: () => void } {
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const fake = globalThis.fetch;
+  let seen = 0;
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    if ((init?.method ?? 'GET') === 'GET' && input === path) {
+      seen += 1;
+      if (seen === n) {
+        await gate;
+      }
+    }
+    return fake(input, init);
+  });
+  return {
+    release: () => {
+      release();
+    },
+  };
+}
+
 describe('MembersPage', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -419,6 +446,33 @@ describe('MembersPage', () => {
     expect(count(calls, 'GET', MEMBERS)).toBe(2);
   });
 
+  it('keeps the controls disabled and the table busy until the list after a change has been read', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), members([ada])],
+      [`DELETE ${ORG}/members/m-2`]: new Response(null, { status: 204 }),
+    });
+    const reload = holdGet(MEMBERS, 2);
+    renderAt('/o/org-a/members');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Grace Tester was removed.');
+    // The removed member is still shown until the server's list arrives, but cannot be acted on.
+    expect(screen.getByRole('table')).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('button', { name: 'Remove Grace Tester' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Remove Ada Tester' })).toBeDisabled();
+
+    reload.release();
+    await waitFor(() => {
+      expect(screen.queryByRole('rowheader', { name: 'Grace Tester' })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole('table')).toHaveAttribute('aria-busy', 'false');
+    expect(screen.getByRole('button', { name: 'Remove Ada Tester' })).toBeEnabled();
+  });
+
   it('returns to the login when the session has ended', async () => {
     fakeApi({
       'GET /api/v1/auth/session': adminSession(),
@@ -495,6 +549,28 @@ describe('MembersPage', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Previous' }));
     expect(await screen.findByRole('table', { name: '2 members, page 1 of 2' })).toBeInTheDocument();
     expect(screen.getByRole('rowheader', { name: 'Ada Tester (you)' })).toBeInTheDocument();
+  });
+
+  it('labels the page it shows, not the one being read, and marks the table busy meanwhile', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${ORG}/members?page=1`]: members([ada], { page: 1, pageSize: 1, total: 2 }),
+      [`GET ${ORG}/members?page=2`]: members([grace], { page: 2, pageSize: 1, total: 2 }),
+    });
+    const next = holdGet(`${ORG}/members?page=2`, 1);
+    renderAt('/o/org-a/members');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Next' }));
+
+    const table = screen.getByRole('table', { name: '2 members, page 1 of 2' });
+    expect(table).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('navigation', { name: 'Member pages' })).toHaveTextContent('Page 1 of 2');
+    expect(screen.getByRole('button', { name: 'Remove Ada Tester' })).toBeDisabled();
+
+    next.release();
+    expect(await screen.findByRole('table', { name: '2 members, page 2 of 2' })).toHaveAttribute('aria-busy', 'false');
+    expect(screen.getByRole('rowheader', { name: 'Grace Tester' })).toBeInTheDocument();
   });
 
   it.each(['0', '-1', 'abc', '1e3'])('reads the page %j as the first page', async (value) => {
