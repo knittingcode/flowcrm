@@ -37,6 +37,9 @@ return [
     ['tenant route without a permission', 'src/Organizations/Http/Api/OrganizationController.php',
         "    #[TenantPermission(Permission::MembershipList)]\n    public function members(", '    public function members(',
         'RouteSecurityTest::testEveryTenantRouteHasAValidatedOrganizationAndExactlyOnePermission|TenantAuthorizationTest::testEmailAddressesNeedThePermission'],
+    ['tenant route weakened to another permission', 'src/Organizations/Http/Api/OrganizationController.php',
+        "    #[TenantPermission(Permission::MembershipList)]\n    public function member(string", "    #[TenantPermission(Permission::OrganizationView)]\n    public function member(string",
+        'RouteSecurityTest::testEveryTenantRouteDeclaresItsPinnedPermission'],
     ['tenant route that fails open without a permission', 'src/Organizations/Http/Tenant/TenantGuard.php',
         'if (1 !== \count($permissions)) {', 'if (false) {',
         'TenantGuardTest::testATenantRouteWithoutAPermissionFailsClosed'],
@@ -90,6 +93,12 @@ return [
     ['password changed outside the audit transaction', 'src/Identity/Application/ChangeOwnPassword.php',
         "        \$this->transaction->run(function () use (\$user, \$hash, \$requestId): void {\n            \$user->changePassword(\$hash, \$this->clock->now());\n", "        \$this->transaction->run(fn () => \$user->changePassword(\$hash, \$this->clock->now()));\n        \$this->transaction->run(function () use (\$user, \$requestId): void {\n",
         'AuditTrailTest::testAPasswordChangeWhoseAuditEventCannotBeWrittenChangesNothing'],
+    ['enabling a user is not audited', 'src/Identity/Application/ManageUsers.php',
+        "            \$this->audit->record(new AuditRecord('user.enabled', 'user', \$user->id(), Actor::operator()));\n", '',
+        'AuditTrailTest::testOperatorUserChangesAreAuditedWithTheirAction'],
+    ['user enabled outside the audit transaction', 'src/Identity/Application/ManageUsers.php',
+        "        \$this->transaction->run(function () use (\$user): void {\n            \$user->enable();\n", "        \$this->transaction->run(fn () => \$user->enable());\n        \$this->transaction->run(function () use (\$user): void {\n",
+        'AuditTrailTest::testOperatorEnableAndProvisioningWhoseAuditEventCannotBeWrittenChangeNothing'],
 
     // Log redaction (FCRM-003 section Q).
     ['URL queries kept in log text', 'src/Shared/Infrastructure/Logging/LogRedactor.php',

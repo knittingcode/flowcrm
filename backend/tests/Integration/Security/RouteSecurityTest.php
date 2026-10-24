@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Security;
 
+use App\Organizations\Domain\Permission;
 use App\Organizations\Http\Tenant\TenantPermission;
 use App\Tests\Support\Http\OpenApiContract;
 use Symfony\Bundle\FrameworkBundle\Test\KernelTestCase;
@@ -29,6 +30,16 @@ final class RouteSecurityTest extends KernelTestCase
         'api_v1_auth_logout',
     ];
 
+    /**
+     * The permission each tenant route declares (FCRM-002 section H). A new
+     * tenant route, or a changed permission, must be added here deliberately.
+     */
+    private const TENANT_PERMISSIONS = [
+        'api_v1_organization' => Permission::OrganizationView,
+        'api_v1_organization_member' => Permission::MembershipList,
+        'api_v1_organization_members' => Permission::MembershipList,
+    ];
+
     public function testEveryTenantRouteHasAValidatedOrganizationAndExactlyOnePermission(): void
     {
         $tenantRoutes = 0;
@@ -45,6 +56,24 @@ final class RouteSecurityTest extends KernelTestCase
             self::assertCount(1, $this->permissions($route), "$name must declare exactly one TenantPermission");
         }
         self::assertGreaterThanOrEqual(3, $tenantRoutes);
+    }
+
+    /**
+     * Pins the declared permission of every tenant route, so that a route
+     * cannot be weakened to another permission unnoticed, even where the
+     * roles of today happen to hold both.
+     */
+    public function testEveryTenantRouteDeclaresItsPinnedPermission(): void
+    {
+        $declared = [];
+        foreach ($this->apiRoutes() as $name => $route) {
+            if (str_starts_with($route->getPath(), '/api/v1/organizations')) {
+                $declared[$name] = array_map(static fn (\ReflectionAttribute $attribute): Permission => $attribute->newInstance()->permission, $this->permissions($route));
+            }
+        }
+        ksort($declared);
+
+        self::assertSame(array_map(static fn (Permission $permission): array => [$permission], self::TENANT_PERMISSIONS), $declared);
     }
 
     public function testEveryApiRouteOutsideThePublicListNeedsALogin(): void
