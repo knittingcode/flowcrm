@@ -4,8 +4,9 @@ This document defines the interface between the development lifecycle
 (`Makefile`, `bin/devenv`) and the Docker Compose stacks it starts:
 
 - the **application stack** (`compose.yaml`, `FLOWCRM_STACK=app`, the
-  default since FND-004): the FCRM-003 architecture below. It is a
-  development foundation without CRM features, authentication or tenancy;
+  default since FND-004): the FCRM-003 architecture below. It has session
+  authentication and tenant authorization ([ADR-019](adr/ADR-019-authentication-and-tenant-authorization.md))
+  but no CRM features yet;
 - the **fixture** (`compose.fixture.yaml`, `FLOWCRM_STACK=fixture`): a
   BusyBox HTTP server and a helper with a named volume, used only by the
   allocator regression tests. It is **not** a CRM application.
