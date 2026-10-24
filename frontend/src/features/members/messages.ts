@@ -50,6 +50,16 @@ function waitTime(seconds: number | null): string {
   return `${String(minutes)} ${minutes === 1 ? 'minute' : 'minutes'}`;
 }
 
+/**
+ * Refusals after which the user's own access may have changed (a 403 other
+ * than csrf-invalid: the role was lowered; a 404: the membership or the
+ * organization is gone): the session is read again, so that the organization
+ * switcher and the start page follow the server.
+ */
+export function accessMayHaveChanged(error: unknown): boolean {
+  return error instanceof ApiProblem && ((error.status === 403 && error.type !== CSRF_INVALID) || error.status === 404);
+}
+
 /** The message for one field error of a membership request. */
 export function fieldMessage(detail: ProblemDetail): string {
   if (detail.pointer === '/email') {

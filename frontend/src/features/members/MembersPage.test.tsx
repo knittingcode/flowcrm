@@ -810,4 +810,83 @@ describe('MembersPage: unclear answers, repeated clicks and changed access', () 
     expect(screen.getByRole('alert')).toHaveTextContent('The members could not be loaded');
     expect(screen.getByRole('alert')).toHaveFocus();
   });
+
+  it('reads the session again after a 404, so the start page no longer offers an organization that is gone', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': [adminSession(), adminSession([])],
+      [`GET ${ORG}`]: [organization(ADMIN), problem(404, 'not-found')],
+      [`GET ${MEMBERS}`]: [members([ada, grace]), problem(404, 'not-found')],
+      [`DELETE ${ORG}/members/m-2`]: problem(404, 'not-found'),
+    });
+    renderAt('/o/org-a/members');
+
+    await change('DELETE');
+
+    expect(await screen.findByRole('heading', { name: 'Not found' })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByRole('navigation', { name: 'Organizations' })).not.toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByRole('link', { name: 'Go to the start page' }));
+    expect(await screen.findByText(/not a member of any organization/)).toBeInTheDocument();
+    expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
+  });
+
+  it('reads the session again after a 403, as the role may have changed', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': [
+        adminSession(),
+        adminSession([{ organizationId: 'org-a', organizationName: 'Alpha', membershipId: 'm-1', role: 'MANAGER', permissions: MANAGER }]),
+      ],
+      [`GET ${ORG}`]: [organization(ADMIN), organization(MANAGER, 'MANAGER')],
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`PATCH ${ORG}/members/m-2`]: problem(403, 'forbidden'),
+    });
+    renderAt('/o/org-a/members');
+
+    await change('PATCH');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('You do not have permission to do this.');
+    await waitFor(() => {
+      expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('form', { name: 'Add a member' })).not.toBeInTheDocument();
+    });
+    expect(screen.getByRole('columnheader', { name: 'E-mail address' })).toBeInTheDocument();
+  });
+
+  it("shows another organization's own controls, without the answer of a change still running in the first", async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession([
+        { organizationId: 'org-a', organizationName: 'Alpha', membershipId: 'm-1', role: 'ADMIN', permissions: ADMIN },
+        { organizationId: 'org-b', organizationName: 'Beta', membershipId: 'm-9', role: 'REP', permissions: REP },
+      ]),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`PATCH ${ORG}/members/m-2`]: problem(409, 'conflict'),
+      'GET /api/v1/organizations/org-b': json(200, {
+        id: 'org-b',
+        name: 'Beta',
+        currency: 'EUR',
+        timezone: 'Europe/Warsaw',
+        membership: { id: 'm-9', role: 'REP', permissions: REP },
+      }),
+      'GET /api/v1/organizations/org-b/members?page=1': members([withoutEmail({ ...ada, membershipId: 'm-9', role: 'REP' })]),
+    });
+    const held = hold('PATCH', `${ORG}/members/m-2`, 1);
+    renderAt('/o/org-a/members');
+
+    await change('PATCH');
+    await userEvent.click(within(screen.getByRole('navigation', { name: 'Organizations' })).getByRole('link', { name: 'Beta' }));
+    await userEvent.click(await screen.findByRole('link', { name: 'Open the members page' }));
+    expect(await screen.findByRole('heading', { name: 'Members of Beta' })).toBeInTheDocument();
+    held.release();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(screen.getByRole('heading', { name: 'Members of Beta' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toBeEmptyDOMElement();
+    expect(screen.queryByRole('form', { name: 'Add a member' })).not.toBeInTheDocument();
+    expect(screen.queryAllByRole('button', { name: /^(Change role of|Remove) / })).toHaveLength(0);
+  });
 });

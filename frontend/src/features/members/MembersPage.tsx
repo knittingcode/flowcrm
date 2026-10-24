@@ -7,7 +7,7 @@ import { getOrganization, listMembers, type Member, type MemberPage, type Organi
 import { useAuth } from '../../auth/context.ts';
 import { NotFoundPage } from '../../pages/NotFoundPage.tsx';
 import { AddMemberForm, type Outcome } from './AddMemberForm.tsx';
-import { failureMessage, needsReload } from './messages.ts';
+import { accessMayHaveChanged, failureMessage, needsReload } from './messages.ts';
 
 type Load =
   | { kind: 'loading' }
@@ -49,7 +49,8 @@ function pageOf(value: string | null): number {
  * and whenever it is unknown whether a change was saved (no answer arrived,
  * its success answer could not be read, or it was a server error), the
  * organization and the members are read again: nothing is changed in the page
- * before the server has confirmed it. While the list shown
+ * before the server has confirmed it. After a 403 or 404 the session is read
+ * again too, as the user's own access may have changed. While the list shown
  * is older than the one requested (after a change or another page), its
  * controls are disabled and the table is marked busy. If the list cannot be
  * read again, the answer to the change stays in view next to the load error.
@@ -150,6 +151,9 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
           return { status: 'invalid', errors: error.errors };
         }
         setFeedback({ kind: 'error', message: failureMessage(error), focus: true });
+        if (accessMayHaveChanged(error)) {
+          void refresh();
+        }
         if (needsReload(error)) {
           reload();
         }

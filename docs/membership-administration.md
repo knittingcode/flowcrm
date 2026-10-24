@@ -104,6 +104,10 @@ The organization page (`/o/:organizationId`) links to the members page
 - Nothing is shown as changed before the server has confirmed it. After
   every change, and after a 403, 404 or 409, the organization and the list
   are read again, so the controls follow the role the server reports now.
+  After a 403 (other than `csrf-invalid`) or a 404 the session is read again
+  too, so the organization switcher and the start page follow the access
+  the user has now (for example after the user's own membership was removed
+  while the page was open).
   What the page shows for each refusal is listed under
   [What the members page shows](#what-the-members-page-shows).
 - Controls are hidden, not disabled, for roles without the permission. A
