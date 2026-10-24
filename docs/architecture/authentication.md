@@ -121,12 +121,16 @@ limits in `backend/config/services.yaml`):
 | 50 per client IP | 15 minutes | password spraying over many accounts |
 | 100 per account | 1 day | distributed guessing against one account |
 
-The account part of a key folds case exactly like the user lookup
+The account part of a key folds case at least as far as the user lookup
 (PostgreSQL `lower()`, simple one-to-one Unicode mapping), so every spelling
 that loads an account shares its windows; with the full mapping, a spelling
-with `İ` (U+0130) would have got windows of its own. The equivalence was
-checked for every code point under the database locale (libc, `en_US.utf8`)
-and must be checked again if the locale or collation provider changes.
+with `İ` (U+0130) would have got windows of its own. This was checked for
+every code point under the database locale (libc, `en_US.utf8`): no two
+spellings that `lower()` folds together get different keys. For 124 code
+points (circled letters such as `Ⓐ`, for example) the key folds and `lower()`
+does not; those spellings share an account's windows without loading it,
+which only makes the limit stricter. The check must be repeated if the
+locale, the collation provider, the C library or PHP's Unicode tables change.
 
 A successful login clears only the account-and-IP window. The state is in
 `cache_items` (pool `cache.rate_limits`) under HMAC keys; PostgreSQL

@@ -65,15 +65,20 @@ final class LoginRateLimiter extends AbstractRequestRateLimiter
     }
 
     /**
-     * The account part of the keys. It must fold case exactly like the user
-     * lookup, PostgreSQL lower(email) = lower(?): every spelling that loads
-     * the same account must give the same key, or each spelling would get
-     * windows of its own. lower() maps one character to one character, so
-     * this uses the simple Unicode mapping; the full mapping (mb_strtolower)
-     * turns U+0130 into "i" + U+0307 and a final capital sigma into U+03C2,
-     * while lower() gives "i" and U+03C3. Checked against every code point
-     * for the database locale (libc, en_US.utf8): a change of the database
-     * locale or collation provider needs this check again.
+     * The account part of the keys. It must fold case at least as far as the
+     * user lookup, PostgreSQL lower(email) = lower(?): every spelling that
+     * loads the same account must give the same key, or each spelling would
+     * get windows of its own. lower() maps one character to one character,
+     * so this uses the simple Unicode mapping; the full mapping
+     * (mb_strtolower) turns U+0130 into "i" + U+0307 and a final capital
+     * sigma into U+03C2, while lower() gives "i" and U+03C3. Checked against
+     * every code point for the database locale (libc, en_US.utf8): no two
+     * spellings that lower() folds together get different keys. The reverse
+     * does not hold for 124 code points (circled letters such as U+24B6, for
+     * example), which this folds and lower() does not; those spellings share
+     * the account's windows without loading it, which only makes the limit
+     * stricter. A change of the database locale, collation provider, C
+     * library or PHP's Unicode tables needs this check again.
      */
     private static function account(Request $request): string
     {

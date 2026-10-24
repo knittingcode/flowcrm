@@ -89,7 +89,7 @@ final class LoginThrottlingTest extends FpmApiTestCase
             str_replace('i', "\u{130}", $user->email),
             strtoupper($user->email),
             str_replace('i', 'I', $user->email),
-            str_replace('i', "\u{130}", strtoupper($user->email)),
+            strtoupper(str_replace('i', "\u{130}", $user->email)),
         ];
         self::assertSame(200, $this->tryLogin($this->client(), $variants[1], $user->password)->status(), 'the variant resolves to the account');
         $client = $this->client();
