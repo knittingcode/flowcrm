@@ -1104,6 +1104,55 @@ u21 "the gate's 503 is blocked" "503 Service Unavailable" "FlowCRM is blocked by
 u21 "another 503 is not the gate" "503 Service Unavailable" "upstream unavailable" 1
 u21 "a 200 is not blocked" "200 OK" "<!doctype html>" 1
 
+# --- U-22 a gate that cannot be recorded is reported, never silent (FND-009E)
+# gate_failed and cancel_db_op (fake Compose: no running edge, the cancel
+# call fails) with a gate directory that cannot be written: the failure to
+# record the gate is reported on stderr, gate_failed still reports the
+# original failure with its exit code, and cancel_db_op returns non-zero.
+# Controls: the same calls with a writable gate directory record the gate.
+saved_fns=$(declare -f compose compose_op)
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
+compose() { return 0; }
+compose_op() { [ "$1" != exec ]; }
+u22_paths() { # writable(yes|no)
+  RUNTIME_DIR=$work/u22-$1/.runtime GATE_DIR=$work/u22-$1/.runtime/gate
+  GATE_FILE=$GATE_DIR/security-gate
+  mkdir -p "$RUNTIME_DIR"
+  # A regular file where the directory should be: unwritable even for root.
+  if [ "$1" = yes ]; then mkdir -p "$GATE_DIR"; else : >"$GATE_DIR"; fi
+}
+for w in no yes; do
+  u22_paths "$w"
+  out=$( (gate_failed "$EX_SAFETY" "the roles of the test project are inconsistent") 2>&1)
+  r=$?
+  rec=$(head -n 1 "$GATE_FILE" 2>/dev/null)
+  case $out in *"security gate could not be recorded"*) said=yes ;; *) said=no ;; esac
+  if [ "$w" = no ]; then
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = yes ] && [ -z "$rec" ] &&
+      case $out in *"devenv: ERROR: the roles of the test project are inconsistent"*) true ;; *) false ;; esac
+    result "U-22 gate_failed reports an unrecordable gate on stderr and still fails with the original error" $? "(exit $r: $out)"
+  else
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = no ] && [ "$rec" = "the roles of the test project are inconsistent" ]
+    result "U-22 control: gate_failed records the gate when it can and does not report a failure" $? "(exit $r: $out)"
+  fi
+  rm -f "$GATE_FILE" 2>/dev/null
+  DB_OP_ID=u22-op
+  out=$( (cancel_db_op) 2>&1)
+  r=$?
+  rec=$(head -n 1 "$GATE_FILE" 2>/dev/null)
+  case $out in *"security gate could not be recorded"*) said=yes ;; *) said=no ;; esac
+  if [ "$w" = no ]; then
+    [ "$r" != 0 ] && [ "$said" = yes ] && [ -z "$rec" ] && case $out in *"stack is blocked"*) false ;; *) true ;; esac
+    result "U-22 cancel_db_op reports an unrecordable gate, does not claim the stack is blocked, and returns non-zero" $? "(exit $r: $out)"
+  else
+    [ "$r" = 0 ] && [ "$said" = no ] && case $rec in *"u22-op"*"could not be confirmed as ended"*) true ;; *) false ;; esac
+    result "U-22 control: cancel_db_op records the gate when it can" $? "(exit $r: $out)"
+  fi
+done
+DB_OP_ID=
+eval "$saved_fns"
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
+
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
   "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1

@@ -632,6 +632,8 @@ on_signal() { # exit-code signal
   exit "$1"
 }
 
+# Returns non-zero when the operation could not be confirmed as ended and
+# the security gate could not be recorded either (reported on stderr).
 cancel_db_op() {
   local id=$DB_OP_ID rc
   DB_OP_ID=
@@ -649,8 +651,13 @@ cancel_db_op() {
   # make up has ended it, or found it finished, and passed every check.
   local edge=''
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
-  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} | write_gate 2>/dev/null
-  log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
+  local recorded=yes
+  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} | write_gate || recorded=no
+  if [ "$recorded" = yes ]; then
+    log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
+  else
+    log "ERROR: could not confirm that the interrupted database operation ended (exit $rc), and the security gate could not be recorded in $GATE_FILE; make status and make url do not report the stack as blocked: stop the stack (make down) and run make up"
+  fi
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
       log "stopped the edge: an interrupted database operation may still be running"
@@ -658,6 +665,7 @@ cancel_db_op() {
       log "WARNING: could not stop the edge of $PROJECT; stop the stack with make down"
     fi
   fi
+  [ "$recorded" = yes ]
 }
 
 # Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill|:int], used
@@ -912,7 +920,12 @@ gate_failed() { # exit-code message
   local id edge=''
   id=$(compose ps --quiet "$EDGE" 2>/dev/null | head -n 1)
   if [ -n "$id" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
-  { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } | write_gate 2>/dev/null
+  # Fail closed: the original failure is still reported (and its exit code
+  # kept), but never without saying that the gate is not recorded.
+  local recorded=yes
+  { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } | write_gate || recorded=no
+  [ "$recorded" = yes ] ||
+    log "ERROR: the security gate could not be recorded in $GATE_FILE; make status and make url do not report the stack as blocked: stop the stack (make down) until make up passes"
   if [ -n "$id" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
       log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"

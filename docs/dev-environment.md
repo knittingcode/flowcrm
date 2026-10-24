@@ -489,7 +489,8 @@ run, so several runs from one checkout do not interfere.
   replaced or mounting an old secret is refused, also when Compose reported
   success), the edge's return after a rotation (it must answer readiness;
   otherwise it is stopped, the gate is recorded again and the command
-  fails), the Makefile interface
+  fails), a security gate that cannot be recorded (reported on stderr,
+  never a success), the Makefile interface
   (targets and the commands they run) and checks that the result tally
   detects failed and lost results.
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
