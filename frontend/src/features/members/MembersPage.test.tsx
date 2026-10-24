@@ -393,6 +393,32 @@ describe('MembersPage', () => {
     expect(count(calls, 'GET', MEMBERS)).toBe(2);
   });
 
+  it.each([
+    ['502 with an empty body', () => new Response('', { status: 502 }), 502],
+    ['504 with an HTML body', () => new Response('<html>Gateway Timeout</html>', { status: 504, headers: { 'Content-Type': 'text/html' } }), 504],
+  ])('treats a server error that did not come from the API (%s) as an unknown outcome and reloads', async (_, answer, code) => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), members([ada, { ...grace, role: 'MANAGER' }])],
+      [`PATCH ${ORG}/members/m-2`]: answer,
+    });
+    renderAt('/o/org-a/members');
+
+    await userEvent.selectOptions(await screen.findByLabelText('New role for Grace Tester'), 'MANAGER');
+    await userEvent.click(screen.getByRole('button', { name: 'Change role of Grace Tester' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      `The API did not answer properly (status ${String(code)}), so it is not known whether the change was saved. The list was reloaded to show the current state.`,
+    );
+    expect(alert).not.toHaveTextContent('could not be saved');
+    await waitFor(() => {
+      expect(screen.getByLabelText('New role for Grace Tester')).toHaveValue('MANAGER');
+    });
+    expect(count(calls, 'GET', MEMBERS)).toBe(2);
+  });
+
   it('returns to the login when the session has ended', async () => {
     fakeApi({
       'GET /api/v1/auth/session': adminSession(),
