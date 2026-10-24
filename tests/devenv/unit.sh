@@ -1124,41 +1124,66 @@ u21 "a 200 is not blocked" "200 OK" "<!doctype html>" 1
 # call fails) with a gate directory that cannot be written: the failure to
 # record the gate is reported on stderr, gate_failed still reports the
 # original failure with its exit code, and cancel_db_op returns non-zero.
+# The report says whether make status and make url still show the stack as
+# blocked: not when no gate is recorded; yes, with the earlier reason, when a
+# gate recorded before (here: a failing write next to an existing record) is
+# still in place.
 # Controls: the same calls with a writable gate directory record the gate.
 saved_fns=$(declare -f compose compose_op)
+saved_write_gate=$(declare -f write_gate)
 saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
 compose() { return 0; }
 compose_op() { [ "$1" != exec ]; }
-u22_paths() { # writable(yes|no)
+u22_paths() { # writable(yes|no|old)
   RUNTIME_DIR=$work/u22-$1/.runtime GATE_DIR=$work/u22-$1/.runtime/gate
   GATE_FILE=$GATE_DIR/security-gate
   mkdir -p "$RUNTIME_DIR"
   # A regular file where the directory should be: unwritable even for root.
-  if [ "$1" = yes ]; then mkdir -p "$GATE_DIR"; else : >"$GATE_DIR"; fi
+  if [ "$1" = no ]; then : >"$GATE_DIR"; else mkdir -p "$GATE_DIR"; fi
+  [ "$1" != old ] || printf 'the earlier reason\nedge\n' >"$GATE_FILE"
 }
-for w in no yes; do
+u22_reported() { # output: "blocked" with the earlier reason, or "unblocked"
+  case $1 in
+    *"do not report the stack as blocked"*) printf unblocked ;;
+    *"an earlier gate is still recorded, so make status and make url report the stack as blocked, but with its reason (the earlier reason)"*) printf blocked ;;
+    *) printf none ;;
+  esac
+}
+for w in no old yes; do
   u22_paths "$w"
+  # A gate write that fails while an earlier gate is recorded (disk full,
+  # for example): the earlier record stays.
+  if [ "$w" = old ]; then write_gate() { cat >/dev/null; return 1; }; else eval "$saved_write_gate"; fi
   out=$( (gate_failed "$EX_SAFETY" "the roles of the test project are inconsistent") 2>&1)
   r=$?
   rec=$(head -n 1 "$GATE_FILE" 2>/dev/null)
   case $out in *"security gate could not be recorded"*) said=yes ;; *) said=no ;; esac
   if [ "$w" = no ]; then
-    [ "$r" = "$EX_SAFETY" ] && [ "$said" = yes ] && [ -z "$rec" ] &&
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = yes ] && [ -z "$rec" ] && [ "$(u22_reported "$out")" = unblocked ] &&
       case $out in *"devenv: ERROR: the roles of the test project are inconsistent"*) true ;; *) false ;; esac
     result "U-22 gate_failed reports an unrecordable gate on stderr and still fails with the original error" $? "(exit $r: $out)"
+  elif [ "$w" = old ]; then
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = yes ] && [ "$rec" = "the earlier reason" ] && [ "$(u22_reported "$out")" = blocked ] &&
+      case $out in *"devenv: ERROR: the roles of the test project are inconsistent"*) true ;; *) false ;; esac
+    result "U-22 gate_failed with an earlier gate still recorded says the stack is still reported as blocked, with the earlier reason" $? "(exit $r: $out)"
   else
     [ "$r" = "$EX_SAFETY" ] && [ "$said" = no ] && [ "$rec" = "the roles of the test project are inconsistent" ]
     result "U-22 control: gate_failed records the gate when it can and does not report a failure" $? "(exit $r: $out)"
   fi
   rm -f "$GATE_FILE" 2>/dev/null
+  [ "$w" != old ] || printf 'the earlier reason\nedge\n' >"$GATE_FILE"
   DB_OP_ID=u22-op
   out=$( (cancel_db_op) 2>&1)
   r=$?
   rec=$(head -n 1 "$GATE_FILE" 2>/dev/null)
   case $out in *"security gate could not be recorded"*) said=yes ;; *) said=no ;; esac
   if [ "$w" = no ]; then
-    [ "$r" != 0 ] && [ "$said" = yes ] && [ -z "$rec" ] && case $out in *"stack is blocked"*) false ;; *) true ;; esac
+    [ "$r" != 0 ] && [ "$said" = yes ] && [ -z "$rec" ] && [ "$(u22_reported "$out")" = unblocked ] &&
+      case $out in *"stack is blocked"*) false ;; *) true ;; esac
     result "U-22 cancel_db_op reports an unrecordable gate, does not claim the stack is blocked, and returns non-zero" $? "(exit $r: $out)"
+  elif [ "$w" = old ]; then
+    [ "$r" != 0 ] && [ "$said" = yes ] && [ "$rec" = "the earlier reason" ] && [ "$(u22_reported "$out")" = blocked ]
+    result "U-22 cancel_db_op with an earlier gate still recorded says the stack is still reported as blocked, with the earlier reason" $? "(exit $r: $out)"
   else
     [ "$r" = 0 ] && [ "$said" = no ] && case $rec in *"u22-op"*"could not be confirmed as ended"*) true ;; *) false ;; esac
     result "U-22 control: cancel_db_op records the gate when it can" $? "(exit $r: $out)"

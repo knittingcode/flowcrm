@@ -656,7 +656,7 @@ cancel_db_op() {
   if [ "$recorded" = yes ]; then
     log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
   else
-    log "ERROR: could not confirm that the interrupted database operation ended (exit $rc), and the security gate could not be recorded in $GATE_FILE; make status and make url do not report the stack as blocked: stop the stack (make down) and run make up"
+    log "ERROR: could not confirm that the interrupted database operation ended (exit $rc), and the security gate could not be recorded in $GATE_FILE; $(gate_unrecorded_status): stop the stack (make down) and run make up"
   fi
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
@@ -925,7 +925,7 @@ gate_failed() { # exit-code message
   local recorded=yes
   { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } | write_gate || recorded=no
   [ "$recorded" = yes ] ||
-    log "ERROR: the security gate could not be recorded in $GATE_FILE; make status and make url do not report the stack as blocked: stop the stack (make down) until make up passes"
+    log "ERROR: the security gate could not be recorded in $GATE_FILE; $(gate_unrecorded_status): stop the stack (make down) until make up passes"
   if [ -n "$id" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
       log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"
@@ -959,6 +959,18 @@ protect_for() { # reason
 }
 
 gate_clear() { rm -f "$GATE_FILE" "$RUNTIME_DIR/security-gate"; }
+
+# What make status and make url show after a gate could not be recorded: a
+# gate recorded earlier (for example by protect_for) is left in place by the
+# failed write, so they still report the stack as blocked, with that reason.
+gate_unrecorded_status() {
+  local rec
+  if rec=$(gate_record); then
+    printf 'an earlier gate is still recorded, so make status and make url report the stack as blocked, but with its reason (%s)' "$(head -n 1 "$rec" | head -c 200)"
+  else
+    printf 'make status and make url do not report the stack as blocked'
+  fi
+}
 
 # The recorded gate for read-only commands: also one an earlier version left
 # at .runtime/security-gate (moved by the next command that prepares .runtime).
