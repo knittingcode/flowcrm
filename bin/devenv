@@ -202,7 +202,11 @@ init_paths() {
   SECRETS_DIR=$RUNTIME_DIR/secrets
   STATE_FILE=$RUNTIME_DIR/dev.env
   LOCK_DIR=$RUNTIME_DIR/lock
-  GATE_FILE=$RUNTIME_DIR/security-gate
+  # The security gate lives in its own directory, which the edge mounts
+  # read-only: while the file exists the edge serves nothing but its health
+  # paths (docker/edge/common.caddy, ADR-018).
+  GATE_DIR=$RUNTIME_DIR/gate
+  GATE_FILE=$GATE_DIR/security-gate
   SELF=$here/${BASH_SOURCE[0]##*/}
   PROJECT=flowcrm-$(sha256_prefix "$ROOT")
   [[ $PROJECT =~ $PROJECT_RE ]] || die $EX_PREREQ "could not derive a project name"
@@ -211,6 +215,25 @@ init_paths() {
 ensure_runtime_dir() {
   [ ! -L "$RUNTIME_DIR" ] || die $EX_SAFETY ".runtime is a symbolic link; refusing to write through it"
   mkdir -p "$RUNTIME_DIR" || die $EX_SAFETY "cannot create $RUNTIME_DIR"
+  [ ! -L "$GATE_DIR" ] || die $EX_SAFETY ".runtime/gate is a symbolic link; refusing to write through it"
+  # World-readable (it holds only the reason): the edge's unprivileged user
+  # must be able to see the gate, or it would serve.
+  { mkdir -p "$GATE_DIR" && chmod 0755 "$GATE_DIR"; } || die $EX_SAFETY "cannot create $GATE_DIR"
+  # A gate recorded by an earlier version, at .runtime/security-gate.
+  if [ -f "$RUNTIME_DIR/security-gate" ] && [ ! -e "$GATE_FILE" ]; then
+    { chmod 0644 "$RUNTIME_DIR/security-gate" && mv -f "$RUNTIME_DIR/security-gate" "$GATE_FILE"; } ||
+      die $EX_SAFETY "cannot move the security gate to $GATE_FILE"
+  fi
+}
+
+# Records the security gate from standard input, atomically (rename) and
+# readable by the edge.
+write_gate() {
+  local tmp
+  tmp=$(mktemp "$GATE_DIR/.security-gate.XXXXXX") || return 1
+  if cat >"$tmp" && chmod 0644 "$tmp" && mv -f "$tmp" "$GATE_FILE"; then return 0; fi
+  rm -f "$tmp"
+  return 1
 }
 
 new_tmp() { # prefix -> sets TMP_FILE (removed on exit); removes the previous one
@@ -609,6 +632,8 @@ on_signal() { # exit-code signal
   exit "$1"
 }
 
+# Returns non-zero when the operation could not be confirmed as ended and
+# the security gate could not be recorded either (reported on stderr).
 cancel_db_op() {
   local id=$DB_OP_ID rc
   DB_OP_ID=
@@ -626,8 +651,13 @@ cancel_db_op() {
   # make up has ended it, or found it finished, and passed every check.
   local edge=''
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
-  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} >"$GATE_FILE" 2>/dev/null
-  log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
+  local recorded=yes
+  printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} | write_gate || recorded=no
+  if [ "$recorded" = yes ]; then
+    log "WARNING: could not confirm that the interrupted database operation ended (exit $rc); the stack is blocked until make up has ended it and passed every check"
+  else
+    log "ERROR: could not confirm that the interrupted database operation ended (exit $rc), and the security gate could not be recorded in $GATE_FILE; $(gate_unrecorded_status): stop the stack (make down) and run make up"
+  fi
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
       log "stopped the edge: an interrupted database operation may still be running"
@@ -635,14 +665,16 @@ cancel_db_op() {
       log "WARNING: could not stop the edge of $PROJECT; stop the stack with make down"
     fi
   fi
+  [ "$recorded" = yes ]
 }
 
-# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill], used by
-# tests/app/stack.sh): stop with SIGTERM (or SIGKILL, which runs no handler)
-# at a named point, exactly as an interrupted or killed command would.
-# Points: rotate-after-pending, rotate-after-db, rotate-after-promote,
-# upgrade-after-backup, up-after-migrations; upgrade-corrupt-copy damages
-# the host copy of the backup instead.
+# Test-only fault injection (FLOWCRM_DEVENV_FAULT=<point>[:kill|:int], used
+# by tests/app/stack.sh): stop with SIGTERM (or SIGKILL, which runs no
+# handler, or SIGINT) at a named point, exactly as an interrupted or killed
+# command would. Points: rotate-after-pending, rotate-after-db,
+# rotate-after-promote, upgrade-after-backup, up-after-migrations,
+# restore-before-edge, edge-started; upgrade-corrupt-copy damages the host
+# copy of the backup instead.
 fault_point() { # name
   case ${FLOWCRM_DEVENV_FAULT-} in
     "$1")
@@ -652,6 +684,10 @@ fault_point() { # name
     "$1:kill")
       log "test fault injection: SIGKILL at $1"
       kill -KILL $$
+      ;;
+    "$1:int")
+      log "test fault injection: SIGINT at $1"
+      kill -INT $$
       ;;
   esac
 }
@@ -678,14 +714,14 @@ on_exit() {
 
 # Read-only Docker Compose call (ps, port, logs).
 compose() {
-  COMPOSE_PROFILES=$COMPOSE_PROFILES_VALUE FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND docker compose \
+  COMPOSE_PROFILES=$COMPOSE_PROFILES_VALUE FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND FLOWCRM_GATE_DIR=$GATE_DIR docker compose \
     --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
 }
 
 # Mutating Docker Compose call (up, down, rm); only while the lock is held.
 compose_op() {
   [ "$LOCK_HELD" = 1 ] || die $EX_SAFETY "internal error: mutating Docker Compose call without the lock"
-  COMPOSE_PROFILES=$COMPOSE_PROFILES_VALUE FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND run_op docker compose \
+  COMPOSE_PROFILES=$COMPOSE_PROFILES_VALUE FLOWCRM_HTTP_PORT=$COMPOSE_PORT FLOWCRM_HTTP_BIND=$BIND FLOWCRM_GATE_DIR=$GATE_DIR run_op docker compose \
     --project-name "$PROJECT" --project-directory "$ROOT" --file "$COMPOSE_FILE" "$@"
 }
 
@@ -884,12 +920,19 @@ gate_failed() { # exit-code message
   local id edge=''
   id=$(compose ps --quiet "$EDGE" 2>/dev/null | head -n 1)
   if [ -n "$id" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
-  { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } >"$GATE_FILE" 2>/dev/null
+  # Fail closed: the original failure is still reported (and its exit code
+  # kept), but never without saying that the gate is not recorded.
+  local recorded=yes
+  { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } | write_gate || recorded=no
+  [ "$recorded" = yes ] ||
+    log "ERROR: the security gate could not be recorded in $GATE_FILE; $(gate_unrecorded_status): stop the stack (make down) until make up passes"
   if [ -n "$id" ]; then
     if compose_op stop "$EDGE" >/dev/null 2>&1; then
       log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"
+    elif gate_blocks; then
+      log "WARNING: could not stop the edge of $PROJECT after a failed security gate; it answers only with the gate's 503 (checked); stop it with make down"
     else
-      log "WARNING: could not stop the edge of $PROJECT after a failed security gate; stop the stack with make down"
+      log "WARNING: could not stop the edge of $PROJECT after a failed security gate, and it was not seen blocking requests; stop the stack now: make down"
     fi
   fi
   die "$1" "$2"
@@ -904,13 +947,9 @@ gate_failed() { # exit-code message
 # clears it (gate_clear). The first line is the reason; the line "edge"
 # records that the edge was serving, so a rotation can restore it.
 protect_for() { # reason
-  local tmp edge=''
+  local edge=''
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
-  tmp=$(mktemp "$RUNTIME_DIR/.security-gate.XXXXXX") || die $EX_SAFETY "could not record the security gate; nothing was changed"
-  if ! { printf '%s\n' "$1" ${edge:+"$edge"} >"$tmp" && mv -f "$tmp" "$GATE_FILE"; }; then
-    rm -f "$tmp"
-    die $EX_SAFETY "could not record the security gate; nothing was changed"
-  fi
+  printf '%s\n' "$1" ${edge:+"$edge"} | write_gate || die $EX_SAFETY "could not record the security gate; nothing was changed"
   if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
     compose_op stop "$EDGE" >/dev/null 2>&1
     [ -z "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] ||
@@ -919,17 +958,122 @@ protect_for() { # reason
   fi
 }
 
-gate_clear() { rm -f "$GATE_FILE"; }
+gate_clear() { rm -f "$GATE_FILE" "$RUNTIME_DIR/security-gate"; }
 
-# After a rotation or abort that passed every check: serve again on the saved
-# port if the gate had stopped a serving edge (make up does this itself).
-restore_edge() { # gate-had-edge
-  [ "$1" = edge ] && [ "$STATE_STATUS" = valid ] || return 0
-  if try_edge "$STATE_PORT" && wait_http "$STATE_PORT"; then
-    log "the edge serves again on port $STATE_PORT"
+# What make status and make url show after a gate could not be recorded: a
+# gate recorded earlier (for example by protect_for) is left in place by the
+# failed write, so they still report the stack as blocked, with that reason.
+gate_unrecorded_status() {
+  local rec
+  if rec=$(gate_record); then
+    printf 'an earlier gate is still recorded, so make status and make url report the stack as blocked, but with its reason (%s)' "$(head -n 1 "$rec" | head -c 200)"
   else
-    log "WARNING: the edge did not start again on port $STATE_PORT; run make up"
+    printf 'make status and make url do not report the stack as blocked'
   fi
+}
+
+# The recorded gate for read-only commands: also one an earlier version left
+# at .runtime/security-gate (moved by the next command that prepares .runtime).
+gate_record() {
+  if [ -f "$GATE_FILE" ]; then printf '%s' "$GATE_FILE"
+  elif [ -f "$RUNTIME_DIR/security-gate" ]; then printf '%s' "$RUNTIME_DIR/security-gate"
+  else return 1
+  fi
+}
+
+# The edge on the port answers a request for / with the security gate's 503
+# (docker/edge/common.caddy): checked, not assumed, before an edge started
+# while the gate is recorded is trusted to serve nothing.
+gate_blocks() { # [port]
+  (
+    exec 3<>"/dev/tcp/$BIND/${1:-$COMPOSE_PORT}" || exit 1
+    printf 'GET / HTTP/1.0\r\nHost: %s:%s\r\nConnection: close\r\n\r\n' "$BIND" "${1:-$COMPOSE_PORT}" >&3
+    IFS= read -r -t 5 line <&3 || exit 1
+    case $line in "HTTP/1."[01]" 503"*) ;; *) exit 1 ;; esac
+    while IFS= read -r -t 5 line <&3; do
+      case $line in '' | $'\r') break ;; esac
+    done
+    body=
+    IFS= read -r -t 5 body <&3 || [ -n "$body" ] || exit 1
+    case $body in *"blocked by its security gate"*) exit 0 ;; esac
+    exit 1
+  ) 2>/dev/null
+}
+
+# Before the edge is started while the gate is recorded: a one-off container
+# of the edge service (it publishes no port) must show that its Caddy
+# configuration has the gate rule and that the edge user can read the gate.
+# An image built before the rule (a rotation does not build) or a gate the
+# edge cannot read would let a started edge serve until the check after its
+# start, and an interruption in between would leave it serving.
+edge_sees_gate() {
+  compose_op run --rm --no-deps -T --entrypoint sh "$EDGE" -c \
+    'grep -q "blocked by its security gate" /etc/caddy/common.caddy && test -r /run/flowcrm-gate/security-gate' >/dev/null 2>&1
+}
+
+# Starts the edge on a port and accepts it only when it answers the
+# readiness path with this stack's 200 (docker compose up --wait alone is not
+# proof, see refresh_secret_mounts). While the security gate is recorded,
+# the edge must also be seen answering everything else with the gate's 503
+# first: the gate, not this process, keeps it from serving if the command is
+# interrupted from here on. An edge that started but fails a check is
+# stopped again (not removed); EDGE_FAILURE says why, and whether it is
+# still running.
+serve_edge() { # port
+  EDGE_FAILURE=
+  if try_edge "$1"; then
+    LAST_ERROR=
+    fault_point edge-started
+    if [ -f "$GATE_FILE" ] && ! gate_blocks "$1"; then
+      EDGE_FAILURE="it does not block requests while the security gate is recorded (expected the gate's 503 for /)"
+    elif wait_http "$1"; then
+      return 0
+    else
+      EDGE_FAILURE="it does not answer $READY_PATH with 200"
+    fi
+  else
+    EDGE_FAILURE=$LAST_FAILURE
+  fi
+  edge_state
+  if [ "$EDGE_RUNNING" = true ]; then
+    if compose_op stop "$EDGE" >/dev/null 2>&1; then
+      EDGE_FAILURE="$EDGE_FAILURE; the started edge was stopped"
+    elif [ -f "$GATE_FILE" ] && gate_blocks "$1"; then
+      EDGE_FAILURE="$EDGE_FAILURE; the started edge could not be stopped, but it answers only with the gate's 503 (checked); stop it with make down"
+    else
+      EDGE_FAILURE="$EDGE_FAILURE; WARNING: the started edge could not be stopped and was not seen blocking requests; stop the stack now: make down"
+    fi
+  fi
+  return 1
+}
+
+# The last step of a rotation or abort that passed every check, while the
+# security gate is still recorded (ADR-018, Rotation, state 7): if the gate
+# had stopped a serving edge, start it on the saved port, where the gate
+# keeps it from serving anything but its health paths; only once it answers
+# readiness is the gate cleared, and it serves. If the edge does not get
+# ready, the gate stays (with the reason), the edge is stopped and the
+# command fails: the change itself is complete and verified, and make up
+# serves once the cause is fixed. Interrupted anywhere here, even by
+# SIGKILL, the gate is still recorded.
+restore_edge() { # gate-had-edge what-was-done
+  if [ "$1" != edge ] || [ "$STATE_STATUS" != valid ]; then
+    gate_clear
+    return 0
+  fi
+  fault_point restore-before-edge
+  if ! edge_sees_gate; then
+    gate_failed $EX_DOCKER "$2, but the edge was not started again: its image does not enforce the security gate or cannot read it (.runtime/gate); run make up, which rebuilds the images and serves once every check passed"
+  fi
+  if serve_edge "$STATE_PORT"; then
+    gate_clear
+    log "the edge serves again on port $STATE_PORT"
+    return 0
+  fi
+  [ -z "$LAST_ERROR" ] || printf '%s\n' "$LAST_ERROR" >&2
+  # gate_failed keeps the "edge" line already in the gate, so the next
+  # rotation or abort brings the edge back too.
+  gate_failed $EX_DOCKER "$2, but the edge did not serve again on port $STATE_PORT (${EDGE_FAILURE:-unknown}); the stack is not served: run make up once fixed (make logs edge api)"
 }
 
 sha256_of() { # file
@@ -1172,10 +1316,11 @@ do_up() {
     COMPOSE_PORT=$restore
     edge_state
     if [ "$EDGE_RUNNING" != true ] || [ "$EDGE_PORT" != "$restore" ]; then
-      if try_edge "$restore"; then
+      if serve_edge "$restore"; then
         log "the previous edge on port $restore was restored"
       else
-        log "WARNING: could not restore the previous edge on port $restore"
+        [ -z "$LAST_ERROR" ] || printf '%s\n' "$LAST_ERROR" >&2
+        log "WARNING: could not restore the previous edge on port $restore ($EDGE_FAILURE)"
       fi
     else
       log "the running edge on port $restore was left unchanged"
@@ -1243,7 +1388,7 @@ cmd_restart() {
 }
 
 cmd_status() {
-  local svc id s rc=$EX_NOT_RUNNING
+  local svc id s gate rc=$EX_NOT_RUNNING
   preflight
   read_state
   require_owned_project
@@ -1266,8 +1411,8 @@ cmd_status() {
   if [ "$EDGE_RUNNING" = true ]; then
     printf 'mapping:    %s:%s -> %s\n' "$BIND" "${EDGE_PORT:-unknown}" "$EDGE_CONTAINER_PORT"
   fi
-  if [ -f "$GATE_FILE" ]; then
-    printf 'blocked:    %s\n' "$(head -n 1 "$GATE_FILE" | head -c 300)"
+  if gate=$(gate_record); then
+    printf 'blocked:    %s\n' "$(head -n 1 "$gate" | head -c 300)"
     printf 'result:     blocked by the security gate (a database change is in progress, was interrupted, or a check failed); fix the cause and run make up\n'
     return "$rc"
   fi
@@ -1284,11 +1429,12 @@ cmd_status() {
 }
 
 cmd_url() {
+  local gate
   preflight
   read_state
   require_owned_project
   [ "$STATE_STATUS" = valid ] || die $EX_NOT_RUNNING "not started in this checkout (no verified port saved); run make up"
-  [ ! -f "$GATE_FILE" ] || die $EX_NOT_RUNNING "blocked by the security gate: $(head -n 1 "$GATE_FILE" | head -c 300)"
+  ! gate=$(gate_record) || die $EX_NOT_RUNNING "blocked by the security gate: $(head -n 1 "$gate" | head -c 300)"
   COMPOSE_PORT=$STATE_PORT
   edge_state
   [ "$EDGE_RUNNING" = true ] || die $EX_NOT_RUNNING "the edge is not running; run make up"
@@ -1597,9 +1743,8 @@ cmd_rotate_db_password() {
   fault_point rotate-after-promote
   refresh_secret_mounts
   verify_role_client "$ROT_ROLE"
-  gate_clear
   log "rotated the password of flowcrm_$ROT_ROLE"
-  restore_edge "$had_edge"
+  restore_edge "$had_edge" "the password of flowcrm_$ROT_ROLE was rotated and verified"
 }
 
 cmd_rotate_db_password_abort() {
@@ -1618,9 +1763,8 @@ cmd_rotate_db_password_abort() {
   rm -f "$ROT_PENDING"
   refresh_secret_mounts
   verify_role_client "$ROT_ROLE"
-  gate_clear
   log "aborted the rotation of flowcrm_$ROT_ROLE; the database uses the current password again (SCRAM login checked)"
-  restore_edge "$had_edge"
+  restore_edge "$had_edge" "the rotation of flowcrm_$ROT_ROLE was aborted and the current password verified"
 }
 
 main() {

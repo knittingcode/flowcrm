@@ -513,7 +513,7 @@ dv a-up-nodrift "$A" up
   [ "$(rc_of a-status-drift)" = 1 ] && grep -q '^blocked: ' "$work/out/a-status-drift.out" &&
   [ "$(rc_of a-url-drift)" = 1 ] && err_has a-url-drift 'blocked by the security gate' &&
   [ "$drift_db" = true ] && [ "$(saved_port "$A")" = "$PA" ] &&
-  [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10 && [ ! -e "$A/.runtime/security-gate" ]
+  [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10 && [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-48 privilege drift on a running stack: make up exits 6 and stops the edge (no request served, status and url blocked, db and port kept); after the fix make up serves again" $? "before=$drift_before during=$drift_code $(grep -m1 VIOLATION "$work/out/a-up-drift.err")"
 
 # A missing or malformed role secret of an existing volume fails closed and
@@ -658,6 +658,90 @@ ev "rotation 5: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)'
 ev "rotation 6: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot6.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
 ev "api before/after 6: ${r6_before#* api=} -> ${r6_after#* api=}"
 
+# A rotation that passes every check, but whose edge cannot get ready again
+# (FND-009E): the owner rotation recreates only the db, so the api keeps the
+# broken index.php and the edge's health check through it fails. The
+# command fails (exit 2) instead of warning, the started edge is stopped, the
+# stack is blocked again, and make up serves once the cause is fixed.
+printf '<?php syntax error\n' >"$A/backend/public/index.php"
+(cd "$A" && ROLE=owner FLOWCRM_WAIT_TIMEOUT=20 ./bin/devenv rotate-db-password) >"$work/out/a-rot7.out" 2>"$work/out/a-rot7.err"
+echo $? >"$work/out/a-rot7.rc"
+r7_edge_ps=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+get "$PA" /
+r7_code=$CODE
+dv a-status-rot7 "$A" status
+cp -p "$work/index.php.kept" "$A/backend/public/index.php"
+# The api turned unhealthy while index.php was broken; make up's wait fails
+# fast on an unhealthy container, so give its health check time to recover.
+i=0
+until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cid "$A" api)" 2>/dev/null)" = healthy ] || [ "$i" -ge 60 ]; do sleep 1; i=$((i + 1)); done
+dv a-up-rot7 "$A" up
+[ "$(rc_of a-rot7)" = 2 ] && err_has a-rot7 'rotated the password of flowcrm_owner' &&
+  err_has a-rot7 'was rotated and verified, but the edge did not serve again' && [ -z "$r7_edge_ps" ] && [ "$r7_code" = 000 ] &&
+  [ "$(rc_of a-status-rot7)" = 1 ] && grep -q '^blocked: .*did not serve again' "$work/out/a-status-rot7.out" &&
+  [ "$(rc_of a-up-rot7)" = 0 ] && until_ready "$PA" 200 30 && no_leftovers
+v "ST-50 a verified rotation whose edge cannot get ready fails (exit 2): the started edge is stopped, nothing is served, the stack is blocked; make up serves once fixed" $? \
+  "rotation exit $(rc_of a-rot7), edge container [$r7_edge_ps], GET / $r7_code, make up exit $(rc_of a-up-rot7)
+$(sed 's/^/      | /' "$work/out/a-rot7.err" | tail -n 12)
+$(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)"
+
+# The security gate is enforced by the running edge itself (FND-009E): while
+# .runtime/gate/security-gate exists, every request but exactly /health/live
+# and /health/ready is answered with the gate's 503 (raw URI, as ADR-017).
+gate_probe() { # -> "path=code ..." for the paths that matter
+  local out='' p
+  for p in / /api/v1/system/status /health/live /health/ready /HEALTH/READY //health/ready; do
+    out="$out $p=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --path-as-is "http://127.0.0.1:$PA$p")"
+  done
+  printf '%s' "${out# }"
+}
+GATED="/=503 /api/v1/system/status=503 /health/live=200 /health/ready=200 /HEALTH/READY=503 //health/ready=503"
+OPEN="/=200 /api/v1/system/status=200 /health/live=200 /health/ready=200 /HEALTH/READY=200 //health/ready=200"
+probe_until() { # expected [seconds]: poll (a bind mount can show a change a moment late)
+  local i=0
+  PROBE=$(gate_probe)
+  while [ "$PROBE" != "$1" ] && [ "$i" -lt "${2:-10}" ]; do sleep 1; i=$((i + 1)); PROBE=$(gate_probe); done
+  [ "$PROBE" = "$1" ]
+}
+printf 'a gate recorded by the test\n' >"$A/.runtime/gate/security-gate"
+chmod 0644 "$A/.runtime/gate/security-gate"
+probe_until "$GATED"
+g_on=$PROBE
+g_body=$(curl -s -m 5 "http://127.0.0.1:$PA/")
+rm -f "$A/.runtime/gate/security-gate"
+probe_until "$OPEN"
+g_off=$PROBE
+[ "$g_on" = "$GATED" ] && case $g_body in *"blocked by its security gate"*) true ;; *) false ;; esac && [ "$g_off" = "$OPEN" ]
+v "ST-50 the running edge enforces the gate: only /health/live and /health/ready pass while it is recorded, everything serves once it is removed" $? "gated: $g_on; open: $g_off"
+
+# Interrupted while the edge comes back after a verified rotation: the gate
+# is cleared only once the edge answers readiness, so whatever kills the
+# command leaves the gate recorded, and the edge (if it already started)
+# serves nothing but its health paths. make up reconciles and serves.
+interrupted_restore() { # label fault expected-exit
+  (cd "$A" && ROLE=owner FLOWCRM_DEVENV_FAULT=$2 ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err"
+  echo $? >"$work/out/$1.rc"
+  IR_EDGE=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+  IR_PROBE=$(gate_probe)
+  dv "$1-status" "$A" status
+  IR_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absent)
+  dv "$1-up" "$A" up
+  [ "$(rc_of "$1")" = "$3" ] && [ "$IR_GATE" = recorded ] && [ "$(rc_of "$1-status")" = 1 ] && grep -q '^blocked: ' "$work/out/$1-status.out" &&
+    [ "$(rc_of "$1-up")" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
+}
+interrupted_restore a-ir-kill edge-started:kill 137
+r=$?
+[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
+v "ST-50 SIGKILL right after the edge started again: the gate stays recorded, the running edge serves only its health paths, make up serves" $? "exit $(rc_of a-ir-kill), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-kill-up)"
+interrupted_restore a-ir-int edge-started:int 130
+r=$?
+[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
+v "ST-50 SIGINT right after the edge started again: the gate stays recorded, nothing but the health paths is served, make up serves" $? "exit $(rc_of a-ir-int), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-int-up)"
+interrupted_restore a-ir-term restore-before-edge 143
+r=$?
+[ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000" ]
+v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $? "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)"
+
 # Interrupted while the password change waits inside PostgreSQL (another
 # session holds the operations' advisory lock): the interrupted transaction
 # is ended before the command exits, and nothing commits later.
@@ -728,7 +812,7 @@ u_up=$?
   err_has a-unconf 'stopped the edge' && [ "$PAUSED_EDGE" = 000 ] && [ "$(rc_of a-unconf-status)" = 1 ] &&
   grep -q '^blocked: .*could not be confirmed' "$work/out/a-unconf-status.out" && [ "$(rc_of a-unconf-url)" = 1 ] &&
   [ "$u_ended" -lt 120 ] && [ "$u_up" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
-  cmp -s "$sd/db_app_password" "$work/app.5" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+  cmp -s "$sd/db_app_password" "$work/app.5" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-59 unconfirmed cancellation (db paused): the stack is blocked (edge stopped, status and url refuse); the next make up ends the old operation before changing anything, and it never commits" $? "rc=$(rc_of a-unconf) edge=$PAUSED_EDGE ended=$u_ended up=$u_up $(tail -n 1 "$work/out/a-unconf-up.err")"
 rot a-unconf-abort app '' rotate-db-password-abort
 
@@ -833,7 +917,7 @@ wait "$abp"
 k1_abort=$?
 [ "$k_before" = 200 ] && [ "$k1_edge" = 000 ] && [ "$(rc_of a-kill1)" = 137 ] && [ "$k1_blocked" = yes ] && [ "$k1_alive" = 1 ] &&
   [ "$i" -lt 400 ] && [ "$k1_waited" = 1 ] && [ "$k1_abort" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
-  cmp -s "$sd/db_app_password" "$work/app.6" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+  cmp -s "$sd/db_app_password" "$work/app.6" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-62 SIGKILL while ALTER ROLE PASSWORD waits: the edge was already stopped (200 -> 000), status and url blocked; the abort waits for the old operation (no overlap), which rolls back and never commits; the abort then serves again" $? "before=$k_before during=$k1_edge rc=$(rc_of a-kill1) blocked=$k1_blocked alive=$k1_alive waited=$k1_waited/$i abort=$k1_abort"
 
 # Killed, and the old operation commits before a newer command runs: the
@@ -848,7 +932,7 @@ k2_blocked=$(blocked_now a-kill2b && echo yes)
 rot a-kill2-finish app
 [ "$K_EDGE" = 000 ] && [ "$(rc_of a-kill2)" = 137 ] && [ "$k2_committed" = committed ] && [ "$k2_code" = 000 ] && [ "$k2_blocked" = yes ] &&
   [ "$(rc_of a-kill2-finish)" = 0 ] && login_ok app "$sd/db_app_password" && until_ready "$PA" 200 30 && no_leftovers &&
-  [ ! -e "$A/.runtime/security-gate" ]
+  [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-63 SIGKILL during a rotation whose password change commits later: no edge and blocked throughout; finishing the rotation serves again" $? "committed=$k2_committed code=$k2_code blocked=$k2_blocked"
 
 # Killed after the change committed, before it was verified: a rotation
@@ -891,7 +975,7 @@ dv a-kill4-up "$A" up
 [ "$(rc_of a-kill3)" = 137 ] && [ "$k3_code" = 000 ] && [ "$k3_blocked" = yes ] && [ "$(rc_of a-kill3-finish)" = 0 ] &&
   [ "$(rc_of a-kill4)" = 137 ] && err_has a-kill4 'stopped the edge before changing the database' && [ "$k4_code" = 000 ] &&
   [ "$k4_blocked" = yes ] && [ "$k4_migrated" = 1 ] && [ "$(rc_of a-kill4-up)" = 0 ] && until_ready "$PA" 200 30 &&
-  [ ! -e "$A/.runtime/security-gate" ]
+  [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $? "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated"
 
 # Recovery while PostgreSQL is temporarily unreachable: make up fails and
@@ -917,7 +1001,7 @@ k5_pending=$(login_ok app "$(pend app)" && echo committed)
 rot a-kill5-abort app '' rotate-db-password-abort
 [ "$(rc_of a-kill5)" = 137 ] && [ "$(rc_of a-kill5-up)" != 0 ] && [ "$k5_code" = 000 ] && [ "$k5_blocked" = yes ] &&
   [ "$i" -lt 400 ] && [ "$k5_up" = 0 ] && [ -z "$k5_pending" ] && [ "$(rc_of a-kill5-abort)" = 0 ] &&
-  until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ] && no_leftovers
+  until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && no_leftovers
 v "ST-65 after SIGKILL, recovery while PostgreSQL is paused fails and stays blocked; once reachable, make up ends the old operation (no commit) and serves" $? "up=$(rc_of a-kill5-up) code=$k5_code blocked=$k5_blocked up2=$k5_up pending=$k5_pending"
 
 dv a-up-rotated "$A" up
@@ -1241,7 +1325,7 @@ holder_c_down
 wait "$retry"
 sleep 5
 [ "$ck_rc" = 137 ] && [ -n "$ck_old" ] && [ "$(rc_of c-kill-status)" = 1 ] && grep -q '^blocked: *upgrading the database roles' "$work/out/c-kill-status.out" &&
-  [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/security-gate" ]
+  [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/gate/security-gate" ]
 v "ST-66 SIGKILL while ALTER TABLE OWNER waits: blocked (status, url); the next upgrade ends the old operation first and it never commits; the gate stays until an upgrade passes every check" $? "rc=$ck_rc old=$ck_old waited=$i"
 
 # The backup check requires an intact audit log once its migration is

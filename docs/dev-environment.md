@@ -91,7 +91,13 @@ and leaves `.runtime/dev.env` unchanged:
    When this check or the role check of phase 5 fails, a running edge is
    stopped, so the stack is not served; the database and the saved port are
    kept, `make status` reports `blocked` and `make url` fails until a
-   `make up` passes;
+   `make up` passes. The gate is the file `.runtime/gate/security-gate`; an
+   edge started by `bin/devenv` mounts that directory (`FLOWCRM_GATE_DIR`)
+   and, while the file exists, answers everything but `/health/live` and
+   `/health/ready` with 503, so a stack that has not passed its checks
+   serves nothing even if such an edge is running. An edge started directly
+   with `docker compose up` mounts the empty `docker/edge/no-gate` instead
+   and does not enforce the gate; use `make` (ADR-018);
 8. start the edge on the first usable port (`up --no-deps --wait edge`);
 9. verify Docker's actual mapping and `GET` of the stack's readiness path
    (`/health/ready`, which must answer 200 with the stack's own body) through
@@ -115,7 +121,7 @@ configuration changed)` and/or `applied pending database migrations`.
 | `make logs` | Recent logs of this project only. `SERVICE` is one of the stack's services (`edge`, `web`, `api`, `db`; fixture: `edge`, `state`), `TAIL=200`, `FOLLOW=1`. |
 | `make doctor` | Read-only prerequisite and configuration check. |
 | `make db-upgrade-roles` | Application stack only, explicit: convert a database created before the role separation. Creates the two role secrets, stops `api`, `web` and `edge`, takes a backup verified by a restore into a scratch database (`.runtime/backups/`), moves the schema to `flowcrm_owner` in one transaction, migrates and verifies. On a converted database it only re-checks. |
-| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: a new password for `flowcrm_app` or `flowcrm_owner`. The pending password (`.runtime/secrets/.db_<role>_password.pending`, `0600`) is set in the database, a SCRAM login is checked, then it replaces the current file, the containers that mount it are recreated and the role's own client logs in. After an interruption or failure, running it again finishes the rotation (ADR-018, Rotation). |
+| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: a new password for `flowcrm_app` or `flowcrm_owner`. The pending password (`.runtime/secrets/.db_<role>_password.pending`, `0600`) is set in the database, a SCRAM login is checked, then it replaces the current file, the containers that mount it are recreated and the role's own client logs in. The edge serves again only when it answers readiness; otherwise the command exits 2 and the stack stays blocked until `make up` succeeds. After an interruption or failure, running it again finishes the rotation (ADR-018, Rotation). |
 | `make db-rotate-password-abort ROLE=app\|owner` | Undo an unfinished rotation: the database gets the current password back (SCRAM login checked) and the pending file is removed. |
 | `make help` | List the targets. |
 | `make test-devenv` | Run the allocator tests on the fixture (see below). |
@@ -481,7 +487,10 @@ run, so several runs from one checkout do not interfere.
   recreated container after a secret change (with fake Compose and Docker:
   a container still starting, unhealthy, without a health check, not
   replaced or mounting an old secret is refused, also when Compose reported
-  success), the Makefile interface
+  success), the edge's return after a rotation (it must answer readiness;
+  otherwise it is stopped, the gate is recorded again and the command
+  fails), a security gate that cannot be recorded (reported on stderr,
+  never a success), the Makefile interface
   (targets and the commands they run) and checks that the result tally
   detects failed and lost results.
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
