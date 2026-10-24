@@ -127,6 +127,12 @@ return [
     ['login key folds case unlike the user lookup', 'src/Identity/Infrastructure/Security/LoginRateLimiter.php',
         "mb_convert_case(\$email, \\MB_CASE_LOWER_SIMPLE, 'UTF-8')", "mb_strtolower(\$email, 'UTF-8')",
         'LoginThrottlingTest::testEveryVariantThatResolvesToTheAccountSharesItsWindow|LoginRateLimiterTest'],
+    ['login lookup cut at a NUL byte (per-account limits bypassed)', 'src/Identity/Infrastructure/Persistence/DoctrineUserRepository.php',
+        'if (!User::canHoldEmail($email)) {', 'if (false) {',
+        'LoginThrottlingTest::testAnAddressWithANulByteMatchesNoAccount|ProvisioningCommandTest::testAnAddressWithANulByteOrInvalidUtf8NamesNoUser'],
+    ['user directory lookup cut at a NUL byte', 'src/Identity/Infrastructure/Persistence/DbalUserDirectory.php',
+        'if (!User::canHoldEmail($email)) {', 'if (false) {',
+        'ProvisioningCommandTest::testAnAddressWithANulByteOrInvalidUtf8NamesNoUser'],
     // Per-user API limit (FCRM-002 NFR-007).
     ['no per-user API limit', 'src/Identity/Http/Security/UserRateLimitListener.php',
         'if (!$limit->isAccepted()) {', 'if (false) {',
