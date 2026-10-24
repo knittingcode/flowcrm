@@ -32,7 +32,7 @@ FlowCRM is designed around practical sales workflows, with a focus on data owner
 | CI/CD | GitHub Actions |
 | Testing | PHPUnit, PHPStan, PHP-CS-Fixer, Vitest, Testing Library, Playwright, ESLint |
 
-No cache server or message broker is part of the stack (ADR-007): sessions and the application cache use PostgreSQL, and rate limits and locks will too. If background processing becomes necessary, Symfony Messenger will start with its Doctrine transport.
+No cache server or message broker is part of the stack (ADR-007): sessions, the application cache, rate limits and their locks use PostgreSQL. If background processing becomes necessary, Symfony Messenger will start with its Doctrine transport.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ flowchart LR
 - The core schema (users, organizations, memberships, pipeline, audit log) enforces its invariants in PostgreSQL, including composite tenant foreign keys and an append-only audit log ([data model](docs/architecture/data-model.md)).
 - The API writes structured JSON logs to stderr; the edge, the API's log records and problem documents share one request ID per request ([observability](docs/architecture/observability.md)).
 - Sessions and the application cache are stored in PostgreSQL (Symfony `PdoSessionHandler` and `DoctrineDbalAdapter`); sessions are lazy, so stateless routes set no cookie ([sessions and cache](docs/architecture/sessions-and-cache.md)).
-- Authentication uses Symfony Security with these sessions: Argon2id passwords, a new session ID at login, an 8-hour absolute and 30-minute idle lifetime, Origin checks and a session-bound CSRF token for unsafe requests, and layered login throttling. Access to an organization is decided on every request from the user's active membership in the database; a foreign organization looks exactly like an unknown one (404) ([authentication](docs/architecture/authentication.md), [ADR-019](docs/architecture/adr/ADR-019-authentication-and-tenant-authorization.md)). The API contract is [`backend/openapi.yaml`](backend/openapi.yaml).
+- Authentication uses Symfony Security with these sessions: Argon2id passwords, a new session ID at login, an 8-hour absolute and 30-minute idle lifetime, Origin checks and a session-bound CSRF token for unsafe requests, layered login throttling and a per-user API limit of 600 requests per minute. Access to an organization is decided on every request from the user's active membership in the database; a foreign organization looks exactly like an unknown one (404) ([authentication](docs/architecture/authentication.md), [ADR-019](docs/architecture/adr/ADR-019-authentication-and-tenant-authorization.md)). The API contract is [`backend/openapi.yaml`](backend/openapi.yaml).
 - The API connects as the least-privileged role `flowcrm_app` (explicit table privileges from `backend/config/database/runtime-privileges.yaml`, no DDL, append-only audit log); migrations run as the schema owner `flowcrm_owner` in a one-off `migrate` job; the PostgreSQL superuser is used only inside the database container ([ADR-018 database roles](docs/architecture/adr/ADR-018-database-roles.md)).
 
 Details: [development lifecycle contract](docs/architecture/development-lifecycle-contract.md), [ADR-017 health endpoint routing](docs/architecture/adr/ADR-017-health-endpoint-routing.md).
@@ -208,7 +208,7 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 
 ## Known limitations
 
-- No CRM features yet. The organization roles are a provisional, read-only matrix; membership management and tenant changes through the API, self-service password reset (there is no e-mail delivery) and the per-user API rate limit follow later ([authentication](docs/architecture/authentication.md#known-limitations)).
+- No CRM features yet. The organization roles are a provisional, read-only matrix; membership management and tenant changes through the API and self-service password reset (there is no e-mail delivery) follow later ([authentication](docs/architecture/authentication.md#known-limitations)).
 - The production-like configuration is tested locally and in CI only; there is no deployment.
 - The API image is rebuilt when PHP dependencies change; there is no hot reload of Composer packages.
 
@@ -217,7 +217,7 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 - [ ] Define domain boundaries and data model
 - [x] Set up Symfony and React applications
 - [x] Configure Docker, Makefile, and CI
-- [ ] Implement authentication and authorization
+- [x] Implement authentication and authorization
 - [ ] Build customer and contact management
 - [ ] Implement sales pipelines
 - [ ] Add activities and notifications
