@@ -1193,6 +1193,82 @@ DB_OP_ID=
 eval "$saved_fns"
 RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 
+# --- U-23 protection before a change fails closed (FND-009E)
+# protect_for with a fake Compose (the edge's state is in a file, because
+# protect_for may exit): the gate is recorded before a serving edge is
+# stopped, so a command killed in between leaves it blocked; an edge that
+# cannot be stopped, or a gate that cannot be recorded, stops the command
+# before anything changes (and an unrecorded gate stops nothing either).
+# cancel_db_op keeps the "edge" line, so a rotation can restore the edge.
+# gate_clear also removes a gate left at the old place. edge_sees_gate runs
+# a one-off container that publishes no port, with the gate directory
+# mounted, and checks both the rule and that the gate is readable.
+saved_fns=$(declare -f compose compose_op run_op write_gate)
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
+compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(cat "$work/u23-running" 2>/dev/null)" = true ] && printf 'edge-id\n'; return 0; }
+compose_op() {
+  [ "$1" = exec ] && return 1 # cancel_db_op: the cancellation is not confirmed
+  [ "$1" = stop ] || return 0
+  printf 'stop %s gate=%s\n' "$2" "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u23-calls"
+  [ "$U23_STOP" = fails ] && return 1
+  echo false >"$work/u23-running"
+}
+u23() { # name gate-dir(dir|file) stop(ok|fails)
+  RUNTIME_DIR=$work/u23-$1/.runtime GATE_DIR=$work/u23-$1/.runtime/gate
+  GATE_FILE=$GATE_DIR/security-gate
+  mkdir -p "$RUNTIME_DIR"
+  if [ "$2" = file ]; then : >"$GATE_DIR"; else mkdir -p "$GATE_DIR"; fi
+  rm -f "$work/u23-calls"
+  echo true >"$work/u23-running"
+  U23_STOP=$3
+  U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
+  U23_RC=$?
+  U23_CALLS=$(paste -sd ";" - 2>/dev/null <"$work/u23-calls")
+  U23_GATE=$(paste -sd ";" - 2>/dev/null <"$GATE_FILE")
+}
+u23 ok dir ok
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  [ "$(cat "$work/u23-running")" = false ]
+result "U-23 protect_for records the gate (with the edge line) before it stops the serving edge" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE])"
+u23 stuck dir fails
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the edge cannot be stopped; the gate stays recorded" $? "(exit $U23_RC: $U23_OUT)"
+u23 unwritable file ok
+[ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ "$(cat "$work/u23-running")" = true ] &&
+  case $U23_OUT in *"could not record the security gate; nothing was changed"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command, changing nothing, when the gate cannot be recorded" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
+# cancel_db_op on a serving edge, unconfirmed cancellation.
+RUNTIME_DIR=$work/u23-cancel/.runtime GATE_DIR=$work/u23-cancel/.runtime/gate GATE_FILE=$work/u23-cancel/.runtime/gate/security-gate
+mkdir -p "$GATE_DIR"
+echo true >"$work/u23-running"
+rm -f "$work/u23-calls"
+U23_STOP=ok DB_OP_ID=u23-op
+(cancel_db_op) >/dev/null 2>&1
+r=$?
+DB_OP_ID=
+[ "$r" = 0 ] && [ "$(sed -n 2p "$GATE_FILE" 2>/dev/null)" = edge ] && [ "$(paste -sd ';' - <"$work/u23-calls")" = "stop edge gate=yes" ]
+result "U-23 cancel_db_op records the edge line and the gate before it stops the serving edge" $? "(exit $r, gate [$(paste -sd ';' - <"$GATE_FILE" 2>/dev/null)])"
+# gate_clear with a gate at both places (an older version recorded one at
+# .runtime/security-gate, a newer one in .runtime/gate).
+printf 'new\n' >"$GATE_FILE"
+printf 'old\n' >"$RUNTIME_DIR/security-gate"
+gate_clear
+[ ! -e "$GATE_FILE" ] && [ ! -e "$RUNTIME_DIR/security-gate" ] && ! gate_record >/dev/null
+result "U-23 gate_clear also removes a gate left at the old place" $?
+# edge_sees_gate: the arguments and environment of its one Docker Compose
+# call (the real compose_op, with run_op faked).
+eval "$saved_fns"
+run_op() { { printf 'FLOWCRM_GATE_DIR=%s\n' "${FLOWCRM_GATE_DIR-unset}"; printf '%s\n' "$@"; } >"$work/u23-run"; }
+(LOCK_HELD=1 COMPOSE_PORT=18555 && edge_sees_gate)
+grep -qx "FLOWCRM_GATE_DIR=$GATE_DIR" "$work/u23-run" && grep -qx run "$work/u23-run" && grep -qx -- --rm "$work/u23-run" &&
+  grep -qx -- --no-deps "$work/u23-run" && ! grep -Eqx -- '--service-ports|-p|--publish(=.*)?' "$work/u23-run" &&
+  grep -qF 'grep -q "blocked by its security gate" /etc/caddy/common.caddy' "$work/u23-run" &&
+  grep -qF 'test -r /run/flowcrm-gate/security-gate' "$work/u23-run"
+result "U-23 edge_sees_gate: one-off edge container with the gate directory, no published port, checks the rule and that the gate is readable" $? "($(paste -sd ' ' - <"$work/u23-run"))"
+eval "$saved_fns"
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
+
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
   "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1
