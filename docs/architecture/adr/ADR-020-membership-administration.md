@@ -133,9 +133,11 @@ Recorded for the owner's decision; not approved.
   new membership row after a removal: today both are refused with
   `MEMBERSHIP_EXISTS`.
 - **Disabled ADMINs:** the last-admin rule counts active memberships whatever
-  the user's account state, so an organization whose only other ADMIN is
-  disabled cannot demote its last enabled ADMIN, but could be left with only
-  a disabled ADMIN. Whether disabled users should count is not specified.
+  the user's account state, so the enabled ADMIN of an organization whose
+  only other ADMIN is disabled can still demote or remove themselves, which
+  leaves the organization with only a disabled ADMIN (pinned by
+  `MembershipAdministrationTest::testADisabledAdminCountsForTheLastAdminRule`).
+  Whether disabled users should count is not specified.
   Disabled users can also be added.
 - **Account discovery and consent (privacy):** an ADMIN of any organization
   can learn whether an e-mail address has a FlowCRM account (422

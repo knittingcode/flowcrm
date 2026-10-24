@@ -1,7 +1,7 @@
 # ADR-019: Browser session authentication and tenant authorization
 
 - **Status:** accepted for FCRM-FND-010B, amended by the FCRM-FND-010V security gate (the role matrix is provisional, see below)
-- **Related:** FCRM-002 (REQ-001 to REQ-006, NFR-001, NFR-002, NFR-005 to NFR-007, NFR-012, TI-01 to TI-13, BR-32, BR-33, section H), FCRM-003 sections G, H and I, C-05 and C-07, ADR-004 (tenant enforcement), ADR-005 (authentication and sessions), ADR-006 (REST conventions), ADR-007 (no Redis), ADR-017 (edge routing), ADR-018 (database roles)
+- **Related:** FCRM-002 (REQ-001 to REQ-006, NFR-001, NFR-002, NFR-005 to NFR-007, NFR-012, TI-01 to TI-13, BR-32, BR-33, section H), FCRM-003 sections G, H and I, C-05 and C-07, ADR-004 (tenant enforcement), ADR-005 (authentication and sessions), ADR-006 (REST conventions), ADR-007 (no Redis), ADR-017 (edge routing), ADR-018 (database roles), ADR-020 (membership administration)
 - **Design:** FCRM-FND-010A; details in [authentication](../authentication.md)
 
 ## Context
@@ -104,6 +104,8 @@ another's permissions.
 | `membership.view_email` | yes | yes | no | not specified in FCRM-002; provisional |
 
 Tenant mutations and membership management are not part of FND-010B.
+Membership administration (add, change role, remove) is decided in
+[ADR-020](ADR-020-membership-administration.md).
 
 ## Deviations, with reasons
 

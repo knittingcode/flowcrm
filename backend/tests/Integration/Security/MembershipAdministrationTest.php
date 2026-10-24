@@ -267,6 +267,28 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertSame(['ADMIN'], $this->activeAdmins(), 'the other ADMIN remains');
     }
 
+    /**
+     * Current behaviour, pinned for ADR-020's open decision on disabled
+     * ADMINs: the last-admin rule counts active memberships whatever the
+     * account state, so the only enabled ADMIN may step down while a
+     * disabled ADMIN remains, leaving only the disabled one.
+     */
+    public function testADisabledAdminCountsForTheLastAdminRule(): void
+    {
+        $disabled = $this->fixtures->user('disabled-admin');
+        $disabledMembership = $this->fixtures->member($this->a, $disabled, 'ADMIN');
+        $this->fixtures->connection()->executeStatement('UPDATE users SET disabled_at = now() WHERE id = ?', [$disabled->id->toRfc4122()]);
+        $client = $this->logIn($this->adminA);
+
+        $demoted = $client->patch($this->member($this->adminAMembership), ['role' => 'MANAGER']);
+
+        self::assertSame(200, $demoted->status(), $demoted->raw->body);
+        self::assertSame('MANAGER', $demoted->value('role'));
+        self::assertSame(['membership.role_changed'], array_column($this->events($this->adminAMembership), 'action'));
+        self::assertSame(['role' => 'ADMIN', 'status' => 'ACTIVE', 'organization_id' => $this->a->toRfc4122(), 'user_id' => $disabled->id->toRfc4122()], $this->membership($disabledMembership));
+        self::assertSame(['ADMIN'], $this->activeAdmins(), 'only the disabled ADMIN is left');
+    }
+
     /** With two ADMINs one may be removed, also by themselves; the removed user's next request is a 404 (TI-04). */
     public function testWithTwoAdminsOneMayBeRemoved(): void
     {

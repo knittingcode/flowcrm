@@ -404,10 +404,12 @@ role with an unknown address is only `INVALID_ROLE`.
   listed. There is no way to undo a removal through the API or the console.
 - **Disabled ADMINs count.** The last-admin rule counts active memberships
   whatever the user's account state. If the only other ADMIN is disabled,
-  the last enabled ADMIN still cannot be demoted, but the enabled ADMIN can
-  be removed or demoted while a disabled ADMIN remains, which can leave the
-  organization with only a disabled ADMIN. Disabled users can also be
-  added. Whether disabled users should count is an open decision.
+  the enabled ADMIN can still be demoted or removed (also by themselves),
+  because the disabled ADMIN is counted; the organization is then left with
+  only a disabled ADMIN, and only the operator can help (see Operator
+  console). Disabled users can also be added. Whether disabled users should
+  count is an open decision.
+  <!-- verified by MembershipAdministrationTest::testADisabledAdminCountsForTheLastAdminRule -->
 - **Add by e-mail reveals whether an account exists.** An ADMIN can tell an
   unknown address (422 `UNKNOWN_USER`) from an existing one (201 or 409).
   This is bounded only by the per-user API limit of 600 requests per
