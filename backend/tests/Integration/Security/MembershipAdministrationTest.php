@@ -135,6 +135,25 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertSame($before, $this->snapshot());
     }
 
+    /**
+     * PostgreSQL text cannot hold a NUL, and pdo_pgsql cuts a bound string
+     * at the first one: an address with a NUL must not resolve to the
+     * account whose address is the part before it.
+     */
+    public function testAnAddressWithANulIsAnUnknownUser(): void
+    {
+        $user = $this->fixtures->user('nul-target');
+        $client = $this->logIn($this->adminA);
+        $before = $this->snapshot();
+
+        foreach ([$user->email."\0", $user->email."\0junk", "\0".$user->email] as $email) {
+            $response = $client->post($this->members(), ['email' => $email, 'role' => 'REP']);
+            self::assertSame(422, $response->status(), json_encode($email, \JSON_THROW_ON_ERROR).' '.$response->raw->body);
+            self::assertSame([['pointer' => '/email', 'code' => 'UNKNOWN_USER']], $response->value('errors'));
+        }
+        self::assertSame($before, $this->snapshot());
+    }
+
     /** The status order: an unknown target is a 404 before the body is validated. */
     public function testAnUnknownTargetIsNotFoundBeforeTheBodyIsValidated(): void
     {

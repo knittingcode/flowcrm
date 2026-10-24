@@ -362,7 +362,7 @@ role with an unknown address is only `INVALID_ROLE`.
 | 409 | `conflict` | `LAST_ADMIN` | demoting or removing the only active ADMIN, also oneself |
 | 409 | `conflict` | `MEMBERSHIP_EXISTS` | the user already has a membership in the organization, active or removed |
 | 415 | `unsupported-media-type` | none | a body that is not `application/json` |
-| 422 | `validation-error` | `UNKNOWN_USER` (`/email`) | no user has this address |
+| 422 | `validation-error` | `UNKNOWN_USER` (`/email`) | no user has this address (an address with a NUL character never matches one) |
 | 422 | `validation-error` | `INVALID_ROLE` (`/role`) | not exactly `ADMIN`, `MANAGER` or `REP` |
 | 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string |
 | 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) |
