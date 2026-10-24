@@ -234,15 +234,50 @@ final class AuthenticationTest extends FpmApiTestCase
         $client = $this->client();
         $client->login($user->email, $user->password);
         $id = (string) $client->sessionId();
+        $connection = $this->fixtures->connection();
+        $row = $connection->fetchAssociative("SELECT encode(sess_data, 'hex') AS data, sess_lifetime, sess_time FROM sessions WHERE sess_id = ?", [$id]);
+        self::assertIsArray($row);
 
         self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        self::assertNull($this->sessionData($id), 'the session row is deleted with the disable');
 
+        // A session stored after the disable (a login that was already past
+        // its checks) still ends on its next request.
+        $connection->executeStatement("INSERT INTO sessions (sess_id, sess_data, sess_lifetime, sess_time) VALUES (?, decode(?, 'hex'), ?, ?)", [$id, $row['data'], $row['sess_lifetime'], $row['sess_time']]);
         self::assertSame(401, $client->get('/api/v1/me')->status());
         self::assertNull($this->sessionData($id), 'the session is invalidated');
         self::assertSame(401, $this->client()->post('/api/v1/auth/login', ['email' => $user->email, 'password' => $user->password])->status());
 
         self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
         $this->client()->login($user->email, $user->password);
+    }
+
+    /**
+     * Disabling ends every session at once (ADR-019): enabling the user
+     * again, with no request in between, does not bring a session back.
+     * Sessions of other users stay.
+     */
+    public function testReEnablingAUserDoesNotRestoreTheirSessions(): void
+    {
+        $user = $this->fixtures->user('reenabled');
+        $bystander = $this->fixtures->user('bystander');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $second = $this->client();
+        $second->login($user->email, $user->password);
+        $unrelated = $this->client();
+        $unrelated->login($bystander->email, $bystander->password);
+
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        self::assertNull($this->sessionData($client->sessionId()), 'the session row is deleted with the disable');
+        self::assertNull($this->sessionData($second->sessionId()), 'the session row is deleted with the disable');
+        self::assertNotNull($this->sessionData($unrelated->sessionId()), 'another user\'s session row stays');
+        self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
+
+        self::assertSame(401, $client->get('/api/v1/me')->status(), 'a session from before the disable stays ended');
+        self::assertSame(401, $second->get('/api/v1/me')->status(), 'every session of the user ends');
+        self::assertSame(200, $unrelated->get('/api/v1/me')->status(), 'sessions of other users stay');
+        self::assertSame(200, $this->client()->login($user->email, $user->password)->status(), 'the enabled user can log in again');
     }
 
     /** A password reset ends the sessions but leaves the user's memberships and their roles as they were. */
