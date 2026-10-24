@@ -399,7 +399,10 @@ time-based retention) before any real personal data is processed.
   (`GET /organizations/{id}`) has `membership.add`, `membership.change_role`
   or `membership.remove`. Nothing in the page changes before the server has
   answered: after every change, and after a 403, 404 or 409, the
-  organization and the member list are read again. A 409 `LAST_ADMIN` says
+  organization and the member list are read again, and so they are when it
+  is unknown whether a change was saved (no answer, an unreadable success
+  answer, or a 5xx that is not an API problem); the rows are not actionable
+  until the new list has arrived. A 409 `LAST_ADMIN` says
   that an organization needs at least one admin, `MEMBERSHIP_EXISTS` that
   the user has a membership already; 422 errors are shown at their inputs.
   Removing oneself reads the session again and leads to `/`.
