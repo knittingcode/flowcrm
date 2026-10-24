@@ -116,6 +116,9 @@ return [
     ['a success resets every window', 'src/Identity/Infrastructure/Security/LoginRateLimiter.php',
         "        \$this->accountAndIpLimiter(\$request)->reset();\n", "        foreach (\$this->getLimiters(\$request) as \$limiter) {\n            \$limiter->reset();\n        }\n",
         'LoginThrottlingTest::testOneClientIpIsLimitedAcrossAccounts|LoginRateLimiterTest'],
+    ['login key folds case unlike the user lookup', 'src/Identity/Infrastructure/Security/LoginRateLimiter.php',
+        "mb_convert_case(\$email, \\MB_CASE_LOWER_SIMPLE, 'UTF-8')", "mb_strtolower(\$email, 'UTF-8')",
+        'LoginThrottlingTest::testEveryVariantThatResolvesToTheAccountSharesItsWindow|LoginRateLimiterTest'],
     // Per-user API limit (FCRM-002 NFR-007).
     ['no per-user API limit', 'src/Identity/Http/Security/UserRateLimitListener.php',
         'if (!$limit->isAccepted()) {', 'if (false) {',

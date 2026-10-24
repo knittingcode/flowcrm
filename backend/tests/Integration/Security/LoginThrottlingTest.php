@@ -75,6 +75,33 @@ final class LoginThrottlingTest extends FpmApiTestCase
         self::assertSame(429, $this->tryLogin($client, $user->email, $user->password)->status());
     }
 
+    /**
+     * Every spelling the lookup resolves to the same account shares its
+     * windows. The lookup compares PostgreSQL lower() values; Unicode
+     * variants such as U+0130 (lower() maps it to "i", full case mapping to
+     * "i" + U+0307) or a final capital sigma must not open fresh windows.
+     */
+    public function testEveryVariantThatResolvesToTheAccountSharesItsWindow(): void
+    {
+        $user = $this->fixtures->user('casing');
+        $variants = [
+            $user->email,
+            str_replace('i', "\u{130}", $user->email),
+            strtoupper($user->email),
+            str_replace('i', 'I', $user->email),
+            str_replace('i', "\u{130}", strtoupper($user->email)),
+        ];
+        self::assertSame(200, $this->tryLogin($this->client(), $variants[1], $user->password)->status(), 'the variant resolves to the account');
+        $client = $this->client();
+        foreach ($variants as $i => $email) {
+            self::assertSame(401, $this->tryLogin($client, $email, 'wrong '.$i)->status(), "failure $i");
+        }
+
+        foreach ($variants as $i => $email) {
+            self::assertSame(429, $this->tryLogin($client, $email, $user->password)->status(), "variant $i is limited");
+        }
+    }
+
     /** A success clears only the account-and-IP window, not the IP's. */
     public function testASuccessfulLoginClearsOnlyTheAccountAndIpWindow(): void
     {
