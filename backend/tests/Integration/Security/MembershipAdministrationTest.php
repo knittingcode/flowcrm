@@ -8,6 +8,7 @@ use App\Tests\Support\Database\FailingAudit;
 use App\Tests\Support\Http\ApiClient;
 use App\Tests\Support\Http\ApiResponse;
 use App\Tests\Support\Http\FpmApiTestCase;
+use App\Tests\Support\Http\PendingRequest;
 use App\Tests\Support\Security\TestUser;
 use App\Tests\Support\Session\SeparateConnection;
 use Symfony\Component\Uid\Uuid;
@@ -512,6 +513,124 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         self::assertCount(1, $this->events(Uuid::fromString(self::string($ids[0]))));
     }
 
+    /**
+     * Two ADMINs remove each other at the same time: the second request
+     * finds that its actor's membership was removed and gets the 404 that
+     * TenantGuard would now answer. Exactly one ADMIN remains.
+     */
+    public function testConcurrentMutualRemovalsLeaveExactlyOneAdmin(): void
+    {
+        $second = $this->fixtures->user('second-admin');
+        $secondMembership = $this->fixtures->member($this->a, $second, 'ADMIN');
+        $first = $this->logIn($this->adminA);
+        $other = $this->logIn($second);
+
+        [$waiting, $responses] = $this->releasedTogether(fn (): array => [
+            $first->dispatch('DELETE', $this->member($secondMembership)),
+            $other->dispatch('DELETE', $this->member($this->adminAMembership)),
+        ], 2);
+
+        self::assertSame(2, $waiting, 'both requests waited for the organization lock');
+        $statuses = array_map(static fn (ApiResponse $r): int => $r->status(), $responses);
+        sort($statuses);
+        self::assertSame([204, 404], $statuses, 'the second actor was removed meanwhile');
+        self::assertSame(['ADMIN'], $this->activeAdmins());
+        self::assertCount(1, [...$this->events($secondMembership), ...$this->events($this->adminAMembership)], 'one change, one audit event');
+    }
+
+    /**
+     * The last two ADMINs step down at the same time, one by demoting and
+     * one by removing themselves. Neither request changes the other's
+     * actor, so only the ADMINs counted under the lock (BR-03) keep the
+     * second from leaving the organization without an ADMIN.
+     */
+    public function testTheLastTwoAdminsSteppingDownAtOnceLeaveOne(): void
+    {
+        $second = $this->fixtures->user('second-admin');
+        $secondMembership = $this->fixtures->member($this->a, $second, 'ADMIN');
+        $first = $this->logIn($this->adminA);
+        $other = $this->logIn($second);
+
+        [$waiting, $responses] = $this->releasedTogether(fn (): array => [
+            $first->dispatch('PATCH', $this->member($this->adminAMembership), ['role' => 'MANAGER']),
+            $other->dispatch('DELETE', $this->member($secondMembership)),
+        ], 2);
+
+        self::assertSame(2, $waiting, 'both requests waited for the organization lock');
+        [$demotion, $removal] = $responses;
+        $conflict = 409 === $demotion->status() ? $demotion : $removal;
+        $winner = 409 === $demotion->status() ? $removal : $demotion;
+        self::assertSame(409, $conflict->status(), $conflict->raw->body);
+        self::assertSame('/problems/conflict', $conflict->problem());
+        self::assertSame([['code' => 'LAST_ADMIN']], $conflict->value('errors'));
+        self::assertContains($winner->status(), [200, 204], $winner->raw->body);
+        self::assertSame(['ADMIN'], $this->activeAdmins());
+        self::assertCount(1, [...$this->events($secondMembership), ...$this->events($this->adminAMembership)], 'one change, one audit event');
+    }
+
+    /** An ADMIN removed while their request waits for the lock gets a 404, as their next request would. */
+    public function testAnActorRemovedWhileWaitingIsNotFound(): void
+    {
+        $second = $this->fixtures->user('second-admin');
+        $this->fixtures->member($this->a, $second, 'ADMIN');
+        $client = $this->logIn($this->adminA);
+        $before = $this->membership($this->repAMembership);
+
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
+        try {
+            $pending = $client->dispatch('DELETE', $this->member($this->repAMembership));
+            $waiting = $this->requestsWaitingForTheOrganizationLock($holder, 1);
+            $holder->prepare("UPDATE memberships SET status = 'REMOVED', removed_at = now() WHERE id = ?")->execute([$this->adminAMembership->toRfc4122()]);
+            $holder->commit();
+            [$response] = ApiClient::collect($pending);
+        } finally {
+            if ($holder->inTransaction()) {
+                $holder->rollBack();
+            }
+        }
+
+        self::assertSame(1, $waiting, 'TenantGuard let it through, then it waited for the lock');
+        self::assertSame(404, $response->status(), $response->raw->body);
+        self::assertSame('/problems/not-found', $response->problem());
+        self::assertSame($before, $this->membership($this->repAMembership));
+        self::assertSame([], $this->events($this->repAMembership));
+    }
+
+    /**
+     * The lock is per organization: while A is locked, B's ADMIN changes B
+     * without waiting, and the same ADMIN's request for A is the 404 of a
+     * foreign organization, also without waiting and without a change.
+     */
+    public function testALockedOrganizationBlocksNeitherAnotherOrganizationNorItsRefusals(): void
+    {
+        $client = $this->logIn($this->adminB);
+        $before = $this->membership($this->repAMembership);
+
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
+        try {
+            $start = microtime(true);
+            $own = $client->patch('/api/v1/organizations/'.$this->b->toRfc4122().'/members/'.$this->repBMembership->toRfc4122(), ['role' => 'MANAGER']);
+            $foreign = $client->patch($this->member($this->repAMembership), ['role' => 'ADMIN']);
+            $elapsed = microtime(true) - $start;
+            self::assertTrue($holder->inTransaction(), 'A was locked throughout');
+        } finally {
+            $holder->rollBack();
+        }
+
+        self::assertLessThan(5.0, $elapsed, 'neither request waited for A\'s lock');
+        self::assertSame(200, $own->status(), $own->raw->body);
+        self::assertSame('MANAGER', $own->value('role'));
+        self::assertSame(['membership.role_changed'], array_column($this->events($this->repBMembership), 'action'));
+        self::assertSame(404, $foreign->status());
+        self::assertSame('/problems/not-found', $foreign->problem());
+        self::assertSame($before, $this->membership($this->repAMembership));
+        self::assertSame([], $this->events($this->repAMembership));
+    }
+
     /** Broken bodies and malformed IDs are refused before anything is read or written. */
     public function testMalformedRequestsChangeNothing(): void
     {
@@ -592,6 +711,33 @@ final class MembershipAdministrationTest extends FpmApiTestCase
             'changes' => json_decode(self::string($row['changes']), true, flags: \JSON_THROW_ON_ERROR),
             'request_id' => $row['request_id'],
         ], $rows);
+    }
+
+    /**
+     * Starts the requests $dispatch returns while a separate connection holds
+     * A's organization lock, waits until $expected of them wait for it and
+     * releases it, so they then run one after the other in any order.
+     *
+     * @param callable(): list<PendingRequest> $dispatch
+     *
+     * @return array{int, list<ApiResponse>} the number of requests seen waiting, and the responses in the order of $dispatch
+     */
+    private function releasedTogether(callable $dispatch, int $expected): array
+    {
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
+        try {
+            $pending = $dispatch();
+            $waiting = $this->requestsWaitingForTheOrganizationLock($holder, $expected);
+            $holder->rollBack();
+
+            return [$waiting, ApiClient::collect(...$pending)];
+        } finally {
+            if ($holder->inTransaction()) {
+                $holder->rollBack();
+            }
+        }
     }
 
     /**

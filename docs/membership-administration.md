@@ -101,6 +101,8 @@ The organization page (`/o/:organizationId`) links to the members page
 - Nothing is shown as changed before the server has confirmed it. After
   every change, and after a 403, 404 or 409, the organization and the list
   are read again, so the controls follow the role the server reports now.
+  What the page shows for each refusal is listed under
+  [What the members page shows](#what-the-members-page-shows).
 - Controls are hidden, not disabled, for roles without the permission. A
   request sent anyway is refused by the API with 403.
 
@@ -363,25 +365,44 @@ Checked in this order: 415 and 403 `csrf-invalid` (request origin), 401
 and the other body checks come before the user is looked up, so an invalid
 role with an unknown address is only `INVALID_ROLE`.
 
-| Status | Problem type | `errors[].code` | Cause | SPA shows |
-|---|---|---|---|---|
-| 400 | `bad-request` | none | the body is not a JSON object | "The change could not be saved (request …)." (the SPA always sends JSON objects) |
-| 401 | `unauthenticated` | none | no valid session (logged out, expired, disabled user, password changed elsewhere) | the login page with "Your session has ended" |
-| 403 | `csrf-invalid` | none | origin, `Sec-Fetch-Site` or CSRF token check failed | retried once after reading the session again; if refused again: "The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again." The list is not reloaded (the request was not processed) |
-| 403 | `forbidden` | none | the actor's role has no such permission, also when the actor was demoted while the request waited for the lock | "You do not have permission to do this. The list was reloaded." |
-| 404 | `not-found` | none | organization unknown or not the actor's; target membership unknown, of another organization or removed; the actor's own membership removed meanwhile | "This member was changed or removed by someone else; the list was reloaded." If the organization itself is gone, the reload shows the "Not found" page |
-| 409 | `conflict` | `LAST_ADMIN` | demoting or removing the only active ADMIN, also oneself | "An organization needs at least one admin. Make another member an admin first. Nothing was changed." |
-| 409 | `conflict` | `MEMBERSHIP_EXISTS` | the user already has a membership in the organization, active or removed | "This user already has a membership in this organization (active or removed). Nothing was changed." |
-| 415 | `unsupported-media-type` | none | a body that is not `application/json` | "The change could not be saved (request …)." (the SPA always sends JSON) |
-| 422 | `validation-error` | `UNKNOWN_USER` (`/email`) | no user has this address | at the e-mail input: "No user has this e-mail address. Only existing users can be added." |
-| 422 | `validation-error` | `INVALID_ROLE` (`/role`) | not exactly `ADMIN`, `MANAGER` or `REP` | at the role input: "Choose one of the roles ADMIN, MANAGER or REP." |
-| 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string | `/email`: "Enter an e-mail address." (`REQUIRED`) or "Enter a valid e-mail address."; `/role`: "Choose one of the roles ADMIN, MANAGER or REP." |
-| 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) | "The request was refused (`<pointer>`: UNKNOWN_FIELD)." |
-| 429 | `too-many-requests` | none | the per-user API limit (600 requests per minute) | "Too many requests. Try again in … seconds." (or minutes, from `Retry-After`) |
-| 500 | `internal-error` | none | the change or its audit event could not be written; nothing was changed | "The change could not be saved (request …)." |
+| Status | Problem type | `errors[].code` | Cause |
+|---|---|---|---|
+| 400 | `bad-request` | none | the body is not a JSON object |
+| 401 | `unauthenticated` | none | no valid session (logged out, expired, disabled user, password changed elsewhere) |
+| 403 | `csrf-invalid` | none | origin, `Sec-Fetch-Site` or CSRF token check failed |
+| 403 | `forbidden` | none | the actor's role has no such permission, also when the actor was demoted while the request waited for the lock |
+| 404 | `not-found` | none | organization unknown or not the actor's; target membership unknown, of another organization or removed; the actor's own membership removed meanwhile |
+| 409 | `conflict` | `LAST_ADMIN` | demoting or removing the only active ADMIN, also oneself |
+| 409 | `conflict` | `MEMBERSHIP_EXISTS` | the user already has a membership in the organization, active or removed |
+| 415 | `unsupported-media-type` | none | a body that is not `application/json` |
+| 422 | `validation-error` | `UNKNOWN_USER` (`/email`) | no user has this address |
+| 422 | `validation-error` | `INVALID_ROLE` (`/role`) | not exactly `ADMIN`, `MANAGER` or `REP` |
+| 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string |
+| 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) |
+| 429 | `too-many-requests` | none | the per-user API limit (600 requests per minute) |
+| 500 | `internal-error` | none | the change or its audit event could not be written; nothing was changed |
 
 <!-- 400 and malformed membership IDs (404) verified by MembershipAdministrationTest::testMalformedRequestsChangeNothing -->
 <!-- no-store and Vary: Cookie on every answer verified by MembershipAdministrationTest::testMembershipResponsesAreNotCached -->
+
+### What the members page shows
+
+| Status | Problem type, code | The members page shows |
+|---|---|---|
+| 400 | `bad-request` | "The change could not be saved (request …)." (the SPA always sends JSON objects) |
+| 401 | `unauthenticated` | the login page with "Your session has ended" |
+| 403 | `csrf-invalid` | retried once after reading the session again; if refused again: "The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again." The list is not reloaded (the request was not processed) |
+| 403 | `forbidden` | "You do not have permission to do this. The list was reloaded." |
+| 404 | `not-found` | "This member was changed or removed by someone else; the list was reloaded." If the organization itself is gone, the reload shows the "Not found" page |
+| 409 | `conflict`, `LAST_ADMIN` | "An organization needs at least one admin. Make another member an admin first. Nothing was changed." |
+| 409 | `conflict`, `MEMBERSHIP_EXISTS` | "This user already has a membership in this organization (active or removed). Nothing was changed." |
+| 415 | `unsupported-media-type` | "The change could not be saved (request …)." (the SPA always sends JSON) |
+| 422 | `validation-error`, `UNKNOWN_USER` (`/email`) | at the e-mail input: "No user has this e-mail address. Only existing users can be added." |
+| 422 | `validation-error`, `INVALID_ROLE` (`/role`) | at the role input: "Choose one of the roles ADMIN, MANAGER or REP." |
+| 422 | `validation-error`, `REQUIRED`, `INVALID_TYPE` | `/email`: "Enter an e-mail address." (`REQUIRED`) or "Enter a valid e-mail address."; `/role`: "Choose one of the roles ADMIN, MANAGER or REP." |
+| 422 | `validation-error`, `UNKNOWN_FIELD` | "The request was refused (`<pointer>`: UNKNOWN_FIELD)." |
+| 429 | `too-many-requests` | "Too many requests. Try again in … seconds." (or minutes, from `Retry-After`) |
+| 500 | `internal-error` | "The change could not be saved (request …)." |
 
 When the API cannot be reached at all the SPA shows "The API could not be
 reached, so it is not known whether the change was saved. The list was
@@ -404,10 +425,19 @@ are disabled, so no change is made on rows the server may no longer have.
   removal locks the organization row (`SELECT id FROM organizations WHERE
   id = ? FOR NO KEY UPDATE`) and re-reads the actor's membership under the
   lock. Two ADMINs who demote each other at the same time end with one
-  ADMIN: the second request finds its actor no longer ADMIN and gets 403.
-  Reads take no lock and are not blocked.
+  ADMIN: the second request finds its actor no longer ADMIN and gets 403
+  (removed instead of demoted: 404). The last two ADMINs stepping down at
+  the same time also leave one: the second request counts one ADMIN and
+  gets 409 `LAST_ADMIN`. Two adds of the same user give one 201 and one 409
+  `MEMBERSHIP_EXISTS`. The lock is per organization, and reads take no
+  lock and are not blocked.
   <!-- verified by MembershipAdministrationTest::testConcurrentDemotionsLeaveExactlyOneAdmin -->
+  <!-- verified by MembershipAdministrationTest::testConcurrentMutualRemovalsLeaveExactlyOneAdmin -->
+  <!-- verified by MembershipAdministrationTest::testTheLastTwoAdminsSteppingDownAtOnceLeaveOne -->
+  <!-- verified by MembershipAdministrationTest::testConcurrentAddsOfOneUserCreateOneMembership -->
   <!-- verified by MembershipAdministrationTest::testTheActorIsCheckedAgainUnderTheLock -->
+  <!-- verified by MembershipAdministrationTest::testAnActorRemovedWhileWaitingIsNotFound -->
+  <!-- verified by MembershipAdministrationTest::testALockedOrganizationBlocksNeitherAnotherOrganizationNorItsRefusals -->
 - **The operator's `flowcrm:membership:add` takes the same lock**, so it
   waits for a running API change and cannot race an ADMIN's add of the
   same user (`OrganizationLockTest::testTheOperatorAddTakesTheLock`).
