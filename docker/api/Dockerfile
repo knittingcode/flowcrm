@@ -11,7 +11,11 @@ ARG COMPOSER_IMAGE=composer:2.9.7@sha256:02062f7719ec9433a9d4256cfba1c792db96dc9
 FROM ${COMPOSER_IMAGE} AS composer
 
 FROM ${PHP_IMAGE} AS base
-RUN apk add --no-cache fcgi postgresql-libs \
+# brotli-libs >= 1.2.1-r0 fixes CVE-2026-111497 (HIGH), which the pinned base
+# image still ships; remove once the base includes it
+# (docs/security/container-vulnerabilities.md).
+RUN apk add --no-cache --upgrade 'brotli-libs>=1.2.1-r0' \
+    && apk add --no-cache fcgi postgresql-libs \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS postgresql-dev \
     && docker-php-ext-install -j"$(nproc)" pdo_pgsql \
     && apk del .build-deps
