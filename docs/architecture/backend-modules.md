@@ -7,13 +7,13 @@ lists the rules and how they are enforced.
 
 | Module | Responsibility | Status |
 |---|---|---|
-| `Identity` | users, password hashing, login, sessions, `/me` | `User` entity (FND-007); session storage is framework configuration ([sessions and cache](sessions-and-cache.md)) |
-| `Organizations` | organizations, memberships, roles, tenant resolution | `Organization`, `Membership` entities (FND-007) |
+| `Identity` | users, password hashing, login, sessions, `/me` | login, logout, sessions, `/me`, own password change and operator console (FND-010B, [authentication](authentication.md)); session storage is framework configuration ([sessions and cache](sessions-and-cache.md)) |
+| `Organizations` | organizations, memberships, roles, tenant resolution | tenant authorization (`TenantGuard`, permissions), organization and member directory endpoints, operator console (FND-010B, [ADR-019](adr/ADR-019-authentication-and-tenant-authorization.md)) |
 | `CRM` | accounts, contacts | planned |
 | `Sales` | pipelines, stages, opportunities | `Pipeline`, `PipelineStage` entities (FND-007) |
 | `Activities` | tasks | planned |
 | `Reporting` | dashboard queries; no tables of its own | planned |
-| `Audit` | audit writer and queries | `AuditEvent` entity (FND-007) |
+| `Audit` | audit writer and queries | `AuditEvent` entity (FND-007) and the audit writer `AuditTrail` (FND-010B) |
 | `Shared` | small cross-cutting code: health checks, API status, problem details, request IDs; later `Clock`, UUIDv7 and `Money` | implemented |
 
 Modules without code exist only as rules in `backend/deptrac.modules.yaml`;
@@ -38,7 +38,7 @@ sits at the root.
 | Layer | May depend on | Must not use |
 |---|---|---|
 | `Domain` | nothing else in the application | framework HTTP (`Symfony\Component\HttpFoundation`, `HttpKernel`, `Routing`, `Form`, `Security`, `Symfony\Bundle`); Doctrine except the mapping attributes (`Doctrine\ORM\Mapping`), `Doctrine\DBAL\Types\Types` and `Doctrine\Common\Collections` |
-| `Api` | `Domain` (identifiers and value objects) | framework HTTP, persistence |
+| `Api` | `Shared` only (the module rules above; the layer rules alone would allow `Domain`) | framework HTTP, persistence |
 | `Application` | `Domain`, `Api` | framework HTTP, persistence |
 | `Infrastructure` | `Domain`, `Application`, `Api`, framework HTTP, Doctrine | — |
 | `Http` | `Domain`, `Application`, `Api`, framework HTTP | `Infrastructure`, Doctrine |
