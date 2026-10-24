@@ -26,6 +26,12 @@ downloaded on every run.
   fixed yet, in `security/trivyignore.yaml`, with the evidence for the
   decision, the affected path and an expiry no more than 90 days ahead, and
   it is listed in the table below. There are currently **no exceptions**.
+  `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
+  rules on the file: one CVE or GHSA id per entry, no duplicate, `paths` or
+  `purls` without wildcards, a non-empty `statement`, a valid `expired_at`
+  no more than 90 days after the day of the check, the id mentioned in this
+  document, and only the documented form (any other section or key fails).
+  Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
 - A control scan of the unmodified PostgreSQL base image (with its `gosu`)
   must fail; it proves the gate is not passing vacuously.
 - Every scan must report the package sources expected for the image (Alpine
