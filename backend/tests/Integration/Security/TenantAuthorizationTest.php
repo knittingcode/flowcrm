@@ -217,9 +217,23 @@ final class TenantAuthorizationTest extends FpmApiTestCase
         }
     }
 
-    /** Pages past the end are empty, out-of-range sizes are refused, and pages follow one stable order (oldest membership first). */
+    /**
+     * Pages past the end are empty, out-of-range sizes are refused, and pages
+     * follow one stable order: oldest membership first, ties broken by id. The
+     * memberships are backdated so that the creation-time order differs from
+     * the id order, and two of them share a creation time.
+     */
     public function testPaginationEdgesAndOrder(): void
     {
+        $byId = [$this->adminA, $this->managerA, $this->repA, $this->both];
+        $membershipIds = array_map(fn (TestUser $user): string => $this->membershipIn($this->a, $user), $byId);
+        $sorted = $membershipIds;
+        sort($sorted, \SORT_STRING);
+        self::assertSame($membershipIds, $sorted, 'precondition: membership ids ascend in creation order');
+        foreach ([[$this->both, '2026-10-20 08:00:00+00'], [$this->repA, '2026-10-21 08:00:00+00'], [$this->adminA, '2026-10-22 08:00:00+00'], [$this->managerA, '2026-10-22 08:00:00+00']] as [$user, $createdAt]) {
+            $this->fixtures->connection()->executeStatement('UPDATE memberships SET created_at = ? WHERE id = ?', [$createdAt, $this->membershipIn($this->a, $user)]);
+        }
+
         $client = $this->logIn($this->adminA);
         $path = '/api/v1/organizations/'.$this->a->toRfc4122().'/members';
 
@@ -238,7 +252,12 @@ final class TenantAuthorizationTest extends FpmApiTestCase
         self::assertSame($all, $paged, 'the pages do not overlap and miss nothing');
         self::assertSame($all, self::ids($client->get($path.'?pageSize=100')->value('data')), 'the order is stable');
         $names = array_column(self::rows($client->get($path.'?pageSize=100')->value('data')), 'displayName');
-        self::assertSame([$this->adminA->displayName, $this->managerA->displayName, $this->repA->displayName, $this->both->displayName], $names, 'oldest membership first');
+        self::assertSame([$this->both->displayName, $this->repA->displayName, $this->adminA->displayName, $this->managerA->displayName], $names, 'oldest membership first, a shared creation time broken by id');
+    }
+
+    private function membershipIn(Uuid $organization, TestUser $user): string
+    {
+        return self::string($this->fixtures->connection()->fetchOne('SELECT id FROM memberships WHERE organization_id = ? AND user_id = ?', [$organization->toRfc4122(), $user->id->toRfc4122()]));
     }
 
     /** @return list<array<mixed>> */
