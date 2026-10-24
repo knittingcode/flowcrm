@@ -1,9 +1,8 @@
 # Membership administration
 
 How an organization's ADMIN adds existing users, changes their roles and
-removes them, through the members page of the SPA or the API
-(FCRM-FND-010C). The design and its reasons are in
-[ADR-020](architecture/adr/ADR-020-membership-administration.md)
+removes them through the API (FCRM-FND-010C). The design and its reasons
+are in [ADR-020](architecture/adr/ADR-020-membership-administration.md)
 (proposed); sessions, CSRF and tenant authorization in
 [authentication](architecture/authentication.md); the contract is
 [`backend/openapi.yaml`](../backend/openapi.yaml).
@@ -74,35 +73,6 @@ administration permissions immediately.
 
 Refused: removing the only active ADMIN, also oneself (409 `LAST_ADMIN`).
 A repeated removal is a 404.
-
-### Members page in the SPA
-
-The organization page (`/o/:organizationId`) links to the members page
-(`/o/:organizationId/members`) for every role.
-
-| Role | Columns | Controls |
-|---|---|---|
-| ADMIN | Name, Role, E-mail address, Actions | "Add a member" form; per member a role select with "Change role" and "Remove" |
-| MANAGER | Name, Role, E-mail address | none |
-| REP | Name, Role | none |
-
-- The own row is marked "(you)".
-- The add form trims the address, defaults to `REP`, shows field errors of a
-  422 at their inputs and in a summary, and moves the focus to the first
-  invalid input.
-- "Change role" is enabled only when another role is selected. Selecting
-  another role for the own membership shows: "This is your own membership.
-  With another role you may no longer be able to manage members."
-- "Remove" asks for confirmation ("Remove … from …?", "Yes, remove",
-  "Cancel"; Escape cancels). For the own membership it warns: "You are
-  removing yourself: you will lose access to this organization
-  immediately." After removing oneself the SPA reads the session again and
-  goes to the start page.
-- Nothing is shown as changed before the server has confirmed it. After
-  every change, and after a 403, 404 or 409, the organization and the list
-  are read again, so the controls follow the role the server reports now.
-- Controls are hidden, not disabled, for roles without the permission. A
-  request sent anyway is refused by the API with 403.
 
 ## HTTP examples
 
@@ -363,29 +333,25 @@ Checked in this order: 415 and 403 `csrf-invalid` (request origin), 401
 and the other body checks come before the user is looked up, so an invalid
 role with an unknown address is only `INVALID_ROLE`.
 
-| Status | Problem type | `errors[].code` | Cause | SPA shows |
-|---|---|---|---|---|
-| 400 | `bad-request` | none | the body is not a JSON object | "The change could not be saved (request …)." (the SPA always sends JSON objects) |
-| 401 | `unauthenticated` | none | no valid session (logged out, expired, disabled user, password changed elsewhere) | the login page with "Your session has ended" |
-| 403 | `csrf-invalid` | none | origin, `Sec-Fetch-Site` or CSRF token check failed | retried once after reading the session again; if refused again: "You do not have permission to do this. The list was reloaded." |
-| 403 | `forbidden` | none | the actor's role has no such permission, also when the actor was demoted while the request waited for the lock | "You do not have permission to do this. The list was reloaded." |
-| 404 | `not-found` | none | organization unknown or not the actor's; target membership unknown, of another organization or removed; the actor's own membership removed meanwhile | "This member was changed or removed by someone else; the list was reloaded." If the organization itself is gone, the reload shows the "Not found" page |
-| 409 | `conflict` | `LAST_ADMIN` | demoting or removing the only active ADMIN, also oneself | "An organization needs at least one admin. Make another member an admin first. Nothing was changed." |
-| 409 | `conflict` | `MEMBERSHIP_EXISTS` | the user already has a membership in the organization, active or removed | "This user already has a membership in this organization (active or removed). Nothing was changed." |
-| 415 | `unsupported-media-type` | none | a body that is not `application/json` | "The change could not be saved (request …)." (the SPA always sends JSON) |
-| 422 | `validation-error` | `UNKNOWN_USER` (`/email`) | no user has this address | at the e-mail input: "No user has this e-mail address. Only existing users can be added." |
-| 422 | `validation-error` | `INVALID_ROLE` (`/role`) | not exactly `ADMIN`, `MANAGER` or `REP` | at the role input: "Choose one of the roles ADMIN, MANAGER or REP." |
-| 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string | `/email`: "Enter an e-mail address." (`REQUIRED`) or "Enter a valid e-mail address."; `/role`: "Choose one of the roles ADMIN, MANAGER or REP." |
-| 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) | "The request was refused (`<pointer>`: UNKNOWN_FIELD)." |
-| 429 | `too-many-requests` | none | the per-user API limit (600 requests per minute) | "Too many requests. Try again in … seconds." (or minutes, from `Retry-After`) |
-| 500 | `internal-error` | none | the change or its audit event could not be written; nothing was changed | "The change could not be saved (request …)." |
+| Status | Problem type | `errors[].code` | Cause |
+|---|---|---|---|
+| 400 | `bad-request` | none | the body is not a JSON object |
+| 401 | `unauthenticated` | none | no valid session (logged out, expired, disabled user, password changed elsewhere) |
+| 403 | `csrf-invalid` | none | origin, `Sec-Fetch-Site` or CSRF token check failed |
+| 403 | `forbidden` | none | the actor's role has no such permission, also when the actor was demoted while the request waited for the lock |
+| 404 | `not-found` | none | organization unknown or not the actor's; target membership unknown, of another organization or removed; the actor's own membership removed meanwhile |
+| 409 | `conflict` | `LAST_ADMIN` | demoting or removing the only active ADMIN, also oneself |
+| 409 | `conflict` | `MEMBERSHIP_EXISTS` | the user already has a membership in the organization, active or removed |
+| 415 | `unsupported-media-type` | none | a body that is not `application/json` |
+| 422 | `validation-error` | `UNKNOWN_USER` (`/email`) | no user has this address |
+| 422 | `validation-error` | `INVALID_ROLE` (`/role`) | not exactly `ADMIN`, `MANAGER` or `REP` |
+| 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string |
+| 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) |
+| 429 | `too-many-requests` | none | the per-user API limit (600 requests per minute) |
+| 500 | `internal-error` | none | the change or its audit event could not be written; nothing was changed |
 
 <!-- 400 and malformed membership IDs (404) verified by MembershipAdministrationTest::testMalformedRequestsChangeNothing -->
 <!-- no-store and Vary: Cookie on every answer verified by MembershipAdministrationTest::testMembershipResponsesAreNotCached -->
-
-When the API cannot be reached at all the SPA shows "The API could not be
-reached. The change may not have been saved." After a 403, 404 or 409 it
-reads the organization and the list again.
 
 ## Operational notes and limitations
 

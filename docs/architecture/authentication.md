@@ -419,9 +419,11 @@ is checked against `backend/openapi.yaml`.
 ## Known limitations
 
 - The role matrix is provisional. Membership administration (ADMIN only)
-  is the only tenant mutation; ADR-020 is proposed and lists its open
-  decisions (reactivation of removed members, whether disabled users count
-  as ADMINs, a dedicated limit for adding by e-mail).
+  is the only tenant mutation; ADR-020 is proposed and lists its
+  [open decisions](adr/ADR-020-membership-administration.md#open-decisions):
+  reactivation of removed members, whether disabled ADMINs count, account
+  discovery and consent when adding by e-mail (including a dedicated
+  limit), the code name `LAST_ADMIN`, and a bound on the lock wait.
 - A removed member cannot be added again (409 `MEMBERSHIP_EXISTS`): there is
   no reactivation yet.
 - No self-service password reset (no e-mail delivery exists); recovery is

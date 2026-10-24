@@ -103,8 +103,18 @@ Two things make a naive implementation unsafe:
 - Changes to account recovery: the operator's
   `flowcrm:user:reset-password` stays the recovery path (FCRM-002 OQ-10).
 - A dedicated rate limit for adding by e-mail beyond the per-user API limit
-  (600 requests per minute).
+  (600 requests per minute): not implemented here; whether to add one is
+  open (see "Account discovery and consent" under Open decisions).
 - Invitations or creating users through the API.
+
+## Deviations, with reasons
+
+Recorded for the owner's decision; not approved.
+
+| From | Implemented here | Why |
+|---|---|---|
+| FCRM-002 E (audit catalog): membership events record "Target user ID; role old/new" | the event's entity is the membership (`entity_type` `membership`, `entity_id` the membership ID) with `{role}` or `{roleFrom, roleTo}`; no user ID in `changes` | the same form as the operator's `membership.added`; the membership row is never deleted (C-11), so the target user follows from it |
+| FCRM-003 I ("Errors"): a top-level stable `code` in problem documents | the 409 `conflict` problem carries its code in `errors: [{"code": …}]`; there is no top-level `code` | the `errors[]` form of the existing problem documents (ADR-019); one place for codes in every problem type |
 
 ## Open decisions
 
