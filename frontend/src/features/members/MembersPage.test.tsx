@@ -330,7 +330,7 @@ describe('MembersPage', () => {
   it.each([
     [problem(429, 'too-many-requests', { 'Retry-After': '30' }), 'Too many requests. Try again in 30 seconds.'],
     [problem(429, 'too-many-requests', { 'Retry-After': '90' }), 'Too many requests. Try again in 2 minutes.'],
-    [problem(500, 'internal-error'), 'The change could not be saved (request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c).'],
+    [problem(400, 'bad-request'), 'The change could not be saved (request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c).'],
   ])('reports other failures inline (%#)', async (answer, message) => {
     const calls = fakeApi({
       'GET /api/v1/auth/session': adminSession(),
@@ -472,6 +472,38 @@ describe('MembersPage', () => {
     expect(count(calls, 'GET', MEMBERS)).toBe(2);
   });
 
+  it.each(['POST', 'PATCH', 'DELETE'])('treats an API 500 problem to %s as an unknown outcome and reloads, as the change may have been committed', async (method) => {
+    const target = method === 'POST' ? `${ORG}/members` : `${ORG}/members/m-2`;
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`${method} ${target}`]: problem(500, 'internal-error'),
+    });
+    renderAt('/o/org-a/members');
+
+    if (method === 'POST') {
+      await userEvent.type(await screen.findByLabelText('E-mail address of the user'), 'x@example.test');
+      await userEvent.click(screen.getByRole('button', { name: 'Add member' }));
+    } else if (method === 'PATCH') {
+      await userEvent.selectOptions(await screen.findByLabelText('New role for Grace Tester'), 'MANAGER');
+      await userEvent.click(screen.getByRole('button', { name: 'Change role of Grace Tester' }));
+    } else {
+      await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+      await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+    }
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'The API reported an error (status 500, request 0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c), so it is not known whether the change was saved. The list was reloaded to show the current state.',
+    );
+    expect(alert).not.toHaveTextContent('could not be saved');
+    await waitFor(() => {
+      expect(count(calls, 'GET', MEMBERS)).toBe(2);
+    });
+    expect(count(calls, 'GET', ORG)).toBe(2);
+  });
+
   it('keeps the controls disabled and the table busy until the list after a change has been read', async () => {
     fakeApi({
       'GET /api/v1/auth/session': adminSession(),
@@ -598,7 +630,7 @@ describe('MembersPage', () => {
       'GET /api/v1/auth/session': adminSession(),
       [`GET ${ORG}`]: organization(ADMIN),
       [`GET ${MEMBERS}`]: members([ada, grace]),
-      [`DELETE ${ORG}/members/m-2`]: problem(500, 'internal-error'),
+      [`DELETE ${ORG}/members/m-2`]: problem(429, 'too-many-requests', { 'Retry-After': '5' }),
     });
     renderAt('/o/org-a/members');
 
@@ -606,7 +638,7 @@ describe('MembersPage', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('The change could not be saved');
+    expect(alert).toHaveTextContent('Too many requests. Try again in 5 seconds.');
     await waitFor(() => {
       expect(screen.queryByRole('group')).not.toBeInTheDocument();
     });

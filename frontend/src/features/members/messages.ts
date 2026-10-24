@@ -5,23 +5,23 @@ import { isConflict } from '../../api/memberships.ts';
 const CSRF_INVALID = '/problems/csrf-invalid';
 
 /**
- * A server error that is not a problem document of the API (no problem type),
- * such as a 502 or 504 of the edge when PHP-FPM failed or timed out: the
- * request may have been processed. The API's own 5xx problems say that
- * nothing was changed.
+ * A server error (5xx), from the API or from the edge (such as a 502 or 504
+ * when PHP-FPM failed or timed out): the change may have been committed. The
+ * API also answers 500 when an error happens after the commit, for example
+ * while the member is read for the answer (docs/membership-administration.md).
  */
-function gatewayFailure(error: ApiProblem): boolean {
-  return error.status >= 500 && error.type === 'about:blank';
+function serverError(error: ApiProblem): boolean {
+  return error.status >= 500;
 }
 
 /**
  * Whether it is unknown if the change was saved: the API could not be reached
  * (the request may have been processed before the connection failed), it
- * answered with success but a body that could not be read, or a server error
- * came from somewhere other than the API.
+ * answered with success but a body that could not be read, or it answered
+ * with a server error.
  */
 function outcomeUnknown(error: unknown): boolean {
-  return !(error instanceof ApiProblem) || (error.status >= 200 && error.status < 300) || gatewayFailure(error);
+  return !(error instanceof ApiProblem) || (error.status >= 200 && error.status < 300) || serverError(error);
 }
 
 /**
@@ -72,8 +72,11 @@ export function failureMessage(error: unknown): string {
   if (!(error instanceof ApiProblem)) {
     return 'The API could not be reached, so it is not known whether the change was saved. The list was reloaded to show the current state.';
   }
-  if (gatewayFailure(error)) {
+  if (serverError(error) && error.type === 'about:blank') {
     return `The API did not answer properly (status ${String(error.status)}), so it is not known whether the change was saved. The list was reloaded to show the current state.`;
+  }
+  if (serverError(error)) {
+    return `The API reported an error (status ${String(error.status)}, request ${error.requestId ?? 'unknown'}), so it is not known whether the change was saved. The list was reloaded to show the current state.`;
   }
   if (outcomeUnknown(error)) {
     return 'The answer of the API could not be read, so it is not known whether the change was saved. The list was reloaded to show the current state.';

@@ -417,19 +417,20 @@ role with an unknown address is only `INVALID_ROLE`.
 | 422 | `validation-error`, `REQUIRED`, `INVALID_TYPE` | `/email`: "Enter an e-mail address." (`REQUIRED`) or "Enter a valid e-mail address."; `/role`: "Choose one of the roles ADMIN, MANAGER or REP." |
 | 422 | `validation-error`, `UNKNOWN_FIELD` | "The request was refused (`<pointer>`: UNKNOWN_FIELD)." |
 | 429 | `too-many-requests` | "Too many requests. Try again in … seconds." (or minutes, from `Retry-After`) |
-| 500 | `internal-error` | "The change could not be saved (request …)." |
+| 500 | `internal-error` | "The API reported an error (status 500, request …), so it is not known whether the change was saved. The list was reloaded to show the current state." (a 500 can follow a saved change, see above) |
 
 When the API cannot be reached at all the SPA shows "The API could not be
 reached, so it is not known whether the change was saved. The list was
 reloaded to show the current state." When a success answer (2xx) has a body
 that cannot be read or does not have the expected shape, it shows "The answer
 of the API could not be read, so it is not known whether the change was
-saved. The list was reloaded to show the current state." A server error that
-is not a problem document of the API (for example a 502 or 504 of the edge
-when PHP-FPM failed or timed out) may come after the change was committed:
-the SPA shows "The API did not answer properly (status …), so it is not known
-whether the change was saved. The list was reloaded to show the current
-state." In these cases, and after a 403 (other than `csrf-invalid`), 404 or
+saved. The list was reloaded to show the current state." Every server error
+(5xx) may come after the change was committed: the API's own 500 problem (see
+"A 500 does not always mean that nothing changed" above) shows the message in
+the table, and a 5xx that is not a problem document of the API (for example a
+502 or 504 of the edge when PHP-FPM failed or timed out) shows "The API did
+not answer properly (status …), so it is not known whether the change was
+saved. The list was reloaded to show the current state." In these cases, and after a 403 (other than `csrf-invalid`), 404 or
 409, it reads the organization and the list again. Until that list (or
 another page of it) has arrived, the table is marked busy and its controls
 are disabled, so no change is made on rows the server may no longer have.
