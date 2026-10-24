@@ -64,12 +64,23 @@ final class LoginRateLimiter extends AbstractRequestRateLimiter
         return $this->accountAndIp->create($this->key('account-ip', self::account($request)."\0".$request->getClientIp()));
     }
 
+    /**
+     * The account part of the keys. It must fold case exactly like the user
+     * lookup, PostgreSQL lower(email) = lower(?): every spelling that loads
+     * the same account must give the same key, or each spelling would get
+     * windows of its own. lower() maps one character to one character, so
+     * this uses the simple Unicode mapping; the full mapping (mb_strtolower)
+     * turns U+0130 into "i" + U+0307 and a final capital sigma into U+03C2,
+     * while lower() gives "i" and U+03C3. Checked against every code point
+     * for the database locale (libc, en_US.utf8): a change of the database
+     * locale or collation provider needs this check again.
+     */
     private static function account(Request $request): string
     {
         $email = $request->attributes->get(SecurityRequestAttributes::LAST_USERNAME, '');
         $email = \is_string($email) ? $email : '';
 
-        return mb_check_encoding($email, 'UTF-8') ? mb_strtolower($email, 'UTF-8') : strtolower($email);
+        return mb_check_encoding($email, 'UTF-8') ? mb_convert_case($email, \MB_CASE_LOWER_SIMPLE, 'UTF-8') : strtolower($email);
     }
 
     private function key(string $limit, string $value): string
