@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Tests\Unit\Shared\Infrastructure\Logging;
 
 use App\Shared\Infrastructure\Logging\JsonLineFormatter;
+use App\Shared\Infrastructure\Logging\LogRedactor;
 use Doctrine\DBAL\Driver\Exception as DriverExceptionInterface;
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
 use Monolog\Level;
@@ -123,6 +124,60 @@ final class JsonLineFormatterTest extends TestCase
     public function testUrlsWithoutAQueryAreKept(): void
     {
         self::assertStringContainsString('"uri":"/api/v1/system/status"', $this->format('request', ['uri' => '/api/v1/system/status']));
+    }
+
+    /**
+     * URLs written into free text (messages and context strings), such as
+     * the Referer that the framework quotes for an unknown route, lose
+     * their query and fragment like URL values do.
+     *
+     * @return iterable<string, array{string, list<string>, list<string>}>
+     */
+    public static function urlsInText(): iterable
+    {
+        yield 'referer of an unknown route' => [
+            'No route found for "GET http://localhost/api/v1/nope" (from "https://crm.example.test/accounts?search=ada@example.test&page=2")',
+            ['ada@example.test', 'page=2'],
+            ['No route found for "GET http://localhost/api/v1/nope" (from "https://crm.example.test/accounts?[redacted]")'],
+        ];
+        yield 'fragment' => [
+            'opened https://crm.example.test/accounts#search=ada-fragment',
+            ['ada-fragment'],
+            ['opened https://crm.example.test/accounts?[redacted]'],
+        ];
+        yield 'query and fragment' => [
+            'opened https://crm.example.test/a?q=first-value#second-value',
+            ['first-value', 'second-value'],
+            ['opened https://crm.example.test/a?[redacted]'],
+        ];
+        yield 'several URLs' => [
+            "from 'https://a.example.test/x?q=one-value' to https://b.example.test/y?q=two-value, then http://c.example.test/z",
+            ['one-value', 'two-value'],
+            ["from 'https://a.example.test/x?[redacted]' to https://b.example.test/y?[redacted]", 'then http://c.example.test/z'],
+        ];
+        yield 'URL without a query' => [
+            'No route found for "GET http://localhost/api/v1/nope" (from "https://crm.example.test/accounts")',
+            [],
+            ['No route found for "GET http://localhost/api/v1/nope" (from "https://crm.example.test/accounts")'],
+        ];
+    }
+
+    /**
+     * @param list<string> $absent
+     * @param list<string> $present
+     */
+    #[DataProvider('urlsInText')]
+    public function testQueriesOfUrlsInTextAreRemoved(string $text, array $absent, array $present): void
+    {
+        $scrubbed = LogRedactor::scrub($text);
+
+        foreach ($absent as $value) {
+            self::assertStringNotContainsString($value, $scrubbed);
+        }
+        foreach ($present as $value) {
+            self::assertStringContainsString($value, $scrubbed);
+        }
+        self::assertStringNotContainsString('one-value', $this->format('failed', ['detail' => 'see https://a.example.test/x?q=one-value']), 'context strings too');
     }
 
     public function testPlaceholdersAreFilledFromTheRedactedContext(): void

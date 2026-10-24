@@ -103,7 +103,12 @@ final class LogRedactor
         $text = (string) preg_replace('~\b((?:[\w-]*(?:password|passwd|pwd|secret|token|api[_-]?key|session|cookie|csrf))\b["\']?\s*[=:]\s*)("[^"]*"|\'[^\']*\'|[^\s,;&"\']+)~i', '$1'.self::MASK, $text);
         $text = (string) preg_replace('#\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+#i', '$1 '.self::MASK, $text);
 
-        return (string) preg_replace('~([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@~i', '$1'.self::MASK.'@', $text);
+        $text = (string) preg_replace('~([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@~i', '$1'.self::MASK.'@', $text);
+
+        // The query and fragment of a URL in free text, like withoutQuery():
+        // the framework quotes the full Referer in the message of an unknown
+        // route, and a query can hold search terms or other personal data.
+        return (string) preg_replace('~\b([a-z][a-z0-9+.-]*://[^\s?#"\'<>]*)[?#][^\s"\'<>]*~i', '$1?'.self::MASK, $text);
     }
 
     /**

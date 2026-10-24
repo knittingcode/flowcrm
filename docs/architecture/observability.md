@@ -101,6 +101,7 @@ to every record:
 |---|---|
 | Values under the keys `password`, `passwd`, `pwd`, `secret`, `token`, `csrf`, `authorization`, `cookie`, `set-cookie`, `session`, `sid`, `sess_id`, `sess_data`, `api_key`, `apikey`, `email`, `phone`, `first_name`, `last_name`, `display_name` (any case), keys containing `password`, `secret`, `token`, `csrf`, `cookie`, `session`, `sessid` or `authorization`, and keys ending in `_sid` or `-sid` (the session cookie names `flowcrm_sid`, `__Host-flowcrm_sid`) | replaced by `[redacted]`, at any depth |
 | `key=value` or `key: value` text with such a key, `Bearer`/`Basic` credentials, passwords in URLs (`scheme://user:password@`) | value replaced by `[redacted]` in messages and strings |
+| The query and fragment of a URL (`scheme://…`) written into messages and strings, for example the `Referer` that the framework quotes for an unknown route (`No route found … (from "…")`) | replaced by `?[redacted]`; the scheme, host and path are kept |
 | Messages of database errors (DBAL exceptions, driver exceptions, `PDOException`) | replaced by `database error (SQLSTATE …)`: PostgreSQL error details can quote row values |
 | Objects other than exceptions | logged as their type only |
 
@@ -125,5 +126,6 @@ channel, and slow requests through `duration_ms`.
 | `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` | record shape, redaction of every class above, placeholders after redaction, database error messages reduced to SQLSTATE |
 | `backend/tests/Unit/Shared/Http/Logging/RequestLoggingTest.php` | request ID processor, request record fields, no path, query or headers, health at debug |
 | `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` (URLs) | the query string of a URL value (`request_uri`, `uri`, `url`, `referer`, `referrer`, `redirect_uri`, `location`, `target_path`, `href`, `return_to`), such as the router's "Matched route" record, becomes `?[redacted]` |
-| `backend/tests/Integration/Shared/LoggingTest.php` | the configured pipeline on the booted kernel: request and error records share the response's request ID; a database error is logged without its data and correlates with the problem document |
+| `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` (URLs in text) | the query and fragment of URLs in messages and context strings (one or several URLs) become `?[redacted]`; a URL without a query is kept |
+| `backend/tests/Integration/Shared/LoggingTest.php` | the configured pipeline on the booted kernel: request and error records share the response's request ID; a database error is logged without its data and correlates with the problem document; the query of the `Referer` of an unknown route is not logged |
 | `tests/app/stack.sh` ST-40 to ST-43 | on the running stack: the api record and the edge access log carry the response's request ID; every api JSON line is complete; query, `Authorization`, `Cookie` and CSRF values appear in no log |
