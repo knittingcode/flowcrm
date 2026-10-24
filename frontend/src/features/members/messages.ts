@@ -7,8 +7,10 @@ const CSRF_INVALID = '/problems/csrf-invalid';
 /**
  * A server error (5xx), from the API or from the edge (such as a 502 or 504
  * when PHP-FPM failed or timed out): the change may have been committed. The
- * API also answers 500 when an error happens after the commit, for example
- * while the member is read for the answer (docs/membership-administration.md).
+ * API's own 500 means that nothing changed, except when the commit ended
+ * without a known result or an error happened after the commit, for example
+ * while the session was written (docs/membership-administration.md, "A 500
+ * after the commit"); the page cannot tell these cases apart.
  */
 function serverError(error: ApiProblem): boolean {
   return error.status >= 500;

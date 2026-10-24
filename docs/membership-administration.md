@@ -428,7 +428,7 @@ role with an unknown address is only `INVALID_ROLE`.
 | 422 | `validation-error`, `REQUIRED`, `INVALID_TYPE` | `/email`: "Enter an e-mail address." (`REQUIRED`) or "Enter a valid e-mail address."; `/role`: "Choose one of the roles ADMIN, MANAGER or REP." |
 | 422 | `validation-error`, `UNKNOWN_FIELD` | "The request was refused (`<pointer>`: UNKNOWN_FIELD)." |
 | 429 | `too-many-requests` | "Too many requests. Try again in … seconds." (or minutes, from `Retry-After`) |
-| 500 | `internal-error` | "The API reported an error (status 500, request …), so it is not known whether the change was saved. The list is read again to show the current state." (a 500 can follow a saved change, see above) |
+| 500 | `internal-error` | "The API reported an error (status 500, request …), so it is not known whether the change was saved. The list is read again to show the current state." (a 500 can, rarely, follow a saved change, see above) |
 
 When no answer arrives (the connection fails, or the browser aborts the
 request or gives up waiting, possibly after the server has processed it) the
@@ -438,9 +438,9 @@ the current state." When a success answer (2xx) has a body that cannot be
 read or does not have the expected shape, it shows "The answer of the API
 could not be read, so it is not known whether the change was saved. The list
 is read again to show the current state." Every server error
-(5xx) may come after the change was committed: the API's own 500 problem (see
-"A 500 does not always mean that nothing changed" above) shows the message in
-the table, and a 5xx that is not a problem document of the API (for example a
+(5xx) may come after the change was committed: the API's own 500 problem (rarely after a
+saved change, see "A 500 after the commit" above; the page cannot tell these
+cases apart) shows the message in the table, and a 5xx that is not a problem document of the API (for example a
 502 or 504 of the edge when PHP-FPM failed or timed out) shows "The API did
 not answer properly (status …), so it is not known whether the change was
 saved. The list is read again to show the current state." In these cases,
