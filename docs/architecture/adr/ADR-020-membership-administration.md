@@ -116,10 +116,17 @@ Two things make a naive implementation unsafe:
   disabled cannot demote its last enabled ADMIN, but could be left with only
   a disabled ADMIN. Whether disabled users should count is not specified.
   Disabled users can also be added.
-- **Add-by-e-mail limit:** an ADMIN can learn whether an e-mail address has
-  an account (422 `UNKNOWN_USER` against 201 or 409), bounded only by the
-  per-user API limit. FCRM-002 BR-02 requires the distinction; a dedicated,
-  lower limit for this route is a product decision.
+- **Account discovery and consent (privacy):** an ADMIN of any organization
+  can learn whether an e-mail address has a FlowCRM account (422
+  `UNKNOWN_USER` against 201 or 409), bounded only by the per-user API
+  limit. A successful add also returns the user's display name and ID and
+  makes them a member without their consent; the add is audited, and a
+  removal blocks a later re-add (no reactivation). FCRM-002 BR-02 requires
+  the distinction between known and unknown addresses, so this ADR keeps
+  it. Not decided: a dedicated, lower limit for this route; a uniform answer
+  with an invitation the user accepts (needs e-mail delivery, which does not
+  exist); or no change. This is a product and privacy decision for the
+  owner.
 - **Code name:** `LAST_ADMIN` follows FCRM-002 BR-03; the sprint plan
   suggested `LAST_ADMIN_REQUIRED`. The API and the SPA must use one name.
 - **Lock wait:** the lock wait is not bounded beyond PHP-FPM's request
