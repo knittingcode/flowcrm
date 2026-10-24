@@ -559,6 +559,61 @@ describe('MembersPage', () => {
     expect(calls.filter((c) => c.method === 'DELETE')).toEqual([]);
   });
 
+  it('keeps the focus in the busy confirmation while a removal runs, then moves it to the status', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), members([ada])],
+      [`DELETE ${ORG}/members/m-2`]: new Response(null, { status: 204 }),
+    });
+    const removal = hold('DELETE', `${ORG}/members/m-2`, 1);
+    renderAt('/o/org-a/members');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+
+    const group = screen.getByRole('group', { name: 'Remove Grace Tester from Alpha?' });
+    expect(group).toHaveFocus();
+    expect(group).toHaveAttribute('aria-busy', 'true');
+    expect(within(group).getByRole('button', { name: 'Yes, remove Grace Tester' })).toBeDisabled();
+    expect(within(group).getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    // Escape cannot cancel a removal that has been sent.
+    await userEvent.keyboard('{Escape}');
+    expect(screen.getByRole('group', { name: 'Remove Grace Tester from Alpha?' })).toHaveFocus();
+
+    removal.release();
+    const status = await screen.findByRole('status');
+    await waitFor(() => {
+      expect(status).toHaveTextContent('Grace Tester was removed.');
+    });
+    expect(status).toHaveFocus();
+    await waitFor(() => {
+      expect(screen.queryByRole('group')).not.toBeInTheDocument();
+    });
+    expect(status).toHaveFocus();
+  });
+
+  it('closes the confirmation and moves the focus to the error message after a failed removal', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`DELETE ${ORG}/members/m-2`]: problem(500, 'internal-error'),
+    });
+    renderAt('/o/org-a/members');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The change could not be saved');
+    await waitFor(() => {
+      expect(screen.queryByRole('group')).not.toBeInTheDocument();
+    });
+    expect(alert).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Remove Grace Tester' })).toBeEnabled();
+  });
+
   it('keeps the page in the address', async () => {
     const calls = fakeApi({
       'GET /api/v1/auth/session': adminSession(),

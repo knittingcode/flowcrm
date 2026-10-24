@@ -96,8 +96,11 @@ The organization page (`/o/:organizationId`) links to the members page
 - "Remove" asks for confirmation ("Remove … from …?", "Yes, remove",
   "Cancel"; Escape cancels). For the own membership it warns: "You are
   removing yourself: you will lose access to this organization
-  immediately." After removing oneself the SPA reads the session again and
-  goes to the start page.
+  immediately." While the removal runs, the confirmation stays open, marked
+  busy with its buttons disabled, and holds the focus; Escape no longer
+  cancels it. Then it closes and the focus moves to the success status or
+  to the error message. After removing oneself the SPA reads the session
+  again and goes to the start page.
 - Nothing is shown as changed before the server has confirmed it. After
   every change, and after a 403, 404 or 409, the organization and the list
   are read again, so the controls follow the role the server reports now.
@@ -391,7 +394,7 @@ role with an unknown address is only `INVALID_ROLE`.
 |---|---|---|
 | 400 | `bad-request` | "The change could not be saved (request …)." (the SPA always sends JSON objects) |
 | 401 | `unauthenticated` | the login page with "Your session has ended" |
-| 403 | `csrf-invalid` | retried once after reading the session again; if refused again: "The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again." The list is not reloaded (the request was not processed) |
+| 403 | `csrf-invalid` | retried once after reading the session again; if refused again, or if the session cannot be read (the request is then not sent again): "The security token of your session could not be verified, so nothing was changed. Reload the page or sign in again, then try again." The list is not reloaded (the request was not processed) |
 | 403 | `forbidden` | "You do not have permission to do this. The list was reloaded." |
 | 404 | `not-found` | "This member was changed or removed by someone else; the list was reloaded." If the organization itself is gone, the reload shows the "Not found" page |
 | 409 | `conflict`, `LAST_ADMIN` | "An organization needs at least one admin. Make another member an admin first. Nothing was changed." |

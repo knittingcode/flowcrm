@@ -258,9 +258,12 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
                   setConfirming(null);
                 }}
                 onRemove={() => {
-                  setConfirming(null);
+                  // The confirmation stays open (busy, holding the focus) until the
+                  // answer; then the focus moves to the status or the error message.
                   void run(() => removeMember(organization.id, member.membershipId), `${member.displayName} was removed.`, {
                     leave: member.membershipId === ownId,
+                  }).finally(() => {
+                    setConfirming(null);
                   });
                 }}
               />
@@ -431,30 +434,48 @@ function ConfirmRemoval(props: {
   onRemove: () => void;
 }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const groupRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     cancelRef.current?.focus();
   }, []);
 
   function keyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' && !props.pending) {
       event.preventDefault();
       props.onCancel();
     }
   }
 
   return (
-    <div className="confirm" role="group" aria-labelledby={`${props.id}-confirm`} onKeyDown={keyDown}>
+    <div
+      className="confirm"
+      role="group"
+      aria-labelledby={`${props.id}-confirm`}
+      aria-busy={props.pending}
+      tabIndex={-1}
+      ref={groupRef}
+      onKeyDown={keyDown}
+    >
       <p id={`${props.id}-confirm`}>
         Remove {props.member.displayName} from {props.organizationName}?
       </p>
       {props.self && (
         <p className="warning">You are removing yourself: you will lose access to this organization immediately.</p>
       )}
-      <button type="button" aria-label={`Yes, remove ${props.member.displayName}`} disabled={props.pending} onClick={props.onRemove}>
+      <button
+        type="button"
+        aria-label={`Yes, remove ${props.member.displayName}`}
+        disabled={props.pending}
+        onClick={() => {
+          // The buttons are disabled while the request runs; the group keeps the focus.
+          groupRef.current?.focus();
+          props.onRemove();
+        }}
+      >
         Yes, remove
       </button>
-      <button type="button" ref={cancelRef} onClick={props.onCancel}>
+      <button type="button" ref={cancelRef} disabled={props.pending} onClick={props.onCancel}>
         Cancel
       </button>
     </div>
