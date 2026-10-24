@@ -153,16 +153,21 @@ Two things make a naive implementation unsafe:
 - `backend/tests/Integration/Security/MembershipAdministrationTest` over
   the real PHP-FPM and PostgreSQL: the role matrix of the new routes,
   foreign organizations and membership IDs, the last-admin rule, audit
-  events and their rollback, CSRF on the new routes, and two lock tests
-  that hold the organization row from a separate connection: concurrent
-  mutual demotions leave exactly one ADMIN, and an ADMIN demoted while
-  their request waits is refused.
+  events and their rollback, CSRF on the new routes, and lock tests that
+  hold the organization row from a separate connection: concurrent mutual
+  demotions and mutual removals leave exactly one ADMIN; the last two
+  ADMINs stepping down at once (one demotion, one removal) leave one, the
+  second getting 409 `LAST_ADMIN`; two adds of one user create one
+  membership and a 409 `MEMBERSHIP_EXISTS`; an ADMIN demoted (403) or
+  removed (404) while their request waits is refused; another
+  organization's changes and refusals do not wait for the lock.
 - Unit tests: `RolePolicyTest` (the matrix), `MembershipRulesTest`
   (`Membership::changeRole`, `LastAdminRule`), `ManageMembershipsTest` (the
   lock comes first; every check and the audit event are inside the
   transaction).
-- `tests/app/backend.sh` BE-18: ten new negative controls (last-admin
-  rule, lock, actor re-check, MANAGER granted `membership.change_role`,
+- `tests/app/backend.sh` BE-18: eleven new negative controls (last-admin
+  rule, lock, actor re-check of the role and of a removed membership,
+  MANAGER granted `membership.change_role`,
   unscoped target lookup, audit event after the commit, a route without
   `TenantPermission`, an unvalidated role, a lock that blocks foreign key
   checks, the operator's add without the lock).

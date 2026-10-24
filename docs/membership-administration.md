@@ -393,10 +393,19 @@ reads the organization and the list again.
   removal locks the organization row (`SELECT id FROM organizations WHERE
   id = ? FOR NO KEY UPDATE`) and re-reads the actor's membership under the
   lock. Two ADMINs who demote each other at the same time end with one
-  ADMIN: the second request finds its actor no longer ADMIN and gets 403.
-  Reads take no lock and are not blocked.
+  ADMIN: the second request finds its actor no longer ADMIN and gets 403
+  (removed instead of demoted: 404). The last two ADMINs stepping down at
+  the same time also leave one: the second request counts one ADMIN and
+  gets 409 `LAST_ADMIN`. Two adds of the same user give one 201 and one 409
+  `MEMBERSHIP_EXISTS`. The lock is per organization, and reads take no
+  lock and are not blocked.
   <!-- verified by MembershipAdministrationTest::testConcurrentDemotionsLeaveExactlyOneAdmin -->
+  <!-- verified by MembershipAdministrationTest::testConcurrentMutualRemovalsLeaveExactlyOneAdmin -->
+  <!-- verified by MembershipAdministrationTest::testTheLastTwoAdminsSteppingDownAtOnceLeaveOne -->
+  <!-- verified by MembershipAdministrationTest::testConcurrentAddsOfOneUserCreateOneMembership -->
   <!-- verified by MembershipAdministrationTest::testTheActorIsCheckedAgainUnderTheLock -->
+  <!-- verified by MembershipAdministrationTest::testAnActorRemovedWhileWaitingIsNotFound -->
+  <!-- verified by MembershipAdministrationTest::testALockedOrganizationBlocksNeitherAnotherOrganizationNorItsRefusals -->
 - **The operator's `flowcrm:membership:add` takes the same lock**, so it
   waits for a running API change and cannot race an ADMIN's add of the
   same user (`OrganizationLockTest::testTheOperatorAddTakesTheLock`).
