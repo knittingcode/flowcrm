@@ -245,6 +245,28 @@ final class AuthenticationTest extends FpmApiTestCase
         $this->client()->login($user->email, $user->password);
     }
 
+    /** A password reset ends the sessions but leaves the user's memberships and their roles as they were. */
+    public function testAnOperatorPasswordResetKeepsTheMemberships(): void
+    {
+        $user = $this->fixtures->user('reset-member');
+        $this->fixtures->member($this->fixtures->organization('kept-a'), $user, 'MANAGER');
+        $this->fixtures->member($this->fixtures->organization('kept-b'), $user, 'REP');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $before = $client->get('/api/v1/me')->value('memberships');
+        $rows = $this->fixtures->connection()->fetchAllAssociative('SELECT id, organization_id, role, status FROM memberships WHERE user_id = ? ORDER BY id', [$user->id->toRfc4122()]);
+
+        $command = $this->console('flowcrm:user:reset-password', ['email' => $user->email], 'another brand new passphrase');
+        self::assertSame(0, $command->getStatusCode(), $command->getDisplay());
+
+        self::assertSame(401, $client->get('/api/v1/me')->status());
+        $again = $this->client();
+        $again->login($user->email, 'another brand new passphrase');
+        self::assertSame($before, $again->get('/api/v1/me')->value('memberships'));
+        self::assertCount(2, $rows);
+        self::assertSame($rows, $this->fixtures->connection()->fetchAllAssociative('SELECT id, organization_id, role, status FROM memberships WHERE user_id = ? ORDER BY id', [$user->id->toRfc4122()]));
+    }
+
     public function testAnOperatorPasswordResetEndsEverySession(): void
     {
         $user = $this->fixtures->user('reset');
