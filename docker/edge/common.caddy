@@ -13,7 +13,13 @@
 
 (baseline) {
 	# The request ID is always generated here; a client-supplied one is replaced.
+	# The same ID goes to the api (request header), back to the client on
+	# every response, also one the edge answers itself (deferred, so it
+	# replaces the api's identical copy instead of adding a second value),
+	# and into the access log as request_id.
 	request_header X-Request-Id {http.request.uuid}
+	header >X-Request-Id {http.request.uuid}
+	log_append request_id {http.request.uuid}
 	header {
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin
@@ -31,6 +37,8 @@
 				request>uri regexp "\?.*$" "?[redacted]"
 				request>headers>Referer regexp "\?.*$" "?[redacted]"
 				request>headers>X-Csrf-Token delete
+				# The client's own X-Request-Id is replaced; its value is not logged.
+				request>headers>X-Request-Id delete
 			}
 		}
 	}

@@ -105,10 +105,12 @@ v "PL-09 /health/live and /health/ready answer 200" $?
 req /index.php
 [ "$CODE" = 200 ] && grep -q '<div id="root">' "$work/body"; v "PL-10 /index.php is not executed (served as the SPA)" $?
 
-# ADR-017 boundary with raw request paths (curl --path-as-is). Symfony sets
-# X-Request-Id on every response; the built SPA never does.
+# ADR-017 boundary with raw request paths (curl --path-as-is). Symfony marks
+# every response Cache-Control private (its default "no-cache, private"); the
+# built SPA and the edge never do (the edge sets X-Request-Id on every
+# response, so that is no marker).
 layer() {
-  if [ -n "$(header X-Request-Id)" ]; then
+  if header Cache-Control | grep -qi 'private'; then
     case $TYPE in application/problem+json*) printf 'symfony-problem' ;; application/json*) printf 'symfony-json' ;; *) printf 'symfony-other' ;; esac
   elif grep -q '<div id="root">' "$work/body"; then
     printf 'spa'

@@ -106,9 +106,11 @@ get_raw() { # port path [curl args...]
   get "$port" "$path" --path-as-is "$@"
 }
 body_has() { grep -q -- "$1" "$BODY"; }
-# Symfony sets X-Request-Id on every response; the frontend never does.
+# Symfony marks every response Cache-Control private (its default "no-cache,
+# private"); the frontend and the edge never do. (X-Request-Id is no marker:
+# the edge sets it on every response.)
 served_by() {
-  if [ -n "$(header X-Request-Id)" ]; then
+  if header Cache-Control | grep -qi 'private'; then
     case $TYPE in application/problem+json*) printf 'symfony-problem' ;; application/json*) printf 'symfony-json' ;; *) printf 'symfony-other' ;; esac
   elif body_has '<div id="root">'; then
     printf 'spa'
@@ -315,6 +317,35 @@ docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
 v "ST-40 the api logs the request as one JSON record with the response's request ID" $? "$(grep -F "$rid" "$api_log" | head -n 2)"
 grep -F "$rid" "$edge_log" | grep -qF '"uri":"/api/v1/system/status?[redacted]"'
 v "ST-41 the edge access log has the same request ID and no query string" $? "$(grep -F "$rid" "$edge_log" | head -c 600)"
+# The ID in the edge log is the one the edge generated, forwarded to the api
+# and returned to the client (field request_id), also for a request the
+# edge answers itself (the SPA) and for a client that sends its own
+# X-Request-Id, whose value is replaced and logged nowhere.
+spoof=st41-spoofed-$(random_secret | cut -c1-12)
+get "$PA" /api/v1/system/status -H "X-Request-Id: $spoof"
+rid_spoof=$(header X-Request-Id) code_spoof=$CODE
+get "$PA" /accounts/st41-spa-probe
+rid_spa=$(header X-Request-Id) code_spa=$CODE
+sleep 1
+docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
+docker logs "$(cid "$A" api)" >"$api_log" 2>&1
+edge_rid() { # uri -> request_id of the edge log records for that uri (one per line)
+  grep '^{' "$edge_log" | python3 -c 'import json, sys
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("request", {}).get("uri") == sys.argv[1]:
+        print(d.get("request_id", "-"), (d.get("resp_headers", {}).get("X-Request-Id") or ["-"])[0])' "$1"
+}
+uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+[ "$code_spoof" = 200 ] && [ "$code_spa" = 200 ] && [[ $rid_spoof =~ $uuid_re ]] && [[ $rid_spa =~ $uuid_re ]] &&
+  edge_rid '/api/v1/system/status?[redacted]' | grep -qx "$rid $rid" &&
+  edge_rid /api/v1/system/status | grep -qx "$rid_spoof $rid_spoof" &&
+  edge_rid /accounts/st41-spa-probe | grep -qx "$rid_spa $rid_spa" && ! grep -qF "$spoof" "$edge_log" "$api_log"
+v "ST-41 the edge logs the request ID it generated (field request_id = response header) for API and SPA requests; a client's own ID is replaced and logged nowhere" $? \
+  "api [$rid]: $(edge_rid '/api/v1/system/status?[redacted]' | tr '\n' ' ') spoofed [$rid_spoof]: $(edge_rid /api/v1/system/status | tr '\n' ' ') spa ($code_spa) [$rid_spa]: $(edge_rid /accounts/st41-spa-probe | tr '\n' ' ') spoof logged: $(grep -cF "$spoof" "$edge_log")"
 # Every JSON line of the api is a complete record with the baseline fields.
 json_check=$(grep '^{' "$api_log" | docker exec -i "$(cid "$A" api)" php -r '
   $n = 0; $bad = 0;
