@@ -91,6 +91,14 @@ return [
         "        \$this->transaction->run(function () use (\$user, \$hash, \$requestId): void {\n            \$user->changePassword(\$hash, \$this->clock->now());\n", "        \$this->transaction->run(fn () => \$user->changePassword(\$hash, \$this->clock->now()));\n        \$this->transaction->run(function () use (\$user, \$requestId): void {\n",
         'AuditTrailTest::testAPasswordChangeWhoseAuditEventCannotBeWrittenChangesNothing'],
 
+    // Log redaction (FCRM-003 section Q).
+    ['URL queries kept in log text', 'src/Shared/Infrastructure/Logging/LogRedactor.php',
+        "return (string) preg_replace('~\\b([a-z][a-z0-9+.-]*://", "return \$text; (string) preg_replace('~\\b([a-z][a-z0-9+.-]*://",
+        'JsonLineFormatterTest::testQueriesOfUrlsInTextAreRemoved|LoggingTest::testTheQueryOfAReferrerIsNotLogged'],
+    ['URL keys keep their query', 'src/Shared/Infrastructure/Logging/LogRedactor.php',
+        '$result[$key] = self::scrub(self::withoutQuery($value));', '$result[$key] = self::scrub($value);',
+        'JsonLineFormatterTest::testEveryUrlKeyLosesTheQueryOfARelativeUrl'],
+
     // Request forgery.
     ['Origin not checked', 'src/Shared/Http/Security/RequestOriginGuard.php',
         'if ($origin !== $request->getSchemeAndHttpHost()) {', 'if (false) {',
