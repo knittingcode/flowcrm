@@ -32,6 +32,14 @@ final class LogRedactor
      */
     private const SESSION_ID_NAME = '/[_-]sid$/';
 
+    /**
+     * Keys whose values are URLs: their query string is removed, as the
+     * edge's access log does (for example the router's "Matched route"
+     * record carries the full request URI, and redirect targets carry the
+     * page to return to).
+     */
+    private const URL_KEYS = ['request_uri', 'uri', 'url', 'referer', 'referrer', 'redirect_uri', 'location', 'target_path', 'href', 'return_to'];
+
     private const MAX_DEPTH = 8;
 
     public static function isSensitiveKey(string $key): bool
@@ -64,6 +72,8 @@ final class LogRedactor
                 $result[$key] = self::exception($value);
             } elseif (\is_array($value)) {
                 $result[$key] = $depth >= self::MAX_DEPTH ? '[too deep]' : self::redact($value, $depth + 1);
+            } elseif (\is_string($value) && \is_string($key) && \in_array(strtolower($key), self::URL_KEYS, true)) {
+                $result[$key] = self::scrub(self::withoutQuery($value));
             } elseif (\is_string($value)) {
                 $result[$key] = self::scrub($value);
             } elseif (null === $value || \is_scalar($value)) {
@@ -78,6 +88,12 @@ final class LogRedactor
         return $result;
     }
 
+    /** A URL without its query string (and fragment): "?[redacted]" instead. */
+    public static function withoutQuery(string $url): string
+    {
+        return (string) preg_replace('/[?#].*$/s', '?'.self::MASK, $url);
+    }
+
     /**
      * Masks credentials written as text: key=value or key: value pairs with a
      * sensitive key, bearer tokens and passwords in URLs.
@@ -87,7 +103,12 @@ final class LogRedactor
         $text = (string) preg_replace('~\b((?:[\w-]*(?:password|passwd|pwd|secret|token|api[_-]?key|session|cookie|csrf))\b["\']?\s*[=:]\s*)("[^"]*"|\'[^\']*\'|[^\s,;&"\']+)~i', '$1'.self::MASK, $text);
         $text = (string) preg_replace('#\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+#i', '$1 '.self::MASK, $text);
 
-        return (string) preg_replace('~([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@~i', '$1'.self::MASK.'@', $text);
+        $text = (string) preg_replace('~([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@~i', '$1'.self::MASK.'@', $text);
+
+        // The query and fragment of a URL in free text, like withoutQuery():
+        // the framework quotes the full Referer in the message of an unknown
+        // route, and a query can hold search terms or other personal data.
+        return (string) preg_replace('~\b([a-z][a-z0-9+.-]*://[^\s?#"\'<>]*)[?#][^\s"\'<>]*~i', '$1?'.self::MASK, $text);
     }
 
     /**
