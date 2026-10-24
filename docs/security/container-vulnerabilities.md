@@ -132,6 +132,19 @@ matching the registry's SHA-512 integrity); a wrong checksum fails the
 build. The web image now has **0 HIGH/CRITICAL**; it stays report-only
 because it is a development and test image.
 
+## CVE-2026-111497: `brotli-libs` (runtime images)
+
+Published after FND-010; found by the scan of PR #15 (run 40016420940), not
+by a change of the project. The Alpine package `brotli-libs` 1.2.0 (HIGH)
+was in all three runtime images through their pinned base images (PHP
+8.5.12 FPM on Alpine 3.24, Caddy 2.11.7 on Alpine 3.23, PostgreSQL 18.6 on
+Alpine 3.24); 1.2.1-r0 fixes it and is in the Alpine 3.23 and 3.24
+repositories. No base image ships it yet, so `docker/api/Dockerfile`,
+`docker/edge/Dockerfile` and `docker/db/Dockerfile` upgrade the package
+(`apk add --upgrade 'brotli-libs>=1.2.1-r0'`; the build fails if that
+version cannot be installed). Remove the upgrade when the pinned base
+images include the fix. No exception was added.
+
 ## Deferred hardening items
 
 - `framework.trusted_hosts` is not configured: behind the edge, Symfony
