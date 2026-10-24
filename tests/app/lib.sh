@@ -97,7 +97,7 @@ seed_e2e() { # env-file api-container
   password=$(random_secret)
   suffix=$(random_secret | cut -c1-8)
   console() { docker exec -i "$api" php bin/console --no-interaction "$@"; }
-  for who in Admin Rep Multi Other Spare; do
+  for who in Admin Rep Multi Other Spare Deputy; do
     printf '%s\n' "$password" |
       console flowcrm:user:create --email="$(printf '%s' "$who" | tr '[:upper:]' '[:lower:]')-$suffix@example.test" --display-name="$who Tester" >/dev/null || return 1
   done
@@ -112,6 +112,7 @@ seed_e2e() { # env-file api-container
     "E2E_REP_EMAIL=rep-$suffix@example.test" \
     "E2E_MULTI_EMAIL=multi-$suffix@example.test" \
     "E2E_SPARE_EMAIL=spare-$suffix@example.test" \
+    "E2E_DEPUTY_EMAIL=deputy-$suffix@example.test" \
     "E2E_ORG_A=$org_a" "E2E_ORG_A_NAME=Alpha-$suffix" \
     "E2E_ORG_B=$org_b" "E2E_ORG_B_NAME=Beta-$suffix" >"$env")
 }

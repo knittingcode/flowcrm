@@ -4,9 +4,9 @@ import { expect, type Page, test } from '@playwright/test';
  * The member administration against the real API and PostgreSQL
  * (FCRM-FND-010C), with the synthetic users and organizations of the stack
  * test (tests/app/lib.sh seed_e2e). Other specs rely on the seeded
- * memberships (Alpha: Admin ADMIN, Rep REP, Multi REP): only the seeded user
- * Spare, who has no membership, is added, changed and removed again; every
- * other change tried here is one the server refuses.
+ * memberships (Alpha: Admin ADMIN, Rep REP, Multi REP): only the seeded users
+ * Spare and Deputy, who have no membership, are added, changed and removed
+ * again; every other change tried here is one the server refuses.
  *
  * Organization B (Other ADMIN, Multi MANAGER) is only read: by its MANAGER,
  * and by the ADMIN of A, to whom it is unknown.
@@ -14,9 +14,9 @@ import { expect, type Page, test } from '@playwright/test';
  * Like auth.spec.ts in the development stack (MODE=dev) and on the
  * production build over HTTPS (MODE=https).
  *
- * Each run needs a fresh seed: Spare's removed membership stays REMOVED and
- * cannot be added again (no reactivation, 409 MEMBERSHIP_EXISTS), and a
- * failure between the add and the removal leaves Spare ACTIVE. stack.sh and
+ * Each run needs a fresh seed: the removed memberships of Spare and Deputy stay
+ * REMOVED and cannot be added again (no reactivation, 409 MEMBERSHIP_EXISTS),
+ * and a failure between an add and its removal leaves the user ACTIVE. stack.sh and
  * prodlike.sh seed new users for every run, and Playwright does not retry.
  */
 const mode = process.env.MODE ?? 'prod';
@@ -260,6 +260,99 @@ test.describe('member administration', () => {
     await expect(page.getByRole('alert')).toContainText('An organization needs at least one admin.');
     await expect(page).toHaveURL(new RegExp(`/o/${env('E2E_ORG_A')}/members$`));
     await expect(page.getByRole('rowheader', { name: 'Admin Tester (you)' })).toBeVisible();
+    expect(await membersOf(page)).toEqual(before);
+  });
+
+  test('keyboard only: an ADMIN who is demoted or removed while the page is open is told so; a lost answer is an unknown outcome', async ({
+    browser,
+    page,
+  }) => {
+    const org = env('E2E_ORG_A');
+    const path = `/api/v1/organizations/${org}/members`;
+    await openMembers(page, env('E2E_ADMIN_EMAIL'));
+    const before = await membersOf(page);
+
+    // The ADMIN adds Deputy as ADMIN with the keyboard only.
+    await page.getByLabel('E-mail address of the user').focus();
+    await page.keyboard.type(env('E2E_DEPUTY_EMAIL'));
+    await page.keyboard.press('Tab');
+    await expect(page.getByLabel('Role', { exact: true })).toBeFocused();
+    await page.keyboard.type('ADMIN');
+    await expect(page.getByLabel('Role', { exact: true })).toHaveValue('ADMIN');
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('status')).toHaveText(`${env('E2E_DEPUTY_EMAIL')} was added as ADMIN.`);
+    await expect(page.getByLabel('E-mail address of the user')).toBeFocused();
+    const deputy = (await membersOf(page)).find((m) => m.displayName === 'Deputy Tester');
+    expect(deputy).toMatchObject({ role: 'ADMIN' });
+    const deputyId = deputy?.membershipId ?? '';
+
+    // Deputy opens the members page in a session of their own.
+    const other = await browser.newContext();
+    const second = await other.newPage();
+    await openMembers(second, env('E2E_DEPUTY_EMAIL'));
+    await expect(second.getByRole('form', { name: 'Add a member' })).toBeVisible();
+
+    // The ADMIN makes Deputy a MANAGER, with the keyboard.
+    await page.getByLabel('New role for Deputy Tester').focus();
+    await page.keyboard.type('MANAGER');
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('button', { name: 'Change role of Deputy Tester' })).toBeFocused();
+    await page.keyboard.press('Enter');
+    const status = page.getByRole('status');
+    await expect(status).toHaveText('The role of Deputy Tester is now MANAGER.');
+    await expect(status).toBeFocused();
+
+    // Deputy's page still shows the controls of an ADMIN; the next change is refused and the controls go.
+    await second.getByLabel('New role for Rep Tester').selectOption('MANAGER');
+    await second.getByRole('button', { name: 'Change role of Rep Tester' }).click();
+    await expect(second.getByRole('alert')).toHaveText('You do not have permission to do this. The list was reloaded.');
+    await expect(second.getByRole('alert')).toBeFocused();
+    await expect(second.getByRole('form', { name: 'Add a member' })).toHaveCount(0);
+    await expect(second.getByRole('button', { name: /^(Change role of|Remove) / })).toHaveCount(0);
+    await expect(second.getByRole('columnheader', { name: 'E-mail address' })).toHaveCount(1);
+    expect((await membersOf(page)).find((m) => m.displayName === 'Rep Tester')).toMatchObject({ role: 'REP' });
+
+    // Deputy is ADMIN again and reloads the page.
+    const promoted = await page.request.patch(`${path}/${deputyId}`, { headers: await unsafeHeaders(page), data: { role: 'ADMIN' } });
+    expect(promoted.status()).toBe(200);
+    await second.reload();
+    await expect(second.getByRole('form', { name: 'Add a member' })).toBeVisible();
+
+    // The ADMIN removes Deputy with the keyboard. The removal reaches the
+    // server, but its answer is lost: the browser's own request is aborted
+    // after the same removal has been sent with the ADMIN's session.
+    await page.route(`**${path}/${deputyId}`, async (route) => {
+      if (route.request().method() !== 'DELETE') {
+        await route.continue();
+        return;
+      }
+      const removed = await page.request.delete(`${path}/${deputyId}`, { headers: await unsafeHeaders(page) });
+      expect(removed.status()).toBe(204);
+      await route.abort('connectionreset');
+    });
+    await page.getByRole('button', { name: 'Remove Deputy Tester' }).focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('button', { name: 'Cancel' })).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.getByRole('button', { name: 'Yes, remove Deputy Tester' })).toBeFocused();
+    await page.keyboard.press('Enter');
+    const alert = page.getByRole('alert');
+    await expect(alert).toContainText('so it is not known whether the change was saved');
+    await expect(alert).toBeFocused();
+    // The list read again shows what the server has: Deputy is gone.
+    await expect(page.getByRole('table')).not.toContainText('Deputy Tester');
+    await page.unroute(`**${path}/${deputyId}`);
+
+    // Deputy's next change finds nothing; the page and the start page follow the lost access.
+    await second.getByLabel('New role for Rep Tester').selectOption('MANAGER');
+    await second.getByRole('button', { name: 'Change role of Rep Tester' }).click();
+    await expect(second.getByRole('heading', { name: 'Not found' })).toBeVisible();
+    await expect(second.getByRole('navigation', { name: 'Organizations' })).toHaveCount(0);
+    await second.getByRole('link', { name: 'Go to the start page' }).click();
+    await expect(second.getByText('You are not a member of any organization yet.')).toBeVisible();
+    await other.close();
+
     expect(await membersOf(page)).toEqual(before);
   });
 });
