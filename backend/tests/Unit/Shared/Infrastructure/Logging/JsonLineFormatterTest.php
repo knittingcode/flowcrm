@@ -113,6 +113,20 @@ final class JsonLineFormatterTest extends TestCase
         self::assertStringContainsString('"'.$key.'":"https://app.example.test/accounts?[redacted]"', $line);
     }
 
+    /**
+     * Relative URLs, such as a redirect target or the path of a request,
+     * have no scheme for the free-text rule: only the key removes their query.
+     */
+    #[DataProvider('urlKeys')]
+    public function testEveryUrlKeyLosesTheQueryOfARelativeUrl(string $key): void
+    {
+        $line = $this->format('redirect', [$key => '/accounts?search=ada@example.test#row-2']);
+
+        self::assertStringNotContainsString('ada@example.test', $line);
+        self::assertStringNotContainsString('row-2', $line);
+        self::assertStringContainsString('"'.$key.'":"/accounts?[redacted]"', $line);
+    }
+
     /** @return iterable<string, array{string}> */
     public static function urlKeys(): iterable
     {
