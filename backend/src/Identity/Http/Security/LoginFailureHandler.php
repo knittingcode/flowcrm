@@ -39,7 +39,9 @@ final readonly class LoginFailureHandler implements AuthenticationFailureHandler
         $email = $request->attributes->get(SecurityRequestAttributes::LAST_USERNAME);
         $context = [
             'event' => 'login_failed',
-            'account_ref' => $this->pseudonym->of(\is_string($email) ? mb_strtolower($email) : null),
+            // Folded like the user lookup and the login limiter key, so every
+            // spelling of one account has one pseudonym.
+            'account_ref' => $this->pseudonym->of(\is_string($email) ? mb_convert_case($email, \MB_CASE_LOWER_SIMPLE, 'UTF-8') : null),
             'client_ref' => $this->pseudonym->of($request->getClientIp()),
         ];
 

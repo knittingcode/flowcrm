@@ -44,6 +44,22 @@ final class LoggingTest extends WebTestCase
         self::assertSame('0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c', $error['request_id']);
     }
 
+    /**
+     * The framework writes the Referer of an unknown route into the message
+     * ("No route found ... (from \"<referer>\")"); its query can hold search
+     * terms or other personal data of the page the user came from.
+     */
+    public function testTheQueryOfAReferrerIsNotLogged(): void
+    {
+        $client = self::createClient();
+        $client->request('GET', '/api/v1/does-not-exist', server: ['HTTP_REFERER' => 'https://crm.example.test/accounts?search=referer-marker-7f3a']);
+
+        self::assertResponseStatusCodeSame(404);
+        $raw = implode('', $this->formatted());
+        self::assertStringContainsString('(from \\"https://crm.example.test/accounts?[redacted]\\")', $raw);
+        self::assertStringNotContainsString('referer-marker-7f3a', $raw);
+    }
+
     public function testHealthChecksAreDebugRecordsOnTheirChannel(): void
     {
         $client = self::createClient();
