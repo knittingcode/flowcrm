@@ -102,6 +102,7 @@ to every record:
 | Values under the keys `password`, `passwd`, `pwd`, `secret`, `token`, `csrf`, `authorization`, `cookie`, `set-cookie`, `session`, `sid`, `sess_id`, `sess_data`, `api_key`, `apikey`, `email`, `phone`, `first_name`, `last_name`, `display_name` (any case), keys containing `password`, `secret`, `token`, `csrf`, `cookie`, `session`, `sessid` or `authorization`, and keys ending in `_sid` or `-sid` (the session cookie names `flowcrm_sid`, `__Host-flowcrm_sid`) | replaced by `[redacted]`, at any depth |
 | `key=value` or `key: value` text with such a key, `Bearer`/`Basic` credentials, passwords in URLs (`scheme://user:password@`) | value replaced by `[redacted]` in messages and strings |
 | The query and fragment of a URL (`scheme://…`) written into messages and strings, for example the `Referer` that the framework quotes for an unknown route (`No route found … (from "…")`) | replaced by `?[redacted]`; the scheme, host and path are kept |
+| Values under the URL keys `request_uri`, `uri`, `url`, `referer`, `referrer`, `redirect_uri`, `location`, `target_path`, `href`, `return_to` (any case), relative or absolute | query and fragment replaced by `?[redacted]`; the path (and scheme and host) is kept |
 | Messages of database errors (DBAL exceptions, driver exceptions, `PDOException`) | replaced by `database error (SQLSTATE …)`: PostgreSQL error details can quote row values |
 | Objects other than exceptions | logged as their type only |
 
