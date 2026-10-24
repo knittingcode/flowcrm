@@ -209,7 +209,7 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 
 ## Known limitations
 
-- No CRM features yet. The organization roles are a provisional matrix; ADMINs can add members, change their roles and remove them ([ADR-020](docs/architecture/adr/ADR-020-membership-administration.md), proposed), other tenant changes through the API, self-service password reset (there is no e-mail delivery) and the per-user API rate limit follow later ([authentication](docs/architecture/authentication.md#known-limitations)).
+- No CRM features yet. The organization roles are a provisional matrix; ADMINs can add members, change their roles and remove them ([ADR-020](docs/architecture/adr/ADR-020-membership-administration.md), proposed); other tenant changes through the API and self-service password reset (there is no e-mail delivery) follow later ([authentication](docs/architecture/authentication.md#known-limitations)).
 - The production-like configuration is tested locally and in CI only; there is no deployment.
 - The API image is rebuilt when PHP dependencies change; there is no hot reload of Composer packages.
 
