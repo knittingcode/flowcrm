@@ -89,7 +89,10 @@ Two things make a naive implementation unsafe:
    - Status order: 415/403 `csrf-invalid`, 401, 429, 404 organization, 403
      permission, 404 target, 422, 409. For `PATCH` the body is parsed only
      after the target has been found under the lock, so an unknown target
-     is a 404 even with an invalid body.
+     is a 404 even with an invalid body. For `POST` the body is validated
+     before the actor is checked again under the lock: an actor demoted
+     while the request is in flight gets 422 for an invalid body instead
+     of 403; nothing is written either way.
 6. **Adding** finds the user by e-mail address, case-insensitively
    (`UserDirectory::idOfEmail`). Only existing users can be added (BR-02);
    an unknown address is a 422 `UNKNOWN_USER`. Any existing membership of
@@ -115,6 +118,7 @@ Recorded for the owner's decision; not approved.
 |---|---|---|
 | FCRM-002 E (audit catalog): membership events record "Target user ID; role old/new" | the event's entity is the membership (`entity_type` `membership`, `entity_id` the membership ID) with `{role}` or `{roleFrom, roleTo}`; no user ID in `changes` | the same form as the operator's `membership.added`; the membership row is never deleted (C-11), so the target user follows from it |
 | FCRM-003 I ("Errors"): a top-level stable `code` in problem documents | the 409 `conflict` problem carries its code in `errors: [{"code": …}]`; there is no top-level `code` | the `errors[]` form of the existing problem documents (ADR-019); one place for codes in every problem type |
+| FCRM-002 Q, RK-09: "Add existing user by e-mail" reveals whether an e-mail is registered, to Admins; mitigation "Admin-only, rate limited, audited; revisit with invitations" | Admin-only as required; rate limited only by the per-user API limit; successful adds are audited, refused lookups (422 `UNKNOWN_USER`, 409 `MEMBERSHIP_EXISTS`) are not audited, only logged on the `security` channel as `membership_change_refused` without the e-mail address | refusals are not audited anywhere (decision 4, as ADR-019 for failed logins); see "Account discovery and consent" under Open decisions |
 
 ## Open decisions
 
