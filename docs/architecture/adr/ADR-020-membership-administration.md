@@ -154,10 +154,11 @@ Two things make a naive implementation unsafe:
   (`Membership::changeRole`, `LastAdminRule`), `ManageMembershipsTest` (the
   lock comes first; every check and the audit event are inside the
   transaction).
-- `tests/app/backend.sh` BE-18: eight new negative controls (last-admin
+- `tests/app/backend.sh` BE-18: ten new negative controls (last-admin
   rule, lock, actor re-check, MANAGER granted `membership.change_role`,
   unscoped target lookup, audit event after the commit, a route without
-  `TenantPermission`, an unvalidated role).
+  `TenantPermission`, an unvalidated role, a lock that blocks foreign key
+  checks, the operator's add without the lock).
 
 ## Alternatives rejected
 
