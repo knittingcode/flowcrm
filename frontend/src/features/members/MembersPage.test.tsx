@@ -57,10 +57,10 @@ function renderAt(path: string) {
 const count = (calls: Call[], method: string, path: string) => calls.filter((c) => c.method === method && c.path === path).length;
 
 /**
- * Holds the n-th GET of `path` (1-based) until `release` is called; every
- * other request is answered by the fake API at once.
+ * Holds the n-th request `method path` (1-based) until `release` is called;
+ * every other request is answered by the fake API at once.
  */
-function holdGet(path: string, n: number): { release: () => void } {
+function hold(method: string, path: string, n: number): { release: () => void } {
   let release: () => void = () => undefined;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
@@ -68,7 +68,7 @@ function holdGet(path: string, n: number): { release: () => void } {
   const fake = globalThis.fetch;
   let seen = 0;
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
-    if ((init?.method ?? 'GET') === 'GET' && input === path) {
+    if ((init?.method ?? 'GET') === method && input === path) {
       seen += 1;
       if (seen === n) {
         await gate;
@@ -82,6 +82,8 @@ function holdGet(path: string, n: number): { release: () => void } {
     },
   };
 }
+
+const holdGet = (path: string, n: number) => hold('GET', path, n);
 
 describe('MembersPage', () => {
   afterEach(() => {
@@ -367,6 +369,30 @@ describe('MembersPage', () => {
     expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
     expect(count(calls, 'GET', MEMBERS)).toBe(1);
     expect(screen.getByRole('form', { name: 'Add a member' })).toBeInTheDocument();
+  });
+
+  it('says nothing was changed, without reloading, when the token cannot be refreshed after csrf-invalid', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: members([ada, grace]),
+      [`POST ${ORG}/members`]: problem(403, 'csrf-invalid'),
+    });
+    renderAt('/o/org-a/members');
+    await userEvent.type(await screen.findByLabelText('E-mail address of the user'), 'x@example.test');
+    // From now on the session (and with it the token) cannot be read.
+    const fake = globalThis.fetch;
+    vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) =>
+      input === '/api/v1/auth/session' ? Promise.reject(new TypeError('Failed to fetch')) : fake(input, init),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Add member' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The security token of your session could not be verified, so nothing was changed.');
+    expect(alert).not.toHaveTextContent('not known');
+    expect(alert).toHaveFocus();
+    expect(count(calls, 'POST', `${ORG}/members`)).toBe(1);
+    expect(count(calls, 'GET', MEMBERS)).toBe(1);
   });
 
   it('reloads the list when the API could not be reached, as the change may have been saved', async () => {

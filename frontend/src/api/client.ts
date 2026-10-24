@@ -113,14 +113,21 @@ function send(path: string, options: RequestOptions): Promise<Response> {
  * Sends a request to the API on the same origin and reads its JSON answer
  * with `read` (null for 204). Problems are thrown as ApiProblem. An unsafe
  * request refused with csrf-invalid was not processed, so it is retried once
- * after fetching the session's current token; nothing else is retried.
+ * after fetching the session's current token; if that token cannot be
+ * fetched, the csrf-invalid problem is thrown. Nothing else is retried.
  */
 export async function apiRequest<T>(path: string, options: RequestOptions, read: (body: unknown) => T): Promise<T> {
   let response = await send(path, options);
   if (response.status === 403 && UNSAFE.has(options.method ?? 'GET') && csrfRefresher !== null) {
     const problem = await problemOf(response.clone());
     if (problem.type === '/problems/csrf-invalid') {
-      await csrfRefresher();
+      try {
+        await csrfRefresher();
+      } catch {
+        // The refused request was not processed and is not sent again:
+        // report the refusal, not an unreachable API.
+        throw problem;
+      }
       response = await send(path, options);
     }
   }
