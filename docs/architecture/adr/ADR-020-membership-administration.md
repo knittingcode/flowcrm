@@ -63,7 +63,10 @@ Two things make a naive implementation unsafe:
       including an ADMIN demoting or removing themselves.
    5. The change and its audit event are written and committed together
       (BR-31). If the event cannot be written the transaction rolls back
-      and the answer is a 500.
+      and the answer is a 500. The answer is built after the commit (for
+      `POST` and `PATCH` the member's profile is read then), so a 500 can
+      also follow a committed change and its event; clients re-read the
+      list instead of assuming a rollback.
 
    Every membership change of an organization takes the same row lock, so
    two concurrent changes run one after the other and the second sees the

@@ -360,6 +360,18 @@ a 500 with type `/problems/internal-error` and the `requestId` of the
 `X-Request-Id` header.
 <!-- verified by MembershipAdministrationTest::testAChangeWhoseAuditEventCannotBeWrittenChangesNothing -->
 
+**A 500 does not always mean that nothing changed.** The change and its
+audit event are committed together, so either both are saved or neither
+is; only a failed audit write (or any other error before the commit)
+guarantees the rollback. The answer is prepared after the commit: for
+`POST` and `PATCH` the member's name and e-mail address are read from the
+user account then, and any request can still fail while its response is
+finished. A 500 to `POST`, `PATCH` or `DELETE` can therefore follow a
+saved change. A client must read the member list again before it retries;
+a retried add of a saved member is a 409 `MEMBERSHIP_EXISTS`, a retried
+removal a 404. The audit log (`membership.*` events with the `requestId`)
+shows whether the change was saved.
+
 ## Errors
 
 Checked in this order: 415 and 403 `csrf-invalid` (request origin), 401
@@ -383,7 +395,7 @@ role with an unknown address is only `INVALID_ROLE`.
 | 422 | `validation-error` | `REQUIRED`, `INVALID_TYPE` | a missing member or one that is not a string |
 | 422 | `validation-error` | `UNKNOWN_FIELD` | a body member other than `email`, `role` (`POST`) or `role` (`PATCH`) |
 | 429 | `too-many-requests` | none | the per-user API limit (600 requests per minute) |
-| 500 | `internal-error` | none | the change or its audit event could not be written; nothing was changed |
+| 500 | `internal-error` | none | the change or its audit event could not be written (nothing was changed), or an error after the commit (the change and its audit event were saved); read the list again |
 
 <!-- 400 and malformed membership IDs (404) verified by MembershipAdministrationTest::testMalformedRequestsChangeNothing -->
 <!-- no-store and Vary: Cookie on every answer verified by MembershipAdministrationTest::testMembershipResponsesAreNotCached -->
