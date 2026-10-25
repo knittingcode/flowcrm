@@ -473,7 +473,12 @@ Application suites (`tests/app/`), each in its own Compose projects:
   foreign holder of the advisory lock) keeping the stack blocked until the
   old operation has ended, and SIGKILL of `bin/devenv` during a rotation,
   an ownership conversion and after a committed but unverified change, with
-  the edge already stopped before the change began; and the upgrade of a
+  the edge already stopped before the change began; the security gate
+  enforced by the running edge (only `/health/live` and `/health/ready`
+  answered while it is recorded), kept through SIGKILL, SIGINT and SIGTERM
+  while the edge comes back after a rotation and through a `make up`
+  killed before its checks finished, and an edge without the gate mount
+  being recreated by `make up`; and the upgrade of a
   volume from FND-004 (before the audit log existed) and of one whose audit
   triggers were disabled or dropped (refused); and authentication through
   the edge with users created by the operator console: the session cookie's
