@@ -106,9 +106,11 @@ get_raw() { # port path [curl args...]
   get "$port" "$path" --path-as-is "$@"
 }
 body_has() { grep -q -- "$1" "$BODY"; }
-# Symfony sets X-Request-Id on every response; the frontend never does.
+# Symfony marks every response Cache-Control private (its default "no-cache,
+# private"); the frontend and the edge never do. (X-Request-Id is no marker:
+# the edge sets it on every response.)
 served_by() {
-  if [ -n "$(header X-Request-Id)" ]; then
+  if header Cache-Control | grep -qi 'private'; then
     case $TYPE in application/problem+json*) printf 'symfony-problem' ;; application/json*) printf 'symfony-json' ;; *) printf 'symfony-other' ;; esac
   elif body_has '<div id="root">'; then
     printf 'spa'
@@ -286,7 +288,9 @@ done
 boundary symfony-json '/health/live?probe=1'
 
 get "$PA" /accounts/some/deep/link
-[ "$CODE" = 200 ] && body_has '<div id="root">'; v "ST-11 client-side routes fall back to the SPA" $?
+# The SPA is not marked private: served_by relies on that marker.
+[ "$CODE" = 200 ] && body_has '<div id="root">' && ! header Cache-Control | grep -qi private
+v "ST-11 client-side routes fall back to the SPA (not marked Cache-Control private)" $?
 
 get "$PA" /api/v1/system/status -H 'X-Request-Id: attacker-chosen'
 rid=$(header X-Request-Id)
@@ -315,6 +319,48 @@ docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
 v "ST-40 the api logs the request as one JSON record with the response's request ID" $? "$(grep -F "$rid" "$api_log" | head -n 2)"
 grep -F "$rid" "$edge_log" | grep -qF '"uri":"/api/v1/system/status?[redacted]"'
 v "ST-41 the edge access log has the same request ID and no query string" $? "$(grep -F "$rid" "$edge_log" | head -c 600)"
+# The ID in the edge log is the one the edge generated, forwarded to the api
+# and returned to the client (field request_id), also for a request the
+# edge answers itself (the SPA) and for a client that sends its own
+# X-Request-Id, whose value is replaced and logged nowhere.
+spoof=st41-spoofed-$(random_secret | cut -c1-12)
+get "$PA" /api/v1/system/status -H "X-Request-Id: $spoof"
+rid_spoof=$(header X-Request-Id) code_spoof=$CODE
+n_spoof=$(grep -ci '^X-Request-Id:' "$HEADERS")
+get "$PA" /accounts/st41-spa-probe
+rid_spa=$(header X-Request-Id) code_spa=$CODE n_spa=$(grep -ci '^X-Request-Id:' "$HEADERS")
+# A problem document of the api carries the same ID as its response header.
+get "$PA" /api/v1/st41-not-found
+rid_pd=$(header X-Request-Id) code_pd=$CODE n_pd=$(grep -ci '^X-Request-Id:' "$HEADERS")
+pd_id=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("requestId", ""))' "$BODY" 2>/dev/null)
+sleep 1
+docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
+docker logs "$(cid "$A" api)" >"$api_log" 2>&1
+edge_rid() { # uri -> request_id of the edge log records for that uri (one per line)
+  grep '^{' "$edge_log" | python3 -c 'import json, sys
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("request", {}).get("uri") == sys.argv[1]:
+        print(d.get("request_id", "-"), (d.get("resp_headers", {}).get("X-Request-Id") or ["-"])[0])' "$1"
+}
+uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+[ "$code_spoof" = 200 ] && [ "$code_spa" = 200 ] && [[ $rid_spoof =~ $uuid_re ]] && [[ $rid_spa =~ $uuid_re ]] &&
+  edge_rid '/api/v1/system/status?[redacted]' | grep -qx "$rid $rid" &&
+  edge_rid /api/v1/system/status | grep -qx "$rid_spoof $rid_spoof" &&
+  edge_rid /accounts/st41-spa-probe | grep -qx "$rid_spa $rid_spa" && ! grep -qF "$spoof" "$edge_log" "$api_log"
+v "ST-41 the edge logs the request ID it generated (field request_id = response header) for API and SPA requests; a client's own ID is replaced and logged nowhere" $? \
+  "api [$rid]: $(edge_rid '/api/v1/system/status?[redacted]' | tr '\n' ' ') spoofed [$rid_spoof]: $(edge_rid /api/v1/system/status | tr '\n' ' ') spa ($code_spa) [$rid_spa]: $(edge_rid /accounts/st41-spa-probe | tr '\n' ' ') spoof logged: $(grep -cF "$spoof" "$edge_log")"
+# Exactly one X-Request-Id per response (the edge's deferred header replaces
+# the api's copy instead of adding a second value), the same ID in the
+# problem document and in the edge log, and a new ID for every request.
+[ "$n_spoof" = 1 ] && [ "$n_spa" = 1 ] && [ "$n_pd" = 1 ] && [ "$code_pd" = 404 ] && [ "$pd_id" = "$rid_pd" ] &&
+  edge_rid /api/v1/st41-not-found | grep -qx "$rid_pd $rid_pd" &&
+  [ "$(printf '%s\n' "$rid" "$rid_nf" "$rid_spoof" "$rid_spa" "$rid_pd" | sort -u | grep -cE "$uuid_re")" = 5 ]
+v "ST-41 one X-Request-Id per response (API, SPA, problem document); the problem document's requestId and the edge log carry it; every request has its own" $? \
+  "headers: api $n_spoof spa $n_spa problem $n_pd ($code_pd); requestId [$pd_id] header [$rid_pd] edge: $(edge_rid /api/v1/st41-not-found | tr '\n' ' ') ids: $rid $rid_nf $rid_spoof $rid_spa $rid_pd"
 # Every JSON line of the api is a complete record with the baseline fields.
 json_check=$(grep '^{' "$api_log" | docker exec -i "$(cid "$A" api)" php -r '
   $n = 0; $bad = 0;
@@ -1092,6 +1138,42 @@ live_code=$CODE
 get "$PA" /api/v1/system/status
 [ "$down503" = 0 ] && [ "$live_code" = 200 ] && [ "$CODE $TYPE" = '503 application/problem+json' ] && ! grep -qi 'sqlstate\|password\|db:5432' "$BODY"
 v "ST-19 database stopped: ready 503, live 200, API 503 problem without details" $?
+# The api stopped as well: the edge answers 502 itself (known limitation:
+# without X-Request-Id or the baseline headers, observability.md). Its access
+# record still has a request ID, and the error record Caddy writes for the
+# failed upstream is redacted like the access log: no query, no Referer
+# query, no CSRF token and no client-chosen X-Request-Id.
+api_id=$(cid "$A" api)
+docker stop "$api_id" >/dev/null
+spoof502=st19-spoofed-$(random_secret | cut -c1-12)
+get "$PA" '/api/v1/system/status?token=st19-query-secret' -H "X-Request-Id: $spoof502" -H 'X-CSRF-Token: st19-csrf-secret' \
+  -H 'Referer: https://crm.example.test/accounts?search=st19-referer-secret'
+code502=$CODE
+log502=$work/edge-502.log
+# The records of the 502 (Docker may deliver them a moment later).
+records502() {
+  docker logs "$(cid "$A" edge)" >"$log502" 2>&1
+  grep '^{' "$log502" | python3 -c 'import json, sys
+acc = err = 0
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("status") != 502 or d.get("request", {}).get("uri") != "/api/v1/system/status?[redacted]":
+        continue
+    if d.get("logger", "").startswith("http.log.access") and len(d.get("request_id", "")) == 36:
+        acc += 1
+    elif d.get("logger", "").startswith("http.log.error"):
+        err += 1
+print(acc, err)'
+}
+i=0
+until rec502=$(records502) && [ "$rec502" = '1 1' ] || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
+docker start "$api_id" >/dev/null
+[ "$code502" = 502 ] && [ "$rec502" = '1 1' ] && ! grep -qE "st19-(query|csrf|referer)-secret|$spoof502" "$log502"
+v "ST-19 api stopped: the edge's 502 is logged with its request ID; its error record is redacted like the access log (no query, CSRF token or client X-Request-Id)" $? \
+  "$code502, records (access with request_id, error): $rec502; leaked: $(grep -oE "st19-(query|csrf|referer)-secret|$spoof502" "$log502" | sort -u | tr '\n' ' ')"
 dv a-up3 "$A" up
 [ "$(rc_of a-up3)" = 0 ] && until_ready "$PA" 200 30
 v "ST-20 make up restarts the database and the stack is ready again" $?
