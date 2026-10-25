@@ -30,6 +30,11 @@ body {
   padding: 1.5rem;
 }
 
+.shell-alert {
+  max-width: 48rem;
+  margin: 1rem 1.5rem 0;
+}
+
 .status dl {
   display: grid;
   grid-template-columns: max-content 1fr;
