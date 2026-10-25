@@ -7,7 +7,7 @@ import { getOrganization, listMembers, type Member, type MemberPage, type Organi
 import { useAuth } from '../../auth/context.ts';
 import { NotFoundPage } from '../../pages/NotFoundPage.tsx';
 import { AddMemberForm, type Outcome } from './AddMemberForm.tsx';
-import { accessMayHaveChanged, failureMessage, needsReload } from './messages.ts';
+import { accessMayHaveChanged, failureMessage, needsReload, outcomeUnknown } from './messages.ts';
 
 type Load =
   | { kind: 'loading' }
@@ -50,9 +50,10 @@ function pageOf(value: string | null): number {
  * its success answer could not be read, or it was a server error), the
  * organization and the members are read again: nothing is changed in the page
  * before the server has confirmed it. After a 403 or 404 the session is read
- * again too, as the user's own access may have changed. While the list shown
- * is older than the one requested (after a change or another page), its
- * controls are disabled and the table is marked busy. If the list cannot be
+ * again too, as the user's own access may have changed, and so it is when it
+ * is unknown whether a change of the user's own membership was saved. While
+ * the list shown is older than the one requested (after a change or another
+ * page), its controls are disabled and the table is marked busy. If the list cannot be
  * read again, the answer to the change stays in view next to the load error.
  */
 export function MembersPage() {
@@ -135,7 +136,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
     async (
       action: () => Promise<unknown>,
       success: string,
-      options: { fields?: boolean; leave?: boolean; refreshSession?: boolean; focus?: boolean } = {},
+      options: { fields?: boolean; own?: boolean; leave?: boolean; refreshSession?: boolean; focus?: boolean } = {},
     ): Promise<Outcome> => {
       setPending(true);
       setFeedback(null);
@@ -151,7 +152,9 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
           return { status: 'invalid', errors: error.errors };
         }
         setFeedback({ kind: 'error', message: failureMessage(error), focus: true });
-        if (accessMayHaveChanged(error)) {
+        // The user's own access may have changed: by someone else (a 403 or
+        // 404), or by this change of the own membership if it was saved.
+        if (accessMayHaveChanged(error) || (options.own === true && outcomeUnknown(error))) {
           void refresh();
         }
         if (needsReload(error)) {
@@ -275,7 +278,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
                   void run(
                     () => changeRole(organization.id, member.membershipId, role),
                     `The role of ${member.displayName} is now ${role}.`,
-                    { refreshSession: member.membershipId === ownId },
+                    { own: member.membershipId === ownId, refreshSession: member.membershipId === ownId },
                   );
                 }}
                 onConfirm={() => {
@@ -289,6 +292,7 @@ function MembersView({ organizationId, page, onPage }: { organizationId: string;
                   // The confirmation stays open (busy, holding the focus) until the
                   // answer; then the focus moves to the status or the error message.
                   void run(() => removeMember(organization.id, member.membershipId), `${member.displayName} was removed.`, {
+                    own: member.membershipId === ownId,
                     leave: member.membershipId === ownId,
                   }).finally(() => {
                     setConfirming(null);

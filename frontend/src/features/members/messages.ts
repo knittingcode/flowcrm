@@ -22,7 +22,7 @@ function serverError(error: ApiProblem): boolean {
  * been processed), the API answered with success but a body that could not
  * be read, or it answered with a server error.
  */
-function outcomeUnknown(error: unknown): boolean {
+export function outcomeUnknown(error: unknown): boolean {
   return !(error instanceof ApiProblem) || (error.status >= 200 && error.status < 300) || serverError(error);
 }
 

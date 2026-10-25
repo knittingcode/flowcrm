@@ -107,7 +107,11 @@ The organization page (`/o/:organizationId`) links to the members page
   After a 403 (other than `csrf-invalid`) or a 404 the session is read again
   too, so the organization switcher and the start page follow the access
   the user has now (for example after the user's own membership was removed
-  while the page was open).
+  while the page was open). So it is when it is unknown whether a change of
+  the user's own membership was saved (no answer, an unreadable success
+  answer, or a 5xx): if removing oneself was saved after all, the list read
+  again is "Not found", and the start page no longer leads back to the
+  organization.
   What the page shows for each refusal is listed under
   [What the members page shows](#what-the-members-page-shows).
 - Controls are hidden, not disabled, for roles without the permission. A

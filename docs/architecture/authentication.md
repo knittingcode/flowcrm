@@ -419,7 +419,9 @@ time-based retention) before any real personal data is processed.
   is unknown whether a change was saved (no answer, an unreadable success
   answer, or any 5xx); the rows are not actionable
   until the new list has arrived. After a 403 or 404 the session is read
-  again as well, as the user's own access may have changed. A 409 `LAST_ADMIN` says
+  again as well, as the user's own access may have changed, and so it is
+  when it is unknown whether a change of the user's own membership was
+  saved. A 409 `LAST_ADMIN` says
   that an organization needs at least one admin, `MEMBERSHIP_EXISTS` that
   the user has a membership already; 422 errors are shown at their inputs.
   Removing oneself reads the session again and leads to `/`.

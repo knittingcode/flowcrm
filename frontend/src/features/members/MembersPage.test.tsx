@@ -831,6 +831,82 @@ describe('MembersPage: unclear answers, repeated clicks and changed access', () 
     expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
   });
 
+  it.each([
+    ['the connection fails', () => Promise.reject(new TypeError('Failed to fetch'))],
+    ['the edge answers 502', () => Promise.resolve(new Response('', { status: 502 }))],
+  ] as const)(
+    'reads the session again when it is unknown whether removing oneself was saved (%s), so the start page does not lead back to "not found"',
+    async (_, answer) => {
+      const calls = fakeApi({
+        'GET /api/v1/auth/session': [adminSession(), adminSession([])],
+        [`GET ${ORG}`]: [organization(ADMIN), problem(404, 'not-found')],
+        [`GET ${MEMBERS}`]: [members([ada, grace]), problem(404, 'not-found')],
+      });
+      const fake = globalThis.fetch;
+      vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) =>
+        init?.method === 'DELETE' && input === `${ORG}/members/m-1` ? answer() : fake(input, init),
+      );
+      renderAt('/o/org-a/members');
+
+      await userEvent.click(await screen.findByRole('button', { name: 'Remove Ada Tester' }));
+      await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Ada Tester' }));
+
+      // The removal was saved: the list read again is "not found".
+      expect(await screen.findByRole('heading', { name: 'Not found' })).toBeInTheDocument();
+      await waitFor(() => {
+        expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
+      });
+      await waitFor(() => {
+        expect(screen.queryByRole('navigation', { name: 'Organizations' })).not.toBeInTheDocument();
+      });
+      await userEvent.click(screen.getByRole('link', { name: 'Go to the start page' }));
+      expect(await screen.findByText(/not a member of any organization/)).toBeInTheDocument();
+    },
+  );
+
+  it('reads the session again when it is unknown whether changing one\'s own role was saved', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': [
+        adminSession(),
+        adminSession([{ organizationId: 'org-a', organizationName: 'Alpha', membershipId: 'm-1', role: 'MANAGER', permissions: MANAGER }]),
+      ],
+      [`GET ${ORG}`]: [organization(ADMIN), organization(MANAGER, 'MANAGER')],
+      [`GET ${MEMBERS}`]: [members([ada, { ...grace, role: 'ADMIN' }]), members([{ ...ada, role: 'MANAGER' }, { ...grace, role: 'ADMIN' }])],
+      [`PATCH ${ORG}/members/m-1`]: new Response('', { status: 504 }),
+    });
+    renderAt('/o/org-a/members');
+
+    await userEvent.selectOptions(await screen.findByLabelText('New role for Ada Tester'), 'MANAGER');
+    await userEvent.click(screen.getByRole('button', { name: 'Change role of Ada Tester' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('so it is not known whether the change was saved');
+    await waitFor(() => {
+      expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(2);
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('form', { name: 'Add a member' })).not.toBeInTheDocument();
+    });
+  });
+
+  it("does not read the session again when it is unknown whether another member's change was saved", async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': adminSession(),
+      [`GET ${ORG}`]: organization(ADMIN),
+      [`GET ${MEMBERS}`]: [members([ada, grace]), members([ada])],
+      [`DELETE ${ORG}/members/m-2`]: new Response('', { status: 502 }),
+    });
+    renderAt('/o/org-a/members');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove Grace Tester' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Yes, remove Grace Tester' }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('rowheader', { name: 'Grace Tester' })).not.toBeInTheDocument();
+    });
+    expect(count(calls, 'GET', MEMBERS)).toBe(2);
+    expect(count(calls, 'GET', '/api/v1/auth/session')).toBe(1);
+  });
+
   it('reads the session again after a 403, as the role may have changed', async () => {
     const calls = fakeApi({
       'GET /api/v1/auth/session': [
