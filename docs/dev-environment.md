@@ -112,6 +112,16 @@ mount existed, or by a plain `docker compose up`) would not enforce the
 security gate; `make up` recreates it on its port instead of reporting it
 as running.
 
+**Upgrade note (security gate mount, FND-009E):** in a checkout whose
+stack was started before this change, the first `make up` afterwards
+recreates the running edge once and says so (`recreating the edge on port
+…: it does not mount .runtime/gate`). Only the stateless edge container is
+replaced: the database, its volume, `.runtime/secrets` and the api and web
+containers are handled exactly as by any `make up`. The edge comes back on
+the same port (if another program took the port in the meantime, the next
+free one is used and the printed URL shows it); the UI and API are
+unavailable for a few seconds. Later runs report `already running`.
+
 ## Commands
 
 | Command | Behaviour |
