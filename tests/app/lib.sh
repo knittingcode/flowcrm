@@ -2,7 +2,8 @@
 #
 # Shared helpers of the application-stack test runners (sourced).
 # Every Docker resource is created under a Compose project name that the
-# runner owns; cleanup removes only those projects, checked by label.
+# runner owns; cleanup removes only those projects' containers, volumes and
+# networks, checked by label, and their images by name (remove_images).
 
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../devenv/tally.sh
@@ -66,6 +67,61 @@ remove_project() { # project dir
     while read -r id; do docker volume rm "$id" >/dev/null 2>&1; done
   docker network ls -q --filter "label=com.docker.compose.project=$p" |
     while read -r id; do docker network rm "$id" >/dev/null 2>&1; done
+}
+
+# Removes the images of a run by name: every tag that starts with PREFIX
+# (the run's Compose project followed by "-", or a run-specific
+# repository:tag). Never by image ID and never forced, so Docker deletes an
+# image only when its last name goes: an image that also carries a name
+# outside PREFIX (a base image the run re-tagged, or the same image under
+# another project) only loses the run's name and stays. Images used by any
+# container are left alone. Every image that is kept is reported.
+remove_images() { # prefix
+  local prefix=$1 dev containers used ref id others
+  # Refused, removing nothing: an empty prefix, characters outside image
+  # names, and any prefix that could match an image of this checkout's
+  # development stack ("<dev>-<service>"), unless it names a run project
+  # of this checkout ("<dev>-test-<run>-", "<dev>-prod-<run>-").
+  dev=$(project_of "$APP_REPO")-
+  case $prefix in
+    '' | *[!A-Za-z0-9_.:/-]*)
+      say "      KEPT images: refusing the name prefix '$prefix'"
+      return 1
+      ;;
+  esac
+  case $dev in
+    "$prefix"*)
+      say "      KEPT images: the name prefix '$prefix' also matches the development stack"
+      return 1
+      ;;
+  esac
+  case $prefix in
+    "$dev"*)
+      case ${prefix#"$dev"} in
+        [a-z]*-??????-) ;;
+        *)
+          say "      KEPT images: the name prefix '$prefix' also matches the development stack"
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+  containers=$(docker ps -aq --no-trunc)
+  # shellcheck disable=SC2086 # one argument per container ID
+  used=$([ -z "$containers" ] || docker inspect -f '{{.Image}}' $containers 2>/dev/null)
+  docker image ls --format '{{.Repository}}:{{.Tag}}' | sort -u | while IFS= read -r ref; do
+    case $ref in "$prefix"*) ;; *) continue ;; esac
+    case $ref in *'<none>'*) continue ;; esac
+    id=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null) || continue
+    if printf '%s\n' "$used" | grep -qxF -- "$id"; then
+      say "      KEPT image $ref ($id): used by a container"
+      continue
+    fi
+    others=$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$ref" 2>/dev/null |
+      awk -v p="$prefix" 'NF && index($0, p) != 1' | tr '\n' ' ')
+    [ -z "$others" ] || say "      image $ref is also named ${others% }: only the name $ref is removed"
+    docker image rm "$ref" >/dev/null 2>&1 || say "      KEPT image $ref: Docker refused to remove the name"
+  done
 }
 
 project_resources() { # project: number of containers + volumes + networks left

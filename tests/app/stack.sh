@@ -58,11 +58,10 @@ final_cleanup() {
     [ -n "$d" ] || continue
     [ -d "$d" ] && (cd "$d" && ./bin/devenv down) >/dev/null 2>&1
     remove_project "$(project_of "$d")" "$d"
-    docker images -q --filter "label=com.docker.compose.project=$(project_of "$d")" | sort -u |
-      while read -r id; do docker image rm -f "$id" >/dev/null 2>&1; done
   done <"$work/checkouts"
-  docker image rm -f "$e2e_image" >/dev/null 2>&1
   docker ps -aq --filter "label=devenv.test=stack-$(sha6 "$work")" | while read -r id; do docker rm -f "$id" >/dev/null 2>&1; done
+  while read -r d; do [ -n "$d" ] && remove_images "$(project_of "$d")-"; done <"$work/checkouts"
+  remove_images "$e2e_image"
 }
 trap 'final_cleanup; rm -rf "$work"' EXIT
 

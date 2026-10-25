@@ -1310,6 +1310,113 @@ STACK=$saved_stack
 unset -f docker
 [ -z "$saved_fns" ] || eval "$saved_fns"
 
+# --- U-26 test cleanup removes images by name only (tests/app/lib.sh)
+# remove_images with a fake docker that keeps image names ("name id") and
+# containers ("container image-id") in files. Like Docker, removing an image
+# ID (or forcing) drops every name of that image. Only names starting with
+# the prefix may be removed, never by ID or forced; an image that also has
+# another name keeps it; an image used by a container is kept; a prefix that
+# would match the development stack is refused.
+mkdir -p "$work/fakeimg"
+cat >"$work/fakeimg/docker" <<'FAKE'
+#!/bin/sh
+d=$FAKE_IMG
+echo "$*" >>"$d/calls"
+case "$1 $2" in
+  "ps -aq"*) cut -d' ' -f1 "$d/containers" ;;
+  "inspect -f")
+    shift 3
+    for c in "$@"; do awk -v c="$c" '$1 == c { print $2 }' "$d/containers"; done ;;
+  "image ls") cut -d' ' -f1 "$d/names" ;;
+  "image inspect")
+    ref=$5
+    id=$(awk -v r="$ref" '$1 == r { print $2 }' "$d/names")
+    [ -n "$id" ] || exit 1
+    case $4 in
+      *RepoTags*) awk -v i="$id" '$2 == i { print $1 }' "$d/names" ;;
+      *) echo "$id" ;;
+    esac ;;
+  "image rm")
+    shift 2
+    for a in "$@"; do
+      case $a in
+        -f | --force) continue ;;
+      esac
+      id=$(awk -v r="$a" '$1 == r { print $2 }' "$d/names")
+      if [ -z "$id" ]; then id=$a; all=1; else all=0; fi
+      case " $* " in *' -f '* | *' --force '*) all=1 ;; esac
+      if [ "$all" = 0 ] && [ "$(awk -v i="$id" '$2 == i' "$d/names" | wc -l)" -eq 1 ] &&
+        awk -v i="$id" '$2 == i { f = 1 } END { exit !f }' "$d/containers"; then
+        echo "conflict: image is being used by a container" >&2
+        exit 1
+      fi
+      if [ "$all" = 1 ]; then
+        awk -v i="$id" '$2 != i' "$d/names" >"$d/names.new"
+      else
+        awk -v r="$a" '$1 != r' "$d/names" >"$d/names.new"
+      fi
+      mv "$d/names.new" "$d/names"
+    done ;;
+  *) echo "unexpected: docker $*" >&2; exit 99 ;;
+esac
+FAKE
+chmod +x "$work/fakeimg/docker"
+u26_dev=$( . "$here/../app/lib.sh" && project_of "$APP_REPO")
+u26_run=flowcrm-aaaaaa-test-bbbbbb
+u26() { # prefix: run remove_images on a fresh fixture; prints its output and status
+  rm -rf "$work/img" && mkdir -p "$work/img"
+  printf '%s\n' \
+    "$u26_run-api:latest sha256:01" \
+    "$u26_run-db:latest sha256:02" "$u26_dev-db:latest sha256:02" \
+    "$u26_run-edge:latest sha256:03" \
+    "$u26_dev-edge:latest sha256:04" "$u26_dev-api:latest sha256:05" \
+    "flowcrm-aaaaaa-test-bbbbbc-api:latest sha256:06" \
+    "flowcrm-scan-cccccc:control sha256:07" "postgres@sha256:07 sha256:07" \
+    "flowcrm-scan-cccccc:db sha256:08" >"$work/img/names"
+  printf '%s\n' "c-run-edge sha256:03" "c-dev-api sha256:05" >"$work/img/containers"
+  # shellcheck disable=SC2031 # the suite's PATH, only read: the fake docker comes first
+  PATH=$work/fakeimg:$PATH FAKE_IMG=$work/img "$BASH" -c '. "$1" && remove_images "$2"; echo "rc=$?"' u26 "$here/../app/lib.sh" "$1" 2>&1
+}
+u26_names() { cut -d' ' -f1 "$work/img/names" | sort | paste -sd ' ' -; }
+u26_unforced() { ! grep -E '^image rm .*(-f|--force|sha256:)' "$work/img/calls" >/dev/null; }
+
+out=$(u26 "$u26_run-")
+expect_eq "U-26 the run's names are removed, all others kept" \
+  "$(printf '%s\n' "$u26_dev-api:latest" "$u26_dev-db:latest" "$u26_dev-edge:latest" "$u26_run-edge:latest" \
+    flowcrm-aaaaaa-test-bbbbbc-api:latest flowcrm-scan-cccccc:control flowcrm-scan-cccccc:db postgres@sha256:07 |
+    sort | paste -sd ' ' -)" "$(u26_names)"
+u26_unforced
+result "U-26 removal is by name, never by ID and never forced" $? "($(paste -sd ';' - <"$work/img/calls"))"
+printf '%s\n' "$out" | grep -qF "image $u26_run-db:latest is also named $u26_dev-db:latest: only the name $u26_run-db:latest is removed"
+result "U-26 an image that also has another name is reported and keeps it" $? "($out)"
+printf '%s\n' "$out" | grep -qF "KEPT image $u26_run-edge:latest (sha256:03): used by a container"
+result "U-26 an image used by a container is kept and reported" $? "($out)"
+
+out=$(u26 "flowcrm-scan-cccccc:")
+expect_eq "U-26 scan: the re-tagged base image keeps its own name" \
+  "$(printf '%s\n' "$u26_dev-api:latest" "$u26_dev-db:latest" "$u26_dev-edge:latest" "$u26_run-api:latest" \
+    "$u26_run-db:latest" "$u26_run-edge:latest" flowcrm-aaaaaa-test-bbbbbc-api:latest postgres@sha256:07 |
+    sort | paste -sd ' ' -)" "$(u26_names)"
+u26_unforced
+result "U-26 scan: removal is by name, never by ID and never forced" $? "($(paste -sd ';' - <"$work/img/calls"))"
+
+for p in '' flowcrm- "$u26_dev" "$u26_dev-" "$u26_dev-a" "$u26_dev-db" "$u26_dev-test-bbbbbb-api" 'flowcrm-*' 'x y'; do
+  out=$(u26 "$p")
+  [ "$(u26_names | wc -w | tr -d ' ')" = 10 ] && ! grep -q '^image rm' "$work/img/calls" && printf '%s\n' "$out" | grep -qx 'rc=1'
+  r=$?
+  result "U-26 prefix $(show "$p") is refused: nothing removed" $r "($out)"
+done
+
+out=$(u26 "$u26_dev-test-bbbbbb-")
+[ "$(u26_names | wc -w | tr -d ' ')" = 10 ] && printf '%s\n' "$out" | grep -qx 'rc=0'
+result "U-26 a run project of this checkout (<dev>-test-<run>-) is accepted" $? "($out)"
+
+# A guard against the old pattern: no test runner removes images by ID or
+# with force; tests/app/lib.sh remove_images is the only image removal.
+if grep -nE 'docker +(image +rm|rmi)' "$here"/../app/*.sh | grep -vE '^[^:]*/lib\.sh:' >/dev/null ||
+  grep -nE 'docker +(image +rm|rmi)[^|;&]*(-f|--force)' "$here"/../app/*.sh >/dev/null; then r=1; else r=0; fi
+result "U-26 test runners remove images only through remove_images, never forced" $r
+
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
   "$BASH" -c '. "$0"; tally_init "$1"; '"$1"'; tally_finish' "$here/tally.sh" "$work/self.tally" >/dev/null 2>&1
