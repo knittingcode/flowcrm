@@ -22,7 +22,8 @@ use Symfony\Component\Security\Core\Authorization\AuthorizationCheckerInterface;
 use Symfony\Component\Uid\Uuid;
 
 /**
- * Read-only organization endpoints of FCRM-FND-010B. TenantGuard has
+ * Read-only organization endpoints of FCRM-FND-010B (membership changes:
+ * MembershipController). TenantGuard has
  * resolved the active membership and checked the declared permission
  * before any of these runs; every query is filtered by the organization.
  */
@@ -63,7 +64,7 @@ final readonly class OrganizationController
         $withEmail = $this->authorization->isGranted(Permission::MembershipViewEmail->value, $tenant);
 
         return new JsonResponse([
-            'data' => array_map(static fn (MemberView $member): array => self::view($member, $withEmail), $members),
+            'data' => array_map(static fn (MemberView $member): array => MemberJson::of($member, $withEmail), $members),
             'meta' => ['page' => $pagination->page, 'pageSize' => $pagination->pageSize, 'total' => $total],
         ]);
     }
@@ -75,22 +76,6 @@ final readonly class OrganizationController
     {
         $member = $this->members->member($tenant->organizationId, Uuid::fromString($membershipId)) ?? throw ProblemException::notFound();
 
-        return new JsonResponse(self::view($member, $this->authorization->isGranted(Permission::MembershipViewEmail->value, $tenant)));
-    }
-
-    /** @return array<string, string> */
-    private static function view(MemberView $member, bool $withEmail): array
-    {
-        $view = [
-            'membershipId' => $member->membershipId->toRfc4122(),
-            'userId' => $member->userId->toRfc4122(),
-            'displayName' => $member->displayName,
-            'role' => $member->role,
-        ];
-        if ($withEmail) {
-            $view['email'] = $member->email;
-        }
-
-        return $view;
+        return new JsonResponse(MemberJson::of($member, $this->authorization->isGranted(Permission::MembershipViewEmail->value, $tenant)));
     }
 }

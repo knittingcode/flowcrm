@@ -9,13 +9,17 @@ namespace App\Organizations\Domain;
  * section H: no dynamic permission engine), the single source of truth for
  * the voter and for the permissions shown to the SPA.
  *
- * Provisional matrix of FCRM-FND-010B (ADR-019):
+ * Provisional matrix of FCRM-FND-010B (ADR-019), with the membership
+ * administration of FCRM-FND-010C (ADR-020):
  *
  * | Permission              | ADMIN | MANAGER | REP | Source                     |
  * |-------------------------|-------|---------|-----|----------------------------|
  * | organization.view       | yes   | yes     | yes | FCRM-002 H [TASK]          |
  * | membership.list         | yes   | yes     | yes | FCRM-002 H [PROP]          |
  * | membership.view_email   | yes   | yes     | no  | provisional (not in H)     |
+ * | membership.add          | yes   | no      | no  | FCRM-002 H [TASK]          |
+ * | membership.change_role  | yes   | no      | no  | FCRM-002 H [TASK]          |
+ * | membership.remove       | yes   | no      | no  | FCRM-002 H [TASK]          |
  *
  * Each role lists its permissions explicitly: no role inherits another
  * role's permissions, and anything missing is denied.
@@ -23,7 +27,14 @@ namespace App\Organizations\Domain;
 final class RolePolicy
 {
     private const GRANTS = [
-        'ADMIN' => [Permission::OrganizationView, Permission::MembershipList, Permission::MembershipViewEmail],
+        'ADMIN' => [
+            Permission::OrganizationView,
+            Permission::MembershipList,
+            Permission::MembershipViewEmail,
+            Permission::MembershipAdd,
+            Permission::MembershipChangeRole,
+            Permission::MembershipRemove,
+        ],
         'MANAGER' => [Permission::OrganizationView, Permission::MembershipList, Permission::MembershipViewEmail],
         'REP' => [Permission::OrganizationView, Permission::MembershipList],
     ];

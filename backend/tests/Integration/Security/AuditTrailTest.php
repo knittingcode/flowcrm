@@ -4,10 +4,9 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Security;
 
-use App\Tests\Support\Database\TestDatabase;
+use App\Tests\Support\Database\FailingAudit;
 use App\Tests\Support\Http\FpmApiTestCase;
 use App\Tests\Support\Security\Fixtures;
-use App\Tests\Support\Security\TestUser;
 use Symfony\Component\Uid\Uuid;
 
 /**
@@ -17,6 +16,8 @@ use Symfony\Component\Uid\Uuid;
  */
 final class AuditTrailTest extends FpmApiTestCase
 {
+    use FailingAudit;
+
     public function testLoginPasswordChangeAndLogoutAreAudited(): void
     {
         $user = $this->fixtures->user('audited');
@@ -89,7 +90,7 @@ final class AuditTrailTest extends FpmApiTestCase
         $sessions = $this->sessionCount();
         $client = $this->client();
 
-        $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/auth/login', ['email' => $user->email, 'password' => $user->password]));
+        $response = $this->whileAuditFailsFor($user->id, static fn () => $client->post('/api/v1/auth/login', ['email' => $user->email, 'password' => $user->password]));
 
         self::assertSame(500, $response->status());
         self::assertSame($response->header('X-Request-Id'), $response->value('requestId'));
@@ -108,7 +109,7 @@ final class AuditTrailTest extends FpmApiTestCase
         $client->login($user->email, $user->password);
         $id = (string) $client->sessionId();
 
-        $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/auth/logout'));
+        $response = $this->whileAuditFailsFor($user->id, static fn () => $client->post('/api/v1/auth/logout'));
 
         self::assertSame(500, $response->status());
         self::assertNull($this->sessionData($id), 'the session row is deleted');
@@ -128,7 +129,7 @@ final class AuditTrailTest extends FpmApiTestCase
         $other->login($user->email, $user->password);
         $id = (string) $client->sessionId();
 
-        $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/me/password', ['currentPassword' => $user->password, 'newPassword' => 'a never stored passphrase']));
+        $response = $this->whileAuditFailsFor($user->id, static fn () => $client->post('/api/v1/me/password', ['currentPassword' => $user->password, 'newPassword' => 'a never stored passphrase']));
 
         self::assertSame(500, $response->status());
         self::assertSame($id, $client->sessionId(), 'the session keeps its ID');
@@ -146,7 +147,7 @@ final class AuditTrailTest extends FpmApiTestCase
         $client = $this->client();
         $client->login($user->email, $user->password);
 
-        $this->whileAuditFailsFor($user, function () use ($user): void {
+        $this->whileAuditFailsFor($user->id, function () use ($user): void {
             self::assertNotSame(0, $this->safeConsole('flowcrm:user:disable', ['email' => $user->email]));
             self::assertNotSame(0, $this->safeConsole('flowcrm:user:reset-password', ['email' => $user->email], 'a never stored passphrase'));
         });
@@ -154,30 +155,6 @@ final class AuditTrailTest extends FpmApiTestCase
         self::assertNull($this->fixtures->connection()->fetchOne('SELECT disabled_at FROM users WHERE id = ?', [$user->id->toRfc4122()]));
         self::assertSame(200, $client->get('/api/v1/me')->status(), 'neither disabled nor a new password');
         self::assertSame(['auth.login_succeeded'], array_column($this->events($user->id), 'action'));
-    }
-
-    /**
-     * Runs $action while every audit event about $user fails to be written
-     * (a trigger of the schema owner, removed afterwards).
-     *
-     * @template T
-     *
-     * @param callable(): T $action
-     *
-     * @return T
-     */
-    private function whileAuditFailsFor(TestUser $user, callable $action): mixed
-    {
-        $owner = TestDatabase::owner();
-        $owner->executeStatement("CREATE OR REPLACE FUNCTION test_audit_unavailable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit storage unavailable (test)'; END $$");
-        $owner->executeStatement(\sprintf("CREATE TRIGGER test_audit_unavailable BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.entity_id = '%s') EXECUTE FUNCTION test_audit_unavailable()", $user->id->toRfc4122()));
-        try {
-            return $action();
-        } finally {
-            $owner->executeStatement('DROP TRIGGER test_audit_unavailable ON audit_events');
-            $owner->executeStatement('DROP FUNCTION test_audit_unavailable()');
-            $owner->close();
-        }
     }
 
     /**

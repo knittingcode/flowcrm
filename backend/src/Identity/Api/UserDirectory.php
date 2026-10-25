@@ -16,6 +16,6 @@ interface UserDirectory
      */
     public function profiles(array $ids): array;
 
-    /** Case-insensitive lookup, for the operator console. */
+    /** Case-insensitive lookup, for the operator console and for adding members by e-mail. */
     public function idOfEmail(string $email): ?Uuid;
 }
