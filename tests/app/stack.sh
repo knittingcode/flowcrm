@@ -745,6 +745,21 @@ r=$?
 [ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000 /health/readyz=000 /health/ready/x=000" ]
 v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $? "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)"
 
+# make up clears the gate only after every check: killed before its checks
+# finished, while an edge started by an interrupted rotation runs, it leaves
+# that edge serving nothing but its health paths.
+(cd "$A" && ROLE=owner FLOWCRM_DEVENV_FAULT=edge-started:kill ./bin/devenv rotate-db-password) >"$work/out/a-uk-rot.out" 2>"$work/out/a-uk-rot.err"
+echo $? >"$work/out/a-uk-rot.rc"
+(cd "$A" && FLOWCRM_DEVENV_FAULT=up-after-migrations:kill ./bin/devenv up) >"$work/out/a-uk-up.out" 2>"$work/out/a-uk-up.err"
+echo $? >"$work/out/a-uk-up.rc"
+UK_EDGE=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+UK_PROBE=$(gate_probe)
+UK_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absent)
+dv a-uk-up2 "$A" up
+[ "$(rc_of a-uk-rot)" = 137 ] && [ "$(rc_of a-uk-up)" = 137 ] && [ -n "$UK_EDGE" ] && [ "$UK_PROBE" = "$GATED" ] &&
+  [ "$UK_GATE" = recorded ] && [ "$(rc_of a-uk-up2)" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
+v "ST-50 make up killed before its checks finished, while a started edge enforces the gate: the gate stays recorded, the edge serves only its health paths; make up serves" $? "rotation exit $(rc_of a-uk-rot), make up exit $(rc_of a-uk-up), edge [$UK_EDGE], gate $UK_GATE, probe: $UK_PROBE, make up $(rc_of a-uk-up2)"
+
 # An edge created without the gate directory (by bin/devenv before
 # FND-009E, or by a plain docker compose up) does not enforce the gate:
 # make up recreates it instead of reporting it as already running.
