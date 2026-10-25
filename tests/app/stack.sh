@@ -719,7 +719,10 @@ v "ST-50 the running edge enforces the gate: only /health/live and /health/ready
 # command leaves the gate recorded, and the edge (if it already started)
 # serves nothing but its health paths. make up reconciles and serves.
 interrupted_restore() { # label fault expected-exit
-  (cd "$A" && ROLE=owner FLOWCRM_DEVENV_FAULT=$2 ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err"
+  # SIGINT at its default disposition, as from a terminal: run from a shell
+  # that ignores it (a background job of a non-interactive shell), bash could
+  # neither trap nor receive it, and the :int fault would not interrupt.
+  (cd "$A" && ROLE=owner FLOWCRM_DEVENV_FAULT=$2 exec python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err"
   echo $? >"$work/out/$1.rc"
   IR_EDGE=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
   IR_PROBE=$(gate_probe)
