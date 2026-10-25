@@ -1,12 +1,14 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { getSession, login as apiLogin, logout as apiLogout, type Session } from '../api/auth.ts';
-import { onUnauthenticated, setCsrfRefresher, setCsrfToken } from '../api/client.ts';
+import { ApiProblem, onUnauthenticated, setCsrfRefresher, setCsrfToken } from '../api/client.ts';
 import { type Auth, AuthContext, type AuthState } from './context.ts';
 
 /**
  * The authentication state of the SPA (ADR-019): read from
  * GET /api/v1/auth/session on load, set by login and logout, and reset to
  * anonymous whenever the API answers 401 (the server ended the session).
+ * A logout that does not complete leaves the state signed in and rejects:
+ * the session may still be valid on the server.
  * The CSRF token is kept in memory only. Nothing is written to browser
  * storage.
  */
@@ -62,10 +64,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(async () => {
     try {
       await apiLogout();
-    } finally {
-      setCsrfToken(null);
-      setState({ status: 'anonymous', ended: false });
+    } catch (error) {
+      // A 401: the session had already ended on the server. Anything else
+      // (no answer, a server error, a refused CSRF token) did not end it.
+      if (!(error instanceof ApiProblem && error.status === 401)) {
+        throw error;
+      }
     }
+    setCsrfToken(null);
+    setState({ status: 'anonymous', ended: false });
   }, []);
 
   const auth = useMemo<Auth>(() => ({ state, login, logout, refresh }), [state, login, logout, refresh]);

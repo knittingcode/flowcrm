@@ -91,7 +91,13 @@ and leaves `.runtime/dev.env` unchanged:
    When this check or the role check of phase 5 fails, a running edge is
    stopped, so the stack is not served; the database and the saved port are
    kept, `make status` reports `blocked` and `make url` fails until a
-   `make up` passes;
+   `make up` passes. The gate is the file `.runtime/gate/security-gate`; an
+   edge started by `bin/devenv` mounts that directory (`FLOWCRM_GATE_DIR`)
+   and, while the file exists, answers everything but `/health/live` and
+   `/health/ready` with 503, so a stack that has not passed its checks
+   serves nothing even if such an edge is running. An edge started directly
+   with `docker compose up` mounts the empty `docker/edge/no-gate` instead
+   and does not enforce the gate; use `make` (ADR-018);
 8. start the edge on the first usable port (`up --no-deps --wait edge`);
 9. verify Docker's actual mapping and `GET` of the stack's readiness path
    (`/health/ready`, which must answer 200 with the stack's own body) through
@@ -100,7 +106,24 @@ and leaves `.runtime/dev.env` unchanged:
 
 When the stack already runs, `make up` reports what it changed: `already
 running; nothing to change`, or `running; recreated: api (image or
-configuration changed)` and/or `applied pending database migrations`.
+configuration changed)` and/or `applied pending database migrations`. A
+running edge that does not mount `.runtime/gate` (created before the gate
+mount existed, or by a plain `docker compose up`) would not enforce the
+security gate; `make up` recreates it on its port instead of reporting it
+as running.
+
+**Upgrade note (security gate mount, FND-009E):** in a checkout whose
+stack was started before this change, the first `make up` afterwards
+recreates the running edge once and says so (`recreating the edge on port
+…: it does not mount .runtime/gate`). Only the stateless edge container is
+replaced: the database, its volume, `.runtime/secrets` and the api and web
+containers are handled exactly as by any `make up`. The edge comes back on
+the same port (if another program took the port in the meantime, the next
+free one is used and the printed URL shows it). The edge image is rebuilt
+first, while the old edge still serves; the UI and API are unavailable
+only while the container is replaced (about one second, 0.5 to 1.2 s in
+tests of this upgrade, with no answer on the port in between). Later runs
+report `already running`.
 
 ## Commands
 
@@ -115,7 +138,7 @@ configuration changed)` and/or `applied pending database migrations`.
 | `make logs` | Recent logs of this project only. `SERVICE` is one of the stack's services (`edge`, `web`, `api`, `db`; fixture: `edge`, `state`), `TAIL=200`, `FOLLOW=1`. |
 | `make doctor` | Read-only prerequisite and configuration check. |
 | `make db-upgrade-roles` | Application stack only, explicit: convert a database created before the role separation. Creates the two role secrets, stops `api`, `web` and `edge`, takes a backup verified by a restore into a scratch database (`.runtime/backups/`), moves the schema to `flowcrm_owner` in one transaction, migrates and verifies. On a converted database it only re-checks. |
-| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: a new password for `flowcrm_app` or `flowcrm_owner`. The pending password (`.runtime/secrets/.db_<role>_password.pending`, `0600`) is set in the database, a SCRAM login is checked, then it replaces the current file, the containers that mount it are recreated and the role's own client logs in. After an interruption or failure, running it again finishes the rotation (ADR-018, Rotation). |
+| `make db-rotate-password ROLE=app\|owner` | Application stack only, development use: a new password for `flowcrm_app` or `flowcrm_owner`. The pending password (`.runtime/secrets/.db_<role>_password.pending`, `0600`) is set in the database, a SCRAM login is checked, then it replaces the current file, the containers that mount it are recreated and the role's own client logs in. The edge serves again only when it answers readiness; otherwise the command exits 2 and the stack stays blocked until `make up` succeeds. After an interruption or failure, running it again finishes the rotation (ADR-018, Rotation). |
 | `make db-rotate-password-abort ROLE=app\|owner` | Undo an unfinished rotation: the database gets the current password back (SCRAM login checked) and the pending file is removed. |
 | `make help` | List the targets. |
 | `make test-devenv` | Run the allocator tests on the fixture (see below). |
@@ -419,7 +442,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   The integration suite includes the API security tests (login, sessions,
   request forgery, throttling, tenant isolation) through a real PHP-FPM,
   each response checked against `backend/openapi.yaml`; BE-18 runs the
-  security negative controls: 28 mutations of a copy of the backend, each
+  security negative controls: 43 mutations of a copy of the backend, each
   of which must make its tests fail (see
   [architecture/authentication.md](architecture/authentication.md#tests)).
 - `frontend.sh` (FE-01 to FE-05): `npm audit`, strict type check, ESLint
@@ -450,7 +473,12 @@ Application suites (`tests/app/`), each in its own Compose projects:
   foreign holder of the advisory lock) keeping the stack blocked until the
   old operation has ended, and SIGKILL of `bin/devenv` during a rotation,
   an ownership conversion and after a committed but unverified change, with
-  the edge already stopped before the change began; and the upgrade of a
+  the edge already stopped before the change began; the security gate
+  enforced by the running edge (only `/health/live` and `/health/ready`
+  answered while it is recorded), kept through SIGKILL, SIGINT and SIGTERM
+  while the edge comes back after a rotation and through a `make up`
+  killed before its checks finished, and an edge without the gate mount
+  being recreated by `make up`; and the upgrade of a
   volume from FND-004 (before the audit log existed) and of one whose audit
   triggers were disabled or dropped (refused); and authentication through
   the edge with users created by the operator console: the session cookie's
@@ -481,7 +509,10 @@ run, so several runs from one checkout do not interfere.
   recreated container after a secret change (with fake Compose and Docker:
   a container still starting, unhealthy, without a health check, not
   replaced or mounting an old secret is refused, also when Compose reported
-  success), the Makefile interface
+  success), the edge's return after a rotation (it must answer readiness;
+  otherwise it is stopped, the gate is recorded again and the command
+  fails), a security gate that cannot be recorded (reported on stderr,
+  never a success), the Makefile interface
   (targets and the commands they run) and checks that the result tally
   detects failed and lost results.
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
