@@ -83,6 +83,31 @@ final class AuditTrailTest extends FpmApiTestCase
         self::assertStringNotContainsString('a provisioned passphrase', json_encode($rows, \JSON_THROW_ON_ERROR));
     }
 
+    /** The operator's user changes are audited by action, with the operator as actor and nothing beyond the action. */
+    public function testOperatorUserChangesAreAuditedWithTheirAction(): void
+    {
+        $user = $this->fixtures->user('operator-changes');
+
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
+        self::assertSame(0, $this->console('flowcrm:user:reset-password', ['email' => $user->email], 'an operator reset passphrase')->getStatusCode());
+
+        $events = $this->events($user->id);
+        self::assertSame(['user.disabled', 'user.enabled', 'user.password_reset'], array_column($events, 'action'));
+        foreach ($events as $event) {
+            self::assertSame('platform_operator', $event['actor_type']);
+            self::assertNull($event['actor_user_id']);
+            self::assertNull($event['actor_role']);
+            self::assertNull($event['organization_id'], 'global events belong to no organization (BR-33)');
+            self::assertNull($event['ip']);
+            self::assertSame('[]', $event['changes'], 'nothing beyond the action');
+        }
+        $all = json_encode($events, \JSON_THROW_ON_ERROR);
+        foreach (['an operator reset passphrase', $user->email, '$argon2'] as $secret) {
+            self::assertStringNotContainsString($secret, $all);
+        }
+    }
+
     /** Without its audit event there is no login: no session, no cookie that authenticates. */
     public function testALoginWhoseAuditEventCannotBeWrittenFails(): void
     {
@@ -158,6 +183,42 @@ final class AuditTrailTest extends FpmApiTestCase
         self::assertSame(['auth.login_succeeded'], array_column($this->events($user->id), 'action'));
     }
 
+    /** Enabling and provisioning are one transaction with their audit events too: without them nothing is stored. */
+    public function testOperatorEnableAndProvisioningWhoseAuditEventCannotBeWrittenChangeNothing(): void
+    {
+        $disabled = $this->fixtures->user('audit-down-enable');
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $disabled->email])->getStatusCode());
+        $this->whileAuditFailsFor($disabled, function () use ($disabled): void {
+            self::assertNotSame(0, $this->safeConsole('flowcrm:user:enable', ['email' => $disabled->email]));
+        });
+        self::assertNotNull($this->fixtures->connection()->fetchOne('SELECT disabled_at FROM users WHERE id = ?', [$disabled->id->toRfc4122()]), 'still disabled');
+        self::assertSame(['user.disabled'], array_column($this->events($disabled->id), 'action'));
+
+        $email = 'audit-down-create-'.bin2hex(random_bytes(4)).'@example.test';
+        $this->whileAuditFails("NEW.action = 'user.created'", function () use ($email): void {
+            self::assertNotSame(0, $this->safeConsole('flowcrm:user:create', ['--email' => $email, '--display-name' => 'Never Stored'], 'a never stored passphrase'));
+        });
+        self::assertFalse($this->fixtures->connection()->fetchOne('SELECT id FROM users WHERE email = ?', [$email]), 'no user without its event');
+
+        $admin = $this->fixtures->user('audit-down-organization');
+        $name = 'Never Stored '.bin2hex(random_bytes(4));
+        $this->whileAuditFails("NEW.action = 'membership.added' AND NEW.actor_type = 'platform_operator'", function () use ($name, $admin): void {
+            self::assertNotSame(0, $this->safeConsole('flowcrm:organization:create', ['--name' => $name, '--admin-email' => $admin->email]));
+        });
+        $connection = $this->fixtures->connection();
+        self::assertFalse($connection->fetchOne('SELECT id FROM organizations WHERE name = ?', [$name]), 'no organization without the event of its first membership');
+        self::assertSame(0, self::int($connection->fetchOne('SELECT count(*) FROM memberships WHERE user_id = ?', [$admin->id->toRfc4122()])));
+
+        $organization = $this->fixtures->organization('audit-down-member');
+        $member = $this->fixtures->user('audit-down-member');
+        $this->whileAuditFails(\sprintf("NEW.organization_id = '%s'", $organization->toRfc4122()), function () use ($organization, $member): void {
+            self::assertNotSame(0, $this->safeConsole('flowcrm:membership:add', ['--organization' => $organization->toRfc4122(), '--email' => $member->email, '--role' => 'REP']));
+        });
+        $connection = $this->fixtures->connection();
+        self::assertSame(0, self::int($connection->fetchOne('SELECT count(*) FROM memberships WHERE organization_id = ?', [$organization->toRfc4122()])), 'no membership without its event');
+        self::assertSame(0, self::int($connection->fetchOne('SELECT count(*) FROM audit_events WHERE organization_id = ?', [$organization->toRfc4122()])));
+    }
+
     /**
      * Runs $action while every audit event about $user fails to be written
      * (a trigger of the schema owner, removed afterwards).
@@ -170,9 +231,24 @@ final class AuditTrailTest extends FpmApiTestCase
      */
     private function whileAuditFailsFor(TestUser $user, callable $action): mixed
     {
+        return $this->whileAuditFails(\sprintf("NEW.entity_id = '%s'", $user->id->toRfc4122()), $action);
+    }
+
+    /**
+     * Runs $action while every audit event matching the trigger condition
+     * $when (SQL over NEW, written by the test) fails to be written.
+     *
+     * @template T
+     *
+     * @param callable(): T $action
+     *
+     * @return T
+     */
+    private function whileAuditFails(string $when, callable $action): mixed
+    {
         $owner = TestDatabase::owner();
         $owner->executeStatement("CREATE OR REPLACE FUNCTION test_audit_unavailable() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit storage unavailable (test)'; END $$");
-        $owner->executeStatement(\sprintf("CREATE TRIGGER test_audit_unavailable BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.entity_id = '%s') EXECUTE FUNCTION test_audit_unavailable()", $user->id->toRfc4122()));
+        $owner->executeStatement(\sprintf('CREATE TRIGGER test_audit_unavailable BEFORE INSERT ON audit_events FOR EACH ROW WHEN (%s) EXECUTE FUNCTION test_audit_unavailable()', $when));
         try {
             return $action();
         } finally {
