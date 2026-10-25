@@ -106,9 +106,11 @@ get_raw() { # port path [curl args...]
   get "$port" "$path" --path-as-is "$@"
 }
 body_has() { grep -q -- "$1" "$BODY"; }
-# Symfony sets X-Request-Id on every response; the frontend never does.
+# Symfony marks every response Cache-Control private (its default "no-cache,
+# private"); the frontend and the edge never do. (X-Request-Id is no marker:
+# the edge sets it on every response.)
 served_by() {
-  if [ -n "$(header X-Request-Id)" ]; then
+  if header Cache-Control | grep -qi 'private'; then
     case $TYPE in application/problem+json*) printf 'symfony-problem' ;; application/json*) printf 'symfony-json' ;; *) printf 'symfony-other' ;; esac
   elif body_has '<div id="root">'; then
     printf 'spa'
@@ -286,7 +288,9 @@ done
 boundary symfony-json '/health/live?probe=1'
 
 get "$PA" /accounts/some/deep/link
-[ "$CODE" = 200 ] && body_has '<div id="root">'; v "ST-11 client-side routes fall back to the SPA" $?
+# The SPA is not marked private: served_by relies on that marker.
+[ "$CODE" = 200 ] && body_has '<div id="root">' && ! header Cache-Control | grep -qi private
+v "ST-11 client-side routes fall back to the SPA (not marked Cache-Control private)" $?
 
 get "$PA" /api/v1/system/status -H 'X-Request-Id: attacker-chosen'
 rid=$(header X-Request-Id)
@@ -315,6 +319,48 @@ docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
 v "ST-40 the api logs the request as one JSON record with the response's request ID" $? "$(grep -F "$rid" "$api_log" | head -n 2)"
 grep -F "$rid" "$edge_log" | grep -qF '"uri":"/api/v1/system/status?[redacted]"'
 v "ST-41 the edge access log has the same request ID and no query string" $? "$(grep -F "$rid" "$edge_log" | head -c 600)"
+# The ID in the edge log is the one the edge generated, forwarded to the api
+# and returned to the client (field request_id), also for a request the
+# edge answers itself (the SPA) and for a client that sends its own
+# X-Request-Id, whose value is replaced and logged nowhere.
+spoof=st41-spoofed-$(random_secret | cut -c1-12)
+get "$PA" /api/v1/system/status -H "X-Request-Id: $spoof"
+rid_spoof=$(header X-Request-Id) code_spoof=$CODE
+n_spoof=$(grep -ci '^X-Request-Id:' "$HEADERS")
+get "$PA" /accounts/st41-spa-probe
+rid_spa=$(header X-Request-Id) code_spa=$CODE n_spa=$(grep -ci '^X-Request-Id:' "$HEADERS")
+# A problem document of the api carries the same ID as its response header.
+get "$PA" /api/v1/st41-not-found
+rid_pd=$(header X-Request-Id) code_pd=$CODE n_pd=$(grep -ci '^X-Request-Id:' "$HEADERS")
+pd_id=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("requestId", ""))' "$BODY" 2>/dev/null)
+sleep 1
+docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
+docker logs "$(cid "$A" api)" >"$api_log" 2>&1
+edge_rid() { # uri -> request_id of the edge log records for that uri (one per line)
+  grep '^{' "$edge_log" | python3 -c 'import json, sys
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("request", {}).get("uri") == sys.argv[1]:
+        print(d.get("request_id", "-"), (d.get("resp_headers", {}).get("X-Request-Id") or ["-"])[0])' "$1"
+}
+uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+[ "$code_spoof" = 200 ] && [ "$code_spa" = 200 ] && [[ $rid_spoof =~ $uuid_re ]] && [[ $rid_spa =~ $uuid_re ]] &&
+  edge_rid '/api/v1/system/status?[redacted]' | grep -qx "$rid $rid" &&
+  edge_rid /api/v1/system/status | grep -qx "$rid_spoof $rid_spoof" &&
+  edge_rid /accounts/st41-spa-probe | grep -qx "$rid_spa $rid_spa" && ! grep -qF "$spoof" "$edge_log" "$api_log"
+v "ST-41 the edge logs the request ID it generated (field request_id = response header) for API and SPA requests; a client's own ID is replaced and logged nowhere" $? \
+  "api [$rid]: $(edge_rid '/api/v1/system/status?[redacted]' | tr '\n' ' ') spoofed [$rid_spoof]: $(edge_rid /api/v1/system/status | tr '\n' ' ') spa ($code_spa) [$rid_spa]: $(edge_rid /accounts/st41-spa-probe | tr '\n' ' ') spoof logged: $(grep -cF "$spoof" "$edge_log")"
+# Exactly one X-Request-Id per response (the edge's deferred header replaces
+# the api's copy instead of adding a second value), the same ID in the
+# problem document and in the edge log, and a new ID for every request.
+[ "$n_spoof" = 1 ] && [ "$n_spa" = 1 ] && [ "$n_pd" = 1 ] && [ "$code_pd" = 404 ] && [ "$pd_id" = "$rid_pd" ] &&
+  edge_rid /api/v1/st41-not-found | grep -qx "$rid_pd $rid_pd" &&
+  [ "$(printf '%s\n' "$rid" "$rid_nf" "$rid_spoof" "$rid_spa" "$rid_pd" | sort -u | grep -cE "$uuid_re")" = 5 ]
+v "ST-41 one X-Request-Id per response (API, SPA, problem document); the problem document's requestId and the edge log carry it; every request has its own" $? \
+  "headers: api $n_spoof spa $n_spa problem $n_pd ($code_pd); requestId [$pd_id] header [$rid_pd] edge: $(edge_rid /api/v1/st41-not-found | tr '\n' ' ') ids: $rid $rid_nf $rid_spoof $rid_spa $rid_pd"
 # Every JSON line of the api is a complete record with the baseline fields.
 json_check=$(grep '^{' "$api_log" | docker exec -i "$(cid "$A" api)" php -r '
   $n = 0; $bad = 0;
@@ -513,7 +559,7 @@ dv a-up-nodrift "$A" up
   [ "$(rc_of a-status-drift)" = 1 ] && grep -q '^blocked: ' "$work/out/a-status-drift.out" &&
   [ "$(rc_of a-url-drift)" = 1 ] && err_has a-url-drift 'blocked by the security gate' &&
   [ "$drift_db" = true ] && [ "$(saved_port "$A")" = "$PA" ] &&
-  [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10 && [ ! -e "$A/.runtime/security-gate" ]
+  [ "$(rc_of a-up-nodrift)" = 0 ] && until_ready "$PA" 200 10 && [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-48 privilege drift on a running stack: make up exits 6 and stops the edge (no request served, status and url blocked, db and port kept); after the fix make up serves again" $? "before=$drift_before during=$drift_code $(grep -m1 VIOLATION "$work/out/a-up-drift.err")"
 
 # A missing or malformed role secret of an existing volume fails closed and
@@ -658,6 +704,129 @@ ev "rotation 5: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)'
 ev "rotation 6: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot6.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
 ev "api before/after 6: ${r6_before#* api=} -> ${r6_after#* api=}"
 
+# A rotation that passes every check, but whose edge cannot get ready again
+# (FND-009E): the owner rotation recreates only the db, so the api keeps the
+# broken index.php and the edge's health check through it fails. The
+# command fails (exit 2) instead of warning, the started edge is stopped, the
+# stack is blocked again, and make up serves once the cause is fixed.
+printf '<?php syntax error\n' >"$A/backend/public/index.php"
+(cd "$A" && ROLE=owner FLOWCRM_WAIT_TIMEOUT=20 ./bin/devenv rotate-db-password) >"$work/out/a-rot7.out" 2>"$work/out/a-rot7.err"
+echo $? >"$work/out/a-rot7.rc"
+r7_edge_ps=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+get "$PA" /
+r7_code=$CODE
+dv a-status-rot7 "$A" status
+cp -p "$work/index.php.kept" "$A/backend/public/index.php"
+# The api turned unhealthy while index.php was broken; make up's wait fails
+# fast on an unhealthy container, so give its health check time to recover.
+i=0
+until [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cid "$A" api)" 2>/dev/null)" = healthy ] || [ "$i" -ge 60 ]; do sleep 1; i=$((i + 1)); done
+dv a-up-rot7 "$A" up
+[ "$(rc_of a-rot7)" = 2 ] && err_has a-rot7 'rotated the password of flowcrm_owner' &&
+  err_has a-rot7 'was rotated and verified, but the edge did not serve again' && [ -z "$r7_edge_ps" ] && [ "$r7_code" = 000 ] &&
+  [ "$(rc_of a-status-rot7)" = 1 ] && grep -q '^blocked: .*did not serve again' "$work/out/a-status-rot7.out" &&
+  [ "$(rc_of a-up-rot7)" = 0 ] && until_ready "$PA" 200 30 && no_leftovers
+v "ST-50 a verified rotation whose edge cannot get ready fails (exit 2): the started edge is stopped, nothing is served, the stack is blocked; make up serves once fixed" $? \
+  "rotation exit $(rc_of a-rot7), edge container [$r7_edge_ps], GET / $r7_code, make up exit $(rc_of a-up-rot7)
+$(sed 's/^/      | /' "$work/out/a-rot7.err" | tail -n 12)
+$(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)"
+
+# The security gate is enforced by the running edge itself (FND-009E): while
+# .runtime/gate/security-gate exists, every request but exactly /health/live
+# and /health/ready is answered with the gate's 503 (raw URI, as ADR-017).
+gate_probe() { # -> "path=code ..." for the paths that matter
+  local out='' p
+  for p in / /api/v1/system/status /health/live /health/ready /HEALTH/READY //health/ready /health/readyz /health/ready/x; do
+    out="$out $p=$(curl -s -o /dev/null -m 5 -w '%{http_code}' --path-as-is "http://127.0.0.1:$PA$p")"
+  done
+  printf '%s' "${out# }"
+}
+GATED="/=503 /api/v1/system/status=503 /health/live=200 /health/ready=200 /HEALTH/READY=503 //health/ready=503 /health/readyz=503 /health/ready/x=503"
+OPEN="/=200 /api/v1/system/status=200 /health/live=200 /health/ready=200 /HEALTH/READY=200 //health/ready=200 /health/readyz=200 /health/ready/x=200"
+probe_until() { # expected [seconds]: poll (a bind mount can show a change a moment late)
+  local i=0
+  PROBE=$(gate_probe)
+  while [ "$PROBE" != "$1" ] && [ "$i" -lt "${2:-10}" ]; do sleep 1; i=$((i + 1)); PROBE=$(gate_probe); done
+  [ "$PROBE" = "$1" ]
+}
+printf 'a gate recorded by the test\n' >"$A/.runtime/gate/security-gate"
+chmod 0644 "$A/.runtime/gate/security-gate"
+probe_until "$GATED"
+g_on=$PROBE
+g_body=$(curl -s -m 5 "http://127.0.0.1:$PA/")
+rm -f "$A/.runtime/gate/security-gate"
+probe_until "$OPEN"
+g_off=$PROBE
+[ "$g_on" = "$GATED" ] && case $g_body in *"blocked by its security gate"*) true ;; *) false ;; esac && [ "$g_off" = "$OPEN" ]
+v "ST-50 the running edge enforces the gate: only /health/live and /health/ready pass while it is recorded, everything serves once it is removed" $? "gated: $g_on; open: $g_off"
+
+# Interrupted while the edge comes back after a verified rotation: the gate
+# is cleared only once the edge answers readiness, so whatever kills the
+# command leaves the gate recorded, and the edge (if it already started)
+# serves nothing but its health paths. make up reconciles and serves.
+interrupted_restore() { # label fault expected-exit
+  # SIGINT at its default disposition, as from a terminal: run from a shell
+  # that ignores it (a background job of a non-interactive shell), bash could
+  # neither trap nor receive it, and the :int fault would not interrupt.
+  (cd "$A" && ROLE=owner FLOWCRM_DEVENV_FAULT=$2 exec python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])' ./bin/devenv rotate-db-password) >"$work/out/$1.out" 2>"$work/out/$1.err"
+  echo $? >"$work/out/$1.rc"
+  IR_EDGE=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+  IR_PROBE=$(gate_probe)
+  dv "$1-status" "$A" status
+  IR_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absent)
+  dv "$1-up" "$A" up
+  [ "$(rc_of "$1")" = "$3" ] && [ "$IR_GATE" = recorded ] && [ "$(rc_of "$1-status")" = 1 ] && grep -q '^blocked: ' "$work/out/$1-status.out" &&
+    [ "$(rc_of "$1-up")" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
+}
+interrupted_restore a-ir-kill edge-started:kill 137
+r=$?
+[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
+v "ST-50 SIGKILL right after the edge started again: the gate stays recorded, the running edge serves only its health paths, make up serves" $? "exit $(rc_of a-ir-kill), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-kill-up)"
+interrupted_restore a-ir-int edge-started:int 130
+r=$?
+[ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
+v "ST-50 SIGINT right after the edge started again: the gate stays recorded, nothing but the health paths is served, make up serves" $? "exit $(rc_of a-ir-int), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-int-up)"
+interrupted_restore a-ir-term restore-before-edge 143
+r=$?
+[ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000 /health/readyz=000 /health/ready/x=000" ]
+v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $? "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)"
+
+# make up clears the gate only after every check: killed before its checks
+# finished, while an edge started by an interrupted rotation runs, it leaves
+# that edge serving nothing but its health paths.
+(cd "$A" && ROLE=owner FLOWCRM_DEVENV_FAULT=edge-started:kill ./bin/devenv rotate-db-password) >"$work/out/a-uk-rot.out" 2>"$work/out/a-uk-rot.err"
+echo $? >"$work/out/a-uk-rot.rc"
+(cd "$A" && FLOWCRM_DEVENV_FAULT=up-after-migrations:kill ./bin/devenv up) >"$work/out/a-uk-up.out" 2>"$work/out/a-uk-up.err"
+echo $? >"$work/out/a-uk-up.rc"
+UK_EDGE=$(docker ps -q --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge)
+UK_PROBE=$(gate_probe)
+UK_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absent)
+dv a-uk-up2 "$A" up
+[ "$(rc_of a-uk-rot)" = 137 ] && [ "$(rc_of a-uk-up)" = 137 ] && [ -n "$UK_EDGE" ] && [ "$UK_PROBE" = "$GATED" ] &&
+  [ "$UK_GATE" = recorded ] && [ "$(rc_of a-uk-up2)" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
+v "ST-50 make up killed before its checks finished, while a started edge enforces the gate: the gate stays recorded, the edge serves only its health paths; make up serves" $? "rotation exit $(rc_of a-uk-rot), make up exit $(rc_of a-uk-up), edge [$UK_EDGE], gate $UK_GATE, probe: $UK_PROBE, make up $(rc_of a-uk-up2)"
+
+# An edge created without the gate directory (by bin/devenv before
+# FND-009E, or by a plain docker compose up) does not enforce the gate:
+# make up recreates it instead of reporting it as already running.
+gate_src() { docker inspect -f '{{range .Mounts}}{{if eq .Destination "/run/flowcrm-gate"}}{{.Source}}{{end}}{{end}}' "$(cid "$A" edge)" 2>/dev/null; }
+(cd "$A" && FLOWCRM_HTTP_PORT=$PA COMPOSE_PROFILES=dev,migrate docker compose --project-name "$(project_of "$A")" up --detach --no-deps --force-recreate edge) >"$work/out/a-legacy-edge.out" 2>&1
+until_ready "$PA" 200 30
+legacy_src=$(gate_src)
+dv a-up-legacy "$A" up
+new_src=$(gate_src)
+printf 'a gate recorded by the test\n' >"$A/.runtime/gate/security-gate"
+chmod 0644 "$A/.runtime/gate/security-gate"
+probe_until "$GATED"
+legacy_probe=$PROBE
+rm -f "$A/.runtime/gate/security-gate"
+probe_until "$OPEN"
+[ "$(rc_of a-up-legacy)" = 0 ] && case $legacy_src in */docker/edge/no-gate) true ;; *) false ;; esac &&
+  case $new_src in *"$A/.runtime/gate") true ;; *) false ;; esac && err_has a-up-legacy 'does not mount .runtime/gate' &&
+  [ "$legacy_probe" = "$GATED" ] && [ "$PROBE" = "$OPEN" ] && [ "$(saved_port "$A")" = "$PA" ]
+v "ST-50 an edge created without the gate directory is recreated by make up and then enforces the gate" $? "make up $(rc_of a-up-legacy), mount before [$legacy_src] after [$new_src], gated probe: $legacy_probe; open: $PROBE
+$(sed 's/^/      | /' "$work/out/a-up-legacy.err" | tail -n 5)"
+
 # Interrupted while the password change waits inside PostgreSQL (another
 # session holds the operations' advisory lock): the interrupted transaction
 # is ended before the command exits, and nothing commits later.
@@ -728,7 +897,7 @@ u_up=$?
   err_has a-unconf 'stopped the edge' && [ "$PAUSED_EDGE" = 000 ] && [ "$(rc_of a-unconf-status)" = 1 ] &&
   grep -q '^blocked: .*could not be confirmed' "$work/out/a-unconf-status.out" && [ "$(rc_of a-unconf-url)" = 1 ] &&
   [ "$u_ended" -lt 120 ] && [ "$u_up" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
-  cmp -s "$sd/db_app_password" "$work/app.5" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+  cmp -s "$sd/db_app_password" "$work/app.5" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-59 unconfirmed cancellation (db paused): the stack is blocked (edge stopped, status and url refuse); the next make up ends the old operation before changing anything, and it never commits" $? "rc=$(rc_of a-unconf) edge=$PAUSED_EDGE ended=$u_ended up=$u_up $(tail -n 1 "$work/out/a-unconf-up.err")"
 rot a-unconf-abort app '' rotate-db-password-abort
 
@@ -833,7 +1002,7 @@ wait "$abp"
 k1_abort=$?
 [ "$k_before" = 200 ] && [ "$k1_edge" = 000 ] && [ "$(rc_of a-kill1)" = 137 ] && [ "$k1_blocked" = yes ] && [ "$k1_alive" = 1 ] &&
   [ "$i" -lt 400 ] && [ "$k1_waited" = 1 ] && [ "$k1_abort" = 0 ] && login_ok app "$sd/db_app_password" && ! login_ok app "$(pend app)" &&
-  cmp -s "$sd/db_app_password" "$work/app.6" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ]
+  cmp -s "$sd/db_app_password" "$work/app.6" && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-62 SIGKILL while ALTER ROLE PASSWORD waits: the edge was already stopped (200 -> 000), status and url blocked; the abort waits for the old operation (no overlap), which rolls back and never commits; the abort then serves again" $? "before=$k_before during=$k1_edge rc=$(rc_of a-kill1) blocked=$k1_blocked alive=$k1_alive waited=$k1_waited/$i abort=$k1_abort"
 
 # Killed, and the old operation commits before a newer command runs: the
@@ -848,7 +1017,7 @@ k2_blocked=$(blocked_now a-kill2b && echo yes)
 rot a-kill2-finish app
 [ "$K_EDGE" = 000 ] && [ "$(rc_of a-kill2)" = 137 ] && [ "$k2_committed" = committed ] && [ "$k2_code" = 000 ] && [ "$k2_blocked" = yes ] &&
   [ "$(rc_of a-kill2-finish)" = 0 ] && login_ok app "$sd/db_app_password" && until_ready "$PA" 200 30 && no_leftovers &&
-  [ ! -e "$A/.runtime/security-gate" ]
+  [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-63 SIGKILL during a rotation whose password change commits later: no edge and blocked throughout; finishing the rotation serves again" $? "committed=$k2_committed code=$k2_code blocked=$k2_blocked"
 
 # Killed after the change committed, before it was verified: a rotation
@@ -891,7 +1060,7 @@ dv a-kill4-up "$A" up
 [ "$(rc_of a-kill3)" = 137 ] && [ "$k3_code" = 000 ] && [ "$k3_blocked" = yes ] && [ "$(rc_of a-kill3-finish)" = 0 ] &&
   [ "$(rc_of a-kill4)" = 137 ] && err_has a-kill4 'stopped the edge before changing the database' && [ "$k4_code" = 000 ] &&
   [ "$k4_blocked" = yes ] && [ "$k4_migrated" = 1 ] && [ "$(rc_of a-kill4-up)" = 0 ] && until_ready "$PA" 200 30 &&
-  [ ! -e "$A/.runtime/security-gate" ]
+  [ ! -e "$A/.runtime/gate/security-gate" ]
 v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $? "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated"
 
 # Recovery while PostgreSQL is temporarily unreachable: make up fails and
@@ -917,7 +1086,7 @@ k5_pending=$(login_ok app "$(pend app)" && echo committed)
 rot a-kill5-abort app '' rotate-db-password-abort
 [ "$(rc_of a-kill5)" = 137 ] && [ "$(rc_of a-kill5-up)" != 0 ] && [ "$k5_code" = 000 ] && [ "$k5_blocked" = yes ] &&
   [ "$i" -lt 400 ] && [ "$k5_up" = 0 ] && [ -z "$k5_pending" ] && [ "$(rc_of a-kill5-abort)" = 0 ] &&
-  until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/security-gate" ] && no_leftovers
+  until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && no_leftovers
 v "ST-65 after SIGKILL, recovery while PostgreSQL is paused fails and stays blocked; once reachable, make up ends the old operation (no commit) and serves" $? "up=$(rc_of a-kill5-up) code=$k5_code blocked=$k5_blocked up2=$k5_up pending=$k5_pending"
 
 dv a-up-rotated "$A" up
@@ -951,6 +1120,42 @@ live_code=$CODE
 get "$PA" /api/v1/system/status
 [ "$down503" = 0 ] && [ "$live_code" = 200 ] && [ "$CODE $TYPE" = '503 application/problem+json' ] && ! grep -qi 'sqlstate\|password\|db:5432' "$BODY"
 v "ST-19 database stopped: ready 503, live 200, API 503 problem without details" $?
+# The api stopped as well: the edge answers 502 itself (known limitation:
+# without X-Request-Id or the baseline headers, observability.md). Its access
+# record still has a request ID, and the error record Caddy writes for the
+# failed upstream is redacted like the access log: no query, no Referer
+# query, no CSRF token and no client-chosen X-Request-Id.
+api_id=$(cid "$A" api)
+docker stop "$api_id" >/dev/null
+spoof502=st19-spoofed-$(random_secret | cut -c1-12)
+get "$PA" '/api/v1/system/status?token=st19-query-secret' -H "X-Request-Id: $spoof502" -H 'X-CSRF-Token: st19-csrf-secret' \
+  -H 'Referer: https://crm.example.test/accounts?search=st19-referer-secret'
+code502=$CODE
+log502=$work/edge-502.log
+# The records of the 502 (Docker may deliver them a moment later).
+records502() {
+  docker logs "$(cid "$A" edge)" >"$log502" 2>&1
+  grep '^{' "$log502" | python3 -c 'import json, sys
+acc = err = 0
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("status") != 502 or d.get("request", {}).get("uri") != "/api/v1/system/status?[redacted]":
+        continue
+    if d.get("logger", "").startswith("http.log.access") and len(d.get("request_id", "")) == 36:
+        acc += 1
+    elif d.get("logger", "").startswith("http.log.error"):
+        err += 1
+print(acc, err)'
+}
+i=0
+until rec502=$(records502) && [ "$rec502" = '1 1' ] || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
+docker start "$api_id" >/dev/null
+[ "$code502" = 502 ] && [ "$rec502" = '1 1' ] && ! grep -qE "st19-(query|csrf|referer)-secret|$spoof502" "$log502"
+v "ST-19 api stopped: the edge's 502 is logged with its request ID; its error record is redacted like the access log (no query, CSRF token or client X-Request-Id)" $? \
+  "$code502, records (access with request_id, error): $rec502; leaked: $(grep -oE "st19-(query|csrf|referer)-secret|$spoof502" "$log502" | sort -u | tr '\n' ' ')"
 dv a-up3 "$A" up
 [ "$(rc_of a-up3)" = 0 ] && until_ready "$PA" 200 30
 v "ST-20 make up restarts the database and the stack is ready again" $?
@@ -1241,7 +1446,7 @@ holder_c_down
 wait "$retry"
 sleep 5
 [ "$ck_rc" = 137 ] && [ -n "$ck_old" ] && [ "$(rc_of c-kill-status)" = 1 ] && grep -q '^blocked: *upgrading the database roles' "$work/out/c-kill-status.out" &&
-  [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/security-gate" ]
+  [ "$(rc_of c-kill-url)" = 1 ] && [ "$i" -lt 400 ] && legacy_same && [ -e "$C/.runtime/gate/security-gate" ]
 v "ST-66 SIGKILL while ALTER TABLE OWNER waits: blocked (status, url); the next upgrade ends the old operation first and it never commits; the gate stays until an upgrade passes every check" $? "rc=$ck_rc old=$ck_old waited=$i"
 
 # The backup check requires an intact audit log once its migration is
