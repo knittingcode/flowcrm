@@ -8,6 +8,7 @@ use App\Tests\Support\Session\FastCgiResponse;
 use App\Tests\Support\Session\FastCgiTimeout;
 use App\Tests\Support\Session\FpmServer;
 use App\Tests\Support\Session\SeparateConnection;
+use App\Tests\Support\Session\SessionRows;
 use App\Tests\Support\TypedValues;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
@@ -66,7 +67,8 @@ final class FpmSessionTest extends KernelTestCase
     public function testStatelessRoutesNeverTouchTheSession(): void
     {
         $known = $this->idFrom(self::$fpm->request('POST', '/api/_test/session/increment'));
-        $before = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->db());
+        $before = $rows->count();
         $routes = ['/health/live' => 200, '/health/ready' => 200, '/api/v1/system/status' => 200, '/api/v1/does-not-exist' => 404];
 
         $holder = SeparateConnection::open();
@@ -85,13 +87,13 @@ final class FpmSessionTest extends KernelTestCase
         } finally {
             $holder->rollBack();
         }
-        self::assertSame($before, $this->sessionCount());
+        self::assertSame($before, $rows->count());
 
         // Reading an empty session starts it, but nothing is stored or sent.
         $response = self::$fpm->request('GET', '/api/_test/session');
         self::assertSame(['n' => null], $response->json());
         self::assertSame([], $response->header('Set-Cookie'));
-        self::assertSame($before, $this->sessionCount());
+        self::assertSame($before, $rows->count());
     }
 
     public function testANewSessionGetsAStrongIdAndASafeCookie(): void
@@ -357,11 +359,6 @@ final class FpmSessionTest extends KernelTestCase
         }
 
         return ['sess_lifetime' => self::int($row['sess_lifetime']), 'sess_time' => self::int($row['sess_time'])];
-    }
-
-    private function sessionCount(): int
-    {
-        return self::int($this->db()->fetchOne('SELECT count(*) FROM sessions'));
     }
 
     private function db(): Connection
