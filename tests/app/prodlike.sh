@@ -291,6 +291,32 @@ need "make a throwaway test certificate (openssl)" make_test_cert "$FLOWCRM_HTTP
   v "PL-22 behind the TLS edge the client IP is the browser's (security log pseudonym), not a forwarded address it sent; every cross-site logout was refused with 403" $? "browser $ip, cross-site logouts $forged (403: $forged_ok)"
 }
 
+# Last, as it stops the api: the production edge answers 502 itself (known
+# limitation, observability.md); its access record has a request ID and the
+# error record for the failed upstream is redacted like the access log.
+dc stop api >/dev/null 2>&1
+spoof=pl23-spoofed-$(random_secret | cut -c1-12)
+req '/api/v1/system/status?token=pl23-query-secret' -H "X-Request-Id: $spoof" -H 'X-CSRF-Token: pl23-csrf-secret'
+sleep 1
+edge_log=$(dc logs --no-color --no-log-prefix edge 2>&1)
+rec502=$(printf '%s\n' "$edge_log" | grep '^{' | python3 -c 'import json, sys
+acc = err = 0
+for line in sys.stdin:
+    try:
+        d = json.loads(line)
+    except ValueError:
+        continue
+    if d.get("status") != 502 or d.get("request", {}).get("uri") != "/api/v1/system/status?[redacted]":
+        continue
+    if d.get("logger", "").startswith("http.log.access") and len(d.get("request_id", "")) == 36:
+        acc += 1
+    elif d.get("logger", "").startswith("http.log.error"):
+        err += 1
+print(acc, err)')
+# req sends the request three times (status, headers, body).
+[ "$CODE" = 502 ] && [ "$rec502" = '3 3' ] && ! printf '%s\n' "$edge_log" | grep -qE "pl23-(query|csrf)-secret|$spoof"
+v "PL-23 api stopped: the edge's 502 is logged with its request ID; its error record is redacted like the access log" $? "$CODE, records (access with request_id, error): $rec502"
+
 docker_cleanup
 [ "$(project_resources "$project")" = 0 ]; v "CLEAN the production-like project left no containers, volumes or networks" $?
 
