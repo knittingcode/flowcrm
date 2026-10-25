@@ -27,8 +27,9 @@ downloaded on every run.
   decision, the affected path and an expiry no more than 90 days ahead, and
   it is listed in the table below. There are currently **no exceptions**.
   `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
-  rules on the file: one CVE or GHSA id per entry, no duplicate, `paths` or
-  `purls` without wildcards, a non-empty `statement`, a valid `expired_at`
+  rules on the file: one CVE or GHSA id per entry, no duplicate id and no
+  key twice in one entry, `paths` or `purls` with non-blank values and without
+  wildcards, a non-empty `statement`, a valid `expired_at`
   no more than 90 days after the day of the check, the id mentioned in this
   document, and only the documented form (any other section or key fails).
   Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.

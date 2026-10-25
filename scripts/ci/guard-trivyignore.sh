@@ -8,6 +8,8 @@
 #   - the affected package or path is named: "paths" or "purls" with at
 #     least one entry and no wildcard;
 #   - the evidence for the risk decision is given: a non-empty "statement";
+#   - no key appears twice in one entry (YAML parsers differ in which value
+#     of a repeated key they keep);
 #   - the decision is reviewed again: "expired_at" is a valid date no more
 #     than 90 days after today (Trivy stops applying an expired entry);
 #   - the entry is listed in docs/security/container-vulnerabilities.md.
@@ -86,8 +88,10 @@ report() { # line message [value]
 }
 
 id_re='^(CVE-[0-9]{4}-[0-9]{4,}|GHSA(-[23456789cfghjmpqrvwx]{4}){3})$'
-list_re='^\[[[:space:]]*"[^"]+"([[:space:]]*,[[:space:]]*"[^"]+")*[[:space:]]*\]$'
-state=start entries=0 entry_line=0 id='' targets='' statement='' expiry='' ids=' '
+# Quoted values with at least one character that is not blank.
+item='"[^"]*[^"[:space:]][^"]*"'
+list_re="^\\[[[:space:]]*$item([[:space:]]*,[[:space:]]*$item)*[[:space:]]*\\]$"
+state=start entries=0 entry_line=0 id='' targets='' statement='' expiry='' ids=' ' keys=' '
 
 # Checks the entry collected so far (called at the next entry and at the end).
 finish_entry() {
@@ -104,7 +108,7 @@ finish_entry() {
   if [ -n "$id" ] && ! grep -qF -- "$id" "$doc"; then
     report "$entry_line" "not listed in docs/security/container-vulnerabilities.md" "$id"
   fi
-  entry_line=0 id='' targets='' statement='' expiry=''
+  entry_line=0 id='' targets='' statement='' expiry='' keys=' '
 }
 
 line_no=0
@@ -138,10 +142,14 @@ while IFS= read -r line || [ -n "$line" ]; do
         ids="$ids$id "
       elif [ "$entry_line" -gt 0 ] && [[ $line =~ ^\ \ \ \ (paths|purls|statement|expired_at):\ (.*)$ ]]; then
         key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+        if [[ $keys == *" $key "* ]]; then
+          report "$line_no" "$key appears twice in this entry" "$id"
+        fi
+        keys="$keys$key "
         case $key in
           paths | purls)
             if [[ ! $value =~ $list_re ]]; then
-              report "$line_no" "$key must be a list of quoted, non-empty values" "$value"
+              report "$line_no" "$key must be a list of quoted, non-blank values" "$value"
             elif [[ $value == *[*?]* ]]; then
               report "$line_no" "$key must not contain wildcards" "$value"
             else
