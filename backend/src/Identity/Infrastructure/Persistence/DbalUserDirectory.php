@@ -6,6 +6,7 @@ namespace App\Identity\Infrastructure\Persistence;
 
 use App\Identity\Api\UserDirectory;
 use App\Identity\Api\UserProfile;
+use App\Identity\Domain\User;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Symfony\Component\Uid\Uuid;
@@ -39,6 +40,9 @@ final readonly class DbalUserDirectory implements UserDirectory
 
     public function idOfEmail(string $email): ?Uuid
     {
+        if (!User::canHoldEmail($email)) {
+            return null;
+        }
         $id = $this->connection->fetchOne('SELECT id FROM users WHERE lower(email) = lower(?)', [$email]);
 
         return \is_string($id) ? Uuid::fromString($id) : null;
