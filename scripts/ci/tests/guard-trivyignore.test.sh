@@ -25,16 +25,29 @@ pass=0
 fail=0
 case_no=0
 
-# expect <name> <expected-exit> <trivyignore content> [doc content]
-expect() {
-  local name=$1 want=$2 repo got
+# fixture <trivyignore content> [doc content]: a new repository in $repo.
+fixture() {
   case_no=$((case_no + 1))
   repo="$work/repo-$case_no"
   git init -q "$repo" || exit 2
   mkdir -p "$repo/security" "$repo/docs/security"
-  printf '%s' "$3" >"$repo/security/trivyignore.yaml"
-  printf '%s' "${4-$DOC}" >"$repo/docs/security/container-vulnerabilities.md"
-  run "$name" "$want" "$repo"
+  printf '%s' "$1" >"$repo/security/trivyignore.yaml"
+  printf '%s' "${2-$DOC}" >"$repo/docs/security/container-vulnerabilities.md"
+}
+
+# expect <name> <expected-exit> <trivyignore content> [doc content]
+expect() {
+  fixture "$3" ${4+"$4"}
+  run "$1" "$2" "$repo"
+}
+
+# expect_bytes <name> <expected-exit> <printf format of the trivyignore
+# content>: for bytes a shell string cannot hold (NUL).
+expect_bytes() {
+  fixture ''
+  # shellcheck disable=SC2059 # the format is the fixture
+  printf "$3" >"$repo/security/trivyignore.yaml"
+  run "$1" "$2" "$repo"
 }
 
 run() { # name expected-exit repo
@@ -103,6 +116,18 @@ expect "an entry hidden behind LS (U+2028) in a comment" 1 "vulnerabilities:${NL
 expect "one documented entry, CRLF line endings" 0 "vulnerabilities:"$'\r'"${NL}$(entry CVE-2026-0001 2026-12-01 | sed $'s/$/\r/')${NL}"
 expect "a statement with apostrophes and #" 0 \
   "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["a"]' "    statement: \"The binary isn't run (see #12).\"")${NL}"
+# Glob syntax of the path patterns (Trivy matches paths with doublestar):
+# besides * and ?, a character class or braces match other paths. Each was
+# applied by Trivy 0.67.2 while the guard reported OK.
+expect "a character class in paths (doublestar: [p] matches p)" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["[p]ackage-lock.json"]')${NL}"
+expect "a negated class in paths" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["[!x]ackage-lock.json"]')${NL}"
+# (in a variable: bash 3.2 brace-expands a quoted word inside "$(...)")
+braces='    paths: ["{package-lock.json,other}"]'
+expect "braces in paths (doublestar alternatives)" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 "$braces")${NL}"
+expect "a closing bracket alone in purls" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    purls: ["pkg:npm/a@1]"]')${NL}"
+# bash drops a NUL byte when it reads a line; Trivy refuses the file.
+expect_bytes "a NUL byte in a comment" 1 'vulnerabilities: []\n# a\000b\n'
+expect_bytes "a NUL byte in a statement" 1 'vulnerabilities:\n  - id: CVE-2026-0001\n    paths: ["a"]\n    statement: "wh\000y"\n    expired_at: 2026-12-01\n'
 expect "a different YAML style" 1 "vulnerabilities:${NL}- id: CVE-2026-0001${NL}  paths: [\"a\"]${NL}  statement: \"why\"${NL}  expired_at: 2026-12-01${NL}"
 mkdir -p "$work/nofile" && git init -q "$work/nofile" || exit 2
 run "missing exception file" 2 "$work/nofile"

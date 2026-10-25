@@ -6,13 +6,15 @@
 #   - one specific vulnerability per entry: id is CVE-<year>-<number> or a
 #     GHSA id, and no id appears twice;
 #   - the affected package or path is named: "paths" or "purls" with at
-#     least one entry and no wildcard;
+#     least one entry and no wildcard (Trivy matches paths as doublestar
+#     patterns, so * ? [ ] { } are all rejected);
 #   - the evidence for the risk decision is given: a non-empty "statement";
 #   - no key appears twice in one entry (YAML parsers differ in which value
 #     of a repeated key they keep);
 #   - the file is read the same way by this check and by YAML: printable
 #     ASCII only (YAML also breaks lines at CR, NEL and U+2028/U+2029, which
-#     could hide lines inside a comment or a value), and no backslash or
+#     could hide lines inside a comment or a value; bash drops or cuts at a
+#     NUL byte, so it is searched separately), and no backslash or
 #     inner double quote in a quoted value (an escape could add a wildcard
 #     or continue the value over the next lines);
 #   - the decision is reviewed again: "expired_at" is a valid date no more
@@ -117,6 +119,11 @@ finish_entry() {
   entry_line=0 id='' targets='' statement='' expiry='' keys=' '
 }
 
+# bash's read drops a NUL byte (or ends the line at it), so the loop below
+# cannot see one; report the line of the first NUL byte.
+nul_line=$(od -An -v -tu1 "$file" | awk '{ for (i = 1; i <= NF; i++) { if ($i == 10) n++; else if ($i == 0) { print n + 1; exit } } }')
+[ -z "$nul_line" ] || report "$nul_line" "only printable ASCII is accepted (NUL byte)"
+
 line_no=0
 while IFS= read -r line || [ -n "$line" ]; do
   line_no=$((line_no + 1))
@@ -160,7 +167,7 @@ while IFS= read -r line || [ -n "$line" ]; do
           paths | purls)
             if [[ ! $value =~ $list_re ]]; then
               report "$line_no" "$key must be a list of quoted, non-blank values without backslash" "$value"
-            elif [[ $value == *[*?]* ]]; then
+            elif inner=${value#\[} inner=${inner%\]} && [[ $inner == *[][*?{}]* ]]; then
               report "$line_no" "$key must not contain wildcards" "$value"
             else
               targets=yes

@@ -29,12 +29,14 @@ downloaded on every run.
   `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
   rules on the file: one CVE or GHSA id per entry, no duplicate id and no
   key twice in one entry, `paths` or `purls` with non-blank values and without
-  wildcards, a non-empty `statement`, a valid `expired_at`
+  wildcards (Trivy matches `paths` as glob patterns, so `*`, `?`, `[`, `]`,
+  `{` and `}` are all rejected), a non-empty `statement`, a valid `expired_at`
   no more than 90 days after the day of the check, the id mentioned in this
   document, and only the documented form (any other section or key fails).
   So that the check reads the file exactly as Trivy's YAML parser does, it
   accepts printable ASCII only (YAML also breaks lines at CR, NEL and
-  U+2028, which could hide an entry inside a comment) and no backslash or
+  U+2028, which could hide an entry inside a comment; a NUL byte, which the
+  shell would drop, is rejected too) and no backslash or
   inner double quote in a quoted value (an escape could add a wildcard or
   continue the statement over `expired_at`).
   Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
