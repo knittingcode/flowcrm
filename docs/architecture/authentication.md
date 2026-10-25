@@ -66,10 +66,13 @@ Every API response has `Cache-Control: no-store` and `Vary: Cookie`.
   address, no organization or role.
 - **When a session ends:** logout (row deleted, cookie expired); 30 minutes
   without a request; 8 hours after the login
-  (`FLOWCRM_SESSION_ABSOLUTE_LIFETIME`, seconds); on the next request after
-  the user was disabled or removed or the password changed elsewhere. The
-  firewall then drops the token and `SessionEndListener` invalidates the
-  whole session.
+  (`FLOWCRM_SESSION_ABSOLUTE_LIFETIME`, seconds); at once when the operator
+  disables the user (`flowcrm:user:disable` deletes every session row of
+  the user in the same transaction, and `flowcrm:user:enable` deletes them
+  again, so a session stored by a login that was in flight during the
+  disable is not revived either); on the next request after the user was disabled or removed or the
+  password changed elsewhere. The firewall then drops the token and
+  `SessionEndListener` invalidates the whole session.
 - **Password change** (`POST /api/v1/me/password`): needs the current
   password; this session gets a new ID and stays logged in, every other
   session of the user ends. Wrong current passwords: 5 per user per 15
@@ -131,6 +134,16 @@ points (circled letters such as `Ⓐ`, for example) the key folds and `lower()`
 does not; those spellings share an account's windows without loading it,
 which only makes the limit stricter. The check must be repeated if the
 locale, the collation provider, the C library or PHP's Unicode tables change.
+
+A NUL byte never reaches PostgreSQL: the driver (`pdo_pgsql`) passes bound
+strings as C strings and cuts them at the first NUL, so
+`ada@example.test\u0000anything` would load Ada's account while the limits
+key the whole string, a fresh set of windows for every suffix. An address
+with a NUL byte, or one that is not UTF-8, therefore matches no account
+before any query (`User::canHoldEmail`, used by every e-mail lookup and by
+user creation): the login is the ordinary 401 `invalid-credentials` of an
+unknown account (same hashing cost), and operator commands treat it as an
+unknown user.
 
 A successful login clears only the account-and-IP window. The state is in
 `cache_items` (pool `cache.rate_limits`) under HMAC keys; PostgreSQL
@@ -292,7 +305,10 @@ $ docker exec -it "$api" php bin/console flowcrm:user:enable ada@example.test
 
 Every change is audited with the actor `platform_operator`. A password
 reset by the operator is the account recovery without e-mail (FCRM-002
-OQ-10); it ends every session of the user.
+OQ-10); it ends every session of the user. Disabling a user deletes every
+session of the user at once; enabling the user deletes them again (none
+can be valid, but a login in flight during the disable may have stored
+one), so enabling restores no session.
 
 ## Audit events and security log
 
@@ -356,15 +372,15 @@ time-based retention) before any real personal data is processed.
 
 | Where | What |
 |---|---|
-| `backend/tests/Integration/Security/AuthenticationTest` | login answer and cookie, fixation (existing and planted IDs), identical failures, case-insensitive e-mail, anonymous introspection and 401s without a stored session or cookie (also with an unknown session ID), logout and replay (AC-27), logout CSRF, absolute and idle expiry, invalidation by disable, operator reset and own password change, no credentials or tenant in the session, hash upgrade, token rotation |
+| `backend/tests/Integration/Security/AuthenticationTest` | login answer and cookie, fixation (existing and planted IDs), identical failures, case-insensitive e-mail, anonymous introspection and 401s without a stored session or cookie (also with an unknown session ID), logout and replay (AC-27), logout CSRF, absolute and idle expiry, invalidation by disable (rows deleted at once, none restored by enabling again, also not one stored after the disable, other users' sessions kept), operator reset and own password change, no credentials or tenant in the session, hash upgrade, token rotation |
 | `RequestForgeryTest` | eight foreign-origin variants refused before authentication and with a valid token (with the request ID), Referer fallback, token missing, empty, forged or of another session, safe methods, form and text bodies (415), anonymous unsafe requests (401), malformed JSON |
 | `ApiRateLimitTest` | the 601st request in a minute is a 429 with `Retry-After`; per user; the session probe and logout stay available; login, public routes, anonymous and refused requests are not counted |
-| `LoginThrottlingTest` | the three limits, unknown accounts alike, case-insensitive accounts (including Unicode spellings that the lookup folds together), reset of the account-and-IP window only, keyed by the forwarded client IP, throttle before the password check |
+| `LoginThrottlingTest` | the three limits, unknown accounts alike, case-insensitive accounts (including Unicode spellings that the lookup folds together), an address with a NUL byte matches no account (even the right password is a 401), reset of the account-and-IP window only, keyed by the forwarded client IP, throttle before the password check |
 | `TenantAuthorizationTest` | anonymous 401, foreign organization identical to an unknown one, no memberships, the role in the answer, e-mail by permission, a user in two organizations, IDOR with guessed and malformed IDs, client-supplied organization IDs, removal and demotion on the next request, pagination |
 | `RouteSecurityTest` | every tenant route has the UUID requirement and exactly one permission; every API route outside the public list needs a login; `/health` is outside the firewall; the specification matches the routes |
-| `AuditTrailTest`, `SecurityLoggingTest`, `ProvisioningCommandTest`, `SecurityConfigurationTest` | audit events without secrets or IP, none for failures; with the audit table failing (a test trigger): no login, no password or operator change, but the logout still ends the session; security log with pseudonyms and the request ID of the answer; console input rules; production hasher, lifetime, limits and trusted headers |
+| `AuditTrailTest`, `SecurityLoggingTest`, `ProvisioningCommandTest`, `SecurityConfigurationTest` | audit events without secrets or IP, none for failures; with the audit table failing (a test trigger): no login, no password or operator change, but the logout still ends the session; security log with pseudonyms and the request ID of the answer; console input rules (an address with a NUL byte or invalid UTF-8 names no user); production hasher, lifetime, limits and trusted headers |
 | Unit tests | `SecurityUser`, `PasswordPolicy`, `UserProvider` (one hash for unknown e-mails), `LoginRateLimiter`, `RolePolicy` (the matrix as data), `TenantPermissionVoter`, `TenantGuard`, `RequestOriginGuard`, `JsonBody`, `Pagination`, problem documents |
-| `tests/app/backend.sh` BE-18 | 38 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
+| `tests/app/backend.sh` BE-18 | 43 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
 | `tests/app/stack.sh` ST-69 to ST-73, ST-16 | through the real edge: cookie attributes, logout with token and replay, cross-origin and form logins, spoofed `X-Forwarded-For` cannot evade the limit, no secrets in any log; Playwright journeys (login, logout, back button, roles, two organizations, foreign organization, CSRF) |
 | `tests/app/prodlike.sh` PL-16, PL-11 | the production cookie (`__Host-`, `Secure`) with curl; the login page under the production CSP |
 | `tests/app/prodlike.sh` PL-17 to PL-22, `frontend/e2e/https.spec.ts` | over HTTPS (see [HTTPS](#https-and-proxies)): the TLS site, spoofed forwarding headers, no CORS, an untrusted TLS proxy fails closed, the cookie and the logged-in journeys in Chromium, cross-site forgeries, the client IP behind the edge |
