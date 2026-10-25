@@ -63,6 +63,31 @@ final class ProvisioningCommandTest extends KernelTestCase
         self::assertSame($users, $this->db()->fetchOne('SELECT count(*) FROM users'));
     }
 
+    /**
+     * A NUL byte never reaches PostgreSQL (pdo_pgsql would cut the bound
+     * string there): an address with one, or one that is not UTF-8, names no
+     * user, so no command acts on the user whose address it starts with.
+     */
+    public function testAnAddressWithANulByteOrInvalidUtf8NamesNoUser(): void
+    {
+        $email = 'nul-'.bin2hex(random_bytes(4)).'@example.test';
+        $organization = 'Nul '.bin2hex(random_bytes(4)).' Ltd';
+        $this->command('flowcrm:user:create', ['--email' => $email, '--display-name' => 'Nul'], 'a sufficiently long one');
+        $before = $this->db()->fetchAssociative('SELECT password_hash, disabled_at FROM users WHERE email = ?', [$email]);
+        $users = $this->db()->fetchOne('SELECT count(*) FROM users');
+
+        foreach ([$email."\0", $email."\0x", "\xff".$email] as $spelling) {
+            self::assertNotSame(Command::SUCCESS, $this->command('flowcrm:user:reset-password', ['email' => $spelling], 'another long passphrase')->getStatusCode());
+            self::assertNotSame(Command::SUCCESS, $this->command('flowcrm:user:disable', ['email' => $spelling])->getStatusCode());
+            self::assertNotSame(Command::SUCCESS, $this->command('flowcrm:organization:create', ['--name' => $organization, '--admin-email' => $spelling])->getStatusCode());
+            self::assertNotSame(Command::SUCCESS, $this->command('flowcrm:user:create', ['--email' => $spelling, '--display-name' => 'Other'], 'a sufficiently long one')->getStatusCode());
+        }
+
+        self::assertSame($before, $this->db()->fetchAssociative('SELECT password_hash, disabled_at FROM users WHERE email = ?', [$email]), 'the user is unchanged');
+        self::assertSame($users, $this->db()->fetchOne('SELECT count(*) FROM users'));
+        self::assertFalse($this->db()->fetchOne('SELECT 1 FROM organizations WHERE name = ?', [$organization]), 'no organization created');
+    }
+
     public function testAMembershipIsAddedOnceWithItsRole(): void
     {
         $admin = 'admin-'.bin2hex(random_bytes(4)).'@example.test';
