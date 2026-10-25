@@ -32,6 +32,11 @@ downloaded on every run.
   wildcards, a non-empty `statement`, a valid `expired_at`
   no more than 90 days after the day of the check, the id mentioned in this
   document, and only the documented form (any other section or key fails).
+  So that the check reads the file exactly as Trivy's YAML parser does, it
+  accepts printable ASCII only (YAML also breaks lines at CR, NEL and
+  U+2028, which could hide an entry inside a comment) and no backslash or
+  inner double quote in a quoted value (an escape could add a wildcard or
+  continue the statement over `expired_at`).
   Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
 - A control scan of the unmodified PostgreSQL base image (with its `gosu`)
   must fail; it proves the gate is not passing vacuously.

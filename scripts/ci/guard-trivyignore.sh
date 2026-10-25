@@ -10,6 +10,11 @@
 #   - the evidence for the risk decision is given: a non-empty "statement";
 #   - no key appears twice in one entry (YAML parsers differ in which value
 #     of a repeated key they keep);
+#   - the file is read the same way by this check and by YAML: printable
+#     ASCII only (YAML also breaks lines at CR, NEL and U+2028/U+2029, which
+#     could hide lines inside a comment or a value), and no backslash or
+#     inner double quote in a quoted value (an escape could add a wildcard
+#     or continue the value over the next lines);
 #   - the decision is reviewed again: "expired_at" is a valid date no more
 #     than 90 days after today (Trivy stops applying an expired entry);
 #   - the entry is listed in docs/security/container-vulnerabilities.md.
@@ -88,8 +93,9 @@ report() { # line message [value]
 }
 
 id_re='^(CVE-[0-9]{4}-[0-9]{4,}|GHSA(-[23456789cfghjmpqrvwx]{4}){3})$'
-# Quoted values with at least one character that is not blank.
-item='"[^"]*[^"[:space:]][^"]*"'
+# Quoted values with at least one character that is not blank, and without
+# backslash (YAML escapes) or inner double quote.
+item='"[^"\\]*[^"\\[:space:]][^"\\]*"'
 list_re="^\\[[[:space:]]*$item([[:space:]]*,[[:space:]]*$item)*[[:space:]]*\\]$"
 state=start entries=0 entry_line=0 id='' targets='' statement='' expiry='' ids=' ' keys=' '
 
@@ -115,6 +121,10 @@ line_no=0
 while IFS= read -r line || [ -n "$line" ]; do
   line_no=$((line_no + 1))
   line=${line%$'\r'}
+  if [[ $line == *[![:print:]]* ]]; then
+    report "$line_no" "only printable ASCII is accepted (YAML may read a control or non-ASCII character as a line break)" "$line"
+    continue
+  fi
   [[ $line =~ ^[[:space:]]*(#.*)?$ ]] && continue
   case $state in
     start)
@@ -149,7 +159,7 @@ while IFS= read -r line || [ -n "$line" ]; do
         case $key in
           paths | purls)
             if [[ ! $value =~ $list_re ]]; then
-              report "$line_no" "$key must be a list of quoted, non-blank values" "$value"
+              report "$line_no" "$key must be a list of quoted, non-blank values without backslash" "$value"
             elif [[ $value == *[*?]* ]]; then
               report "$line_no" "$key must not contain wildcards" "$value"
             else
@@ -157,8 +167,8 @@ while IFS= read -r line || [ -n "$line" ]; do
             fi
             ;;
           statement)
-            if [[ $value =~ ^\"[[:space:]]*\"$ ]] || [[ ! $value =~ ^\".+\"$ ]]; then
-              report "$line_no" "statement must be a non-empty quoted text" "$value"
+            if [[ ! $value =~ ^$item$ ]]; then
+              report "$line_no" "statement must be a non-empty quoted text without backslash or inner double quote" "$value"
             else
               statement=yes
             fi

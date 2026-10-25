@@ -86,6 +86,23 @@ expect "unknown key in an entry" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2
 expect "another top-level section" 1 "vulnerabilities: []${NL}misconfigurations:${NL}  - id: AVD-DS-0001${NL}"
 expect "section without entries" 1 "vulnerabilities:${NL}"
 expect "no section at all" 1 "# only comments${NL}"
+# Content that YAML reads differently from the line-based check: escapes
+# inside double quotes, and characters that YAML treats as line breaks
+# (CR, NEL U+0085, LS U+2028) hiding lines inside what the check sees as a
+# comment or a value. Each was applied by Trivy 0.67.2 while the guard
+# reported OK.
+expect "an escaped quote continues the statement over expired_at (YAML: no expiry)" 1 \
+  "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["a"]' '    statement: "why\"')${NL}    # \"${NL}"
+expect "an escaped wildcard in paths (YAML: \\x2a is *)" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["\x2a"]')${NL}"
+expect "an escape in purls" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    purls: ["pkg:npm/a@1\u002a"]')${NL}"
+expect "an entry hidden behind a CR in a comment" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}# note"$'\r'"  - id: CVE-2026-0002${NL}"
+expect "an entry hidden behind a CR in a statement" 1 \
+  "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["a"]' '    statement: "why" #'$'\r''  - id: CVE-2026-0002 #"')${NL}"
+expect "an entry hidden behind NEL (U+0085) in a comment" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}# note"$'\xc2\x85'"  - id: CVE-2026-0002${NL}"
+expect "an entry hidden behind LS (U+2028) in a comment" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}# note"$'\xe2\x80\xa8'"  - id: CVE-2026-0002${NL}"
+expect "one documented entry, CRLF line endings" 0 "vulnerabilities:"$'\r'"${NL}$(entry CVE-2026-0001 2026-12-01 | sed $'s/$/\r/')${NL}"
+expect "a statement with apostrophes and #" 0 \
+  "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["a"]' "    statement: \"The binary isn't run (see #12).\"")${NL}"
 expect "a different YAML style" 1 "vulnerabilities:${NL}- id: CVE-2026-0001${NL}  paths: [\"a\"]${NL}  statement: \"why\"${NL}  expired_at: 2026-12-01${NL}"
 mkdir -p "$work/nofile" && git init -q "$work/nofile" || exit 2
 run "missing exception file" 2 "$work/nofile"
