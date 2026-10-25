@@ -27,6 +27,7 @@ final readonly class ManageUsers
         private Transaction $transaction,
         private AuditTrail $audit,
         private ClockInterface $clock,
+        private UserSessions $sessions,
     ) {
     }
 
@@ -70,7 +71,8 @@ final readonly class ManageUsers
     }
 
     /**
-     * Every session of the user ends on its next request, and login fails.
+     * Every session of the user ends at once (enabling the user again brings
+     * none back), and login fails.
      *
      * @throws UserNotFound
      */
@@ -80,17 +82,26 @@ final readonly class ManageUsers
 
         $this->transaction->run(function () use ($user): void {
             $user->disable($this->clock->now());
+            $this->sessions->endAll($user->id());
             $this->audit->record(new AuditRecord('user.disabled', 'user', $user->id(), Actor::operator()));
         });
     }
 
-    /** @throws UserNotFound */
+    /**
+     * The user can log in again. Every stored session of the user ends too:
+     * none can be valid (a disabled user cannot log in), but a login that was
+     * in flight during the disable may have stored one after its rows were
+     * deleted, and enabling must not bring it back.
+     *
+     * @throws UserNotFound
+     */
     public function enable(string $email): void
     {
         $user = $this->users->ofEmail($email) ?? throw new UserNotFound();
 
         $this->transaction->run(function () use ($user): void {
             $user->enable();
+            $this->sessions->endAll($user->id());
             $this->audit->record(new AuditRecord('user.enabled', 'user', $user->id(), Actor::operator()));
         });
     }
