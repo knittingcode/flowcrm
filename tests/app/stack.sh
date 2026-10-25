@@ -589,10 +589,19 @@ rot() { # label role [fault] [command]
   (cd "$A" && ROLE=$2 FLOWCRM_DEVENV_FAULT=${3-} ./bin/devenv "${4:-rotate-db-password}") >"$work/out/$1.out" 2>"$work/out/$1.err"
   echo $? >"$work/out/$1.rc"
 }
-login_ok() { # role password-file: SCRAM login as flowcrm_<role>
-  [ -s "$2" ] && docker exec -e PGPASSWORD="$(cat "$2")" "$(cid "$A" db)" \
-    sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>/dev/null | grep -qx 1
+# "ok" when the login returned the row (a line "1" on stdout, whatever psql
+# wrote to stderr), "no-file" for a missing or empty file, otherwise the
+# last line psql or docker reported (never a password), for diagnostics.
+login_result() { # role password-file
+  local out msg
+  [ -s "$2" ] || { echo "no-file"; return; }
+  out=$(docker exec -e PGPASSWORD="$(cat "$2")" "$(cid "$A" db)" \
+    sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>"$work/out/login.err")
+  if printf '%s\n' "$out" | grep -qx 1; then echo ok; return; fi
+  msg=$({ cat "$work/out/login.err"; printf '%s\n' "$out"; } | sed '/^[[:space:]]*$/d' | tail -n 1 | cut -c1-160)
+  printf '%s\n' "${msg:-no-output}"
 }
+login_ok() { [ "$(login_result "$1" "$2")" = ok ]; } # role password-file: SCRAM login as flowcrm_<role>
 no_leftovers() { [ -z "$(find "$sd" -name '.*' -type f ! -name '.db_*_password.pending')" ]; }
 pend() { printf '%s/.db_%s_password.pending' "$sd" "$1"; }
 # Diagnostics for a failed check, never a secret value: container identity
@@ -658,10 +667,17 @@ say "      INFO  a running container saw a secret file replaced on the host as: 
 cp -p "$sd/db_owner_password" "$work/owner.0"
 rot a-rot4 owner rotate-after-db
 rot a-rot4b owner
+# Every condition is evaluated and reported, so a failure says which one.
+r4_new=$(login_result owner "$sd/db_owner_password")
+r4_old=$(login_result owner "$work/owner.0")
+r4_migrate=$(owner_console_in "$A" doctrine:migrations:up-to-date && echo ok || echo "failed: $(tail -n 2 "$work/out/console.log" | tr '\n' ' ' | cut -c1-200)")
+r4_left=$(find "$sd" -name '.*' -type f ! -name '.db_*_password.pending' -exec basename {} \; | tr '\n' ' ')
 [ "$(rc_of a-rot4)" = 143 ] && [ "$(rc_of a-rot4b)" = 0 ] && [ ! -e "$(pend owner)" ] &&
-  login_ok owner "$sd/db_owner_password" && ! login_ok owner "$work/owner.0" &&
-  owner_console_in "$A" doctrine:migrations:up-to-date && no_leftovers
-v "ST-50 owner rotation interrupted after the database change and resumed: the migrate job logs in with the new password, the old one is refused" $? "$(tail -n 2 "$work/out/a-rot4b.err")"
+  [ "$r4_new" = ok ] && [ "$r4_old" != ok ] && [ "$r4_old" != no-file ] && [ "$r4_migrate" = ok ] && [ -z "$r4_left" ]
+r4=$?
+v "ST-50 owner rotation interrupted after the database change and resumed: the migrate job logs in with the new password, the old one is refused" $r4 \
+  "rc=$(rc_of a-rot4)/$(rc_of a-rot4b) pending=$([ -e "$(pend owner)" ] && echo left || echo none) new=$r4_new old=$r4_old migrate=$r4_migrate leftovers=${r4_left:-none} $(lifecycle)"
+[ "$r4" = 0 ] || { show_err a-rot4; show_err a-rot4b; }
 
 # Repeated rotations, and a failed recreation of the api (it does not get
 # healthy): the rotation reports it; after the cause is fixed, make up serves.
@@ -1061,7 +1077,9 @@ dv a-kill4-up "$A" up
   [ "$(rc_of a-kill4)" = 137 ] && err_has a-kill4 'stopped the edge before changing the database' && [ "$k4_code" = 000 ] &&
   [ "$k4_blocked" = yes ] && [ "$k4_migrated" = 1 ] && [ "$(rc_of a-kill4-up)" = 0 ] && until_ready "$PA" 200 30 &&
   [ ! -e "$A/.runtime/gate/security-gate" ]
-v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $? "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated"
+r64=$?
+v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $r64 "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked finish=$(rc_of a-kill3-finish) up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated recovery=$(rc_of a-kill4-up)"
+[ "$r64" = 0 ] || { show_err a-kill3-finish; show_err a-kill4; show_err a-kill4-up; }
 
 # Recovery while PostgreSQL is temporarily unreachable: make up fails and
 # the stack stays blocked; once the database is back, make up ends the old
