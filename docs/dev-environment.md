@@ -121,9 +121,9 @@ containers are handled exactly as by any `make up`. The edge comes back on
 the same port (if another program took the port in the meantime, the next
 free one is used and the printed URL shows it). The edge image is rebuilt
 first, while the old edge still serves; the UI and API are unavailable
-only while the container is replaced (under one second in a test of this
-upgrade, nothing answering on the port in between). Later runs report
-`already running`.
+only while the container is replaced (about one second, 0.5 to 1.2 s in
+tests of this upgrade, with no answer on the port in between). Later runs
+report `already running`.
 
 ## Commands
 
