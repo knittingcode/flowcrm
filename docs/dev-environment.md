@@ -365,6 +365,9 @@ Keep backups outside the checkout and outside any Docker volume, readable
 only by you; they contain all application data. The commands below run in
 the checkout directory unless said otherwise; database commands run as the
 superuser `flowcrm` inside the `db` container (local socket, no password).
+Run all steps in one shell: they share the variables `src`, `backups`,
+`ts` and the function `fingerprint`. In a new shell, define them again
+(step 1) and set `ts` to the timestamp in the backup's file name.
 
 ### 1. Name the project and define the check
 
@@ -463,9 +466,22 @@ $ cd - && git worktree remove --force ../flowcrm-restore-check
 
 ### 4. Switch: restore into the project you work with
 
-Only after a rehearsal of the same backup passed. First take a new logical
-dump of the current state (step 2a, it is your way back), then restore and
-verify exactly as in the rehearsal, in the original checkout:
+Only after a rehearsal of the same backup passed. `ts` must still name
+that rehearsed backup (`echo "$ts"`; in a new shell set it from the file
+name). In the original checkout, first take a dump of the current state
+under a name of its own, so it cannot replace the backup you are about to
+restore; it is your way back:
+
+```console
+$ echo "$ts"                       # the rehearsed backup: $backups/flowcrm-$ts.dump
+$ pre=$(date -u +%Y%m%dT%H%M%SZ)
+$ fingerprint "$src" >"$backups/flowcrm-before-restore-$pre.fingerprint"
+$ docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$src" --filter label=com.docker.compose.service=db)" \
+    pg_dump -U flowcrm -d flowcrm -Fc >"$backups/flowcrm-before-restore-$pre.dump"
+```
+
+Then restore the rehearsed backup and verify it exactly as in the
+rehearsal:
 
 ```console
 $ docker exec -i "$(docker ps -q --filter "label=com.docker.compose.project=$src" --filter label=com.docker.compose.service=db)" \
@@ -474,13 +490,16 @@ $ make up
 $ fingerprint "$src" | diff "$backups/flowcrm-$ts.fingerprint" - && echo identical
 ```
 
+To go back, restore `flowcrm-before-restore-$pre.dump` the same way and
+compare with its fingerprint.
+
 `--single-transaction` makes the restore all or nothing. Requests that
 arrive during it may fail; sessions in the restored data are those of the
 backup. To switch to a volume archive instead, stop the stack
 (`make down`), restore `.runtime/secrets` from the archived copy and the
 volume as in step 3 (remove the old volume first:
-`docker volume rm "${src}_db-data"`, only after the new dump of step 2a
-exists and a rehearsal of the archive passed), then `make up`.
+`docker volume rm "${src}_db-data"`, only after the dump of the current
+state above exists and a rehearsal of the archive passed), then `make up`.
 
 ## Image pinning
 
