@@ -45,7 +45,7 @@ class User
 
     public function __construct(Uuid $id, string $email, string $passwordHash, string $displayName, \DateTimeImmutable $createdAt)
     {
-        if ('' === $email || mb_strlen($email) > self::MAX_EMAIL_LENGTH || 1 !== preg_match('/^[^@\s]+@[^@\s]+$/', $email)) {
+        if (!self::canHoldEmail($email) || '' === $email || mb_strlen($email) > self::MAX_EMAIL_LENGTH || 1 !== preg_match('/^[^@\s]+@[^@\s]+$/', $email)) {
             throw new \InvalidArgumentException('Invalid e-mail address.');
         }
         if ('' === $passwordHash) {
@@ -60,6 +60,17 @@ class User
         $this->passwordHash = $passwordHash;
         $this->displayName = $displayName;
         $this->createdAt = $createdAt;
+    }
+
+    /**
+     * Whether a string can be an e-mail address of a user at all: UTF-8
+     * without a NUL byte. Lookups treat any other string as matching no user
+     * and never send it to PostgreSQL, whose driver (pdo_pgsql) cuts a bound
+     * string at its first NUL byte and would match another address (ADR-019).
+     */
+    public static function canHoldEmail(string $email): bool
+    {
+        return !str_contains($email, "\0") && mb_check_encoding($email, 'UTF-8');
     }
 
     /**
