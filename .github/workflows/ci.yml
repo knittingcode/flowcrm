@@ -37,12 +37,19 @@ jobs:
       - name: Run Dockerfile frontend guard regression tests
         run: scripts/ci/tests/guard-dockerfile-frontend.test.sh
 
+      - name: Check the container scan exceptions against their policy
+        run: scripts/ci/guard-trivyignore.sh
+
+      - name: Run container scan exception guard regression tests
+        run: scripts/ci/tests/guard-trivyignore.test.sh
+
       - name: ShellCheck
         run: >-
           docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
           koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
           scripts/ci/guard-tracked-files.sh scripts/ci/tests/guard-tracked-files.test.sh
           scripts/ci/guard-dockerfile-frontend.sh scripts/ci/tests/guard-dockerfile-frontend.test.sh
+          scripts/ci/guard-trivyignore.sh scripts/ci/tests/guard-trivyignore.test.sh
 
       - name: actionlint
         run: >-
