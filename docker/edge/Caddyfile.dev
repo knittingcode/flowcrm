@@ -1,12 +1,18 @@
 # Development edge: /api and /health/{live,ready} go to PHP-FPM; everything
 # else, including the Vite HMR WebSocket, goes to the Vite dev server.
+import /etc/caddy/common.caddy
+
 {
 	admin off
 	auto_https off
 	persist_config off
+	# Error records (a request the edge could not complete) are redacted like
+	# the access log (common.caddy).
+	log default {
+		output stderr
+		import redacted_json
+	}
 }
-
-import /etc/caddy/common.caddy
 
 :8080 {
 	import baseline

@@ -8,6 +8,7 @@ use App\Tests\Support\Database\TestDatabase;
 use App\Tests\Support\Http\FpmApiTestCase;
 use App\Tests\Support\Security\Fixtures;
 use App\Tests\Support\Security\TestUser;
+use App\Tests\Support\Session\SessionRows;
 use Symfony\Component\Uid\Uuid;
 
 /**
@@ -111,7 +112,8 @@ final class AuditTrailTest extends FpmApiTestCase
     public function testALoginWhoseAuditEventCannotBeWrittenFails(): void
     {
         $user = $this->fixtures->user('audit-down-login');
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
         $client = $this->client();
 
         $response = $this->whileAuditFailsFor($user, static fn () => $client->post('/api/v1/auth/login', ['email' => $user->email, 'password' => $user->password]));
@@ -120,7 +122,7 @@ final class AuditTrailTest extends FpmApiTestCase
         self::assertSame($response->header('X-Request-Id'), $response->value('requestId'));
         self::assertArrayNotHasKey('csrfToken', $response->json());
         self::assertSame(401, $client->get('/api/v1/me')->status(), 'whatever cookie the client kept does not authenticate');
-        self::assertSame($sessions, $this->sessionCount(), 'no session is stored');
+        self::assertSame($sessions, $rows->count(), 'no session is stored');
         self::assertSame([], $this->events($user->id));
         $this->client()->login($user->email, $user->password);
     }
@@ -273,11 +275,6 @@ final class AuditTrailTest extends FpmApiTestCase
         $this->fixtures = Fixtures::from(self::getContainer());
 
         return $status;
-    }
-
-    private function sessionCount(): int
-    {
-        return self::int($this->fixtures->connection()->fetchOne('SELECT count(*) FROM sessions'));
     }
 
     /** @return list<array<string, mixed>> */
