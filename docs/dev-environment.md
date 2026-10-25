@@ -397,10 +397,19 @@ $ fingerprint "$src" >"$backups/flowcrm-$ts.fingerprint"
 $ docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$src" --filter label=com.docker.compose.service=db)" \
     pg_dump -U flowcrm -d flowcrm -Fc >"$backups/flowcrm-$ts.dump"
 $ fingerprint "$src" | diff "$backups/flowcrm-$ts.fingerprint" - && echo unchanged
+$ (cd "$backups" && shasum -a 256 "flowcrm-$ts.dump" >"flowcrm-$ts.dump.sha256")
 ```
 
 `pg_dump` reads one consistent snapshot. If the second fingerprint differs
 (the stack was used meanwhile), take the dump again.
+
+The `.sha256` file records the SHA-256 checksum of the backup under its
+bare file name, so the backup directory can be moved or copied as a whole.
+`shasum -c` resolves that name in the current directory, so every check
+below runs it in `$backups` (in a subshell, from any directory):
+`(cd "$backups" && shasum -a 256 -c "<file>.sha256")` prints `<file>: OK`
+and exits 0, or names the file as `FAILED` and exits 1. `sha256sum` and
+`sha256sum -c` work the same way.
 
 ### 2b. Or take a volume archive
 
@@ -413,6 +422,7 @@ $ make down
 $ docker run --rm --network none -v "${src}_db-data:/data:ro" -v "$backups:/backup" \
     busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e \
     tar -C /data -cf "/backup/flowcrm-volume-$ts.tar" .
+$ (cd "$backups" && shasum -a 256 "flowcrm-volume-$ts.tar" >"flowcrm-volume-$ts.tar.sha256")
 $ cp -Rp .runtime/secrets "$backups/flowcrm-volume-$ts.secrets"
 $ make up
 ```
@@ -434,6 +444,7 @@ database with its own secrets), restore the dump over it, then let
 `make up` check the roles, the migrations and the runtime privileges:
 
 ```console
+$ (cd "$backups" && shasum -a 256 -c "flowcrm-$ts.dump.sha256")
 $ make up
 $ docker exec -i "$(docker ps -q --filter "label=com.docker.compose.project=$chk" --filter label=com.docker.compose.service=db)" \
     pg_restore -U flowcrm -d flowcrm --clean --if-exists --single-transaction --exit-on-error <"$backups/flowcrm-$ts.dump"
@@ -445,6 +456,7 @@ For a **volume archive**: give the new project the archived secrets and a
 volume with the archived files before its first start:
 
 ```console
+$ (cd "$backups" && shasum -a 256 -c "flowcrm-volume-$ts.tar.sha256")
 $ mkdir -p -m 755 .runtime && cp -Rp "$backups/flowcrm-volume-$ts.secrets" .runtime/secrets
 $ docker volume create --label com.docker.compose.project="$chk" --label com.docker.compose.volume=db-data "${chk}_db-data"
 $ docker run --rm --network none -v "${chk}_db-data:/data" -v "$backups:/backup:ro" \
@@ -454,9 +466,9 @@ $ make up
 $ fingerprint "$chk" | diff "$backups/flowcrm-volume-$ts.fingerprint" - && echo identical
 ```
 
-The rehearsal passed when `make up` exits 0 (it refuses a database whose
-roles, migrations or runtime privileges do not match, exit 6) and `diff`
-prints nothing. Then remove the rehearsal project and its volume:
+The rehearsal passed when the checksum is `OK`, `make up` exits 0 (it
+refuses a database whose roles, migrations or runtime privileges do not
+match, exit 6) and `diff` prints nothing. Then remove the rehearsal project and its volume:
 
 ```console
 $ make down
@@ -480,10 +492,11 @@ $ docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$src" -
     pg_dump -U flowcrm -d flowcrm -Fc >"$backups/flowcrm-before-restore-$pre.dump"
 ```
 
-Then restore the rehearsed backup and verify it exactly as in the
-rehearsal:
+Then check that the rehearsed backup is unchanged, restore it and verify it
+exactly as in the rehearsal:
 
 ```console
+$ (cd "$backups" && shasum -a 256 -c "flowcrm-$ts.dump.sha256")
 $ docker exec -i "$(docker ps -q --filter "label=com.docker.compose.project=$src" --filter label=com.docker.compose.service=db)" \
     pg_restore -U flowcrm -d flowcrm --clean --if-exists --single-transaction --exit-on-error <"$backups/flowcrm-$ts.dump"
 $ make up
