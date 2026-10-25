@@ -280,6 +280,31 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertSame(200, $this->client()->login($user->email, $user->password)->status(), 'the enabled user can log in again');
     }
 
+    /**
+     * A login that was in flight during the disable can store its session
+     * after the disable deleted the rows. Enabling the user ends every
+     * session too (none can be valid: a disabled user cannot log in), so such
+     * a session is not revived by the enable.
+     */
+    public function testEnablingAUserEndsASessionStoredAfterTheDisable(): void
+    {
+        $user = $this->fixtures->user('late');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $id = (string) $client->sessionId();
+        $connection = $this->fixtures->connection();
+        $row = $connection->fetchAssociative("SELECT encode(sess_data, 'hex') AS data, sess_lifetime, sess_time FROM sessions WHERE sess_id = ?", [$id]);
+        self::assertIsArray($row);
+
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        $connection->executeStatement("INSERT INTO sessions (sess_id, sess_data, sess_lifetime, sess_time) VALUES (?, decode(?, 'hex'), ?, ?)", [$id, $row['data'], $row['sess_lifetime'], $row['sess_time']]);
+        self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
+
+        self::assertSame(401, $client->get('/api/v1/me')->status(), 'the late session is not revived');
+        self::assertNull($this->sessionData($id), 'no row of the late session is left');
+        self::assertSame(200, $this->client()->login($user->email, $user->password)->status(), 'the enabled user logs in again');
+    }
+
     /** A password reset ends the sessions but leaves the user's memberships and their roles as they were. */
     public function testAnOperatorPasswordResetKeepsTheMemberships(): void
     {

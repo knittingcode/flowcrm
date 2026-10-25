@@ -87,13 +87,21 @@ final readonly class ManageUsers
         });
     }
 
-    /** @throws UserNotFound */
+    /**
+     * The user can log in again. Every stored session of the user ends too:
+     * none can be valid (a disabled user cannot log in), but a login that was
+     * in flight during the disable may have stored one after its rows were
+     * deleted, and enabling must not bring it back.
+     *
+     * @throws UserNotFound
+     */
     public function enable(string $email): void
     {
         $user = $this->users->ofEmail($email) ?? throw new UserNotFound();
 
         $this->transaction->run(function () use ($user): void {
             $user->enable();
+            $this->sessions->endAll($user->id());
             $this->audit->record(new AuditRecord('user.enabled', 'user', $user->id(), Actor::operator()));
         });
     }
