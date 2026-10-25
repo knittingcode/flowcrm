@@ -297,9 +297,10 @@ need "make a throwaway test certificate (openssl)" make_test_cert "$FLOWCRM_HTTP
 dc stop api >/dev/null 2>&1
 spoof=pl23-spoofed-$(random_secret | cut -c1-12)
 req '/api/v1/system/status?token=pl23-query-secret' -H "X-Request-Id: $spoof" -H 'X-CSRF-Token: pl23-csrf-secret'
-sleep 1
-edge_log=$(dc logs --no-color --no-log-prefix edge 2>&1)
-rec502=$(printf '%s\n' "$edge_log" | grep '^{' | python3 -c 'import json, sys
+# The records of the 502 (Docker may deliver them a moment later).
+records502() {
+  edge_log=$(dc logs --no-color --no-log-prefix edge 2>&1)
+  printf '%s\n' "$edge_log" | grep '^{' | python3 -c 'import json, sys
 acc = err = 0
 for line in sys.stdin:
     try:
@@ -312,7 +313,11 @@ for line in sys.stdin:
         acc += 1
     elif d.get("logger", "").startswith("http.log.error"):
         err += 1
-print(acc, err)')
+print(acc, err)'
+}
+i=0
+until rec502=$(records502) && [ "$rec502" = '3 3' ] || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
+edge_log=$(dc logs --no-color --no-log-prefix edge 2>&1)
 # req sends the request three times (status, headers, body).
 [ "$CODE" = 502 ] && [ "$rec502" = '3 3' ] && ! printf '%s\n' "$edge_log" | grep -qE "pl23-(query|csrf)-secret|$spoof"
 v "PL-23 api stopped: the edge's 502 is logged with its request ID; its error record is redacted like the access log" $? "$CODE, records (access with request_id, error): $rec502"

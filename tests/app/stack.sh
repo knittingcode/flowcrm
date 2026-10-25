@@ -1008,10 +1008,11 @@ spoof502=st19-spoofed-$(random_secret | cut -c1-12)
 get "$PA" '/api/v1/system/status?token=st19-query-secret' -H "X-Request-Id: $spoof502" -H 'X-CSRF-Token: st19-csrf-secret' \
   -H 'Referer: https://crm.example.test/accounts?search=st19-referer-secret'
 code502=$CODE
-sleep 1
-docker logs "$(cid "$A" edge)" >"$edge_log" 2>&1
-docker start "$api_id" >/dev/null
-rec502=$(grep '^{' "$edge_log" | python3 -c 'import json, sys
+log502=$work/edge-502.log
+# The records of the 502 (Docker may deliver them a moment later).
+records502() {
+  docker logs "$(cid "$A" edge)" >"$log502" 2>&1
+  grep '^{' "$log502" | python3 -c 'import json, sys
 acc = err = 0
 for line in sys.stdin:
     try:
@@ -1024,10 +1025,14 @@ for line in sys.stdin:
         acc += 1
     elif d.get("logger", "").startswith("http.log.error"):
         err += 1
-print(acc, err)')
-[ "$code502" = 502 ] && [ "$rec502" = '1 1' ] && ! grep -qE "st19-(query|csrf|referer)-secret|$spoof502" "$edge_log"
+print(acc, err)'
+}
+i=0
+until rec502=$(records502) && [ "$rec502" = '1 1' ] || [ "$i" -ge 10 ]; do sleep 1; i=$((i + 1)); done
+docker start "$api_id" >/dev/null
+[ "$code502" = 502 ] && [ "$rec502" = '1 1' ] && ! grep -qE "st19-(query|csrf|referer)-secret|$spoof502" "$log502"
 v "ST-19 api stopped: the edge's 502 is logged with its request ID; its error record is redacted like the access log (no query, CSRF token or client X-Request-Id)" $? \
-  "$code502, records (access with request_id, error): $rec502; leaked: $(grep -oE "st19-(query|csrf|referer)-secret|$spoof502" "$edge_log" | sort -u | tr '\n' ' ')"
+  "$code502, records (access with request_id, error): $rec502; leaked: $(grep -oE "st19-(query|csrf|referer)-secret|$spoof502" "$log502" | sort -u | tr '\n' ' ')"
 dv a-up3 "$A" up
 [ "$(rc_of a-up3)" = 0 ] && until_ready "$PA" 200 30
 v "ST-20 make up restarts the database and the stack is ready again" $?
