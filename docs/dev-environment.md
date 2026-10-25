@@ -119,8 +119,11 @@ recreates the running edge once and says so (`recreating the edge on port
 replaced: the database, its volume, `.runtime/secrets` and the api and web
 containers are handled exactly as by any `make up`. The edge comes back on
 the same port (if another program took the port in the meantime, the next
-free one is used and the printed URL shows it); the UI and API are
-unavailable for a few seconds. Later runs report `already running`.
+free one is used and the printed URL shows it). The edge image is rebuilt
+first, while the old edge still serves; the UI and API are unavailable
+only while the container is replaced (under one second in a test of this
+upgrade, nothing answering on the port in between). Later runs report
+`already running`.
 
 ## Commands
 
