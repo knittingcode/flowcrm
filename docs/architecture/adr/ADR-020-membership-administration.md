@@ -187,7 +187,12 @@ Recorded for the owner's decision; not approved.
   one member apply one after the other, the second starting from the
   first's role (one chain of events, no lost update); an ADMIN demoted (403) or
   removed (404) while their request waits is refused; another
-  organization's changes and refusals do not wait for the lock.
+  organization's changes and refusals do not wait for the lock. With
+  ADR-019's sessions: a disabled ADMIN's session gets 401 on all three
+  routes and stays ended after the user is enabled again, while the
+  membership is untouched; an operator's disable of an ADMIN whose change
+  is in flight waits for that request (it holds its session row) and
+  commits after the change.
 - Unit tests: `RolePolicyTest` (the matrix), `MembershipRulesTest`
   (`Membership::changeRole`, `LastAdminRule`), `ManageMembershipsTest` (the
   lock comes first; every check, the audit event and the read of the member
@@ -195,7 +200,7 @@ Recorded for the owner's decision; not approved.
 - `MembershipRefusalLoggingTest`: refused lookups are logged on the
   `security` channel with reason, actor, organization, route and request
   ID, never the address.
-- `tests/app/backend.sh` BE-18: twenty-one new negative controls
+- `tests/app/backend.sh` BE-18: twenty-two new negative controls
   (last-admin rule not applied or off by one, a removal checked like a
   promotion, the ADMIN count unscoped or including removed ADMINs, lock not
   taken or taking no row lock, actor re-check of the role, of a removed
@@ -204,7 +209,9 @@ Recorded for the owner's decision; not approved.
   target lookup, a removed target changed again, no audit event or an
   audit event after the commit, the member for the answer read after the
   commit, a route without `TenantPermission`, an unvalidated role, a lock
-  that blocks foreign key checks, the operator's add without the lock); the
+  that blocks foreign key checks, the operator's add without the lock, a
+  session row not locked for the request, so a disable does not wait for a
+  change in flight); the
   control for the user directory's NUL check (#28) also runs the add with a
   NUL in the address.
 

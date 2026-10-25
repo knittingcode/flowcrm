@@ -794,6 +794,103 @@ final class MembershipAdministrationTest extends FpmApiTestCase
     }
 
     /**
+     * ADR-019 (decision 4, sessions end when the user is disabled) on the
+     * new routes: a disabled ADMIN's session gets 401 on its next change
+     * and nothing changes. Enabling the user does not bring the session back
+     * (the disable deleted it); the membership itself is untouched by both,
+     * so after a new login the ADMIN administers again.
+     */
+    public function testADisabledAdminsSessionCannotChangeMemberships(): void
+    {
+        $user = $this->fixtures->user('not-added');
+        $client = $this->logIn($this->adminA);
+        $before = $this->snapshot();
+
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $this->adminA->email])->getStatusCode());
+        foreach ([
+            'POST' => $client->post($this->members(), ['email' => $user->email, 'role' => 'ADMIN']),
+            'PATCH' => $client->patch($this->member($this->repAMembership), ['role' => 'ADMIN']),
+            'DELETE' => $client->delete($this->member($this->repAMembership)),
+        ] as $method => $response) {
+            self::assertSame(401, $response->status(), $method.' '.$response->raw->body);
+            self::assertSame('/problems/unauthenticated', $response->problem(), $method);
+        }
+        self::assertSame($before, $this->snapshot(), 'a disabled ADMIN changes nothing');
+
+        self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $this->adminA->email])->getStatusCode());
+        self::assertSame(401, $client->patch($this->member($this->repAMembership), ['role' => 'ADMIN'])->status(), 'the session from before the disable stays ended');
+        self::assertSame($before, $this->snapshot());
+        self::assertSame(['role' => 'ADMIN', 'status' => 'ACTIVE', 'organization_id' => $this->a->toRfc4122(), 'user_id' => $this->adminA->id->toRfc4122()], $this->membership($this->adminAMembership), 'disable and enable leave the membership as it was');
+
+        $changed = $this->logIn($this->adminA)->patch($this->member($this->repAMembership), ['role' => 'MANAGER']);
+        self::assertSame(200, $changed->status(), $changed->raw->body);
+        self::assertSame($this->adminA->id->toRfc4122(), $this->events($this->repAMembership)[0]['actor_user_id'] ?? null);
+    }
+
+    /**
+     * An operator disables an ADMIN whose change is already running: the
+     * request holds its session row (LOCK_TRANSACTIONAL) while it waits for
+     * the organization lock, so the disable, which deletes the user's
+     * sessions in its transaction, waits for the request to end. The change
+     * and its audit event are committed before the disable; the disable then
+     * ends the session, and the next request is a 401.
+     */
+    public function testADisableWaitsForTheAdminsChangeInFlight(): void
+    {
+        $user = $this->fixtures->user('joining');
+        $client = $this->logIn($this->adminA);
+        $session = $client->sessionId();
+        self::assertNotNull($this->sessionData($session));
+
+        $holder = SeparateConnection::open();
+        $holder->beginTransaction();
+        $holder->prepare('SELECT id FROM organizations WHERE id = ? FOR NO KEY UPDATE')->execute([$this->a->toRfc4122()]);
+        $disable = null;
+        try {
+            $pending = $client->dispatch('POST', $this->members(), ['email' => $user->email, 'role' => 'REP']);
+            $waiting = $this->requestsWaitingForTheOrganizationLock($holder, 1);
+            $disable = proc_open(
+                ['php', 'bin/console', 'flowcrm:user:disable', $this->adminA->email],
+                [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                $pipes,
+                \dirname(__DIR__, 3),
+                array_merge(getenv(), ['APP_ENV' => 'test', 'APP_DEBUG' => '0']),
+            );
+            self::assertIsResource($disable);
+            $disableWaiting = $this->backendsWaitingForALock($holder, 'DELETE FROM sessions %', 1);
+            self::assertNull($this->fixtures->connection()->fetchOne('SELECT disabled_at FROM users WHERE id = ?', [$this->adminA->id->toRfc4122()]), 'the disable has not committed');
+            $holder->rollBack();
+            [$response] = ApiClient::collect($pending);
+            $output = stream_get_contents($pipes[1]).stream_get_contents($pipes[2]);
+            $exit = proc_close($disable);
+            $disable = null;
+        } finally {
+            if ($holder->inTransaction()) {
+                $holder->rollBack();
+            }
+            if (\is_resource($disable)) {
+                proc_terminate($disable, 9);
+                proc_close($disable);
+            }
+        }
+
+        self::assertSame(1, $waiting, 'the change waited for the organization lock');
+        self::assertSame(1, $disableWaiting, 'the disable waited for the request\'s session row');
+        self::assertSame(201, $response->status(), $response->raw->body);
+        self::assertSame(0, $exit, $output);
+        $id = Uuid::fromString($response->string('membershipId'));
+        self::assertSame(['role' => 'REP', 'status' => 'ACTIVE', 'organization_id' => $this->a->toRfc4122(), 'user_id' => $user->id->toRfc4122()], $this->membership($id));
+        $events = $this->events($id);
+        self::assertSame(['membership.added'], array_column($events, 'action'));
+        self::assertSame($this->adminA->id->toRfc4122(), $events[0]['actor_user_id']);
+        self::assertNotNull($this->fixtures->connection()->fetchOne('SELECT disabled_at FROM users WHERE id = ?', [$this->adminA->id->toRfc4122()]), 'the disable committed after the change');
+        self::assertSame(1, self::int($this->fixtures->connection()->fetchOne("SELECT count(*) FROM audit_events WHERE action = 'user.disabled' AND entity_id = ?", [$this->adminA->id->toRfc4122()])));
+        self::assertNull($this->sessionData($session), 'the request did not bring its session row back');
+        self::assertSame(401, $client->delete($this->member($id))->status(), 'the next request of the disabled ADMIN');
+        self::assertSame('ACTIVE', $this->membership($id)['status'] ?? null);
+    }
+
+    /**
      * The lock is per organization: while A is locked, B's ADMIN changes B
      * without waiting, and the same ADMIN's request for A is the 404 of a
      * foreign organization, also without waiting and without a change.
@@ -963,19 +1060,25 @@ final class MembershipAdministrationTest extends FpmApiTestCase
         }
     }
 
-    /**
-     * Polls for up to ten seconds until $expected backends wait for a row
-     * lock taken with the organization lock's statement. The observer is
-     * inside a transaction, which keeps one pg_stat_activity snapshot until
-     * it is cleared.
-     */
+    /** Requests waiting for a row lock taken with the organization lock's statement (backendsWaitingForALock). */
     private function requestsWaitingForTheOrganizationLock(\PDO $observer, int $expected): int
     {
+        return $this->backendsWaitingForALock($observer, 'SELECT id FROM organizations WHERE id = % FOR NO KEY UPDATE', $expected);
+    }
+
+    /**
+     * Polls for up to ten seconds until $expected backends other than
+     * $observer wait for a lock in a statement LIKE $query; returns their
+     * number. The observer may be inside a transaction, which keeps one
+     * pg_stat_activity snapshot until it is cleared.
+     */
+    private function backendsWaitingForALock(\PDO $observer, string $query, int $expected): int
+    {
         $clear = $observer->prepare('SELECT pg_stat_clear_snapshot()');
-        $statement = $observer->prepare("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE 'SELECT id FROM organizations WHERE id = % FOR NO KEY UPDATE'");
+        $statement = $observer->prepare("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE ?");
         for ($i = 0;; ++$i) {
             $clear->execute();
-            $statement->execute();
+            $statement->execute([$query]);
             $count = (int) $statement->fetchColumn();
             if ($count >= $expected || $i >= 100) {
                 return $count;

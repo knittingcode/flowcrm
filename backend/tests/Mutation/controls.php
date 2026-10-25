@@ -223,4 +223,7 @@ return [
     ['role from the body not validated', 'src/Organizations/Http/Api/MembershipController.php',
         "return MembershipRole::tryFrom(\$value) ?? throw ProblemException::validation([['pointer' => '/role', 'code' => 'INVALID_ROLE']]);", 'return MembershipRole::tryFrom($value) ?? MembershipRole::Admin;',
         'MembershipAdministrationTest::testInvalidRequestsAreValidationErrors'],
+    ['session row not locked for the request (a disable does not wait for a membership change in flight)', 'config/packages/session.yaml',
+        'lock_mode: !php/const Symfony\\Component\\HttpFoundation\\Session\\Storage\\Handler\\PdoSessionHandler::LOCK_TRANSACTIONAL', 'lock_mode: !php/const Symfony\\Component\\HttpFoundation\\Session\\Storage\\Handler\\PdoSessionHandler::LOCK_NONE',
+        'MembershipAdministrationTest::testADisableWaitsForTheAdminsChangeInFlight'],
 ];
