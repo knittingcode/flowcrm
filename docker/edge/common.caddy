@@ -1,4 +1,24 @@
-# Shared by Caddyfile.dev and Caddyfile.prod.
+# Shared by Caddyfile.dev and Caddyfile.prod, which import it before their
+# global options: it may define snippets only.
+
+# Redacted JSON log format, used by the access log (baseline) and by the
+# default log of both Caddyfiles, which receives the error records Caddy
+# writes for requests it could not complete (a 502 when the api or the Vite
+# dev server is down). Caddy already redacts the Cookie, Set-Cookie,
+# Authorization and Proxy-Authorization headers; query strings (which can
+# carry tokens), CSRF tokens and a client's own X-Request-Id (replaced by
+# the edge, see baseline) are removed too.
+(redacted_json) {
+	format filter {
+		wrap json
+		fields {
+			request>uri regexp "\?.*$" "?[redacted]"
+			request>headers>Referer regexp "\?.*$" "?[redacted]"
+			request>headers>X-Csrf-Token delete
+			request>headers>X-Request-Id delete
+		}
+	}
+}
 
 (php) {
 	# Every PHP request runs Symfony's front controller on the api service.
@@ -26,21 +46,10 @@
 		X-Frame-Options DENY
 		-Server
 	}
-	# JSON access log with the request ID. Caddy already redacts the
-	# Cookie, Set-Cookie, Authorization and Proxy-Authorization headers;
-	# query strings (which can carry tokens) and CSRF tokens are removed too.
+	# JSON access log with the request ID (redacted, see redacted_json).
 	log {
 		output stdout
-		format filter {
-			wrap json
-			fields {
-				request>uri regexp "\?.*$" "?[redacted]"
-				request>headers>Referer regexp "\?.*$" "?[redacted]"
-				request>headers>X-Csrf-Token delete
-				# The client's own X-Request-Id is replaced; its value is not logged.
-				request>headers>X-Request-Id delete
-			}
-		}
+		import redacted_json
 	}
 
 	# ADR-017: Symfony is reached only for /api, /api/... and exactly

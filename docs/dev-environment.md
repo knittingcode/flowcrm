@@ -458,7 +458,7 @@ Application suites (`tests/app/`), each in its own Compose projects:
   another origin and with a form body, spoofed `X-Forwarded-For` that cannot
   evade the login limit, no secrets in any log, and the logged-in browser
   journeys (roles, two organizations, a foreign organization, CSRF).
-- `prodlike.sh` (PL-01 to PL-22): the production images (`<project>-prod`,
+- `prodlike.sh` (PL-01 to PL-23): the production images (`<project>-prod`,
   no published ports): built SPA, CSP, cache headers, SPA fallback, API
   errors, health, the raw-path routing boundary, a Playwright journey
   under the CSP, lazy sessions in production mode, the `migrate` job

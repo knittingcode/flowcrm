@@ -34,9 +34,15 @@ split).
 ### Edge (Caddy)
 
 JSON access log on stdout with the request; the field `request_id` is the
-ID the edge generated for it (`docker/edge/common.caddy`). A client's own
-`X-Request-Id` header is removed from the logged request headers, so its
-value is never logged.
+ID the edge generated for it (`docker/edge/common.caddy`). For a request
+the edge could not complete (a 502 when the api or the Vite dev server is
+down) Caddy also writes an error record (logger `http.log.error…`) on
+stderr; it has no `request_id`, but the access record of the same request
+does. Both use the same redaction (`redacted_json`): Caddy removes the
+values of `Cookie`, `Set-Cookie`, `Authorization` and
+`Proxy-Authorization`; the edge removes query strings (also the Referer's),
+`X-CSRF-Token` and a client's own `X-Request-Id`, so the value a client
+chose is never logged.
 
 ### Retention
 
@@ -60,8 +66,10 @@ deployment must enforce equivalent limits in its log pipeline.
 
 Known limitation: a response the edge generates for a failed upstream (a
 502 when the api is down) has no `X-Request-Id` header and none of the
-baseline headers; its access log record still has `request_id`. Giving such
-errors a body and headers needs a `handle_errors` design of its own.
+baseline headers; its access log record still has `request_id`, and its
+error record is redacted like the access log (`tests/app/stack.sh` ST-19,
+`tests/app/prodlike.sh` PL-23). Giving such errors a body and headers needs
+a `handle_errors` design of its own.
 
 To follow one request:
 
