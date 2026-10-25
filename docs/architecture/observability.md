@@ -33,8 +33,16 @@ split).
 
 ### Edge (Caddy)
 
-JSON access log on stdout with the request, including the `X-Request-Id`
-request header that the edge generated (`docker/edge/common.caddy`).
+JSON access log on stdout with the request; the field `request_id` is the
+ID the edge generated for it (`docker/edge/common.caddy`). For a request
+the edge could not complete (a 502 when the api or the Vite dev server is
+down) Caddy also writes an error record (logger `http.log.error…`) on
+stderr; it has no `request_id`, but the access record of the same request
+does. Both use the same redaction (`redacted_json`): Caddy removes the
+values of `Cookie`, `Set-Cookie`, `Authorization` and
+`Proxy-Authorization`; the edge removes query strings (also the Referer's),
+`X-CSRF-Token` and a client's own `X-Request-Id`, so the value a client
+chose is never logged.
 
 ### Retention
 
@@ -52,6 +60,16 @@ deployment must enforce equivalent limits in its log pipeline.
 3. The ID is returned in the `X-Request-Id` response header, in every
    problem document (`requestId`), and in every log record written while
    the request runs (`App\Shared\Http\Logging\RequestIdProcessor`).
+4. The edge logs the same ID as `request_id` and sets the same
+   `X-Request-Id` response header on every response it sends, also on those
+   it answers itself (the SPA, static files, the security gate's 503).
+
+Known limitation: a response the edge generates for a failed upstream (a
+502 when the api is down) has no `X-Request-Id` header and none of the
+baseline headers; its access log record still has `request_id`, and its
+error record is redacted like the access log (`tests/app/stack.sh` ST-19,
+`tests/app/prodlike.sh` PL-23). Giving such errors a body and headers needs
+a `handle_errors` design of its own.
 
 To follow one request:
 
@@ -126,7 +144,7 @@ channel, and slow requests through `duration_ms`.
 |---|---|
 | `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` | record shape, redaction of every class above, placeholders after redaction, database error messages reduced to SQLSTATE |
 | `backend/tests/Unit/Shared/Http/Logging/RequestLoggingTest.php` | request ID processor, request record fields, no path, query or headers, health at debug |
-| `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` (URLs) | the query string of a URL value (`request_uri`, `uri`, `url`, `referer`, `referrer`, `redirect_uri`, `location`, `target_path`, `href`, `return_to`), such as the router's "Matched route" record, becomes `?[redacted]` |
+| `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` (URLs) | the query string of a URL value (`request_uri`, `uri`, `url`, `referer`, `referrer`, `redirect_uri`, `location`, `target_path`, `href`, `return_to`), such as the router's "Matched route" record, or its fragment, also without a query, becomes `?[redacted]` |
 | `backend/tests/Unit/Shared/Infrastructure/Logging/JsonLineFormatterTest.php` (URLs in text) | the query and fragment of URLs in messages and context strings (one or several URLs) become `?[redacted]`; a URL without a query is kept |
 | `backend/tests/Integration/Shared/LoggingTest.php` | the configured pipeline on the booted kernel: request and error records share the response's request ID; a database error is logged without its data and correlates with the problem document; the query of the `Referer` of an unknown route is not logged |
 | `tests/app/stack.sh` ST-40 to ST-43 | on the running stack: the api record and the edge access log carry the response's request ID; every api JSON line is complete; query, `Authorization`, `Cookie` and CSRF values appear in no log |

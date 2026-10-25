@@ -3,8 +3,8 @@
 # Unit tests for bin/devenv logic that needs no Docker: configuration
 # validation, candidate order, runtime-state parsing and writing, failure
 # classification, project naming, the per-checkout lock (including real
-# processes in other locales and time zones and an orphaned recorded child)
-# and a self-check of the result tally.
+# processes in other locales and time zones and an orphaned recorded child),
+# the login check of the stack suite and a self-check of the result tally.
 #
 # Usage: tests/devenv/unit.sh
 
@@ -1309,6 +1309,47 @@ u24 "the fixture stack has no gate" fixture "" 0
 STACK=$saved_stack
 unset -f docker
 [ -z "$saved_fns" ] || eval "$saved_fns"
+
+# --- U-25 the login check of the stack suite (tests/app/stack.sh): a login
+# counts by its result row alone, so a psql warning on stderr can neither
+# fail a working new password nor make a working old one look refused; any
+# other answer is reported by its last line. STACK_SH=<path> checks a copy.
+stack_sh=${STACK_SH:-"$here/../app/stack.sh"}
+u25_fns=$(sed -n '/^login_result() {/,/^}/p; /^login_ok() {/p' "$stack_sh")
+u25() { # name mode password-file expected("result/login_ok")
+  local got
+  got=$(
+    A=unused U25_MODE=$2
+    # shellcheck disable=SC2329 # called by the evaluated stack.sh functions
+    cid() { echo db-id; }
+    # shellcheck disable=SC2329
+    docker() {
+      case $U25_MODE in
+        (row) echo 1 ;;
+        (row-warning) echo 1; echo 'psql: warning: a notice' >&2 ;;
+        (other-row) echo 10 ;;
+        (refused) echo 'psql: error: FATAL:  password authentication failed for user "flowcrm_owner"' >&2; return 2 ;;
+        (no-db) echo 'Error response from daemon: No such container: db-id' >&2; return 1 ;;
+        (silent) return 1 ;;
+      esac
+    }
+    eval "$u25_fns"
+    printf '%s/' "$(login_result owner "$3")"
+    if login_ok owner "$3"; then echo true; else echo false; fi
+  )
+  expect_eq "U-25 $1" "$4" "$got"
+}
+mkdir -p "$work/out"
+printf 'secret\n' >"$work/u25.pw"
+: >"$work/u25.empty"
+u25 "a returned row is a login" row "$work/u25.pw" ok/true
+u25 "a psql warning on stderr does not hide a returned row" row-warning "$work/u25.pw" ok/true
+u25 "another row is not a login" other-row "$work/u25.pw" 10/false
+u25 "a refused password is reported by psql's last line" refused "$work/u25.pw" 'psql: error: FATAL:  password authentication failed for user "flowcrm_owner"/false'
+u25 "a docker error is not a login" no-db "$work/u25.pw" 'Error response from daemon: No such container: db-id/false'
+u25 "no answer is not a login" silent "$work/u25.pw" no-output/false
+u25 "an empty password file is not a login" row "$work/u25.empty" no-file/false
+u25 "a missing password file is not a login" row "$work/u25.missing" no-file/false
 
 # --- U-26 test cleanup removes images by name only (tests/app/lib.sh)
 # remove_images with a fake docker that keeps image names ("name id") and
