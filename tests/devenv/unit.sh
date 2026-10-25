@@ -1071,6 +1071,19 @@ result "U-20 the gate directory is 0755 and an old gate is moved into it, readab
 printf 'a new reason\n' | write_gate && [ "$(mode_of "$GATE_FILE")" = 644 ] && [ "$(head -n 1 "$GATE_FILE")" = "a new reason" ] &&
   [ -z "$(find "$GATE_DIR" -name '.security-gate.*')" ]
 result "U-20 write_gate replaces the record by rename, readable, with no temporary file left" $?
+# A write that fails part-way (here: the input cannot be read) must leave the
+# earlier record exactly as it was: its reason is what make status reports
+# after an unrecorded gate, and its "edge" line lets a rotation restore the
+# edge. Writing the record in place would truncate it first.
+printf 'the earlier reason\nedge\n' | write_gate
+inode_of() { stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"; }
+before_ino=$(inode_of "$GATE_FILE")
+mkdir -p "$work/u20/unreadable-input"
+r=0
+write_gate <"$work/u20/unreadable-input" 2>/dev/null || r=$?
+[ "$r" != 0 ] && [ "$(cat "$GATE_FILE")" = "$(printf 'the earlier reason\nedge')" ] &&
+  [ "$(inode_of "$GATE_FILE")" = "$before_ino" ] && [ -z "$(find "$GATE_DIR" -name '.security-gate.*')" ]
+result "U-20 a write_gate that fails part-way keeps the earlier record unchanged (same file, reason and edge line) and leaves no temporary file" $? "(r $r, record [$(tr '\n' '|' <"$GATE_FILE")])"
 gate_clear
 [ ! -e "$GATE_FILE" ] && ! gate_record >/dev/null
 result "U-20 gate_clear removes the record" $?
