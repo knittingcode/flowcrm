@@ -205,6 +205,47 @@ test.describe('member administration', () => {
     expect((await page.request.get(`/api/v1/organizations/${env('E2E_ORG_A')}/members`)).status()).toBe(401);
   });
 
+  test('a sign-out without an answer keeps the members page and says so; the next step follows the server', async ({ page }) => {
+    const members = new RegExp(`/o/${env('E2E_ORG_A')}/members$`);
+    const signedOutFailed = 'Signing out did not complete. You may still be signed in, so try again.';
+    await openMembers(page, env('E2E_ADMIN_EMAIL'));
+
+    // 1. The logout never reaches the server: the session is still valid.
+    await page.route('**/api/v1/auth/logout', (route) => route.abort('connectionreset'));
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await expect(page.getByRole('alert')).toHaveText(signedOutFailed);
+    await expect(page).toHaveURL(members);
+    await expect(page.getByRole('button', { name: 'Remove Rep Tester' })).toBeEnabled();
+    expect((await page.request.get('/api/v1/me')).status()).toBe(200);
+
+    // Signing out again, with an answer, ends the session.
+    await page.unroute('**/api/v1/auth/logout');
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    expect((await page.request.get('/api/v1/me')).status()).toBe(401);
+
+    // 2. The logout is processed but its answer is lost: the page cannot know,
+    // so it says the same; the next request finds the session ended.
+    await openMembers(page, env('E2E_ADMIN_EMAIL'));
+    const before = await membersOf(page);
+    await page.route('**/api/v1/auth/logout', async (route) => {
+      expect((await route.fetch()).status()).toBe(204);
+      await route.abort('connectionreset');
+    });
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await expect(page.getByRole('alert')).toHaveText(signedOutFailed);
+    await expect(page).toHaveURL(members);
+    await page.unroute('**/api/v1/auth/logout');
+    await page.getByLabel('New role for Rep Tester').selectOption('MANAGER');
+    await page.getByRole('button', { name: 'Change role of Rep Tester' }).click();
+    await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+    await expect(page.getByText('Your session has ended. Please sign in again.')).toBeVisible();
+    await expect(page.getByText('Rep Tester')).toHaveCount(0);
+
+    await openMembers(page, env('E2E_ADMIN_EMAIL'));
+    expect(await membersOf(page)).toEqual(before);
+  });
+
   test('the members page fits a narrow screen without scrolling sideways', async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 640 });
     await openMembers(page, env('E2E_ADMIN_EMAIL'));
