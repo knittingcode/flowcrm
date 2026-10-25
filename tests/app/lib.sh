@@ -84,9 +84,10 @@ net_curl() {
 }
 
 # Synthetic demonstration data through the operator console of an api
-# container (FND-010B): users admin, rep, multi and other (.test addresses
-# with a random part), organization A (admin ADMIN, rep REP, multi REP) and
-# B (other ADMIN, multi MANAGER). Passwords go to the console's standard
+# container (FND-010B): users admin, rep, multi, other and spare (.test
+# addresses with a random part), organization A (admin ADMIN, rep REP, multi
+# REP) and B (other ADMIN, multi MANAGER); spare has no membership, for the
+# member administration journeys (FND-010C). Passwords go to the console's standard
 # input, never into an argument. Writes the E2E_* variables for the browser
 # tests into ENV-FILE (which holds the synthetic password: keep it in the
 # runner's work directory). Values have no spaces: the file is both sourced
@@ -96,7 +97,7 @@ seed_e2e() { # env-file api-container
   password=$(random_secret)
   suffix=$(random_secret | cut -c1-8)
   console() { docker exec -i "$api" php bin/console --no-interaction "$@"; }
-  for who in Admin Rep Multi Other; do
+  for who in Admin Rep Multi Other Spare Deputy; do
     printf '%s\n' "$password" |
       console flowcrm:user:create --email="$(printf '%s' "$who" | tr '[:upper:]' '[:lower:]')-$suffix@example.test" --display-name="$who Tester" >/dev/null || return 1
   done
@@ -110,6 +111,8 @@ seed_e2e() { # env-file api-container
     "E2E_ADMIN_EMAIL=admin-$suffix@example.test" \
     "E2E_REP_EMAIL=rep-$suffix@example.test" \
     "E2E_MULTI_EMAIL=multi-$suffix@example.test" \
+    "E2E_SPARE_EMAIL=spare-$suffix@example.test" \
+    "E2E_DEPUTY_EMAIL=deputy-$suffix@example.test" \
     "E2E_ORG_A=$org_a" "E2E_ORG_A_NAME=Alpha-$suffix" \
     "E2E_ORG_B=$org_b" "E2E_ORG_B_NAME=Beta-$suffix" >"$env")
 }

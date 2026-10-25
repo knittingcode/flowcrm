@@ -23,6 +23,9 @@ info:
     **Organizations.** The organization is taken only from the path. An
     organization the user has no active membership in returns the same 404 as
     one that does not exist. A member without the permission gets 403.
+    Membership changes (ADMIN only) are checked again under a lock of the
+    organization; conflicts with its memberships are 409 `conflict` problems
+    with a stable code in `errors[]`.
 
     **Rate limits.** Failed logins are limited per account and client IP, per
     client IP and per account; a logged-in user may make 600 requests per
@@ -253,6 +256,55 @@ paths:
           $ref: '#/components/responses/ValidationError'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags: [organizations]
+      operationId: addMember
+      summary: Add an existing user with a role (permission membership.add)
+      description: |
+        The user is found by e-mail address (case-insensitive) and must exist;
+        there is no invitation. A user has at most one membership per
+        organization: an active or a removed one is a 409 `MEMBERSHIP_EXISTS`
+        (a removed membership cannot be reactivated). Audited as
+        `membership.added`. Status order: 404 (organization), 403
+        (permission), 422, 409.
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewMember'
+      responses:
+        '201':
+          description: The new member.
+          headers:
+            Location:
+              description: The new member's URL.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ForbiddenOrCsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/MemberValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
   /api/v1/organizations/{organizationId}/members/{membershipId}:
     parameters:
@@ -283,6 +335,79 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+    patch:
+      tags: [organizations]
+      operationId: changeMemberRole
+      summary: Change a member's role (permission membership.change_role)
+      description: |
+        The same role again answers 200 without a change or audit event.
+        Demoting the organization's only active ADMIN, also oneself, is a 409
+        `LAST_ADMIN`. An unknown, removed or foreign membership is a 404,
+        before the body is validated. Audited as `membership.role_changed`.
+        Status order: 404 (organization), 403 (permission), 404 (member), 422,
+        409.
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleChange'
+      responses:
+        '200':
+          description: The member with the role now held.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ForbiddenOrCsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/MemberValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [organizations]
+      operationId: removeMember
+      summary: Remove a member (permission membership.remove)
+      description: |
+        The membership becomes REMOVED (the row stays); the removed user's
+        next request to the organization is a 404. Removing the only active
+        ADMIN, also oneself, is a 409 `LAST_ADMIN`. An unknown, foreign or
+        already removed membership is a 404, so a repeated DELETE is a 404.
+        Audited as `membership.removed`.
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204':
+          description: The membership is removed.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ForbiddenOrCsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
 
 components:
   securitySchemes:
@@ -354,6 +479,12 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    ForbiddenOrCsrfInvalid:
+      description: The origin check or the CSRF token failed (type csrf-invalid), or a member without the permission (type forbidden).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     NotFound:
       description: Unknown, of another organization or not visible; always the same.
       content:
@@ -372,11 +503,31 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/ValidationProblem'
+    MemberValidationError:
+      description: |
+        Invalid members, each with a stable code: `UNKNOWN_FIELD`, `REQUIRED`,
+        `INVALID_TYPE`, `INVALID_ROLE` (pointer `/role`) and `UNKNOWN_USER`
+        (pointer `/email`: no user has this e-mail address).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ValidationProblem'
+    Conflict:
+      description: |
+        The change conflicts with the organization's memberships (type
+        conflict): `MEMBERSHIP_EXISTS` (the user already has a membership,
+        active or removed) or `LAST_ADMIN` (the organization would have no
+        active ADMIN). Nothing was changed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ConflictProblem'
     InternalError:
       description: |
         The operation could not be completed, for example because its audit
         event could not be written: a login then creates no session, a
-        password change changes nothing, and a logout still ends the session.
+        password change or a membership change changes nothing, and a logout
+        still ends the session.
       content:
         application/problem+json:
           schema:
@@ -452,6 +603,36 @@ components:
                 example: UNKNOWN_FIELD
             additionalProperties: false
       additionalProperties: false
+    ConflictProblem:
+      type: object
+      required: [type, title, status, instance, requestId, errors]
+      properties:
+        type:
+          type: string
+          enum: [/problems/conflict]
+        title:
+          type: string
+        status:
+          type: integer
+          enum: [409]
+        instance:
+          type: string
+        requestId:
+          type: string
+          format: uuid
+        errors:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            type: object
+            required: [code]
+            properties:
+              code:
+                type: string
+                enum: [MEMBERSHIP_EXISTS, LAST_ADMIN]
+            additionalProperties: false
+      additionalProperties: false
     SystemStatus:
       type: object
       required: [service, apiVersion, databaseTime]
@@ -500,7 +681,7 @@ components:
       additionalProperties: false
     Permission:
       type: string
-      enum: [organization.view, membership.list, membership.view_email]
+      enum: [organization.view, membership.list, membership.view_email, membership.add, membership.change_role, membership.remove]
     Role:
       type: string
       enum: [ADMIN, MANAGER, REP]
@@ -611,6 +792,23 @@ components:
         email:
           type: string
           description: Only with the permission membership.view_email.
+      additionalProperties: false
+    NewMember:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          description: The e-mail address of an existing user.
+        role:
+          $ref: '#/components/schemas/Role'
+      additionalProperties: false
+    RoleChange:
+      type: object
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
       additionalProperties: false
     MemberPage:
       type: object

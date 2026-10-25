@@ -26,4 +26,19 @@ final readonly class DoctrineMembershipRepository implements MembershipRepositor
     {
         return $this->entityManager->getRepository(Membership::class)->findOneBy(['organizationId' => $organizationId, 'userId' => $userId]);
     }
+
+    public function ofOrganizationAndId(Uuid $organizationId, Uuid $membershipId): ?Membership
+    {
+        return $this->entityManager->getRepository(Membership::class)->findOneBy(['organizationId' => $organizationId, 'id' => $membershipId]);
+    }
+
+    public function activeAdminCount(Uuid $organizationId): int
+    {
+        $count = $this->entityManager->getConnection()->fetchOne(
+            "SELECT count(*) FROM memberships WHERE organization_id = ? AND role = 'ADMIN' AND status = 'ACTIVE'",
+            [$organizationId->toRfc4122()],
+        );
+
+        return is_numeric($count) ? (int) $count : throw new \UnexpectedValueException('Unexpected count of administrators.');
+    }
 }

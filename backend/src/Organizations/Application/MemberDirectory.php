@@ -28,7 +28,13 @@ final readonly class MemberDirectory
     {
         $row = $this->organizations->member($organizationId, $membershipId);
 
-        return null === $row ? null : ($this->views([$row])[0] ?? null);
+        return null === $row ? null : $this->view($row);
+    }
+
+    /** The member with the user's profile; null when the user does not exist. */
+    public function view(MemberRow $row): ?MemberView
+    {
+        return $this->views([$row])[0] ?? null;
     }
 
     /**
