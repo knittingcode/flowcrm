@@ -102,6 +102,31 @@ final class LoginThrottlingTest extends FpmApiTestCase
         }
     }
 
+    /**
+     * A NUL byte never reaches PostgreSQL: pdo_pgsql passes bound strings as
+     * C strings, so "<address>\0<anything>" would load the account of
+     * <address>, while the limits key the whole string and give every suffix
+     * fresh windows. Such an address matches no account, with the answer of
+     * any unknown one.
+     */
+    public function testAnAddressWithANulByteMatchesNoAccount(): void
+    {
+        $user = $this->fixtures->user('nul');
+        $client = $this->client();
+        for ($i = 1; $i <= 6; ++$i) {
+            $failure = $this->tryLogin($client, $user->email."\0".$i, 'wrong password '.$i);
+            self::assertSame(401, $failure->status(), "failure $i");
+            self::assertSame('/problems/invalid-credentials', $failure->problem());
+        }
+
+        $suffixed = $this->tryLogin($client, $user->email."\0x", $user->password);
+        self::assertSame(401, $suffixed->status(), 'the right password with a NUL suffix logs nobody in');
+        self::assertSame('/problems/invalid-credentials', $suffixed->problem());
+        self::assertNull($client->sessionId());
+        self::assertSame(401, $this->tryLogin($this->client(), $user->email."\0", $user->password)->status(), 'a NUL alone');
+        self::assertSame(200, $this->tryLogin($this->client(), $user->email, $user->password)->status(), 'the account itself is not affected');
+    }
+
     /** A success clears only the account-and-IP window, not the IP's. */
     public function testASuccessfulLoginClearsOnlyTheAccountAndIpWindow(): void
     {

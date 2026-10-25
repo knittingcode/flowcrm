@@ -22,6 +22,9 @@ final readonly class DoctrineUserRepository implements UserRepository
 
     public function ofEmail(string $email): ?User
     {
+        if (!User::canHoldEmail($email)) {
+            return null;
+        }
         $user = $this->entityManager
             ->createQuery('SELECT u FROM '.User::class.' u WHERE LOWER(u.email) = LOWER(:email)')
             ->setParameter('email', $email)

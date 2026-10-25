@@ -195,7 +195,7 @@ Recorded for the owner's decision; not approved.
 - `MembershipRefusalLoggingTest`: refused lookups are logged on the
   `security` channel with reason, actor, organization, route and request
   ID, never the address.
-- `tests/app/backend.sh` BE-18: twenty-two new negative controls
+- `tests/app/backend.sh` BE-18: twenty-one new negative controls
   (last-admin rule not applied or off by one, a removal checked like a
   promotion, the ADMIN count unscoped or including removed ADMINs, lock not
   taken or taking no row lock, actor re-check of the role, of a removed
@@ -203,9 +203,10 @@ Recorded for the owner's decision; not approved.
   to the organization, MANAGER granted `membership.change_role`, unscoped
   target lookup, a removed target changed again, no audit event or an
   audit event after the commit, the member for the answer read after the
-  commit, a route without `TenantPermission`, an unvalidated role, an
-  address with a NUL looked up, a lock that blocks foreign key checks, the
-  operator's add without the lock).
+  commit, a route without `TenantPermission`, an unvalidated role, a lock
+  that blocks foreign key checks, the operator's add without the lock); the
+  control for the user directory's NUL check (#28) also runs the add with a
+  NUL in the address.
 
 ## Alternatives rejected
 

@@ -153,7 +153,7 @@ Membership administration (add, change role, remove) is decided in
 - `backend/tests/Integration/Security/*` over the real PHP-FPM,
   PdoSessionHandler and PostgreSQL; every response checked against the
   OpenAPI file.
-- `tests/app/backend.sh` BE-18: 60 negative controls, each removing one
+- `tests/app/backend.sh` BE-18: 61 negative controls, each removing one
   protection, must make their tests fail.
 - `tests/app/stack.sh` ST-16 and ST-69 to ST-73 through the real edge,
   including spoofed `X-Forwarded-For`; `tests/app/prodlike.sh` PL-16 for the

@@ -6,6 +6,7 @@ namespace App\Identity\Infrastructure\Persistence;
 
 use App\Identity\Api\UserDirectory;
 use App\Identity\Api\UserProfile;
+use App\Identity\Domain\User;
 use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection;
 use Symfony\Component\Uid\Uuid;
@@ -39,9 +40,7 @@ final readonly class DbalUserDirectory implements UserDirectory
 
     public function idOfEmail(string $email): ?Uuid
     {
-        // PostgreSQL text holds no NUL, and pdo_pgsql would cut the bound
-        // value at the first one, so such an address could match another.
-        if (str_contains($email, "\0")) {
+        if (!User::canHoldEmail($email)) {
             return null;
         }
         $id = $this->connection->fetchOne('SELECT id FROM users WHERE lower(email) = lower(?)', [$email]);
