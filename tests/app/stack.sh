@@ -543,18 +543,19 @@ rot() { # label role [fault] [command]
   (cd "$A" && ROLE=$2 FLOWCRM_DEVENV_FAULT=${3-} ./bin/devenv "${4:-rotate-db-password}") >"$work/out/$1.out" 2>"$work/out/$1.err"
   echo $? >"$work/out/$1.rc"
 }
-login_ok() { # role password-file: SCRAM login as flowcrm_<role>
-  [ -s "$2" ] && docker exec -e PGPASSWORD="$(cat "$2")" "$(cid "$A" db)" \
-    sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>/dev/null | grep -qx 1
-}
-# For diagnostics: "ok", or the last line psql reported (never a password).
+# "ok" when the login returned the row (a line "1" on stdout, whatever psql
+# wrote to stderr), "no-file" for a missing or empty file, otherwise the
+# last line psql or docker reported (never a password), for diagnostics.
 login_result() { # role password-file
-  local out
+  local out msg
   [ -s "$2" ] || { echo "no-file"; return; }
   out=$(docker exec -e PGPASSWORD="$(cat "$2")" "$(cid "$A" db)" \
-    sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>&1)
-  if [ "$out" = 1 ]; then echo ok; else printf '%s\n' "$out" | tail -n 1 | cut -c1-160; fi
+    sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>"$work/out/login.err")
+  if printf '%s\n' "$out" | grep -qx 1; then echo ok; return; fi
+  msg=$({ cat "$work/out/login.err"; printf '%s\n' "$out"; } | sed '/^[[:space:]]*$/d' | tail -n 1 | cut -c1-160)
+  printf '%s\n' "${msg:-no-output}"
 }
+login_ok() { [ "$(login_result "$1" "$2")" = ok ]; } # role password-file: SCRAM login as flowcrm_<role>
 no_leftovers() { [ -z "$(find "$sd" -name '.*' -type f ! -name '.db_*_password.pending')" ]; }
 pend() { printf '%s/.db_%s_password.pending' "$sd" "$1"; }
 # Diagnostics for a failed check, never a secret value: container identity
