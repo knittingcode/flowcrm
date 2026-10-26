@@ -559,8 +559,12 @@ deletes the image only when it was the last name. `remove_images PREFIX`:
 - prints one line per call with the number of names removed and kept.
 
 A rebuild within a run (`stack.sh` rebuilds a checkout after editing it)
-moves the name to the new image and leaves the previous image untagged
-(`<none>`), which a removal by name cannot reach. The runners with a Compose
+moves the name to the new image. With Docker's classic image store the
+previous image stays untagged (`<none>`), which a removal by name cannot
+reach. With the containerd image store (Docker Desktop) a rebuild with
+BuildKit or Compose drops the previous image, even while a container still
+uses it; there an untagged image is left only when `docker tag` moves a name
+to another image. The runners with a Compose
 project of their own (`backend.sh`, `prodlike.sh` and, for each temporary
 checkout, `stack.sh`) therefore also call `remove_untagged_images PROJECT`
 after `remove_images`. It:
