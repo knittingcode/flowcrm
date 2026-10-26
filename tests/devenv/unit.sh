@@ -1543,11 +1543,30 @@ for f in backend.sh prodlike.sh stack.sh; do
   result "U-26 $f removes the untagged images of its own Compose project" $?
 done
 
-# A guard against the old pattern: no test runner removes images by ID or
-# with force; tests/app/lib.sh remove_images is the only image removal.
-if grep -nE 'docker +(image +rm|rmi)' "$here"/../app/*.sh | grep -vE '^[^:]*/lib\.sh:' >/dev/null ||
-  grep -nE 'docker +(image +rm|rmi)[^|;&]*(-f|--force)' "$here"/../app/*.sh >/dev/null; then r=1; else r=0; fi
-result "U-26 test runners remove images only through remove_images, never forced" $r
+# Guards against other image removals in tests/app/*.sh and tests/devenv/*.sh
+# (the grep pattern lines of these guards and of U-09 excluded): the Docker
+# image removal commands (image rm, image remove, rmi) only in
+# tests/app/lib.sh and never with a force option anywhere in the command; no
+# Compose down that removes images (its rmi option); no prune command of any
+# kind (image, system, builder, ...).
+u26_pat_rm='docker[[:space:]]+([^|;&]*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))([[:space:]]|$)'
+u26_pat_force='docker[[:space:]]+([^|;&]*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))[[:space:]]([^|;&]*[[:space:]])?(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)'
+u26_pat_rmi='--rmi([[:space:]=]|$)'
+u26_pat_prune='docker[[:space:]]+([^|;&]*[[:space:]])?prune([[:space:]]|$)'
+u26_grep() { # pattern: matching lines of the test scripts, the guards' own excluded
+  grep -nE -- "$1" "$here"/../app/*.sh "$here"/*.sh |
+    grep -vE "^[^:]*/unit\.sh:[0-9]+:[[:space:]]*((if )?grep -nE '|u26_pat_[a-z]+=)"
+}
+u26_guard() { # name pattern [filter]
+  local hits
+  hits=$(u26_grep "$2" | { if [ -n "${3-}" ]; then grep -vE "$3"; else cat; fi; })
+  [ -z "$hits" ]
+  result "U-26 test scripts: $1" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
+}
+u26_guard "images are removed only in tests/app/lib.sh" "$u26_pat_rm" '^[^:]*/app/lib\.sh:'
+u26_guard "no image removal with -f or --force" "$u26_pat_force"
+u26_guard "no Compose down that removes images" "$u26_pat_rmi"
+u26_guard "no prune command of any kind" "$u26_pat_prune"
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it

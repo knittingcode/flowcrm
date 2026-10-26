@@ -588,7 +588,20 @@ not touched.
 `tests/devenv/unit.sh` (U-26) checks both helpers with a fake Docker that
 removes every name of an image removed by ID or with force, and checks that
 `backend.sh`, `prodlike.sh` and `stack.sh` call `remove_untagged_images` with
-their own project.
+their own project. It also checks every `tests/app/*.sh` and
+`tests/devenv/*.sh` file (excluding its own grep pattern lines and those of
+U-09) and fails if:
+
+- `docker image rm`, `docker image remove` or `docker rmi` appears outside
+  `tests/app/lib.sh`;
+- one of these commands has `-f`, a short option group containing `f`, or
+  `--force` anywhere in the same command (up to `|`, `;` or `&`);
+- `--rmi` appears (Compose `down --rmi`);
+- any `docker ... prune` appears (`image`, `system`, `builder`, `buildx`
+  or any other prune).
+
+These are text checks: a removal written so that it does not match them
+(for example through a variable holding the command) is not detected.
 
 To remove leftover test images by hand (for example after a runner was
 killed with `SIGKILL`), list the candidates of one run project, check that
