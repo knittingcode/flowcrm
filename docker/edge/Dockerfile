@@ -20,9 +20,10 @@ COPY docker/edge/caddy/main.go ./
 RUN go build -trimpath -ldflags "-s -w" -o /out/caddy . && /out/caddy version
 
 FROM ${CADDY_IMAGE} AS caddy-base
-# brotli-libs >= 1.2.1-r0 fixes CVE-2026-111497 (HIGH), which the pinned base
-# image still ships (docs/security/container-vulnerabilities.md).
-RUN apk add --no-cache --upgrade 'brotli-libs>=1.2.1-r0'
+# brotli-libs >= 1.2.1-r0 fixes CVE-2026-111497 (HIGH) and curl/libcurl
+# >= 8.23.0-r0 fix CVE-2026-92392 (HIGH), which the pinned base image still
+# ships (docs/security/container-vulnerabilities.md).
+RUN apk add --no-cache --upgrade 'brotli-libs>=1.2.1-r0' 'curl>=8.23.0-r0' 'libcurl>=8.23.0-r0'
 # The rebuilt binary has no file capabilities: port 8080 needs none, and a
 # container without capabilities could not exec a binary that requests one.
 COPY --from=caddy-build /out/caddy /usr/bin/caddy
