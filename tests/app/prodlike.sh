@@ -36,6 +36,7 @@ docker_cleanup() {
   case $project in flowcrm-??????-prod-??????) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
   remove_project "$project" "$APP_REPO"
   remove_images "$project-"
+  remove_untagged_images "$project"
   remove_images "$e2e_image"
 }
 trap 'docker_cleanup; rm -rf "$work" "$secrets"' EXIT

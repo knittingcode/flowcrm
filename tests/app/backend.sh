@@ -31,6 +31,7 @@ cleanup() {
   case $project in flowcrm-??????-test-??????) dc down --volumes --remove-orphans >/dev/null 2>&1 ;; esac
   remove_project "$project" "$APP_REPO"
   remove_images "$project-"
+  remove_untagged_images "$project"
   rm -rf "$work" "$secrets"
 }
 trap cleanup EXIT

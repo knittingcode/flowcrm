@@ -60,7 +60,11 @@ final_cleanup() {
     remove_project "$(project_of "$d")" "$d"
   done <"$work/checkouts"
   docker ps -aq --filter "label=devenv.test=stack-$(sha6 "$work")" | while read -r id; do docker rm -f "$id" >/dev/null 2>&1; done
-  while read -r d; do [ -n "$d" ] && remove_images "$(project_of "$d")-"; done <"$work/checkouts"
+  while read -r d; do
+    [ -n "$d" ] || continue
+    remove_images "$(project_of "$d")-"
+    remove_untagged_images "$(project_of "$d")"
+  done <"$work/checkouts"
   remove_images "$e2e_image"
 }
 trap 'final_cleanup; rm -rf "$work"' EXIT

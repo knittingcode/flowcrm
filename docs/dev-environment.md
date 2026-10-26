@@ -555,10 +555,40 @@ deletes the image only when it was the last name. `remove_images PREFIX`:
 - keeps, and reports, an image used by any container;
 - refuses an empty prefix, characters outside image names and any prefix
   that could match this checkout's development stack (`<project>-<service>`)
-  other than a run project (`<project>-test-<run>-`, `<project>-prod-<run>-`).
+  other than a run project (`<project>-test-<run>-`, `<project>-prod-<run>-`);
+- prints one line per call with the number of names removed and kept.
 
-`tests/devenv/unit.sh` (U-26) checks this with a fake Docker and fails if a
-runner in `tests/app/` removes images any other way.
+A rebuild within a run (`stack.sh` rebuilds a checkout after editing it)
+moves the name to the new image and leaves the previous image untagged
+(`<none>`), which a removal by name cannot reach. The runners with a Compose
+project of their own (`backend.sh`, `prodlike.sh` and, for each temporary
+checkout, `stack.sh`) therefore also call `remove_untagged_images PROJECT`
+after `remove_images`. It:
+
+- selects only images that are untagged and carry the run's project label:
+  `docker image ls -q --no-trunc --filter dangling=true --filter
+  label=com.docker.compose.project=PROJECT`;
+- removes each by ID without `--force`: an untagged image has no name that
+  could belong to someone else, and Docker refuses to remove an image that a
+  container uses or that has child images;
+- skips, and reports, an image that got a name after it was listed or that a
+  container uses, and reports every image Docker refused;
+- refuses an empty project name, one that is not a Compose project name
+  (lowercase letters, digits, `_` and `-`, starting with a letter or digit),
+  and any name the prefix check above refuses as `PROJECT-`, which includes
+  this checkout's development stack;
+- prints one line per call with the number of images removed and kept.
+
+`frontend.sh`, `scan.sh` and the browser test image (`flowcrm-e2e:<run>`)
+build with `docker build` and no Compose project label. Each of their tags
+is built once per run, so they leave no untagged image of their own; any
+untagged image without the label is left alone. BuildKit's build cache is
+not touched.
+
+`tests/devenv/unit.sh` (U-26) checks both helpers with a fake Docker that
+removes every name of an image removed by ID or with force, and checks that
+`backend.sh`, `prodlike.sh` and `stack.sh` call `remove_untagged_images` with
+their own project.
 
 To remove leftover test images by hand (for example after a runner was
 killed with `SIGKILL`), list the candidates of one run project, check that
@@ -570,9 +600,16 @@ $ docker image inspect --format '{{.RepoTags}}' flowcrm-<hash>-test-<run>-api:la
 $ docker image rm flowcrm-<hash>-test-<run>-api:latest
 ```
 
-Do not remove images by ID, with `-f`, with `docker image prune -a` or
-`docker system prune -a`, or through bulk removal of "unused" images in
-Docker Desktop: these also delete other projects' images, including the
+Then remove that project's untagged images by ID, without `-f`:
+
+```console
+$ docker image ls -q --no-trunc --filter dangling=true --filter label=com.docker.compose.project=flowcrm-<hash>-test-<run>
+$ docker image rm <ID>
+```
+
+Do not remove a named image by ID, and do not remove images with `-f`,
+with `docker image prune -a` or `docker system prune -a`, or through bulk
+removal of "unused" images in Docker Desktop: these also delete other projects' images, including the
 development stack's. A running container does not keep its image's name:
 with the containerd image store (Docker Desktop), a `make up` that rebuilds
 an unchanged image gives it a new image ID (BuildKit's attestation index

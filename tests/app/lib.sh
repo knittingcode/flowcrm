@@ -3,7 +3,8 @@
 # Shared helpers of the application-stack test runners (sourced).
 # Every Docker resource is created under a Compose project name that the
 # runner owns; cleanup removes only those projects' containers, volumes and
-# networks, checked by label, and their images by name (remove_images).
+# networks, checked by label, their images by name (remove_images) and the
+# untagged images Compose built for them (remove_untagged_images).
 
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../devenv/tally.sh
@@ -69,19 +70,13 @@ remove_project() { # project dir
     while read -r id; do docker network rm "$id" >/dev/null 2>&1; done
 }
 
-# Removes the images of a run by name: every tag that starts with PREFIX
-# (the run's Compose project followed by "-", or a run-specific
-# repository:tag). Never by image ID and never forced, so Docker deletes an
-# image only when its last name goes: an image that also carries a name
-# outside PREFIX (a base image the run re-tagged, or the same image under
-# another project) only loses the run's name and stays. Images used by any
-# container are left alone. Every image that is kept is reported.
-remove_images() { # prefix
-  local prefix=$1 dev containers used ref id others
-  # Refused, removing nothing: an empty prefix, characters outside image
-  # names, and any prefix that could match an image of this checkout's
-  # development stack ("<dev>-<service>"), unless it names a run project
-  # of this checkout ("<dev>-test-<run>-", "<dev>-prod-<run>-").
+# Returns 0 when PREFIX may select images of a run. Refused, and reported:
+# an empty prefix, characters outside image names, and any prefix that could
+# match an image of this checkout's development stack ("<dev>-<service>"),
+# unless it names a run project of this checkout ("<dev>-test-<run>-",
+# "<dev>-prod-<run>-").
+image_prefix_ok() { # prefix
+  local prefix=$1 dev
   dev=$(project_of "$APP_REPO")-
   case $prefix in
     '' | *[!A-Za-z0-9_.:/-]*)
@@ -106,22 +101,98 @@ remove_images() { # prefix
       esac
       ;;
   esac
+}
+
+# Prints the image ID of every container, running or stopped.
+used_image_ids() {
+  local containers
   containers=$(docker ps -aq --no-trunc)
   # shellcheck disable=SC2086 # one argument per container ID
-  used=$([ -z "$containers" ] || docker inspect -f '{{.Image}}' $containers 2>/dev/null)
-  docker image ls --format '{{.Repository}}:{{.Tag}}' | sort -u | while IFS= read -r ref; do
-    case $ref in "$prefix"*) ;; *) continue ;; esac
-    case $ref in *'<none>'*) continue ;; esac
-    id=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null) || continue
-    if printf '%s\n' "$used" | grep -qxF -- "$id"; then
-      say "      KEPT image $ref ($id): used by a container"
-      continue
-    fi
-    others=$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$ref" 2>/dev/null |
-      awk -v p="$prefix" 'NF && index($0, p) != 1' | tr '\n' ' ')
-    [ -z "$others" ] || say "      image $ref is also named ${others% }: only the name $ref is removed"
-    docker image rm "$ref" >/dev/null 2>&1 || say "      KEPT image $ref: Docker refused to remove the name"
-  done
+  [ -z "$containers" ] || docker inspect -f '{{.Image}}' $containers 2>/dev/null
+}
+
+# Removes the images of a run by name: every tag that starts with PREFIX
+# (the run's Compose project followed by "-", or a run-specific
+# repository:tag). Never by image ID and never forced, so Docker deletes an
+# image only when its last name goes: an image that also carries a name
+# outside PREFIX (a base image the run re-tagged, or the same image under
+# another project) only loses the run's name and stays. Images used by any
+# container are left alone. Every image that is kept is reported, and one
+# line counts the names removed and kept.
+remove_images() { # prefix
+  local prefix=$1 used
+  image_prefix_ok "$prefix" || return 1
+  used=$(used_image_ids)
+  docker image ls --format '{{.Repository}}:{{.Tag}}' | sort -u | {
+    local ref id others removed=0 kept=0
+    while IFS= read -r ref; do
+      case $ref in "$prefix"*) ;; *) continue ;; esac
+      case $ref in *'<none>'*) continue ;; esac
+      id=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null) || continue
+      if printf '%s\n' "$used" | grep -qxF -- "$id"; then
+        say "      KEPT image $ref ($id): used by a container"
+        kept=$((kept + 1))
+        continue
+      fi
+      others=$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$ref" 2>/dev/null |
+        awk -v p="$prefix" 'NF && index($0, p) != 1' | tr '\n' ' ')
+      [ -z "$others" ] || say "      image $ref is also named ${others% }: only the name $ref is removed"
+      if docker image rm "$ref" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        say "      KEPT image $ref: Docker refused to remove the name"
+        kept=$((kept + 1))
+      fi
+    done
+    say "      images $prefix*: $removed names removed, $kept kept"
+  }
+}
+
+# Removes the untagged images that Docker Compose built for PROJECT, the
+# run's own Compose project: a rebuild moves the name to the new image and
+# leaves the previous one without a name, which remove_images cannot see.
+# Only images that are dangling (no name) and labelled with PROJECT, by ID
+# and never forced: an image without a name cannot take another name with
+# it, and Docker refuses to remove an image that a container uses or that
+# has child images. An image that got a name after it was listed is skipped.
+# Refused like remove_images: a project name that is empty, not a Compose
+# project name, or this checkout's development stack. Every image that is
+# kept is reported, and one line counts the images removed and kept.
+remove_untagged_images() { # project
+  local p=$1 used
+  case $p in
+    '' | [!abcdefghijklmnopqrstuvwxyz0123456789]* | *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
+      say "      KEPT untagged images: refusing the project name '$p'"
+      return 1
+      ;;
+  esac
+  image_prefix_ok "$p-" || return 1
+  used=$(used_image_ids)
+  docker image ls -q --no-trunc --filter dangling=true --filter "label=com.docker.compose.project=$p" | sort -u | {
+    local id tags removed=0 kept=0
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      tags=$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$id" 2>/dev/null) || continue
+      if [ -n "$tags" ]; then
+        tags=$(printf '%s' "$tags" | tr '\n' ' ')
+        say "      KEPT image $id: it has a name (${tags% })"
+        kept=$((kept + 1))
+        continue
+      fi
+      if printf '%s\n' "$used" | grep -qxF -- "$id"; then
+        say "      KEPT untagged image $id: used by a container"
+        kept=$((kept + 1))
+        continue
+      fi
+      if docker image rm "$id" >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        say "      KEPT untagged image $id: Docker refused to remove it"
+        kept=$((kept + 1))
+      fi
+    done
+    say "      untagged images of $p: $removed removed, $kept kept"
+  }
 }
 
 project_resources() { # project: number of containers + volumes + networks left
