@@ -159,6 +159,32 @@ repositories. No base image ships it yet, so `docker/api/Dockerfile`,
 version cannot be installed). Remove the upgrade when the pinned base
 images include the fix. No exception was added.
 
+## CVE-2026-92392: `curl` and `libcurl` (runtime images)
+
+Published after the last green scan of `main` (run 40223497868,
+2026-10-25); found by the scan of PR #38 (run 40383573386, 2026-10-26), not
+by a change of the project. The Alpine packages `curl` and `libcurl`
+8.22.0-r0 (HIGH) come from the pinned base images:
+
+| Image | Base (Alpine) | Affected packages |
+|---|---|---|
+| api (`prod`, `dev`) | PHP 8.5.12 FPM (3.24.2) | `curl`, `libcurl` |
+| edge (`prod`, `dev`) | Caddy 2.11.7 (3.23.6) | `curl`, `libcurl` |
+| db | PostgreSQL 18.6 (3.24.2) | `libcurl` (no `curl` tool) |
+
+8.23.0-r0 fixes it and is in the Alpine 3.23 and 3.24 `main` repositories
+for x86_64 and aarch64 (built 2026-10-25). The current builds of the base
+image tags were created on 2026-10-21, before the fix, so refreshing the
+pinned digests would not help. `docker/api/Dockerfile` and
+`docker/edge/Dockerfile` upgrade both packages
+(`apk add --upgrade 'curl>=8.23.0-r0' 'libcurl>=8.23.0-r0'`),
+`docker/db/Dockerfile` upgrades `libcurl` only, so no package is added to an
+image; the build fails if the fixed version cannot be installed. The
+project's own health checks do not use `curl` (they use `cgi-fcgi` and
+`wget`), but the packages belong to the base images and are not removed.
+Remove the upgrade when the pinned base images include the fix. No exception
+was added.
+
 ## Deferred hardening items
 
 - `framework.trusted_hosts` is not configured: behind the edge, Symfony
