@@ -61,6 +61,30 @@ final class SecurityLoggingTest extends WebTestCase
         }
     }
 
+    /**
+     * The pseudonym folds an e-mail address the way the account lookup does
+     * (LoginRateLimiter, #23), so the spellings that reach one account are
+     * traced as one account: U+0130 lower-cases to "i" only in the simple
+     * folding.
+     */
+    public function testFailedLoginsOfOneAccountShareOnePseudonymWhateverTheSpelling(): void
+    {
+        $client = self::createClient();
+        $client->disableReboot();
+        $user = Fixtures::from(self::getContainer())->user('casing-log');
+        $server = ['CONTENT_TYPE' => 'application/json', 'HTTP_ORIGIN' => 'http://localhost', 'REMOTE_ADDR' => '127.0.0.1'];
+
+        $refs = [];
+        foreach ([$user->email, strtoupper(str_replace('i', "\u{130}", $user->email))] as $i => $email) {
+            $client->request('POST', '/api/v1/auth/login', server: $server, content: json_encode(['email' => $email, 'password' => 'a wrong password '.$i], \JSON_THROW_ON_ERROR));
+            self::assertResponseStatusCodeSame(401);
+            $refs[] = ((array) $this->only($this->records(), 'login failed')['context'])['account_ref'];
+        }
+
+        self::assertIsString($refs[0]);
+        self::assertSame($refs[0], $refs[1], 'both spellings are traced as one account');
+    }
+
     /** @param array<string, string> $server */
     private function disabled(KernelBrowser $client, array $server): void
     {
