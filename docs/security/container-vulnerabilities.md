@@ -95,7 +95,7 @@ exception; the vulnerable code is still in the image.
 
 | Id | Package and path | Image | Fixed in | Reachable here | Expires | Decision |
 |---|---|---|---|---|---|---|
-| CVE-2026-116587 (GHSA-mgcc-cww5-fp2q) | `github.com/go-jose/go-jose/v3` v3.0.5 (`pkg:golang/github.com/go-jose/go-jose/v3@v3.0.5`) in `usr/bin/caddy` | edge (`prod`; `dev` is report-only) | none for v3 (v4 fixed in 4.1.6 and upgraded, not excepted) | no: no `acme_server`, `pki` app or `tls internal`, admin API off | 2026-11-30 (gate fails again from 00:00 UTC that day) | [ADR-021](../architecture/adr/ADR-021-edge-go-jose-v3-exception.md), **proposed, not accepted** ([details](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge)) |
+| CVE-2026-116587 (GHSA-mgcc-cww5-fp2q) | `github.com/go-jose/go-jose/v3` v3.0.5 (`pkg:golang/github.com/go-jose/go-jose/v3@v3.0.5`) in `usr/bin/caddy` | edge (`prod`; `dev` is report-only) | none for v3 (v4 fixed in 4.1.6 and upgraded, not excepted) | no: no `acme_server`, `pki` app or `tls internal`, admin API off | 2026-11-30 (gate fails again from 00:00 UTC that day) | [ADR-021](../architecture/adr/ADR-021-edge-go-jose-v3-exception.md), **accepted by the owner on 2026-10-28** ([details](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge)) |
 
 ## Triage of the FCRM-FND-004V findings
 
@@ -271,10 +271,10 @@ untrusted input (the JWS of an ACME request) to the vulnerable parser;
 from its own configuration. With `admin off` the configuration cannot be
 changed at run time.
 
-**Exception (proposed, not accepted):** `security/trivyignore.yaml` excepts
-this id for `go-jose/v3` v3.0.5 in `usr/bin/caddy` only, until 2026-11-30
-(see [Exceptions](#exceptions); decision proposed in ADR-021). It does not
-fix the vulnerable code: go-jose v3 3.0.5 stays in the edge binary, and the
+**Exception (accepted 2026-10-28, ADR-021):** `security/trivyignore.yaml`
+excepts this id for `go-jose/v3` v3.0.5 in `usr/bin/caddy` only, until
+2026-11-30 (see [Exceptions](#exceptions); decision in ADR-021). It does
+not fix the vulnerable code: go-jose v3 3.0.5 stays in the edge binary, and the
 exception only rests on the configuration above, which the edge
 configuration guard is to enforce. Scope, verified with Trivy 0.67.2 and the
 flags of `tests/app/scan.sh` (FCRM-SEC-042):

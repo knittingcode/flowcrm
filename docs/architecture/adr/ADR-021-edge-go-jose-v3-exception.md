@@ -1,8 +1,9 @@
 # ADR-021: Temporary exception for go-jose v3 in the edge Caddy binary
 
-- **Status:** proposed (FCRM-SEC-042), **not accepted**. The owner decides.
-  Until it is accepted, the exception in `security/trivyignore.yaml` must not
-  reach `main`.
+- **Status:** accepted by the owner on 2026-10-28 (FCRM-SEC-042M), Option A
+  with the conditions under "Acceptance". Proposed in FCRM-SEC-041 and
+  FCRM-SEC-042. The vulnerable code is not fixed; the decision accepts a
+  temporary risk.
 - **Related:** [container vulnerabilities](../../security/container-vulnerabilities.md)
   (exception policy, CVE-2026-116587 triage, edge configuration guard),
   ADR-017 (edge routing)
@@ -54,7 +55,7 @@ Reachability in FlowCRM:
 The runtime gate (`tests/app/scan.sh`) fails on every HIGH or CRITICAL
 finding, so this finding blocks every pull request and `main`.
 
-## Decision (proposed)
+## Decision
 
 1. Upgrade go-jose v4 to 4.1.6 (PR #41). v4 gets no exception.
 2. Add one temporary exception to `security/trivyignore.yaml` that matches
@@ -121,6 +122,24 @@ finding, so this finding blocks every pull request and `main`.
 4. The exception is listed in the exceptions table of the container
    vulnerability document, which states that it does not fix the vulnerable
    code.
+
+## Acceptance
+
+Accepted by the owner on 2026-10-28 with the following scope and conditions:
+
+- **Scope:** only CVE-2026-116587 in
+  `pkg:golang/github.com/go-jose/go-jose/v3@v3.0.5`, path `usr/bin/caddy`,
+  in the edge runtime image, until 2026-11-30. go-jose v4, other v3
+  versions, other packages, other binaries and every other HIGH or CRITICAL
+  finding stay blocking. The finding stays visible in the scan logs.
+- **Conditions:** the compensating controls above stay in place and pass in
+  CI. The exception is reassessed immediately on any review trigger listed
+  under Consequences, and before it expires.
+- **Removal:** when an exit criterion is met, delete the entry from
+  `security/trivyignore.yaml` and its row from the exceptions table, and
+  mark this ADR superseded. Renewing it after the expiry needs a new review
+  and a new owner decision. Without either, the exception guard and the
+  gate fail from 2026-11-30.
 
 ## Consequences
 
