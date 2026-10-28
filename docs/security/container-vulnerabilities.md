@@ -185,6 +185,43 @@ project's own health checks do not use `curl` (they use `cgi-fcgi` and
 Remove the upgrade when the pinned base images include the fix. No exception
 was added.
 
+## CVE-2026-116587 / GHSA-mgcc-cww5-fp2q: `go-jose` (edge)
+
+Published by go-jose on 2026-10-14 and added to the GitHub advisory database
+(HIGH) on 2026-10-27, after the last green scan of `main`; not caused by a
+change of the project. Parsing a JWK with a crafted RSA key costs excessive
+CPU (denial of service). The rebuilt Caddy binary (`usr/bin/caddy`, edge
+`prod` and `dev`) contains both affected major versions:
+
+| Package | Installed | Fixed in | Status |
+|---|---|---|---|
+| `github.com/go-jose/go-jose/v4` | 4.1.5 | 4.1.6 | **fixed**: `docker/edge/caddy/go.mod` requires 4.1.6 |
+| `github.com/go-jose/go-jose/v3` | 3.0.5 | none (no fixed v3 release) | **open** |
+
+`go-jose/v3` comes from `modules/caddypki` → `github.com/smallstep/certificates/authority`
+→ `go.step.sm/crypto/jose` (0.91.0; the newest, 0.91.1, still requires
+v3). It cannot be removed by building Caddy without `modules/caddypki`:
+`modules/caddytls` (internal issuer and CA pools) and
+`caddyconfig/httpcaddyfile` import `caddypki` directly, and
+`modules/caddyhttp` imports `caddytls`, so every Caddy build with the HTTP
+app links it. A build from the `modules/standard` list without `caddypki`
+and `caddypki/acmeserver` still contains `go-jose/v3` 3.0.5 (`go version -m`)
+and only drops the `http.handlers.acme_server` module. Removing v3 needs
+either a release of `go.step.sm/crypto` and `smallstep/certificates` on
+go-jose v4, or a change to Caddy itself.
+
+FlowCRM's configuration does not reach the vulnerable code: both
+Caddyfiles disable automatic HTTPS (`auto_https off`), no configuration
+defines a `pki` app, `tls internal` or `acme_server`, and the HTTPS test
+edge (`tests/app/https`) loads its certificate from files
+(`tls.certificates.load_files`). Only the `acme_server` handler passes
+untrusted input (the JWS of an ACME request) to the vulnerable parser;
+`tls internal` and the `pki` app parse only keys Caddy creates or loads
+from its own configuration. With `admin off` the configuration cannot be
+changed at run time. The finding still fails the runtime gate
+for the edge `prod` image until it is fixed upstream or an exception is
+decided.
+
 ## Deferred hardening items
 
 - `framework.trusted_hosts` is not configured: behind the edge, Symfony
