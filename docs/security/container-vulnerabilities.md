@@ -33,7 +33,8 @@ downloaded on every run.
   key twice in one entry; the id is the one Trivy reports (the CVE when one
   exists: Trivy matches only that id, not its aliases), so an id listed as an
   alias in the first column of the [Exceptions](#exceptions) table, as in
-  `CVE-2026-116587 (GHSA-mgcc-cww5-fp2q)`, is rejected; `purls` with at least one value, each of the form
+  `CVE-2026-116587 (GHSA-mgcc-cww5-fp2q)`, is rejected; `purls` with at
+  least one value, each of the form
   `pkg:<type>/<namespace>/<name>@<version>` with a lowercase type and an
   exact version (no purl without a version, which Trivy would apply to every
   version; no range, list or blank; no qualifiers, subpath or
@@ -48,8 +49,8 @@ downloaded on every run.
   and `}` are all rejected); a non-empty `statement`; a valid `expired_at`
   after the day of the check and no more than 90 days after it; the id at
   the start of a row of the [Exceptions](#exceptions) table (a mention
-  elsewhere in this document does not count); and only the documented form (any other
-  section or key fails). Trivy stops applying an entry at 00:00 UTC of its
+  elsewhere in this document does not count); and only the documented form
+  (any other section or key fails). Trivy stops applying an entry at 00:00 UTC of its
   `expired_at` day, and from that day on the guard fails too, so an expired
   exception breaks the `Repository guard` job until it is renewed after a
   new review or removed, instead of lingering in the file. Trivy applies an
@@ -68,8 +69,8 @@ downloaded on every run.
   finding stays visible in CI. Trivy passes suppressed findings to a
   template whether or not `--show-suppressed` is given (that option only
   affects the table and JSON formats), and they do not count towards the
-  exit code. The development-image scans do not read
-  the exception file and report the finding as usual.
+  exit code. The development-image scans do not read the exception file
+  and report the finding as usual.
 - A control scan of the unmodified PostgreSQL base image (with its `gosu`)
   must fail; it proves the gate is not passing vacuously.
 - Every scan must report the package sources expected for the image (Alpine

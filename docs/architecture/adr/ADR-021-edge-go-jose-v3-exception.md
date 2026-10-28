@@ -108,8 +108,8 @@ finding, so this finding blocks every pull request and `main`.
      rejected, because Trivy matches only the id it reports. An entry that
      expires on or before the check date fails the guard.
    - **Visibility:** the scan template prints the suppressed finding as
-     `SUPPRESSED` in the edge-prod scan log. The edge `dev` report scan does not use the
-     ignore file and keeps listing it.
+     `SUPPRESSED` in the edge-prod scan log. The edge `dev` report scan
+     does not use the ignore file and keeps listing it.
 4. The exception is listed in the exceptions table of the container
    vulnerability document, which states that it does not fix the vulnerable
    code.
