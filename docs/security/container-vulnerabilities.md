@@ -226,6 +226,58 @@ changed at run time. The finding still fails the runtime gate
 for the edge `prod` image until it is fixed upstream or an exception is
 decided.
 
+### Edge configuration guard
+
+The finding is acceptable only while no edge configuration runs the code
+that parses untrusted JWS/JWK. Two checks enforce this, and both fail
+closed:
+
+- `scripts/ci/guard-edge-config.sh` (job `Repository guard`, regression
+  suite `scripts/ci/tests/guard-edge-config.test.sh`) reads every tracked
+  Caddy file (`Caddyfile*`, `*.caddyfile`, `*.caddy`) and every place that
+  starts Caddy: the edge Dockerfile (its `COPY` into `/etc/caddy`; no `CMD`
+  or `ENTRYPOINT`, so the pinned base image's
+  `caddy run --config /etc/caddy/Caddyfile --adapter caddyfile` runs),
+  Compose files (commands and read-only bind mounts into `/etc/caddy`, such
+  as `tests/app/https/compose.https.yaml`), scripts, `bin/`, the Makefile
+  and the workflows. It tokenizes and parses each configuration like Caddy
+  2.11 does (comments, quotes, escaped newlines, snippets, imports and import
+  globs, resolved against the files in the container) and rejects:
+  - `acme_server`, `pki`, `internal`, `local_certs`, `acme`, `zerossl`,
+    `issuer`, `cert_issuer`, `acme_ca`, `acme_ca_root`, `acme_dns`,
+    `acme_eab`, `on_demand`, `on_demand_tls`, `skip_install_trust` and
+    `get_certificate` anywhere (in any case, quoted or not), and `tls` in
+    any form other than `tls <cert-file> <key-file>`;
+  - a configuration Caddy starts with that does not have exactly one global
+    options block, first, with exactly `admin off`, `auto_https off` and
+    `persist_config off`; options other than these and `log`;
+  - `{$VAR}` (replaced in the raw text before parsing, even in a comment),
+    `{env.*}`, snippet arguments and blocks, heredocs, named routes,
+    non-ASCII text, and an import that does not resolve;
+  - a `caddy` command other than `run`, `adapt`, `validate`, `version`,
+    `list-modules` and `build-info`; `run`, `adapt` and `validate` without
+    `--config <path the image or a mount provides> --adapter caddyfile`, or
+    with `--resume`, `--watch`, `--envfile` or an unknown flag; `CADDY_ADMIN`
+    anywhere;
+  - a Caddy file that no start point uses, and a tracked JSON file that
+    looks like a Caddy JSON configuration.
+- `tests/app/scan.sh` (job `Dev environment`) runs `caddy adapt` with the
+  built binary in the built edge `prod` and `dev` images and on the HTTPS
+  test edge, checks the images' command and that they set no `CADDY_*`
+  variable other than `CADDY_VERSION`, and checks the adapted JSON with
+  `scripts/ci/edge-adapted-config.jq`: `admin.disabled` is true,
+  `admin.config.persist` is false, there is no other admin setting, no
+  `pki` app, no `tls.automation`, no issuer module (`acme`, `internal`,
+  `zerossl`), no `acme_server` handler at any depth, and every HTTP server
+  has `automatic_https.disable`. A control image with an unsafe
+  configuration must be rejected.
+
+Known limits: the guard reads command lines as written. A command built at
+run time (shell variables, `env_file:`) is not seen, and a
+`docker compose` bind mount applies to every edge stage in its model. A
+Caddy plugin added to `docker/edge/caddy/main.go` would need its own
+review. Changing a rule means reviewing the reason above.
+
 ## Deferred hardening items
 
 - `framework.trusted_hosts` is not configured: behind the edge, Symfony
