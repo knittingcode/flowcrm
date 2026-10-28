@@ -80,14 +80,21 @@ finding, so this finding blocks every pull request and `main`.
      does, including imports, import globs and snippets, and every place
      that starts Caddy. It rejects:
      - `acme_server`, `pki`, issuers, `tls internal`, `local_certs` and
-       other ACME options;
+       other ACME options, in every Caddy file and in every file copied or
+       mounted into `/etc/caddy`, whatever its name;
      - a global block other than exactly `admin off`, `auto_https off` and
        `persist_config off`;
      - environment placeholders;
      - `--resume` and `--watch`;
-     - other configuration files, and `CADDY_ADMIN`.
+     - other configuration files, and `CADDY_ADMIN`;
+     - edge service commands in Compose other than the exact `caddy run`
+       form, entrypoints, YAML escapes, and mounts over `/etc` or the
+       binary;
+     - edge Dockerfile stages that could link, copy or rename the binary.
 
-     Unknown constructs fail.
+     Unknown Caddyfile constructs fail. Shell, YAML and Dockerfile text is
+     read line by line. The guard catches ordinary and accidental changes,
+     but not a deliberate evasion assembled at run time (see Consequences).
    - **Adapted-configuration check**, in `tests/app/scan.sh`. It runs
      `caddy adapt` with the built binary in the built edge images and on
      the HTTPS test edge, and checks the JSON: the admin API is disabled,
@@ -111,10 +118,16 @@ finding, so this finding blocks every pull request and `main`.
 - **Residual risk:** availability only. If a configuration enabled an ACME
   server, or a mutable admin API, a remote client could exhaust the edge's
   CPU. The edge has no CPU or memory limits, so the API and database on the
-  same host could suffer too. Today such a change fails CI through both
-  checks. The checks do not see commands built at run time (shell
-  variables, an `env_file`) or Caddy plugins added to
-  `docker/edge/caddy/main.go`.
+  same host could suffer too. An ordinary change that enables such a
+  configuration fails the static guard. The adapted check also catches it
+  when the change is in the built image. The checks do not see commands or
+  paths assembled at run time (shell variables, `eval`, an `env_file` that
+  sets `CADDY_ADMIN` or a `{$VAR}` value, `docker cp`). They do not see
+  `docker run --entrypoint` with another executable in a script outside
+  Compose, a Caddy plugin added to `docker/edge/caddy/main.go`, or what an
+  `apk add` package installs. The adapted check does not apply Compose
+  mounts. These remain review items: every change under `docker/edge`,
+  `tests/app/https` or a Compose file is a review trigger below.
 - **Expiry:** on 2026-11-30 Trivy stops applying the entry, and the
   exception guard fails the `Repository guard` job, so every pull request
   is blocked until the exception is renewed after a new review or removed.
@@ -129,16 +142,16 @@ finding, so this finding blocks every pull request and `main`.
   - a Go vulnerability database entry with affected symbols, for a
     govulncheck check;
   - a severity change;
-  - any change under `docker/edge` or `tests/app/https`, or a new Caddy
-    plugin;
+  - any change under `docker/edge` or `tests/app/https`, to the edge
+    service in a Compose file, or a new Caddy plugin;
   - a Trivy upgrade;
   - a deployment beyond the loopback-only development and test stacks.
 - **Exit criteria:** go-jose v3 is gone from `go version -m usr/bin/caddy`,
   or replaced by a fixed version. The exception entry and its table row are
   then removed, and this ADR is superseded.
 - **Operations:**
-  - the edge configuration guard takes about 1 s, and its regression
-    suite about 90 s, in the `Repository guard` job;
+  - the edge configuration guard takes about 2 s, and its regression
+    suite about 2.5 minutes, in the `Repository guard` job;
   - the adapted check adds seconds to the scan step;
   - a renewal is a reviewed change to `security/trivyignore.yaml` and the
     exceptions table.

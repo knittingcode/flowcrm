@@ -284,8 +284,9 @@ Trivy upgrade (the exception file format is experimental in Trivy).
 ### Edge configuration guard
 
 The finding is acceptable only while no edge configuration runs the code
-that parses untrusted JWS/JWK. Two checks enforce this, and both fail
-closed:
+that parses untrusted JWS/JWK. Two checks enforce this. They catch
+ordinary and accidental changes and the obfuscations listed below, not every
+deliberate evasion (see "Known limits"):
 
 - `scripts/ci/guard-edge-config.sh` (job `Repository guard`, regression
   suite `scripts/ci/tests/guard-edge-config.test.sh`) reads every tracked
@@ -301,19 +302,37 @@ closed:
   - `acme_server`, `pki`, `internal`, `local_certs`, `acme`, `zerossl`,
     `issuer`, `cert_issuer`, `acme_ca`, `acme_ca_root`, `acme_dns`,
     `acme_eab`, `on_demand`, `on_demand_tls`, `skip_install_trust` and
-    `get_certificate` anywhere (in any case, quoted or not), and `tls` in
-    any form other than `tls <cert-file> <key-file>`;
+    `get_certificate` (in any case, quoted or not) in every tracked Caddy
+    file and in every file copied or mounted into `/etc/caddy`, whatever
+    its name (an import glob can reach any of them), and `tls` in any form
+    other than `tls <cert-file> <key-file>`;
   - a configuration Caddy starts with that does not have exactly one global
     options block, first, with exactly `admin off`, `auto_https off` and
     `persist_config off`; options other than these and `log`;
-  - `{$VAR}` (replaced in the raw text before parsing, even in a comment),
-    `{env.*}`, snippet arguments and blocks, heredocs, named routes,
-    non-ASCII text, and an import that does not resolve;
+  - in the same files: `{$VAR}` (replaced in the raw text before parsing,
+    even in a comment), `{env.*}` and non-ASCII text; snippet arguments and
+    blocks, heredocs, named routes, and an import that does not resolve to
+    a copied or mounted file or a snippet;
   - a `caddy` command other than `run`, `adapt`, `validate`, `version`,
     `list-modules` and `build-info`; `run`, `adapt` and `validate` without
     `--config <path the image or a mount provides> --adapter caddyfile`, or
     with `--resume`, `--watch`, `--envfile` or an unknown flag; `CADDY_ADMIN`
-    anywhere;
+    anywhere; a glob in a command line that matches the binary's name
+    (`cadd?`);
+  - an edge service in Compose (it builds `docker/edge/Dockerfile`, runs a
+    caddy image, directly or through a `<<: *anchor` merge, or overrides
+    such a service) with an `entrypoint`, `extends`, or a `command` other
+    than exactly
+    `["caddy", "run", "--config", "/etc/caddy/<path>", "--adapter", "caddyfile"]`;
+    a backslash anywhere in a Compose file (YAML escapes such as
+    `\u0063addy` would hide a command or a path); a mount over `/`, `/etc`,
+    `/usr` or a bin directory;
+  - in the edge runtime stages of the Dockerfile (from the caddy image or a
+    stage with files in `/etc/caddy`, and every stage built on them): a
+    `RUN` other than a plain `apk add --no-cache <packages>`, a copy of the
+    binary anywhere but `COPY --from=<stage> <path>/caddy /usr/bin/caddy`,
+    anything else in a bin directory, and `ENV PATH` or `SHELL`, so the
+    binary cannot be linked, copied or renamed;
   - a Caddy file that no start point uses, and a tracked JSON file that
     looks like a Caddy JSON configuration.
 - `tests/app/scan.sh` (job `Dev environment`) runs `caddy adapt` with the
@@ -327,11 +346,21 @@ closed:
   has `automatic_https.disable`. A control image with an unsafe
   configuration must be rejected.
 
-Known limits: the guard reads command lines as written. A command built at
-run time (shell variables, `env_file:`) is not seen, and a
-`docker compose` bind mount applies to every edge stage in its model. A
-Caddy plugin added to `docker/edge/caddy/main.go` would need its own
-review. Changing a rule means reviewing the reason above.
+Known limits. The guard reads Caddyfiles like Caddy does, but shell, YAML
+and Dockerfile text only line by line, and some evasions remain open:
+- commands and paths assembled at run time: shell variables, `eval`,
+  `$(...)` in scripts, an `env_file:` that sets `CADDY_ADMIN` or a `{$VAR}`
+  value, `docker cp` or `docker exec` with a variable command;
+- `docker run --entrypoint <other>` in a script, outside Compose (only
+  caddy command words and globs that match its name are checked there);
+- Compose files are not merged as Compose merges them. Bind mounts count
+  for every edge stage, and an override is recognised by its service name;
+- a Caddy plugin added to `docker/edge/caddy/main.go`, or a package an
+  `apk add` installs.
+
+The adapted-config check in `tests/app/scan.sh` sees what the built images
+contain and the one HTTPS test mount. It does not apply Compose mounts.
+Changing a rule means reviewing the reason above.
 
 ## Deferred hardening items
 
