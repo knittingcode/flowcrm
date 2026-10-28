@@ -390,6 +390,10 @@ deliberately:
   extension outside `bin/` is only a risk when something starts it. Compose
   edge commands and edge Dockerfile commands cannot, but a script's
   `docker run --entrypoint` can (see above);
+- a second Caddy under another name in a new Dockerfile: a stage that
+  copies the binary out of a Caddy image (`COPY --from=caddy:… /usr/bin/caddy
+  /opt/x/web`) and starts it with its own configuration is not an edge
+  stage, and `tests/app/scan.sh` does not scan that image;
 - a Caddy plugin added to `docker/edge/caddy/main.go`, or a package an
   `apk add` installs.
 

@@ -135,8 +135,9 @@ finding, so this finding blocks every pull request and `main`.
   paths assembled at run time (shell variables, `eval`, an `env_file` that
   sets `CADDY_ADMIN` or a `{$VAR}` value, `docker cp`). They do not see
   `docker run --entrypoint` with another executable in a script outside
-  Compose, a Caddy plugin added to `docker/edge/caddy/main.go`, or what an
-  `apk add` package installs. They do not recognise a service that runs an
+  Compose, a second Caddy binary copied under another name into a new
+  Dockerfile and started with its own configuration, a Caddy plugin added
+  to `docker/edge/caddy/main.go`, or what an `apk add` package installs. They do not recognise a service that runs an
   already built edge image under a tag without "caddy". The adapted check
   does not apply Compose mounts. A committer can also edit the guards. So
   review of every change under `docker/edge`, `tests/app/https`, the Compose
