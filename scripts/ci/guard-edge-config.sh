@@ -8,12 +8,13 @@
 #     (tls internal, issuer internal, local_certs) and no certificate
 #     issuance or ACME client (acme, zerossl, issuer, cert_issuer, acme_ca,
 #     acme_ca_root, acme_dns, acme_eab, on_demand, on_demand_tls,
-#     skip_install_trust, get_certificate), anywhere in any Caddy file;
+#     skip_install_trust, get_certificate) in any tracked Caddy file and in
+#     any file copied or mounted into /etc/caddy, whatever its name;
 #   - tls only as "tls <cert-file> <key-file>" (no block, no internal);
 #   - every configuration Caddy starts with has exactly one global options
 #     block, first, with exactly "admin off", "auto_https off" and
 #     "persist_config off" and no option outside the allow-list (log);
-#   - no environment placeholder ({$VAR}, substituted into the raw text
+#   - in the same files: no environment placeholder ({$VAR}, substituted into the raw text
 #     before parsing, so it could inject any configuration; {env.VAR}),
 #     no snippet arguments or blocks ({args...}, {block}, {blocks...}), no
 #     heredoc and no named route (&(name), invoke);
@@ -30,12 +31,26 @@
 #     no edge stage sets CMD or ENTRYPOINT (the pinned caddy base image's
 #     "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile" is
 #     used; tests/app/scan.sh checks it in the built images);
+#   - edge services in Compose (build docker/edge/Dockerfile, a caddy
+#     image, or an override of such a service) have no entrypoint or
+#     extends, and a command only in the exact form
+#     ["caddy", "run", "--config", "/etc/caddy/<path>", "--adapter", "caddyfile"];
+#     Compose files contain no backslash (YAML escapes) and no mount over
+#     /, /etc, /usr or a bin directory;
+#   - edge runtime stages of a Dockerfile only RUN "apk add --no-cache
+#     <packages>", copy the binary only to /usr/bin/caddy, put nothing else
+#     in a bin directory and do not change PATH or SHELL; command lines
+#     contain no glob that matches the binary's name;
 #   - no tracked Caddy file is unused by these start points, and no
 #     tracked JSON file looks like a Caddy JSON configuration.
 # Caddyfiles are tokenized like Caddy 2.11's lexer (comments, quotes,
 # backticks, escaped newlines, CR) and parsed like its parser (snippets,
 # imports, logical lines), so comments and quotes neither hide a
-# directive nor invent one. Anything the guard does not model fails.
+# directive nor invent one. Caddyfile constructs the guard does not model
+# fail. Shell and YAML are only read line by line: the guard catches
+# ordinary and accidental changes and the obfuscations above, but not a
+# command or path assembled at run time (shell variables, eval, env_file,
+# docker cp) or a Caddy plugin in docker/edge/caddy/main.go.
 #
 # Usage: guard-edge-config.sh [repository-path]
 # Exit codes: 0 configuration safe, 1 unsafe or unsupported construct,
@@ -158,7 +173,7 @@ stage_index() { # id -> index, or 1
 # lines that mention caddy in any case and are not full-line comments).
 logical_lines() {
   awk -v only="${2-}" '
-    function out(t) { if (only == "" || (t !~ /^[[:space:]]*#/ && tolower(t) ~ /caddy/)) print start "\t" t }
+    function out(t) { if (only == "" || (t !~ /^[[:space:]]*#/ && (tolower(t) ~ /caddy/ || t ~ /[*?[]/))) print start "\t" t }
     { sub(/\r$/, "") }
     { if (acc == "") start = NR; else acc = acc " "
       if ($0 ~ /\\$/) { acc = acc substr($0, 1, length($0) - 1); next }
@@ -183,6 +198,7 @@ words() {
   set +f
 }
 
+ST_FROM=() DL_STAGE=() DL_WHERE=() DL_INSTR=() DL_TEXT=()
 for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
   stage='' has_caddy_copy=no cmd_lines=''
   while IFS=$'\t' read -r ln text; do
@@ -191,7 +207,7 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
     instr=${text%%[[:space:]]*} rest=${text#"$instr"}
     shopt -s nocasematch
     case $instr in
-      from | copy | add | cmd | entrypoint) instr=$(lower "$instr") ;;
+      from | copy | add | cmd | entrypoint | run | env | shell) instr=$(lower "$instr") ;;
       *) instr=other ;;
     esac
     shopt -u nocasematch
@@ -203,9 +219,10 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
         if [ "${#w[@]}" -ge 3 ] && [ "$(lower "${w[1]}")" = as ]; then name=$(lower "${w[2]}"); fi
         stage_index "$df#$img" >/dev/null && parent="$df#$img"
         stage="$df#$name"
-        ST_ID+=("$stage") ST_PARENT+=("$parent")
+        ST_ID+=("$stage") ST_PARENT+=("$parent") ST_FROM+=("${w[0]-}")
         ;;
       copy | add)
+        DL_STAGE+=("$stage") DL_WHERE+=("$df:$ln") DL_INSTR+=("$instr") DL_TEXT+=("$text")
         words "$rest"
         w=(${WORDS[@]+"${WORDS[@]}"})
         dest=${w[${#w[@]}-1]-}
@@ -235,6 +252,9 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
         ;;
       cmd | entrypoint) cmd_lines="$cmd_lines $ln" ;;
       *)
+        case $instr in run | env | shell)
+          DL_STAGE+=("$stage") DL_WHERE+=("$df:$ln") DL_INSTR+=("$instr") DL_TEXT+=("$text") ;;
+        esac
         case $text in *"/etc/caddy"*)
           report "$df:$ln" "only COPY may write to /etc/caddy (the guard checks the copied file)" "$text"
           ;;
@@ -247,13 +267,88 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
   fi
 done
 
+# Edge runtime stages: a stage FROM a caddy image, a stage that copies into
+# /etc/caddy, and every stage built on one. Their RUN may only install
+# Alpine packages, the binary may only be copied to /usr/bin/caddy, and
+# nothing else may be placed in a bin directory or change PATH or SHELL: a
+# renamed or linked copy of the binary would escape the command checks.
+is_runtime_stage() { # stage id
+  local st=$1 idx k seen=' '
+  while [ -n "$st" ]; do
+    case $seen in *" $st "*) return 1 ;; esac
+    seen="$seen$st "
+    for ((k = 0; k < ${#MAP_STAGE[@]}; k++)); do [ "${MAP_STAGE[$k]}" = "$st" ] && return 0; done
+    idx=$(stage_index "$st") || return 1
+    shopt -s nocasematch
+    case ${ST_FROM[$idx]} in *caddy*) [ -z "${ST_PARENT[$idx]}" ] && { shopt -u nocasematch; return 0; } ;; esac
+    shopt -u nocasematch
+    st=${ST_PARENT[$idx]}
+  done
+  return 1
+}
+# Descendants count too: a stage is runtime if it or an ancestor is.
+bin_dir_re='^(/usr/local|/usr)?/s?bin(/|$)'
+for ((k = 0; k < ${#DL_STAGE[@]}; k++)); do
+  is_runtime_stage "${DL_STAGE[$k]}" || continue
+  where=${DL_WHERE[$k]} text=${DL_TEXT[$k]}
+  case ${DL_INSTR[$k]} in
+    run)
+      body=${text#*[[:space:]]}
+      body=${body#"${body%%[![:space:]]*}"}
+      case $body in
+        'apk add --no-cache '*)
+          set -f
+          # shellcheck disable=SC2086 # split on purpose; globbing is off
+          set -- $body
+          set +f
+          for x in "$@"; do
+            [[ $x =~ ^(apk|add|--[a-z-]+|[A-Za-z0-9._+=~-]+|\'[A-Za-z0-9._+=~\<\>-]+\')$ ]] && continue
+            report "$where" "RUN in an edge runtime stage may only be a plain 'apk add --no-cache <packages>' (no shell operators)" "$text"
+            break
+          done
+          ;;
+        *) report "$where" "RUN in an edge runtime stage may only be 'apk add --no-cache <packages>' (a link, copy or rename of the binary would escape the command checks)" "$text" ;;
+      esac
+      ;;
+    env)
+      case $text in *PATH* | *path* | *SHELL*) report "$where" "ENV changing PATH or SHELL in an edge runtime stage" "$text" ;; esac
+      ;;
+    shell) report "$where" "SHELL in an edge runtime stage" "$text" ;;
+    copy | add)
+      words "${text#*[[:space:]]}"
+      w=(${WORDS[@]+"${WORDS[@]}"})
+      dest=${w[${#w[@]}-1]-} src=''
+      for x in "${w[@]}"; do case $x in --*) ;; *) [ -n "$src" ] || src=$x ;; esac; done
+      if [[ $dest =~ $bin_dir_re ]] || [ "${src##*/}" = caddy ]; then
+        case $text in
+          [Cc][Oo][Pp][Yy]' --from='*' '*/caddy' /usr/bin/caddy') [ "${src##*/}" = caddy ] && [ "${#w[@]}" -eq 3 ] || report "$where" "only the Caddy binary may be copied into a bin directory, to /usr/bin/caddy" "$text" ;;
+          *) report "$where" "only 'COPY --from=<stage> <path>/caddy /usr/bin/caddy' may place the binary or anything in a bin directory of an edge runtime stage" "$text" ;;
+        esac
+      fi
+      ;;
+  esac
+done
+
 for cf in ${COMPOSES[@]+"${COMPOSES[@]}"}; do
   ln=0
   while IFS= read -r line || [ -n "$line" ]; do
     ln=$((ln + 1))
     line=${line%$'\r'}
-    case $line in *"/etc/caddy"*) ;; *) continue ;; esac
     [[ $line =~ ^[[:space:]]*# ]] && continue
+    # YAML escapes (\u0063addy, \x2F) would hide a command or a path from
+    # these line checks; Compose decodes them.
+    case $line in *"\\"*) report "$cf:$ln" "backslash in a Compose file (YAML escapes are not supported)" "$line" ;; esac
+    # A mount over /, /etc, /usr or a bin directory replaces /etc/caddy or
+    # the binary without naming them.
+    if [[ $line =~ ^[[:space:]]*-[[:space:]]*[\"\']?[^:\"\'[:space:]]+:(/[^:\"\'[:space:]]*)(:[a-z,]+)?[\"\']?[[:space:]]*$ ]]; then
+      t=${BASH_REMATCH[1]}
+      t=${t%/}
+      case $t in
+        '' | /etc | /usr | /usr/local | /bin | /sbin | /usr/bin | /usr/sbin | /usr/local/bin | /usr/local/sbin | /usr/bin/* | /usr/local/bin/* | /bin/*)
+          report "$cf:$ln" "mount over a directory that holds /etc/caddy or the Caddy binary" "$line" ;;
+      esac
+    fi
+    case $line in *"/etc/caddy"*) ;; *) continue ;; esac
     if [[ $line =~ ^[[:space:]]*-[[:space:]]*\"?\./([^:\"[:space:]]+):(/etc/caddy/[^:\"[:space:]]+)(:([a-z,]+))?\"?[[:space:]]*$ ]]; then
       src=${BASH_REMATCH[1]} dest=${BASH_REMATCH[2]} mode=${BASH_REMATCH[4]}
       if ! is_tracked "$src"; then
@@ -269,6 +364,91 @@ for cf in ${COMPOSES[@]+"${COMPOSES[@]}"}; do
       report "$cf:$ln" "unsupported reference to /etc/caddy (only '- ./<tracked file>:/etc/caddy/<path>:ro' mounts are accepted)" "$line"
     fi
   done <"$top/$cf"
+done
+
+# Edge services in Compose files: a service that builds docker/edge/Dockerfile
+# or runs a caddy image (directly or through a "<<: *anchor" merge), or an
+# override (no image and no dockerfile of its own) of a service that is an
+# edge service in another file. An edge service has no entrypoint and no extends, and its
+# command, if set, is exactly
+#   command: ["caddy", "run", "--config", "/etc/caddy/<path>", "--adapter", "caddyfile"]
+# compose_keys <file>: "<line>\t<service or &anchor>\t<key>\t<value>" for the
+# keys image, dockerfile, build, command, entrypoint, extends and <<.
+compose_keys() {
+  awk '
+    { sub(/\r$/, "") }
+    /^[[:space:]]*(#|$)/ { next }
+    { match($0, /^ */); ind = RLENGTH; t = substr($0, ind + 1) }
+    ind == 0 { top = t; sub(/:.*/, "", top); owner = ""; svc_ind = -1; key_ind = -1
+      if (top ~ /^x-/ && match(t, /&[A-Za-z0-9_.-]+/)) owner = substr(t, RSTART, RLENGTH)
+      next }
+    top == "services" && (svc_ind < 0 || ind <= svc_ind) && t ~ /^[A-Za-z0-9_.-]+:/ {
+      svc_ind = ind; key_ind = -1; owner = t; sub(/:.*/, "", owner); next }
+    owner != "" {
+      if (key_ind < 0) key_ind = ind
+      k = t; sub(/:.*/, "", k); v = t; sub(/^[^:]*:[[:space:]]*/, "", v)
+      if (ind == key_ind && (k == "image" || k == "build" || k == "command" || k == "entrypoint" || k == "extends" || k == "<<"))
+        print NR "\t" owner "\t" k "\t" v
+      else if (k == "dockerfile") print NR "\t" owner "\tdockerfile\t" v
+    }' "$1"
+}
+CK_FILE=() CK_LINE=() CK_OWNER=() CK_KEY=() CK_VAL=()
+for cf in ${COMPOSES[@]+"${COMPOSES[@]}"}; do
+  while IFS=$'\t' read -r ln owner key val; do
+    CK_FILE+=("$cf") CK_LINE+=("$ln") CK_OWNER+=("$owner") CK_KEY+=("$key") CK_VAL+=("$val")
+  done < <(compose_keys "$top/$cf")
+done
+# svc_has <file> <owner> <key> [value-pattern]: the key, directly or through
+# a merged anchor of the same file; sets SVC_VAL, SVC_LINE.
+svc_has() {
+  local f=$1 o=$2 key=$3 pat=${4-*} k m anchors=''
+  for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
+    [ "${CK_FILE[$k]}" = "$f" ] && [ "${CK_OWNER[$k]}" = "$o" ] && [ "${CK_KEY[$k]}" = '<<' ] &&
+      anchors="$anchors ${CK_VAL[$k]//\*/&}"
+  done
+  for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
+    [ "${CK_FILE[$k]}" = "$f" ] && [ "${CK_KEY[$k]}" = "$key" ] || continue
+    m=no
+    [ "${CK_OWNER[$k]}" = "$o" ] && m=yes
+    case " $anchors " in *" ${CK_OWNER[$k]} "*) m=yes ;; esac
+    [ "$m" = yes ] || continue
+    shopt -s nocasematch
+    # shellcheck disable=SC2053 # $pat is a pattern
+    if [[ ${CK_VAL[$k]} == $pat ]]; then
+      shopt -u nocasematch
+      SVC_VAL=${CK_VAL[$k]} SVC_LINE=${CK_LINE[$k]}
+      return 0
+    fi
+    shopt -u nocasematch
+  done
+  return 1
+}
+EDGE_NAMES=' '
+for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
+  case ${CK_OWNER[$k]} in '&'*) continue ;; esac
+  if svc_has "${CK_FILE[$k]}" "${CK_OWNER[$k]}" dockerfile '*docker/edge/Dockerfile*' ||
+    svc_has "${CK_FILE[$k]}" "${CK_OWNER[$k]}" image '*caddy*'; then
+    case $EDGE_NAMES in *" ${CK_OWNER[$k]} "*) ;; *) EDGE_NAMES="$EDGE_NAMES${CK_OWNER[$k]} " ;; esac
+  fi
+done
+edge_cmd_re='^\[ *"caddy" *, *"run" *, *"--config" *, *"/etc/caddy/[A-Za-z0-9._/-]+" *, *"--adapter" *, *"caddyfile" *\]$'
+for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
+  f=${CK_FILE[$k]} o=${CK_OWNER[$k]}
+  case $o in '&'*) continue ;; esac
+  case " ${CHECKED_SVC-} " in *" $f:$o "*) continue ;; esac
+  CHECKED_SVC="${CHECKED_SVC-} $f:$o"
+  edge=no
+  if svc_has "$f" "$o" dockerfile '*docker/edge/Dockerfile*' || svc_has "$f" "$o" image '*caddy*'; then
+    edge=yes
+  elif ! svc_has "$f" "$o" image && ! svc_has "$f" "$o" dockerfile; then
+    case $EDGE_NAMES in *" $o "*) edge=yes ;; esac
+  fi
+  [ "$edge" = yes ] || continue
+  svc_has "$f" "$o" entrypoint && report "$f:$SVC_LINE" "entrypoint of the edge service $o (only the image's command, or the exact caddy run form, is accepted)" "$SVC_VAL"
+  svc_has "$f" "$o" extends && report "$f:$SVC_LINE" "extends in the edge service $o is not supported" "$SVC_VAL"
+  if svc_has "$f" "$o" command && ! [[ $SVC_VAL =~ $edge_cmd_re ]]; then
+    report "$f:$SVC_LINE" "command of the edge service $o must be exactly [\"caddy\", \"run\", \"--config\", \"/etc/caddy/<path>\", \"--adapter\", \"caddyfile\"]" "$SVC_VAL"
+  fi
 done
 
 # --- caddy command lines -------------------------------------------------------
@@ -352,6 +532,19 @@ scan_runner() {
           ;;
         *target=/etc/caddy* | *dst=/etc/caddy* | *destination=/etc/caddy*)
           report "$f:$ln" "--mount into /etc/caddy is not supported" "$w" ;;
+      esac
+      # A glob that matches the binary's name (cadd?, /usr/bin/c*dy) could
+      # run, link or copy it under another name.
+      case $w in
+        *[*?[]*)
+          b=${w##*/}
+          if [ "${#b}" -gt 0 ] && [[ ${b//[^A-Za-z0-9]/} =~ [A-Za-z0-9]{2} ]]; then
+            shopt -s nocasematch
+            # shellcheck disable=SC2053 # $b is the pattern
+            [[ caddy == $b ]] && report "$f:$ln" "glob that matches the Caddy binary's name" "$w"
+            shopt -u nocasematch
+          fi
+          ;;
       esac
       case $w in
         caddy | /*/caddy) ;;
@@ -492,8 +685,14 @@ deny() {
   DENY=$r
 }
 
-# Raw checks of every tracked Caddy file, used or not.
-for f in "${CONFIGS[@]}"; do
+# Raw checks and forbidden tokens: every tracked Caddy file, used or not,
+# and every file copied or mounted into /etc/caddy, whatever its name (any
+# of them can be imported by a glob or a path).
+CHECK_FILES=("${CONFIGS[@]}")
+for ((k = 0; k < ${#MAP_SRC[@]}; k++)); do
+  case " ${CHECK_FILES[*]} " in *" ${MAP_SRC[$k]} "*) ;; *) CHECK_FILES+=("${MAP_SRC[$k]}") ;; esac
+done
+for f in "${CHECK_FILES[@]}"; do
   if [ -n "$(tr -d '\t\n\r -~' <"$top/$f" | head -c 1 | od -An -c)" ]; then
     report "$f" "only printable ASCII, tab, CR and LF are accepted (Caddy splits tokens at Unicode spaces)"
     continue

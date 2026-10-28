@@ -26,7 +26,8 @@ NL=$'\n'
 TAB=$'\t'
 CR=$'\r'
 REAL=(docker/edge/Dockerfile docker/edge/Caddyfile.dev docker/edge/Caddyfile.prod docker/edge/common.caddy
-  tests/app/https/Caddyfile tests/app/https/compose.https.yaml compose.yaml compose.prodlike.yaml tests/app/scan.sh)
+  tests/app/https/Caddyfile tests/app/https/compose.https.yaml compose.yaml compose.prodlike.yaml compose.test.yaml
+  compose.fixture.yaml tests/app/scan.sh)
 P=docker/edge/Caddyfile.prod
 D=docker/edge/Caddyfile.dev
 C=docker/edge/common.caddy
@@ -62,8 +63,13 @@ put() {
 }
 
 # subst <path> <from> <to>: replace every literal <from> (one line) by <to>.
+# Both are passed to awk through files, so backslashes stay literal.
 subst() {
-  FROM=$2 TO=$3 awk 'BEGIN { f = ENVIRON["FROM"]; t = ENVIRON["TO"] }
+  printf '%s' "$2" >"$work/from"
+  printf '%s' "$3" >"$work/to"
+  awk -v ff="$work/from" -v tf="$work/to" '
+    BEGIN { getline f < ff; n = 0; t = ""
+      while ((getline l < tf) > 0) { t = t (n++ ? "\n" : "") l } }
     { out = ""; s = $0
       while ((i = index(s, f)) > 0) { out = out substr(s, 1, i - 1) t; s = substr(s, i + length(f)) }
       print out s }' "$repo/$1" >"$work/subst" || exit 2
@@ -320,6 +326,110 @@ base
 put tests/app/extra.sh "#!/bin/sh${NL}# caddy run --resume is never used here${NL}"
 expect "caddy command in a full-line comment is ignored" 0
 
+
+# --- Audit reproducers (FCRM-SEC-042 E, MEDIUM-1 and LOW-1) ---------------------------
+# shellcheck disable=SC2016 # the Compose text itself, not an expansion
+EDGE_VOL='      - ${FLOWCRM_GATE_DIR:-./docker/edge/no-gate}:/run/flowcrm-gate:ro'
+UNSAFE="{${NL}	admin off${NL}}${NL}:8080 {${NL}	acme_server${NL}}${NL}"
+base
+put docker/edge/acme.conf "acme_server${NL}"
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - ./docker/edge/acme.conf:/etc/caddy/acme.conf:ro"
+subst "$D" "	import baseline" "	import baseline${NL}	import /etc/caddy/*.conf"
+expect "E conf-compose-glob: acme_server in a Compose-mounted .conf reached by a glob" 1 "docker/edge/acme.conf:1: ACME server (acme_server"
+base
+put docker/edge/acme.conf "acme_server${NL}"
+subst "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}COPY docker/edge/acme.conf /etc/caddy/acme.conf"
+subst "$P" "	import baseline" "	import baseline${NL}	import acme.conf"
+expect "E conf-dockerfile-copy: acme_server in a copied .conf imported by path" 1 "docker/edge/acme.conf:1: ACME server (acme_server"
+base
+put docker/edge/extra.conf "{\$EDGE_EXTRA}${NL}respond {env.X}${NL}"
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - ./docker/edge/extra.conf:/etc/caddy/extra.conf:ro"
+subst "$D" "	import baseline" "	import baseline${NL}	import /etc/caddy/*.conf"
+expect "E conf-envvar: {\$VAR} in an imported .conf" 1 "docker/edge/extra.conf:1: environment placeholder {\$...}"
+base
+put docker/edge/extra.conf "{\$EDGE_EXTRA}${NL}respond {env.X}${NL}"
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - ./docker/edge/extra.conf:/etc/caddy/extra.conf:ro"
+subst "$D" "	import baseline" "	import baseline${NL}	import /etc/caddy/*.conf"
+expect "E conf-envvar: {env.*} in an imported .conf" 1 "docker/edge/extra.conf:2: environment placeholder {env.*}"
+base
+put docker/edge/plain.conf "respond "$'\xc2\xa0'"x${NL}"
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - ./docker/edge/plain.conf:/etc/caddy/plain.conf:ro"
+expect "non-ASCII in a mounted file with any name" 1 "only printable ASCII"
+base
+put docker/edge/e.conf "$UNSAFE"
+subst "$HC" '    command: ["caddy", "run", "--config", "/etc/caddy/https/Caddyfile", "--adapter", "caddyfile"]' '    command: ["\u0063addy", "run", "--config", "/srv/e.conf", "--adapter", "caddyfile"]'
+subst "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - ./tests/app/https/attacker:/srv/attacker:ro${NL}      - ./docker/edge/e.conf:/srv/e.conf:ro"
+expect "E yaml-escape-cmd: \\u0063addy in a Compose command" 1 "backslash in a Compose file"
+base
+put docker/edge/e.conf "$UNSAFE"
+subst "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - ./tests/app/https/attacker:/srv/attacker:ro${NL}"'      - "./docker/edge/e.conf:/etc/\u0063addy/Caddyfile:ro"'
+expect "E yaml-escape-mount: \\u0063addy in a Compose mount target" 1 "backslash in a Compose file"
+base
+put docker/edge/e.conf "$UNSAFE"
+subst "$DF" "USER 65534:65534" "RUN ln -s /usr/bin/cadd? /usr/local/bin/edge${NL}USER 65534:65534"
+subst "$HC" '    command: ["caddy", "run", "--config", "/etc/caddy/https/Caddyfile", "--adapter", "caddyfile"]' '    command: ["edge", "run", "--config", "/srv/e.conf", "--adapter", "caddyfile"]'
+subst "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - ./tests/app/https/attacker:/srv/attacker:ro${NL}      - ./docker/edge/e.conf:/srv/e.conf:ro"
+expect "E alias-binary: RUN ln of the binary in an edge stage" 1 "RUN in an edge runtime stage may only be"
+base
+put docker/edge/e.conf "$UNSAFE"
+subst "$HC" '    command: ["caddy", "run", "--config", "/etc/caddy/https/Caddyfile", "--adapter", "caddyfile"]' '    command: ["edge", "run", "--config", "/srv/e.conf", "--adapter", "caddyfile"]'
+expect "E alias-binary: another executable in the edge service command" 1 "command of the edge service edge must be exactly"
+bad "E caddyfile-name-elsewhere: sh -c 'exec caddy run ... --resume' as the edge command" "command of the edge service edge must be exactly" "$HC" '    command: ["caddy", "run", "--config", "/etc/caddy/https/Caddyfile", "--adapter", "caddyfile"]' '    command: ["sh", "-c", "exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --resume"]'
+bad "E json-config-noadapter: caddy run --config /srv/edge.cfg" "command of the edge service edge must be exactly" "$HC" '    command: ["caddy", "run", "--config", "/etc/caddy/https/Caddyfile", "--adapter", "caddyfile"]' '    command: ["caddy", "run", "--config", "/srv/edge.cfg"]'
+
+# --- Edge services in Compose -----------------------------------------------------------
+base
+subst compose.yaml "      target: dev" "      target: dev${NL}    entrypoint: [\"/usr/bin/caddy\"]"
+expect "entrypoint in the edge service (compose.yaml)" 1 "entrypoint of the edge service edge"
+base
+subst compose.prodlike.yaml "    ports: !reset []" "    ports: !reset []${NL}    command: [\"edge\", \"run\"]"
+expect "command in a build-target override of the edge (compose.prodlike.yaml)" 1 "command of the edge service edge must be exactly"
+base
+subst compose.test.yaml "    ports: !reset []" "    ports: !reset []${NL}    entrypoint: [\"sh\", \"-c\"]"
+expect "entrypoint in a plain override of the edge (compose.test.yaml)" 1 "entrypoint of the edge service edge"
+base
+subst compose.yaml "x-hardening: &hardening" "x-hardening: &hardening${NL}  command: [\"edge\", \"run\"]"
+expect "command merged into the edge from an x- anchor" 1 "command of the edge service edge must be exactly"
+base
+subst compose.yaml "      target: dev" "      target: dev${NL}    extends:${NL}      file: other.yaml"
+expect "extends in the edge service" 1 "extends in the edge service edge is not supported"
+base
+put compose.extra.yaml "services:${NL}  proxy:${NL}    image: caddy:2.11.7-alpine${NL}    command: [\"caddy\", \"run\", \"--resume\"]${NL}"
+expect "another service running a caddy image" 1 "command of the edge service proxy must be exactly"
+base
+put compose.extra.yaml "services:${NL}  edge2:${NL}    build:${NL}      context: .${NL}      dockerfile: docker/edge/Dockerfile${NL}    entrypoint: [\"sh\"]${NL}"
+expect "another service building the edge Dockerfile" 1 "entrypoint of the edge service edge2"
+bad "Compose mount over /etc" "mount over a directory that holds /etc/caddy or the Caddy binary" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - ./tests/app/https/attacker:/etc:ro"
+bad "Compose mount over /usr/bin/caddy" "mount over a directory that holds /etc/caddy or the Caddy binary" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - ./tests/app/https/attacker:/usr/bin/caddy:ro"
+bad "Compose mount over / (quoted)" "mount over a directory that holds /etc/caddy or the Caddy binary" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - \"./tests/app/https/attacker:/:ro\""
+bad "backslash anywhere in a Compose file" "backslash in a Compose file" compose.yaml "    read_only: true" "    read_only: \"tr\\x75e\""
+
+# --- Edge runtime stages of the Dockerfile ----------------------------------------------
+bad "RUN cp of the binary in an edge stage" "RUN in an edge runtime stage may only be" "$DF" "USER 65534:65534" "RUN cp /usr/bin/caddy /usr/local/bin/edge${NL}USER 65534:65534"
+bad "RUN in a stage built on caddy-base (prod)" "RUN in an edge runtime stage may only be" "$DF" "COPY docker/edge/Caddyfile.prod /etc/caddy/Caddyfile" "COPY docker/edge/Caddyfile.prod /etc/caddy/Caddyfile${NL}RUN mv /usr/bin/caddy /usr/bin/edge"
+base
+printf 'FROM prod AS extra\nRUN ln -s /usr/bin/caddy /usr/local/bin/edge\n' >>"$repo/$DF"
+expect "RUN in a stage built on prod without files of its own" 1 "RUN in an edge runtime stage may only be"
+bad "apk add with a shell operator" "no shell operators" "$DF" "'libcurl>=8.23.0-r0'" "'libcurl>=8.23.0-r0' && ln -s /usr/bin/caddy /bin/e"
+bad "COPY of the binary under another name" "may place the binary or anything in a bin directory" "$DF" "COPY --from=caddy-build /out/caddy /usr/bin/caddy" "COPY --from=caddy-build /out/caddy /usr/local/bin/edge"
+bad "COPY of the binary outside a bin directory" "only 'COPY --from=<stage> <path>/caddy /usr/bin/caddy'" "$DF" "COPY --from=caddy-build /out/caddy /usr/bin/caddy" "COPY --from=caddy-build /out/caddy /usr/bin/caddy${NL}COPY --from=caddy-build /out/caddy /srv/edge"
+bad "COPY of another file into a bin directory" "may place the binary or anything in a bin directory" "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}COPY docker/edge/no-gate/README.md /usr/local/bin/caddy-wrapper"
+bad "ENV PATH in an edge stage" "ENV changing PATH or SHELL" "$DF" "USER 65534:65534" "ENV PATH=/srv/bin:/usr/bin${NL}USER 65534:65534"
+bad "SHELL in an edge stage" "SHELL in an edge runtime stage" "$DF" "USER 65534:65534" "SHELL [\"/bin/sh\", \"-c\"]${NL}USER 65534:65534"
+base
+subst "$DF" "RUN npm run build" "RUN npm run build && cp /app/dist/index.html /tmp/x"
+expect "RUN in a non-edge stage (spa-build) is not restricted" 0
+
+# --- Globs that match the binary's name ---------------------------------------------------
+base
+put tests/app/extra.sh "#!/bin/sh${NL}docker run --rm img sh -c 'cp /usr/bin/cadd? /tmp/e && /tmp/e run --resume'${NL}"
+expect "cp /usr/bin/cadd? in a script" 1 "glob that matches the Caddy binary's name"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}ls /usr/bin/c*dy${NL}"
+expect "c*dy glob in a script" 1 "glob that matches the Caddy binary's name"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}rm -f /tmp/build/*.log${NL}case \$x in *\" \$y \"*) ;; esac${NL}"
+expect "ordinary globs are accepted" 0
 # --- Adapted JSON (scripts/ci/edge-adapted-config.jq) ---------------------------------------
 SAFE='{"admin":{"disabled":true,"config":{"persist":false}},"logging":{"logs":{"default":{}}},"apps":{"http":{"servers":{"srv0":{"listen":[":8080"],"routes":[{"handle":[{"handler":"file_server"}]}],"automatic_https":{"disable":true}}}}}}'
 # adapted_case <name> <expect-violation-substring or ''> <jq expression applied to SAFE>
