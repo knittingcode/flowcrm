@@ -351,15 +351,26 @@ and `scripts/ci` therefore remains required.
     mappings other than `{}`; paths with `//`, `/./` or `..`; a short or
     long-syntax (`target:`) mount over `/`, `/etc`, `/etc/caddy`, `/usr` or
     a bin directory, other than the read-only short mounts of tracked
-    files into `/etc/caddy`;
+    files into `/etc/caddy`; YAML anchors other than on a top-level `x-*`
+    key, aliases other than `<<: *name` and `logging: *name` (no merge
+    lists), tags other than `!reset` and `!override`, tabs and document
+    markers; `${VAR}`/`$VAR` interpolation anywhere but in ports, in the
+    source of a short volume mount with a literal target, and in the file
+    of a top-level secret; `configs`, `content`, `dockerfile_inline` and
+    secrets from the environment;
   - in the edge runtime stages of the Dockerfile (from the caddy image or a
     stage with files in `/etc/caddy`, and every stage built on them): a
     `RUN` other than a plain `apk add --no-cache <packages>`, a copy of the
     binary anywhere but `COPY --from=<stage> <path>/caddy /usr/bin/caddy`,
     anything else in a bin directory, a `COPY`/`ADD` destination that is
     not an absolute literal path (relative to `WORKDIR`, built from an
-    `ARG`, or with `//`, `.` or `..`), `WORKDIR`, `ONBUILD`, and `ENV PATH`
-    or `SHELL`, so the binary cannot be linked, copied, renamed or shadowed;
+    `ARG`, or with `//`, `.` or `..`), any destination other than a file in
+    `/etc/caddy`, `/usr/bin/caddy` and paths below `/srv` (so no `/`, `/etc`
+    or other ancestor of `/etc/caddy` or a bin directory), `ADD`,
+    `WORKDIR`, `ONBUILD`, and `ENV PATH` or `SHELL`, so the binary cannot be
+    linked, copied, renamed or shadowed;
+  - in every Dockerfile: a parser directive other than `# syntax=` (such
+    as `# escape=`, which changes line continuation);
   - a Caddy file that no start point uses, and a tracked JSON file that
     looks like a Caddy JSON configuration.
 - `tests/app/scan.sh` (job `Dev environment`) runs `caddy adapt` with the
