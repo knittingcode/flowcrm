@@ -192,9 +192,10 @@ was added.
 Published by go-jose on 2026-10-14 and added to the GitHub advisory database
 (HIGH) on 2026-10-27, after the last green scan of `main` (run 40407409241,
 2026-10-26); found by the scan of PR #40 (run 40671261985, 2026-10-28), not
-caused by a change of the project. Parsing a JWK with a crafted RSA key costs excessive
-CPU (denial of service). The rebuilt Caddy binary (`usr/bin/caddy`, edge
-`prod` and `dev`) contains both affected major versions:
+caused by a change of the project. Parsing a JWK with a crafted RSA key
+costs excessive CPU (denial of service). The rebuilt Caddy binary
+(`usr/bin/caddy`, edge `prod` and `dev`) contains both affected major
+versions:
 
 | Package | Installed | Fixed in | Status |
 |---|---|---|---|
