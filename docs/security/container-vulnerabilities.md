@@ -77,7 +77,9 @@ clean) with
 `golang:1.26.10-alpine3.24@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca`
 and `golang.org/x/net` 0.60.0; the official 2.11.7 image provides the base
 layer. `caddy version` reports `v2.11.7`. Result: **0 HIGH/CRITICAL** (was 24
-with the 2.11.4 release binary, 5 with the 2.11.7 release binary).
+with the 2.11.4 release binary, 5 with the 2.11.7 release binary). Since
+2026-10-27 the binary has a `go-jose` finding again; see
+[CVE-2026-116587](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge).
 
 Triage of the 2.11.4 release binary:
 
@@ -188,8 +190,9 @@ was added.
 ## CVE-2026-116587 / GHSA-mgcc-cww5-fp2q: `go-jose` (edge)
 
 Published by go-jose on 2026-10-14 and added to the GitHub advisory database
-(HIGH) on 2026-10-27, after the last green scan of `main`; not caused by a
-change of the project. Parsing a JWK with a crafted RSA key costs excessive
+(HIGH) on 2026-10-27, after the last green scan of `main` (run 40407409241,
+2026-10-26); found by the scan of PR #40 (run 40671261985, 2026-10-28), not
+caused by a change of the project. Parsing a JWK with a crafted RSA key costs excessive
 CPU (denial of service). The rebuilt Caddy binary (`usr/bin/caddy`, edge
 `prod` and `dev`) contains both affected major versions:
 
