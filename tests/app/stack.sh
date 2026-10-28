@@ -791,21 +791,43 @@ interrupted_restore() { # label fault expected-exit
   dv "$1-status" "$A" status
   IR_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absent)
   dv "$1-up" "$A" up
+  local ir_rc
   [ "$(rc_of "$1")" = "$3" ] && [ "$IR_GATE" = recorded ] && [ "$(rc_of "$1-status")" = 1 ] && grep -q '^blocked: ' "$work/out/$1-status.out" &&
     [ "$(rc_of "$1-up")" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
+  ir_rc=$?
+  # Diagnostics for a failure, taken after the checks (never a secret value):
+  # make status's verdict, the gate and the edge's answers after make up, and
+  # the container identity line (a db or api recreated in between shows here).
+  IR_DIAG=''
+  [ "$ir_rc" = 0 ] || IR_DIAG="status $(rc_of "$1-status") [$(head -n 1 "$work/out/$1-status.out" | cut -c1-200)], after make up: gate $([ -e "$A/.runtime/gate/security-gate" ] && echo recorded || echo removed), probe: $(gate_probe), $(lifecycle)"
+  return "$ir_rc"
+}
+# On a failed check: the stderr of the interrupted command and of make up,
+# and the output of make status in between.
+ir_details() { # label
+  show_err "$1"
+  tail -n 15 "$work/out/$1-status.out" | sed 's/^/      status> /'
+  show_err "$1-status"
+  show_err "$1-up"
 }
 interrupted_restore a-ir-kill edge-started:kill 137
 r=$?
 [ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
-v "ST-50 SIGKILL right after the edge started again: the gate stays recorded, the running edge serves only its health paths, make up serves" $? "exit $(rc_of a-ir-kill), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-kill-up)"
+ir=$?
+v "ST-50 SIGKILL right after the edge started again: the gate stays recorded, the running edge serves only its health paths, make up serves" $ir "exit $(rc_of a-ir-kill), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-kill-up)${IR_DIAG:+, $IR_DIAG}"
+[ "$ir" = 0 ] || ir_details a-ir-kill
 interrupted_restore a-ir-int edge-started:int 130
 r=$?
 [ "$r" = 0 ] && [ -n "$IR_EDGE" ] && [ "$IR_PROBE" = "$GATED" ]
-v "ST-50 SIGINT right after the edge started again: the gate stays recorded, nothing but the health paths is served, make up serves" $? "exit $(rc_of a-ir-int), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-int-up)"
+ir=$?
+v "ST-50 SIGINT right after the edge started again: the gate stays recorded, nothing but the health paths is served, make up serves" $ir "exit $(rc_of a-ir-int), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-int-up)${IR_DIAG:+, $IR_DIAG}"
+[ "$ir" = 0 ] || ir_details a-ir-int
 interrupted_restore a-ir-term restore-before-edge 143
 r=$?
 [ "$r" = 0 ] && [ -z "$IR_EDGE" ] && [ "$IR_PROBE" = "/=000 /api/v1/system/status=000 /health/live=000 /health/ready=000 /HEALTH/READY=000 //health/ready=000 /health/readyz=000 /health/ready/x=000" ]
-v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $? "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)"
+ir=$?
+v "ST-50 SIGTERM before the edge started again: the gate stays recorded, nothing listens, make up serves" $ir "exit $(rc_of a-ir-term), edge [$IR_EDGE], gate $IR_GATE, probe: $IR_PROBE, make up $(rc_of a-ir-term-up)${IR_DIAG:+, $IR_DIAG}"
+[ "$ir" = 0 ] || ir_details a-ir-term
 
 # make up clears the gate only after every check: killed before its checks
 # finished, while an edge started by an interrupted rotation runs, it leaves

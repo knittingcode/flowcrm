@@ -4,9 +4,23 @@
 # (security/trivyignore.yaml, used by tests/app/scan.sh) follows the policy
 # in docs/security/container-vulnerabilities.md:
 #   - one specific vulnerability per entry: id is CVE-<year>-<number> or a
-#     GHSA id, and no id appears twice;
-#   - the affected package or path is named: "paths" or "purls" with at
-#     least one entry and no wildcard (Trivy matches paths as doublestar
+#     GHSA id, and no id appears twice. Trivy matches only the id it
+#     reports (the CVE when one exists), so an id that the Exceptions table
+#     of the docs lists as an alias in parentheses, as in
+#     "| CVE-2026-0001 (GHSA-xxxx-xxxx-xxxx) |", is rejected: one
+#     vulnerability cannot be spread over a second entry under its alias;
+#   - the affected package is named exactly: "purls" with at least one
+#     entry, each pkg:<type>/<namespace>/<name>@<version> with an exact
+#     version and no qualifiers, subpath or percent-encoding (a purl
+#     without a version matches every version), and all purls of an entry
+#     name the same package (type, namespace and name), so one entry cannot
+#     cover a second package such as another major version of a Go module;
+#   - one entry per package: no two entries name the same package (purl
+#     without its version), whatever their ids. Packages are compared
+#     without regard to case, as Trivy matches a Go module path whatever its
+#     case;
+#   - the affected path is named exactly: "paths" with at least one entry;
+#     neither list has a wildcard (Trivy matches paths as doublestar
 #     patterns, so * ? [ ] { } are all rejected);
 #   - the evidence for the risk decision is given: a non-empty "statement";
 #   - no key appears twice in one entry (YAML parsers differ in which value
@@ -17,9 +31,16 @@
 #     NUL byte, so it is searched separately), and no backslash or
 #     inner double quote in a quoted value (an escape could add a wildcard
 #     or continue the value over the next lines);
-#   - the decision is reviewed again: "expired_at" is a valid date no more
-#     than 90 days after today (Trivy stops applying an expired entry);
-#   - the entry is listed in docs/security/container-vulnerabilities.md.
+#   - the decision is reviewed again: "expired_at" is a valid date after
+#     today and no more than 90 days after it. An entry on or past its
+#     expired_at fails, so it is renewed after a new review or removed
+#     instead of lingering (Trivy stops applying it at 00:00 UTC of that
+#     day, and the gate fails on the finding again);
+#   - the entry is listed in docs/security/container-vulnerabilities.md:
+#     its id starts a row of the table under "## Exceptions" (a mention
+#     elsewhere in the document does not count). The alias check knows only
+#     the aliases that table lists, so editing its first column can bypass
+#     it; such an edit is visible in review and must be checked there.
 # Only the documented form is accepted (see the example in the file):
 # "vulnerabilities: []", or "vulnerabilities:" followed by entries of
 # "  - id: ..." and "    <key>: <value>" lines, with full-line comments.
@@ -94,29 +115,87 @@ report() { # line message [value]
   errors=$((errors + 1))
 }
 
+# An exact purl: lowercase type, name segments without '@', '%', '?' or
+# '#', and one '@' with a version of plain version characters.
+purl_re='^pkg:[a-z][a-z0-9.+-]*/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+@[A-Za-z0-9][A-Za-z0-9.:_+~-]*$'
 id_re='^(CVE-[0-9]{4}-[0-9]{4,}|GHSA(-[23456789cfghjmpqrvwx]{4}){3})$'
 # Quoted values with at least one character that is not blank, and without
 # backslash (YAML escapes) or inner double quote.
 item='"[^"\\]*[^"\\[:space:]][^"\\]*"'
 list_re="^\\[[[:space:]]*$item([[:space:]]*,[[:space:]]*$item)*[[:space:]]*\\]$"
-state=start entries=0 entry_line=0 id='' targets='' statement='' expiry='' ids=' ' keys=' '
+state=start entries=0 entry_line=0 id='' purls='' paths='' pkg='' statement='' expiry='' ids=' ' keys=' '
+# Packages of the entries so far, as " <package>=<line> ".
+packages=' '
+
+# The Exceptions table of the docs: the id that starts each row, and the
+# aliases listed after it in parentheses, as " <alias>=<id> ".
+listed=' ' aliases=' ' in_table=''
+while IFS= read -r dline || [ -n "$dline" ]; do
+  case $dline in
+    '## Exceptions') in_table=yes ;;
+    '## '*) in_table='' ;;
+  esac
+  [ -n "$in_table" ] || continue
+  [[ $dline =~ ^\|\ *([A-Za-z0-9-]+)(\ \(([A-Za-z0-9, -]*)\))?\ *\| ]] || continue
+  primary=${BASH_REMATCH[1]} rest=${BASH_REMATCH[3]}
+  [[ $primary =~ $id_re ]] || continue
+  listed="$listed$primary "
+  while [[ $rest =~ ([A-Za-z0-9-]+)(.*)$ ]]; do
+    aliases="$aliases${BASH_REMATCH[1]}=$primary " rest=${BASH_REMATCH[2]}
+  done
+done <"$doc"
 
 # Checks the entry collected so far (called at the next entry and at the end).
 finish_entry() {
   [ "$entry_line" -gt 0 ] || return 0
-  [ -n "$targets" ] || report "$entry_line" "no affected package or path (paths or purls)" "$id"
+  [ -n "$purls" ] || report "$entry_line" "no purls (the affected package with its exact version)" "$id"
+  [ -n "$paths" ] || report "$entry_line" "no paths (the affected path)" "$id"
+  if [ -n "$pkg" ]; then
+    if [[ $packages == *" $pkg="* ]]; then
+      local other=${packages#*" $pkg="}
+      report "$entry_line" "package already excepted by the entry at line ${other%% *} (one entry per package)" "$pkg"
+    fi
+    packages="$packages$pkg=$entry_line "
+  fi
   [ -n "$statement" ] || report "$entry_line" "no statement with the evidence for the decision" "$id"
   if [ -z "$expiry" ]; then
     report "$entry_line" "no expired_at date (the exception would be permanent)" "$id"
   elif ! e=$(days_of "$expiry"); then
     report "$entry_line" "expired_at is not a valid YYYY-MM-DD date" "$expiry"
+  elif [ "$e" -le "$today_days" ]; then
+    report "$entry_line" "expired_at is not after $today (expired: renew it after a new review, or remove it)" "$expiry"
   elif [ $((e - today_days)) -gt "$max_days" ]; then
     report "$entry_line" "expired_at is more than $max_days days after $today" "$expiry"
   fi
-  if [ -n "$id" ] && ! grep -qF -- "$id" "$doc"; then
-    report "$entry_line" "not listed in docs/security/container-vulnerabilities.md" "$id"
+  if [ -n "$id" ] && [[ $aliases == *" $id="* ]]; then
+    local primary=${aliases#*" $id="}
+    report "$entry_line" "id is listed as an alias of ${primary%% *} in docs/security/container-vulnerabilities.md (Trivy matches the id it reports; use that id in one entry)" "$id"
+  elif [ -n "$id" ] && [[ $listed != *" $id "* ]]; then
+    report "$entry_line" "not listed in the Exceptions table of docs/security/container-vulnerabilities.md" "$id"
   fi
-  entry_line=0 id='' targets='' statement='' expiry='' keys=' '
+  entry_line=0 id='' purls='' paths='' pkg='' statement='' expiry='' keys=' '
+}
+
+# check_purls <line> <list>: every purl is exact and all name one package.
+# Sets pkg to the package of the entry, in lower case (Trivy matches the
+# namespace of a Go purl whatever its case, so case must not make two
+# packages out of one).
+check_purls() {
+  local rest=$2 purl ok=yes name
+  pkg=''
+  while [[ $rest =~ ^[^\"]*\"([^\"]*)\"(.*)$ ]]; do
+    purl=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
+    if [[ ! $purl =~ $purl_re ]]; then
+      report "$1" "purl is not pkg:<type>/<name>@<exact version> without qualifiers, subpath or encoding" "$purl"
+      ok=''
+    elif name=$(printf '%s' "${purl%@*}" | tr '[:upper:]' '[:lower:]') && [ -z "$pkg" ]; then
+      pkg=$name
+    elif [ "$name" != "$pkg" ]; then
+      report "$1" "purls name more than one package (one package per entry)" "$2"
+      ok=''
+    fi
+  done
+  [ -n "$ok" ]
 }
 
 # bash's read drops a NUL byte (or ends the line at it), so the loop below
@@ -169,8 +248,10 @@ while IFS= read -r line || [ -n "$line" ]; do
               report "$line_no" "$key must be a list of quoted, non-blank values without backslash" "$value"
             elif inner=${value#\[} inner=${inner%\]} && [[ $inner == *[][*?{}]* ]]; then
               report "$line_no" "$key must not contain wildcards" "$value"
-            else
-              targets=yes
+            elif [ "$key" = paths ]; then
+              paths=yes
+            elif check_purls "$line_no" "$value"; then
+              purls=yes
             fi
             ;;
           statement)
