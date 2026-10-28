@@ -7,19 +7,25 @@ export function AppShell() {
   const { state, logout } = useAuth();
   const navigate = useNavigate();
   const [pending, setPending] = useState(false);
+  const [failed, setFailed] = useState(false);
   if (state.status !== 'authenticated') {
     return null;
   }
   const { user, memberships } = state.session;
 
+  /** Goes to the login only when the session has ended; otherwise says that it may not have. */
   async function signOut() {
     setPending(true);
+    setFailed(false);
     try {
       await logout();
-    } finally {
+    } catch {
       setPending(false);
-      await navigate('/login', { replace: true });
+      setFailed(true);
+      return;
     }
+    setPending(false);
+    await navigate('/login', { replace: true });
   }
 
   return (
@@ -42,6 +48,11 @@ export function AppShell() {
           Sign out
         </button>
       </header>
+      {failed && (
+        <p role="alert" className="form-error shell-alert">
+          Signing out did not complete. You may still be signed in, so try again.
+        </p>
+      )}
       <main className="shell-main">
         <Outlet />
       </main>

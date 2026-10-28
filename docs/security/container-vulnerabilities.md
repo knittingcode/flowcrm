@@ -26,6 +26,20 @@ downloaded on every run.
   fixed yet, in `security/trivyignore.yaml`, with the evidence for the
   decision, the affected path and an expiry no more than 90 days ahead, and
   it is listed in the table below. There are currently **no exceptions**.
+  `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
+  rules on the file: one CVE or GHSA id per entry, no duplicate id and no
+  key twice in one entry, `paths` or `purls` with non-blank values and without
+  wildcards (Trivy matches `paths` as glob patterns, so `*`, `?`, `[`, `]`,
+  `{` and `}` are all rejected), a non-empty `statement`, a valid `expired_at`
+  no more than 90 days after the day of the check, the id mentioned in this
+  document, and only the documented form (any other section or key fails).
+  So that the check reads the file exactly as Trivy's YAML parser does, it
+  accepts printable ASCII only (YAML also breaks lines at CR, NEL and
+  U+2028, which could hide an entry inside a comment; a NUL byte, which the
+  shell would drop, is rejected too) and no backslash or
+  inner double quote in a quoted value (an escape could add a wildcard or
+  continue the statement over `expired_at`).
+  Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
 - A control scan of the unmodified PostgreSQL base image (with its `gosu`)
   must fail; it proves the gate is not passing vacuously.
 - Every scan must report the package sources expected for the image (Alpine
@@ -196,6 +210,32 @@ bundles `node-gyp` 13.1.0 (published 2026-10-02), which requires undici
 in `docker/web/Dockerfile`, check that the web scan no longer reports
 CVE-2026-109869, and update this section; update `NODE_IMAGE` once a
 Node.js 24 image bundles such an npm (the edge `spa-build` stage).
+
+## CVE-2026-92392: `curl` and `libcurl` (runtime images)
+
+Published after the last green scan of `main` (run 40223497868,
+2026-10-25); found by the scan of PR #38 (run 40383573386, 2026-10-26), not
+by a change of the project. The Alpine packages `curl` and `libcurl`
+8.22.0-r0 (HIGH) come from the pinned base images:
+
+| Image | Base (Alpine) | Affected packages |
+|---|---|---|
+| api (`prod`, `dev`) | PHP 8.5.12 FPM (3.24.2) | `curl`, `libcurl` |
+| edge (`prod`, `dev`) | Caddy 2.11.7 (3.23.6) | `curl`, `libcurl` |
+| db | PostgreSQL 18.6 (3.24.2) | `libcurl` (no `curl` tool) |
+
+8.23.0-r0 fixes it and is in the Alpine 3.23 and 3.24 `main` repositories
+for x86_64 and aarch64 (built 2026-10-25). The current builds of the base
+image tags were created on 2026-10-21, before the fix, so refreshing the
+pinned digests would not help. `docker/api/Dockerfile` and
+`docker/edge/Dockerfile` upgrade both packages
+(`apk add --upgrade 'curl>=8.23.0-r0' 'libcurl>=8.23.0-r0'`),
+`docker/db/Dockerfile` upgrades `libcurl` only, so no package is added to an
+image; the build fails if the fixed version cannot be installed. The
+project's own health checks do not use `curl` (they use `cgi-fcgi` and
+`wget`), but the packages belong to the base images and are not removed.
+Remove the upgrade when the pinned base images include the fix. No exception
+was added.
 
 ## Deferred hardening items
 
