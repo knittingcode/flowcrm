@@ -28,9 +28,11 @@ CONTROL_IMAGE=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52
 IGNORE_FILE=$APP_REPO/security/trivyignore.yaml
 # One line per scanned target (class, type, path, number of packages), one
 # per finding: severity, CVE, package, installed and fixed versions, target,
-# and one per finding suppressed by an exception of the ignore file (gate
-# scans run with --show-suppressed, which changes the output only, not the
-# exit code), so an excepted finding stays visible in the log.
+# and one per finding suppressed by an exception of the ignore file, so an
+# excepted finding stays visible in the log. Trivy passes the suppressed
+# findings to a template as .ModifiedFindings whatever --show-suppressed
+# says (that option only affects the table and JSON formats), and they do
+# not count towards --exit-code.
 # shellcheck disable=SC2016 # a Go template, not shell expansion
 TEMPLATE='{{- range . }}{{- $t := .Target }}TARGET {{ .Class }} {{ .Type }} {{ $t }} pkgs={{ len .Packages }}
 {{ range .Vulnerabilities }}{{ .Severity }} {{ .VulnerabilityID }} {{ .PkgName }} {{ .InstalledVersion }} fixed={{ if .FixedVersion }}{{ .FixedVersion }}{{ else }}none{{ end }} in={{ $t }}
@@ -78,7 +80,7 @@ scan() {
   shift 2
   docker save -o "$work/images/$archive" "$tag:$name" || { bad "SC $name: could not export the image"; return; }
   if [ "$mode" = gate ]; then
-    trivy "$archive" --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --show-suppressed --format template --template "$TEMPLATE" >"$log" 2>&1
+    trivy "$archive" --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --format template --template "$TEMPLATE" >"$log" 2>&1
     rc=$?
     if [ "$rc" = 0 ]; then ok "SC $name (runtime): no HIGH or CRITICAL vulnerabilities"; else bad "SC $name (runtime): HIGH or CRITICAL vulnerabilities (exit $rc)"; fi
   else
@@ -122,7 +124,7 @@ v "SC control: an image without inventoried packages is rejected" $?
 if ! docker image inspect "$CONTROL_IMAGE" >/dev/null 2>&1; then docker pull -q "$CONTROL_IMAGE" >/dev/null; fi
 need "prepare the control image" docker tag "$CONTROL_IMAGE" "$tag:control" || { tally_finish; exit; }
 docker save -o "$work/images/control.tar" "$tag:control"
-trivy control.tar --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --show-suppressed --format template --template "$TEMPLATE" >"$work/control.log" 2>&1
+trivy control.tar --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --format template --template "$TEMPLATE" >"$work/control.log" 2>&1
 rc=$?
 [ "$rc" = 1 ] && grep -q 'in=usr/local/bin/gosu' "$work/control.log"
 v "SC control: the gate rejects the known-vulnerable PostgreSQL base image" $? "(exit $rc)"

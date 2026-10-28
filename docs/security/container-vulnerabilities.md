@@ -62,11 +62,13 @@ downloaded on every run.
   inner double quote in a quoted value (an escape could add a wildcard or
   continue the statement over `expired_at`).
   Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
-- The gate scans (runtime images and the control scan) run with
-  `--show-suppressed`, and the scan log lists every finding an exception
-  suppressed as a `SUPPRESSED ignored <severity> <id> <package> <version>`
-  line, so an excepted finding stays visible in CI. The option changes the
-  output only, not the exit code. The development-image scans do not read
+- The scan template prints every finding an exception suppressed as a
+  `SUPPRESSED ignored <severity> <id> <package> <version>` line in the log
+  of the gate scans (runtime images and the control scan), so an excepted
+  finding stays visible in CI. Trivy passes suppressed findings to a
+  template whether or not `--show-suppressed` is given (that option only
+  affects the table and JSON formats), and they do not count towards the
+  exit code. The development-image scans do not read
   the exception file and report the finding as usual.
 - A control scan of the unmodified PostgreSQL base image (with its `gosu`)
   must fail; it proves the gate is not passing vacuously.
