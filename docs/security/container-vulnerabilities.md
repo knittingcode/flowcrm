@@ -193,7 +193,7 @@ only the Caddy base and the built SPA (`/srv/www`), the `spa-build` stage is
 discarded, and api and db contain no Node.js. The scan reports 0
 HIGH/CRITICAL for every runtime image.
 
-**Remediation:** none available. As of 2026-10-24 no npm release bundles
+**Remediation:** none available. As of 2026-10-28 no npm release bundles
 a fixed undici (the newest, 11.21.1 and 12.2.1 of 2026-10-15, both bundle
 6.29.0, required by their `node-gyp` 12.4.0 and 13.0.0 as `^6.25.0`), and
 no Node.js release bundles a fixed npm (Node.js 24.22.1 bundles npm
