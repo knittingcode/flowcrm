@@ -255,6 +255,11 @@ apply unchanged to FND-004. Read-only commands (`status`, `url`, `ports`,
   reported ([container vulnerabilities](../security/container-vulnerabilities.md)).
   Every scan must also inventory the expected package sources of the image,
   so an unrecognised image cannot pass as "no findings".
+- The edge configuration must not enable the ACME server, the PKI app, an
+  issuer or a mutable admin configuration: `scripts/ci/guard-edge-config.sh`
+  in `Repository guard` checks the sources, and `tests/app/scan.sh` checks
+  the configuration adapted by the built images
+  ([container vulnerabilities](../security/container-vulnerabilities.md)).
 - Image references, including the Dockerfile `# syntax=` frontend, stay
   pinned by digest (the frontend is enforced by
   `scripts/ci/guard-dockerfile-frontend.sh` in `Repository guard`); actions

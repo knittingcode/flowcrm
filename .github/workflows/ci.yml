@@ -43,6 +43,12 @@ jobs:
       - name: Run container scan exception guard regression tests
         run: scripts/ci/tests/guard-trivyignore.test.sh
 
+      - name: Keep the edge configuration free of ACME server, PKI, issuers and mutable admin
+        run: scripts/ci/guard-edge-config.sh
+
+      - name: Run edge configuration guard regression tests
+        run: scripts/ci/tests/guard-edge-config.test.sh
+
       - name: ShellCheck
         run: >-
           docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
@@ -50,6 +56,7 @@ jobs:
           scripts/ci/guard-tracked-files.sh scripts/ci/tests/guard-tracked-files.test.sh
           scripts/ci/guard-dockerfile-frontend.sh scripts/ci/tests/guard-dockerfile-frontend.test.sh
           scripts/ci/guard-trivyignore.sh scripts/ci/tests/guard-trivyignore.test.sh
+          scripts/ci/guard-edge-config.sh scripts/ci/tests/guard-edge-config.test.sh
 
       - name: actionlint
         run: >-
