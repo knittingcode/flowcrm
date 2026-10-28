@@ -25,9 +25,9 @@ downloaded on every run.
 - An exception for a runtime image is allowed only for one CVE that cannot be
   fixed yet, in `security/trivyignore.yaml`, with the evidence for the
   decision, the affected package at its exact version, the affected path and
-  an expiry no more than 90 days ahead, and it is listed in this document.
-  There are currently **no exceptions**. An exception does **not** fix the
-  vulnerable code: it only stops the gate from failing on that one finding.
+  an expiry no more than 90 days ahead, and it is listed in
+  [Exceptions](#exceptions). An exception does **not** fix the vulnerable
+  code: it only stops the gate from failing on that one finding.
   `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
   rules on the file: one CVE or GHSA id per entry, no duplicate id and no
   key twice in one entry; `purls` with at least one value, each of the form
@@ -70,6 +70,15 @@ downloaded on every run.
   instead of reporting "no findings".
 - Development-image findings are reviewed with every dependency update; they
   never ship in a runtime image.
+
+## Exceptions
+
+Each entry of `security/trivyignore.yaml`. The finding is not fixed by the
+exception; the vulnerable code is still in the image.
+
+| Id | Package and path | Image | Fixed in | Reachable here | Expires | Decision |
+|---|---|---|---|---|---|---|
+| CVE-2026-116587 (GHSA-mgcc-cww5-fp2q) | `github.com/go-jose/go-jose/v3` v3.0.5 (`pkg:golang/github.com/go-jose/go-jose/v3@v3.0.5`) in `usr/bin/caddy` | edge (`prod`; `dev` is report-only) | none for v3 (v4 fixed in 4.1.6 and upgraded, not excepted) | no: no `acme_server`, `pki` app or `tls internal`, admin API off | 2026-11-30 (gate fails again from 00:00 UTC that day) | ADR-021, **proposed, not accepted** ([details](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge)) |
 
 ## Triage of the FCRM-FND-004V findings
 
@@ -243,9 +252,34 @@ edge (`tests/app/https`) loads its certificate from files
 untrusted input (the JWS of an ACME request) to the vulnerable parser;
 `tls internal` and the `pki` app parse only keys Caddy creates or loads
 from its own configuration. With `admin off` the configuration cannot be
-changed at run time. The finding still fails the runtime gate
-for the edge `prod` image until it is fixed upstream or an exception is
-decided.
+changed at run time.
+
+**Exception (proposed, not accepted):** `security/trivyignore.yaml` excepts
+this id for `go-jose/v3` v3.0.5 in `usr/bin/caddy` only, until 2026-11-30
+(see [Exceptions](#exceptions); decision proposed in ADR-021). It does not
+fix the vulnerable code: go-jose v3 3.0.5 stays in the edge binary, and the
+exception only rests on the configuration above, which the edge
+configuration guard is to enforce. Scope, verified with Trivy 0.67.2 and the
+flags of `tests/app/scan.sh` (FCRM-SEC-042):
+
+- The edge `prod` gate passes with the exception; the finding is listed as
+  `SUPPRESSED ignored HIGH CVE-2026-116587 github.com/go-jose/go-jose/v3
+  v3.0.5`, and the edge `dev` report scan still lists it as a HIGH finding.
+- The same file does not cover go-jose v4: the edge `prod` image of `main`
+  (v4 4.1.5) still fails the gate on the v4 finding.
+- It does not cover another v3 version: a build with v3 3.0.4 fails the gate
+  (CVE-2026-116587 and CVE-2026-34986 for 3.0.4).
+- It suppresses nothing in the api, db and control scans; the control scan
+  still fails.
+- With an `expired_at` on or before the day of the scan, Trivy no longer
+  applies the entry and the gate fails; the guard fails as well.
+
+Review it again, at the latest at the expiry, on any of: a go-jose v3
+release that fixes the CVE; `go.step.sm/crypto` or `smallstep/certificates`
+moving to go-jose v4, or a Caddy release without v3; any change to
+`docker/edge` or `tests/app/https`; a change of the advisory's severity or
+a new advisory for go-jose v3; a deployment beyond the loopback binding; a
+Trivy upgrade (the exception file format is experimental in Trivy).
 
 ### Edge configuration guard
 
