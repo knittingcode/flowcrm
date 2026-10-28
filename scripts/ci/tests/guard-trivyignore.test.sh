@@ -209,6 +209,22 @@ expect_error "the same package and version under two ids" "package already excep
   "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose CVE-2026-0001 "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
 expect "two ids for two different packages" 0 \
   "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose CVE-2026-0001 "$J4@v4.1.5")${NL}" "$ALIAS_DOC"
+# Trivy matches the namespace of a Go purl whatever its case (re-audit
+# INFO-R1), so packages are compared in lower case.
+J3_UPPER=pkg:golang/github.com/Go-Jose/go-jose/v3
+expect_error "the same package in another case under a second id" "package already excepted by the entry at line 2" \
+  "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose CVE-2026-0001 "$J3_UPPER@v3.0.5")${NL}" "$ALIAS_DOC"
+expect_error "the same package in upper case first, lower case second" "package already excepted" \
+  "vulnerabilities:${NL}$(jose CVE-2026-0001 "pkg:golang/GitHub.com/Go-Jose/Go-Jose/V3@v3.0.4")${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
+expect "one package in two cases within one entry" 0 \
+  "vulnerabilities:${NL}$(entry CVE-2026-116587 2026-11-30 '    paths: ["usr/bin/caddy"]' "$STATEMENT" "$(purls "$J3@v3.0.5" "$J3_UPPER@v3.0.4")")${NL}" "$ALIAS_DOC"
+# Characters that bash 5.2 treats specially in ${x//pattern/replacement}
+# (patsub_replacement: &) must not change what the guard reads.
+# shellcheck disable=SC2016 # the backtick is literal fixture text
+expect "a statement with & and a backtick" 0 \
+  "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["a"]' '    statement: "Not reachable & not run (see `docs` & ADR-021)."')${NL}"
+expect_error "an & in a purl" "purl is not" "vulnerabilities:${NL}$(go_jose "$(purls "$J3@v3.0.5&x")")${NL}"
+expect_error "an & in an id" "id is not one CVE or GHSA identifier" "vulnerabilities:${NL}$(entry 'CVE-2026-0001&' 2026-12-01)${NL}"
 expect_error "an empty paths list" "paths must be a list" "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: []')${NL}"
 expect_error "a blank path only" "paths must be a list" "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["  "]')${NL}"
 mkdir -p "$work/nofile" && git init -q "$work/nofile" || exit 2

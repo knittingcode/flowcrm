@@ -16,7 +16,9 @@
 #     name the same package (type, namespace and name), so one entry cannot
 #     cover a second package such as another major version of a Go module;
 #   - one entry per package: no two entries name the same package (purl
-#     without its version), whatever their ids;
+#     without its version), whatever their ids. Packages are compared
+#     without regard to case, as Trivy matches a Go module path whatever its
+#     case;
 #   - the affected path is named exactly: "paths" with at least one entry;
 #     neither list has a wildcard (Trivy matches paths as doublestar
 #     patterns, so * ? [ ] { } are all rejected);
@@ -36,7 +38,9 @@
 #     day, and the gate fails on the finding again);
 #   - the entry is listed in docs/security/container-vulnerabilities.md:
 #     its id starts a row of the table under "## Exceptions" (a mention
-#     elsewhere in the document does not count).
+#     elsewhere in the document does not count). The alias check knows only
+#     the aliases that table lists, so editing its first column can bypass
+#     it; such an edit is visible in review and must be checked there.
 # Only the documented form is accepted (see the example in the file):
 # "vulnerabilities: []", or "vulnerabilities:" followed by entries of
 # "  - id: ..." and "    <key>: <value>" lines, with full-line comments.
@@ -173,18 +177,20 @@ finish_entry() {
 }
 
 # check_purls <line> <list>: every purl is exact and all name one package.
-# Sets pkg to the package of the entry.
+# Sets pkg to the package of the entry, in lower case (Trivy matches the
+# namespace of a Go purl whatever its case, so case must not make two
+# packages out of one).
 check_purls() {
-  local rest=$2 purl ok=yes
+  local rest=$2 purl ok=yes name
   pkg=''
   while [[ $rest =~ ^[^\"]*\"([^\"]*)\"(.*)$ ]]; do
     purl=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
     if [[ ! $purl =~ $purl_re ]]; then
       report "$1" "purl is not pkg:<type>/<name>@<exact version> without qualifiers, subpath or encoding" "$purl"
       ok=''
-    elif [ -z "$pkg" ]; then
-      pkg=${purl%@*}
-    elif [ "${purl%@*}" != "$pkg" ]; then
+    elif name=$(printf '%s' "${purl%@*}" | tr '[:upper:]' '[:lower:]') && [ -z "$pkg" ]; then
+      pkg=$name
+    elif [ "$name" != "$pkg" ]; then
       report "$1" "purls name more than one package (one package per entry)" "$2"
       ok=''
     fi
