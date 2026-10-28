@@ -78,7 +78,7 @@ exception; the vulnerable code is still in the image.
 
 | Id | Package and path | Image | Fixed in | Reachable here | Expires | Decision |
 |---|---|---|---|---|---|---|
-| CVE-2026-116587 (GHSA-mgcc-cww5-fp2q) | `github.com/go-jose/go-jose/v3` v3.0.5 (`pkg:golang/github.com/go-jose/go-jose/v3@v3.0.5`) in `usr/bin/caddy` | edge (`prod`; `dev` is report-only) | none for v3 (v4 fixed in 4.1.6 and upgraded, not excepted) | no: no `acme_server`, `pki` app or `tls internal`, admin API off | 2026-11-30 (gate fails again from 00:00 UTC that day) | ADR-021, **proposed, not accepted** ([details](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge)) |
+| CVE-2026-116587 (GHSA-mgcc-cww5-fp2q) | `github.com/go-jose/go-jose/v3` v3.0.5 (`pkg:golang/github.com/go-jose/go-jose/v3@v3.0.5`) in `usr/bin/caddy` | edge (`prod`; `dev` is report-only) | none for v3 (v4 fixed in 4.1.6 and upgraded, not excepted) | no: no `acme_server`, `pki` app or `tls internal`, admin API off | 2026-11-30 (gate fails again from 00:00 UTC that day) | [ADR-021](../architecture/adr/ADR-021-edge-go-jose-v3-exception.md), **proposed, not accepted** ([details](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge)) |
 
 ## Triage of the FCRM-FND-004V findings
 
