@@ -27,7 +27,7 @@ TAB=$'\t'
 CR=$'\r'
 REAL=(docker/edge/Dockerfile docker/edge/Caddyfile.dev docker/edge/Caddyfile.prod docker/edge/common.caddy
   tests/app/https/Caddyfile tests/app/https/compose.https.yaml compose.yaml compose.prodlike.yaml compose.test.yaml
-  compose.fixture.yaml tests/app/scan.sh)
+  compose.fixture.yaml tests/app/scan.sh docker/api/Dockerfile docker/db/Dockerfile docker/web/Dockerfile)
 P=docker/edge/Caddyfile.prod
 D=docker/edge/Caddyfile.dev
 C=docker/edge/common.caddy
@@ -419,6 +419,48 @@ bad "SHELL in an edge stage" "SHELL in an edge runtime stage" "$DF" "USER 65534:
 base
 subst "$DF" "RUN npm run build" "RUN npm run build && cp /app/dist/index.html /tmp/x"
 expect "RUN in a non-edge stage (spa-build) is not restricted" 0
+
+# --- Re-audit (FCRM-SEC-042 E, HIGH-R1 and LOW-R1) ----------------------------------------
+base
+put docker/edge/launcher "#!/bin/sh${NL}exec /usr/bin/caddy run --config /srv/e.conf --adapter caddyfile${NL}"
+subst "$DF" "USER 65534:65534" "WORKDIR /usr/local/bin${NL}COPY --chmod=755 docker/edge/launcher ./caddy${NL}WORKDIR /${NL}USER 65534:65534"
+expect "E workdir-dest: WORKDIR in an edge stage" 1 "WORKDIR in an edge runtime stage"
+base
+put docker/edge/launcher "#!/bin/sh${NL}exec /usr/bin/caddy run --config /srv/e.conf --adapter caddyfile${NL}"
+subst "$DF" "USER 65534:65534" "COPY --chmod=755 docker/edge/launcher ./caddy${NL}USER 65534:65534"
+expect "relative COPY destination in an edge stage" 1 "needs an absolute literal destination"
+base
+put docker/edge/launcher "#!/bin/sh${NL}exec /usr/bin/caddy run --config /srv/e.conf --adapter caddyfile${NL}"
+subst "$DF" "USER 65534:65534" "ARG D=/usr/local/bin${NL}COPY --chmod=755 docker/edge/launcher \${D}/caddy${NL}USER 65534:65534"
+expect "E arg-dest: ARG-built COPY destination" 1 "needs an absolute literal destination"
+bad "COPY to /etc//caddy/Caddyfile (non-canonical)" "needs an absolute literal destination" "$DF" "COPY docker/edge/Caddyfile.prod /etc/caddy/Caddyfile" "COPY docker/edge/Caddyfile.prod /etc/caddy/Caddyfile${NL}COPY docker/edge/no-gate/README.md /etc//caddy/Caddyfile"
+bad "ONBUILD in an edge stage" "ONBUILD in an edge runtime stage" "$DF" "USER 65534:65534" "ONBUILD RUN true${NL}USER 65534:65534"
+bad "E long-mount-bin: long-syntax mount over /usr/local/bin" "long-syntax mount over" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - type: bind${NL}        source: ./tests/app/https/attacker${NL}        target: /usr/local/bin"
+bad "long-syntax mount over /etc" "long-syntax mount over" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - type: bind${NL}        source: ./tests/app/https/attacker${NL}        target: /etc"
+bad "short mount target /usr//bin (non-canonical)" "canonical absolute path" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - ./tests/app/https/attacker:/usr//bin:ro"
+bad "E quoted-key-launcher: quoted \"entrypoint\" key" "quoted key in a Compose file" "$HC" "    command: [" "    \"entrypoint\": [\"/srv/l/launch\"]${NL}    command: ["
+bad "quoted key in single quotes" "quoted key in a Compose file" "$HC" "    command: [" "    'entrypoint': ['/bin/sh']${NL}    command: ["
+base
+put compose.override.yaml "services:${NL}  edge: {entrypoint: [\"/bin/sh\", \"-c\", \"exec /usr/bin/caddy run --resume\"]}${NL}"
+expect "E flow-service: edge service as a flow mapping" 1 "flow mapping in a Compose file"
+base
+put compose.extra.yaml "services:${NL}  edge2:${NL}    build:${NL}      context: .${NL}      dockerfile: docker//edge/Dockerfile${NL}    entrypoint: [\"sh\"]${NL}"
+expect "E dslash-dockerfile: docker//edge/Dockerfile (block style)" 1 "path with //, /./ or .. in a Compose file"
+base
+put compose.extra.yaml "services:${NL}  edge2:${NL}    build: {context: ., dockerfile: docker/edge/Dockerfile}${NL}"
+expect "build as a flow mapping" 1 "flow mapping in a Compose file"
+base
+mkdir -p "$repo/docker/edge2"
+printf '%s\n' "# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e" "FROM caddy:2.11.7-alpine" "USER 65534:65534" >"$repo/docker/edge2/Dockerfile"
+git -C "$repo" add -f docker/edge2/Dockerfile || exit 2
+put compose.extra.yaml "services:${NL}  proxy:${NL}    build:${NL}      context: .${NL}      dockerfile: docker/edge2/Dockerfile${NL}    command: [\"edge\", \"run\"]${NL}"
+expect "service building another Dockerfile with a caddy stage" 1 "command of the edge service proxy must be exactly"
+base
+put compose.extra.yaml "services:${NL}  proxy:${NL}    build:${NL}      context: docker/edge${NL}      dockerfile: Dockerfile${NL}    command: [\"edge\", \"run\"]${NL}"
+expect "service building an untracked or context-relative Dockerfile is treated as edge" 1 "command of the edge service proxy must be exactly"
+base
+subst compose.yaml "    networks: [front, back]" "    networks: [front, back]${NL}    entrypoint: [\"sh\"]"
+expect "HIGH-R1: <<: anchor merge resolves (edge with merged hardening)" 1 "entrypoint of the edge service edge"
 
 # --- Globs that match the binary's name ---------------------------------------------------
 base

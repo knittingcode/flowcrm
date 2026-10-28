@@ -35,11 +35,13 @@
 #     image, or an override of such a service) have no entrypoint or
 #     extends, and a command only in the exact form
 #     ["caddy", "run", "--config", "/etc/caddy/<path>", "--adapter", "caddyfile"];
-#     Compose files contain no backslash (YAML escapes) and no mount over
-#     /, /etc, /usr or a bin directory;
+#     Compose files contain no backslash (YAML escapes), no quoted key, no
+#     flow mapping but {}, no path with //, /./ or .., and no short or
+#     long-syntax (target:) mount over /, /etc, /usr or a bin directory;
 #   - edge runtime stages of a Dockerfile only RUN "apk add --no-cache
 #     <packages>", copy the binary only to /usr/bin/caddy, put nothing else
-#     in a bin directory and do not change PATH or SHELL; command lines
+#     in a bin directory, use only absolute literal COPY/ADD destinations,
+#     no WORKDIR or ONBUILD, and do not change PATH or SHELL; command lines
 #     contain no glob that matches the binary's name;
 #   - no tracked Caddy file is unused by these start points, and no
 #     tracked JSON file looks like a Caddy JSON configuration.
@@ -50,7 +52,9 @@
 # fail. Shell and YAML are only read line by line: the guard catches
 # ordinary and accidental changes and the obfuscations above, but not a
 # command or path assembled at run time (shell variables, eval, env_file,
-# docker cp) or a Caddy plugin in docker/edge/caddy/main.go.
+# docker cp) or a Caddy plugin in docker/edge/caddy/main.go. It stops
+# accidental and casual unsafe changes and makes deliberate ones visible in
+# review; a committer can change this guard too, so review stays required.
 #
 # Usage: guard-edge-config.sh [repository-path]
 # Exit codes: 0 configuration safe, 1 unsafe or unsupported construct,
@@ -102,6 +106,19 @@ report() {
 }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# canonical_abs <path>: an absolute literal path without $, //, /./, /../,
+# a trailing /. or /..; the guard compares paths only in this form.
+canonical_abs() {
+  case $1 in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case $1 in
+    *'$'* | *'//'* | *'/./'* | *'/../'* | */. | */.. | *"\\"*) return 1 ;;
+  esac
+  return 0
+}
 
 # --- Discovery ---------------------------------------------------------------
 
@@ -207,7 +224,7 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
     instr=${text%%[[:space:]]*} rest=${text#"$instr"}
     shopt -s nocasematch
     case $instr in
-      from | copy | add | cmd | entrypoint | run | env | shell) instr=$(lower "$instr") ;;
+      from | copy | add | cmd | entrypoint | run | env | shell | workdir | onbuild) instr=$(lower "$instr") ;;
       *) instr=other ;;
     esac
     shopt -u nocasematch
@@ -215,7 +232,7 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
       from)
         words "$rest"
         w=(${WORDS[@]+"${WORDS[@]}"})
-        img=$(lower "${w[0]-}") name="#${#ST_ID[@]}" parent=''
+        img=$(lower "${w[0]-}") name="stage-${#ST_ID[@]}" parent=''
         if [ "${#w[@]}" -ge 3 ] && [ "$(lower "${w[1]}")" = as ]; then name=$(lower "${w[2]}"); fi
         stage_index "$df#$img" >/dev/null && parent="$df#$img"
         stage="$df#$name"
@@ -252,7 +269,7 @@ for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
         ;;
       cmd | entrypoint) cmd_lines="$cmd_lines $ln" ;;
       *)
-        case $instr in run | env | shell)
+        case $instr in run | env | shell | workdir | onbuild)
           DL_STAGE+=("$stage") DL_WHERE+=("$df:$ln") DL_INSTR+=("$instr") DL_TEXT+=("$text") ;;
         esac
         case $text in *"/etc/caddy"*)
@@ -314,11 +331,17 @@ for ((k = 0; k < ${#DL_STAGE[@]}; k++)); do
       case $text in *PATH* | *path* | *SHELL*) report "$where" "ENV changing PATH or SHELL in an edge runtime stage" "$text" ;; esac
       ;;
     shell) report "$where" "SHELL in an edge runtime stage" "$text" ;;
+    workdir) report "$where" "WORKDIR in an edge runtime stage (a relative COPY destination would land in it)" "$text" ;;
+    onbuild) report "$where" "ONBUILD in an edge runtime stage" "$text" ;;
     copy | add)
       words "${text#*[[:space:]]}"
       w=(${WORDS[@]+"${WORDS[@]}"})
       dest=${w[${#w[@]}-1]-} src=''
       for x in "${w[@]}"; do case $x in --*) ;; *) [ -n "$src" ] || src=$x ;; esac; done
+      if ! canonical_abs "$dest"; then
+        report "$where" "COPY or ADD in an edge runtime stage needs an absolute literal destination (no relative path, variable, //, . or ..)" "$text"
+        continue
+      fi
       if [[ $dest =~ $bin_dir_re ]] || [ "${src##*/}" = caddy ]; then
         case $text in
           [Cc][Oo][Pp][Yy]' --from='*' '*/caddy' /usr/bin/caddy') [ "${src##*/}" = caddy ] && [ "${#w[@]}" -eq 3 ] || report "$where" "only the Caddy binary may be copied into a bin directory, to /usr/bin/caddy" "$text" ;;
@@ -338,10 +361,38 @@ for cf in ${COMPOSES[@]+"${COMPOSES[@]}"}; do
     # YAML escapes (\u0063addy, \x2F) would hide a command or a path from
     # these line checks; Compose decodes them.
     case $line in *"\\"*) report "$cf:$ln" "backslash in a Compose file (YAML escapes are not supported)" "$line" ;; esac
+    # The service model below reads block-style YAML with plain keys only.
+    if [[ $line =~ ^[[:space:]]*(-[[:space:]]+)?[\"\'][^\"\']*[\"\'][[:space:]]*: ]]; then
+      report "$cf:$ln" "quoted key in a Compose file (not supported: it would hide a key from the checks)" "$line"
+    fi
+    if [[ $line =~ (^|[^\$])\{[[:space:]]*[^}[:space:]] ]]; then
+      report "$cf:$ln" "flow mapping in a Compose file (only {} is supported)" "$line"
+    fi
+    # Long-syntax mounts and other path keys.
+    if [[ $line =~ ^[[:space:]]*(-[[:space:]]+)?(target|destination|dst|source|src|file|dockerfile):[[:space:]]*[\"\']?([^\"\'[:space:]]*) ]]; then
+      t=${BASH_REMATCH[3]}
+      case $t in
+        */* | .*)
+          case $t in *'//'* | *'/./'* | *'..'* | */.)
+            report "$cf:$ln" "path with //, /./ or .. in a Compose file (write it in canonical form)" "$line" ;;
+          esac
+          ;;
+      esac
+      case ${BASH_REMATCH[2]} in
+        target | destination | dst)
+          t=${t%/}
+          case $t in
+            '' | /etc | /etc/caddy | /etc/caddy/* | /usr | /usr/local | /bin | /sbin | /usr/bin | /usr/sbin | /usr/local/bin | /usr/local/sbin | /usr/bin/* | /usr/local/bin/* | /bin/*)
+              case $t in '' | /*) report "$cf:$ln" "long-syntax mount over /etc/caddy, the Caddy binary or a directory that holds them" "$line" ;; esac ;;
+          esac
+          ;;
+      esac
+    fi
     # A mount over /, /etc, /usr or a bin directory replaces /etc/caddy or
     # the binary without naming them.
     if [[ $line =~ ^[[:space:]]*-[[:space:]]*[\"\']?[^:\"\'[:space:]]+:(/[^:\"\'[:space:]]*)(:[a-z,]+)?[\"\']?[[:space:]]*$ ]]; then
       t=${BASH_REMATCH[1]}
+      canonical_abs "$t" || [ "$t" = / ] || report "$cf:$ln" "mount target must be a canonical absolute path (no //, . or ..)" "$line"
       t=${t%/}
       case $t in
         '' | /etc | /usr | /usr/local | /bin | /sbin | /usr/bin | /usr/sbin | /usr/local/bin | /usr/local/sbin | /usr/bin/* | /usr/local/bin/* | /bin/*)
@@ -404,7 +455,8 @@ svc_has() {
   local f=$1 o=$2 key=$3 pat=${4-*} k m anchors=''
   for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
     [ "${CK_FILE[$k]}" = "$f" ] && [ "${CK_OWNER[$k]}" = "$o" ] && [ "${CK_KEY[$k]}" = '<<' ] &&
-      anchors="$anchors ${CK_VAL[$k]//\*/&}"
+      # "*name" -> "&name" without & in a replacement (bash >= 5.2 expands it).
+      anchors="$anchors &${CK_VAL[$k]#\*}"
   done
   for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
     [ "${CK_FILE[$k]}" = "$f" ] && [ "${CK_KEY[$k]}" = "$key" ] || continue
@@ -423,10 +475,24 @@ svc_has() {
   done
   return 1
 }
+# Dockerfiles with an edge runtime stage; a Compose service that builds one
+# (or a Dockerfile the guard does not know) is an edge service.
+EDGE_DOCKERFILES=' '
+for ((k = 0; k < ${#ST_ID[@]}; k++)); do
+  is_runtime_stage "${ST_ID[$k]}" && EDGE_DOCKERFILES="$EDGE_DOCKERFILES${ST_ID[$k]%#*} "
+done
+edge_dockerfile() { # dockerfile value from Compose
+  local v=${1#./}
+  v=${v#\"} v=${v%\"} v=${v#\'} v=${v%\'}
+  v=${v#./}
+  case $EDGE_DOCKERFILES in *" $v "*) return 0 ;; esac
+  is_tracked "$v" || return 0
+  return 1
+}
 EDGE_NAMES=' '
 for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
   case ${CK_OWNER[$k]} in '&'*) continue ;; esac
-  if svc_has "${CK_FILE[$k]}" "${CK_OWNER[$k]}" dockerfile '*docker/edge/Dockerfile*' ||
+  if { svc_has "${CK_FILE[$k]}" "${CK_OWNER[$k]}" dockerfile && edge_dockerfile "$SVC_VAL"; } ||
     svc_has "${CK_FILE[$k]}" "${CK_OWNER[$k]}" image '*caddy*'; then
     case $EDGE_NAMES in *" ${CK_OWNER[$k]} "*) ;; *) EDGE_NAMES="$EDGE_NAMES${CK_OWNER[$k]} " ;; esac
   fi
@@ -438,7 +504,7 @@ for ((k = 0; k < ${#CK_KEY[@]}; k++)); do
   case " ${CHECKED_SVC-} " in *" $f:$o "*) continue ;; esac
   CHECKED_SVC="${CHECKED_SVC-} $f:$o"
   edge=no
-  if svc_has "$f" "$o" dockerfile '*docker/edge/Dockerfile*' || svc_has "$f" "$o" image '*caddy*'; then
+  if { svc_has "$f" "$o" dockerfile && edge_dockerfile "$SVC_VAL"; } || svc_has "$f" "$o" image '*caddy*'; then
     edge=yes
   elif ! svc_has "$f" "$o" image && ! svc_has "$f" "$o" dockerfile; then
     case $EDGE_NAMES in *" $o "*) edge=yes ;; esac
