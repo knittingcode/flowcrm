@@ -1,4 +1,24 @@
-# Shared by Caddyfile.dev and Caddyfile.prod.
+# Shared by Caddyfile.dev and Caddyfile.prod, which import it before their
+# global options: it may define snippets only.
+
+# Redacted JSON log format, used by the access log (baseline) and by the
+# default log of both Caddyfiles, which receives the error records Caddy
+# writes for requests it could not complete (a 502 when the api or the Vite
+# dev server is down). Caddy already redacts the Cookie, Set-Cookie,
+# Authorization and Proxy-Authorization headers; query strings (which can
+# carry tokens), CSRF tokens and a client's own X-Request-Id (replaced by
+# the edge, see baseline) are removed too.
+(redacted_json) {
+	format filter {
+		wrap json
+		fields {
+			request>uri regexp "\?.*$" "?[redacted]"
+			request>headers>Referer regexp "\?.*$" "?[redacted]"
+			request>headers>X-Csrf-Token delete
+			request>headers>X-Request-Id delete
+		}
+	}
+}
 
 (php) {
 	# Every PHP request runs Symfony's front controller on the api service.
@@ -13,26 +33,39 @@
 
 (baseline) {
 	# The request ID is always generated here; a client-supplied one is replaced.
+	# The same ID goes to the api (request header), back to the client on
+	# every response, also one the edge answers itself (deferred, so it
+	# replaces the api's identical copy instead of adding a second value),
+	# and into the access log as request_id.
 	request_header X-Request-Id {http.request.uuid}
+	header >X-Request-Id {http.request.uuid}
+	log_append request_id {http.request.uuid}
 	header {
 		X-Content-Type-Options nosniff
 		Referrer-Policy strict-origin-when-cross-origin
 		X-Frame-Options DENY
 		-Server
 	}
-	# JSON access log with the request ID. Caddy already redacts the
-	# Cookie, Set-Cookie, Authorization and Proxy-Authorization headers;
-	# query strings (which can carry tokens) and CSRF tokens are removed too.
+	# JSON access log with the request ID (redacted, see redacted_json).
 	log {
 		output stdout
-		format filter {
-			wrap json
-			fields {
-				request>uri regexp "\?.*$" "?[redacted]"
-				request>headers>Referer regexp "\?.*$" "?[redacted]"
-				request>headers>X-Csrf-Token delete
-			}
+		import redacted_json
+	}
+
+	# Security gate of bin/devenv (ADR-018): while the gate file exists, the
+	# edge answers every request with 503 except exactly /health/live and
+	# /health/ready (raw URI), so a stack that has not passed its checks
+	# serves nothing, and readiness can still be verified through it.
+	@gated {
+		file {
+			root /run/flowcrm-gate
+			try_files /security-gate
 		}
+		not expression `{http.request.orig_uri}.matches("^/health/(live|ready)([?].*)?$")`
+	}
+	handle @gated {
+		header Cache-Control no-store
+		respond "FlowCRM is blocked by its security gate: run make status" 503
 	}
 
 	# ADR-017: Symfony is reached only for /api, /api/... and exactly
