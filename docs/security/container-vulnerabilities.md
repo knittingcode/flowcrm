@@ -24,15 +24,30 @@ downloaded on every run.
 
 - An exception for a runtime image is allowed only for one CVE that cannot be
   fixed yet, in `security/trivyignore.yaml`, with the evidence for the
-  decision, the affected path and an expiry no more than 90 days ahead, and
-  it is listed in the table below. There are currently **no exceptions**.
+  decision, the affected package at its exact version, the affected path and
+  an expiry no more than 90 days ahead, and it is listed in this document.
+  There are currently **no exceptions**. An exception does **not** fix the
+  vulnerable code: it only stops the gate from failing on that one finding.
   `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
   rules on the file: one CVE or GHSA id per entry, no duplicate id and no
-  key twice in one entry, `paths` or `purls` with non-blank values and without
-  wildcards (Trivy matches `paths` as glob patterns, so `*`, `?`, `[`, `]`,
-  `{` and `}` are all rejected), a non-empty `statement`, a valid `expired_at`
-  no more than 90 days after the day of the check, the id mentioned in this
-  document, and only the documented form (any other section or key fails).
+  key twice in one entry; `purls` with at least one value, each of the form
+  `pkg:<type>/<namespace>/<name>@<version>` with a lowercase type and an
+  exact version (no purl without a version, which Trivy would apply to every
+  version; no range, list or blank; no qualifiers, subpath or
+  percent-encoding), and all purls of an entry naming the same package
+  (type, namespace and name), so one entry cannot also cover another package
+  such as a second major version of a Go module; `paths` optional, but if
+  given with at least one value; non-blank values without wildcards in both
+  lists (Trivy matches `paths` as glob patterns, so `*`, `?`, `[`, `]`, `{`
+  and `}` are all rejected); a non-empty `statement`; a valid `expired_at`
+  after the day of the check and no more than 90 days after it; the id
+  mentioned in this document; and only the documented form (any other
+  section or key fails). Trivy stops applying an entry at 00:00 UTC of its
+  `expired_at` day, and from that day on the guard fails too, so an expired
+  exception breaks the `Repository guard` job until it is renewed after a
+  new review or removed, instead of lingering in the file. Trivy applies an
+  entry only to a finding that matches its id, one of its `paths` and one of
+  its `purls`.
   So that the check reads the file exactly as Trivy's YAML parser does, it
   accepts printable ASCII only (YAML also breaks lines at CR, NEL and
   U+2028, which could hide an entry inside a comment; a NUL byte, which the
