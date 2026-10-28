@@ -124,4 +124,56 @@ rc=$?
 v "SC control: the gate rejects the known-vulnerable PostgreSQL base image" $? "(exit $rc)"
 say "      control: $(grep -cE '^(HIGH|CRITICAL) ' "$work/control.log") HIGH/CRITICAL findings, e.g. $(grep -m1 -E '^CRITICAL ' "$work/control.log")"
 
+# Edge configuration (docs/security/container-vulnerabilities.md, edge
+# configuration guard): the JSON the built binary adapts from every
+# configuration the edge images run keeps the admin API, config
+# persistence, the PKI app, issuers, ACME and the acme_server handler off
+# (scripts/ci/edge-adapted-config.jq). The images run the Caddy base
+# image's command unchanged, without a CADDY_* variable (the admin address).
+say "== edge configuration (adapted to JSON by the Caddy of the built images)"
+adapt() { # id docker-run-args...: the adapted JSON goes to $work/<id>.json
+  local id=$1
+  shift
+  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true "$@" \
+    >"$work/$id.json" 2>"$work/$id.adapt.log"
+}
+adapted_ok() { # id: no violation in the adapted JSON
+  jq -r -f "$APP_REPO/scripts/ci/edge-adapted-config.jq" "$work/$1.json" >"$work/$1.violations" 2>&1 &&
+    [ ! -s "$work/$1.violations" ]
+}
+edge_cmd='null ["caddy","run","--config","/etc/caddy/Caddyfile","--adapter","caddyfile"]'
+if need "jq is available" command -v jq >/dev/null; then
+  for image in edge-prod edge-dev; do
+    run_cmd=$(docker image inspect -f '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$tag:$image")
+    env=$(docker image inspect -f '{{json .Config.Env}}' "$tag:$image")
+    [ "$run_cmd" = "$edge_cmd" ] &&
+      printf '%s' "$env" | jq -e 'map(select(startswith("CADDY_") and (startswith("CADDY_VERSION=") | not))) == []' >/dev/null
+    v "SC $image: runs the Caddy base image's command on /etc/caddy/Caddyfile; no CADDY_* variable but CADDY_VERSION" $? "$run_cmd $env"
+  done
+  adapt edge-prod "$tag:edge-prod" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile &&
+    adapted_ok edge-prod
+  v "SC edge-prod config: admin off, persist_config off, automatic HTTPS off, no pki, issuer or acme_server" $? "$(cat "$work/edge-prod.violations" "$work/edge-prod.adapt.log" 2>/dev/null | head -n 20)"
+  adapt edge-dev "$tag:edge-dev" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile &&
+    adapted_ok edge-dev
+  v "SC edge-dev config: admin off, persist_config off, automatic HTTPS off, no pki, issuer or acme_server" $? "$(cat "$work/edge-dev.violations" "$work/edge-dev.adapt.log" 2>/dev/null | head -n 20)"
+  # The HTTPS test edge of prodlike.sh (tests/app/https/compose.https.yaml).
+  adapt edge-https -v "$APP_REPO/tests/app/https/Caddyfile:/etc/caddy/https/Caddyfile:ro" "$tag:edge-prod" \
+    caddy adapt --config /etc/caddy/https/Caddyfile --adapter caddyfile &&
+    adapted_ok edge-https && [ "$(jq -c '.apps.tls.certificates | keys' "$work/edge-https.json")" = '["load_files"]' ]
+  v "SC edge-https config: as edge-prod, certificates from files only" $? "$(cat "$work/edge-https.violations" "$work/edge-https.adapt.log" 2>/dev/null | head -n 20)"
+  # Control: an unsafe configuration in an image derived from edge-prod
+  # (its own command) must be rejected for each of its unsafe settings.
+  mkdir -p "$work/control-edge"
+  printf '%s\n' '{' '	admin localhost:2019' '	local_certs' '}' ':8080 {' '	acme_server' '}' >"$work/control-edge/Caddyfile"
+  printf 'FROM %s\nCOPY Caddyfile /etc/caddy/Caddyfile\n' "$tag:edge-prod" |
+    docker build --quiet -t "$tag:edge-control" -f - "$work/control-edge" >/dev/null &&
+    adapt edge-control "$tag:edge-control" caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile &&
+    ! adapted_ok edge-control && grep -q 'admin.disabled is not true' "$work/edge-control.violations" &&
+    grep -q 'admin.config.persist is not false' "$work/edge-control.violations" &&
+    grep -q 'acme_server handler found' "$work/edge-control.violations" &&
+    grep -q 'issuer modules found: internal' "$work/edge-control.violations" &&
+    grep -q 'automatic_https.disable is not true' "$work/edge-control.violations"
+  v "SC control: the adapted-config check rejects admin, persistence, local_certs, acme_server and automatic HTTPS" $? "$(cat "$work/edge-control.violations" "$work/edge-control.adapt.log" 2>/dev/null | head -n 20)"
+fi
+
 tally_finish "(container scan)"
