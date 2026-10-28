@@ -194,7 +194,8 @@ SHA-256 (`dd77c48eb845f4856c2cdba347cfb52bd877a2655a1ea48ff0c4796e3df9dd7b`,
 matching the registry's SHA-512 integrity); a wrong checksum fails the
 build. The web image had **0 HIGH/CRITICAL** after this remediation; it
 stays report-only because it is a development and test image. npm 11.21.1
-has one HIGH finding published later (CVE-2026-109869, below).
+has three HIGH findings in its bundled undici, published later
+([undici](#cve-2026-109869-cve-2026-109383-cve-2026-87018-undici-bundled-with-npm-web-development-only)).
 
 ## CVE-2026-111497: `brotli-libs` (runtime images)
 
@@ -209,23 +210,39 @@ repositories. No base image ships it yet, so `docker/api/Dockerfile`,
 version cannot be installed). Remove the upgrade when the pinned base
 images include the fix. No exception was added.
 
-## CVE-2026-109869: `undici` bundled with npm (web, development only)
+## CVE-2026-109869, CVE-2026-109383, CVE-2026-87018: `undici` bundled with npm (web, development only)
 
-Published after the npm 11.21.1 remediation; found by the scan of main
-(run 40101147084), not by a change of the project. The advisory
-([GHSA-xjj6-f33q-929c](https://github.com/advisories/GHSA-xjj6-f33q-929c),
-[NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-109869), CVSS 3.1 7.5 HIGH,
-`AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`): undici's `fetch()` terminates the
-process when a malicious server returns more than five content codings and
-closes the connection early. Affected: 6.23.0 to 6.29.0, 7.18.0 to 7.30.0,
-8.0.0 to 8.12.1; fixed in 6.29.1, 7.30.1 and 8.12.2. No workaround.
+Three HIGH advisories for undici, all published after the npm 11.21.1
+remediation and found by the scans of `main`, not by a change of the
+project. All three are fixed in undici 6.29.1, 7.30.1 and 8.12.2, and the
+scan of `main` at 1badf76 (run 40745073009, 2026-10-28) reports each of
+them once for web `dev`, as
+`HIGH <id> undici 6.29.0 fixed=6.29.1, 7.30.1, 8.12.2 in=Node.js`:
+
+| CVE | Advisory | CVSS 3.1 | Affected (6.x / 7.x / 8.x) | Issue | First seen on `main` |
+|---|---|---|---|---|---|
+| CVE-2026-109869 | [GHSA-xjj6-f33q-929c](https://github.com/advisories/GHSA-xjj6-f33q-929c) (2026-10-23) | 7.5, `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` | 6.23.0-6.29.0 / 7.18.0-7.30.0 / 8.0.0-8.12.1 | `fetch()` terminates the process when a malicious server returns more than five content codings and closes the connection early | run 40101147084 |
+| CVE-2026-109383 | [GHSA-2m5v-pch6-74hx](https://github.com/advisories/GHSA-2m5v-pch6-74hx) (2026-10-27) | 7.4, `AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N` | 4.0.0-6.29.0 / 7.0.0-7.30.0 / 8.0.0-8.12.1 | `Agent` drops a function-valued `tls` option such as a custom `checkServerIdentity`, so certificate pinning written that way is silently not applied | run 40745073009 |
+| CVE-2026-87018 | [GHSA-qrxm-fqhp-jwvm](https://github.com/advisories/GHSA-qrxm-fqhp-jwvm) (2026-10-27) | 7.5, `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` | 4.2.1-6.29.0 / 7.0.0-7.30.0 / 8.0.0-8.12.1 | a TLS 1.2 server that renegotiates with a valid certificate for another host crashes the client process | run 40745073009 |
+
+Run 40745073009 is the first scan of `main` after the two advisories of
+2026-10-27; the run before it (40669720894, 999d4d1) failed at BE-03 in the
+backend checks and skipped the scan.
+
+The undici copies in the images:
 
 | undici copy | Image | Version | Status |
 |---|---|---|---|
 | Node.js core (`process.versions.undici`, global `fetch`), Node 24.22.1 | web, edge `spa-build` stage | 7.30.1 | fixed |
 | Project dependency (via `jsdom`, development only), `frontend/package-lock.json` | web | 8.12.3 | fixed |
-| `/usr/local/lib/node_modules/npm/node_modules/undici`, npm 11.21.1 (`NPM_VERSION` in `docker/web/Dockerfile`) | web | 6.29.0 | **open** (Trivy target `Node.js`) |
-| Same path, npm 11.19.1 bundled with Node 24.22.1 | edge `spa-build` stage only | 6.28.0 | open, build stage |
+| `/usr/local/lib/node_modules/npm/node_modules/undici`, npm 11.21.1 (`NPM_VERSION` in `docker/web/Dockerfile`) | web | 6.29.0 | **open**, all three (Trivy target `Node.js`) |
+| Same path, npm 11.19.1 bundled with Node 24.22.1 | edge `spa-build` stage only (not scanned: the stage is not in any image) | 6.28.0 | open, build stage |
+
+The open copy is the undici that the npm CLI bundles. The web image
+replaces the npm of the Node image with npm 11.21.1 (see
+[web](#web-node-24221-development-and-test-only)), whose tarball contains
+undici 6.29.0 at `package/node_modules/undici`; it is not a dependency of
+the project.
 
 **Reachability:** inside npm, only the bundled `node-gyp` (12.4.0) uses
 undici (`node-gyp/lib/download.js`, checked in the 11.21.1 and 12.2.1
@@ -236,7 +253,11 @@ package with an install script is `fsevents` (macOS only, never installed
 in the Alpine images). `npm audit` and `npm run` (tests/app/frontend.sh)
 load npm but not its undici; the Vite dev server, the Vite build, Vitest,
 `tsc` and ESLint do not load npm's modules and use the fixed core or
-project undici. The
+project undici. Even when it runs, `node-gyp` passes no function-valued
+`tls` option (`lib/download.js` sets only a CA, in `connect`, `requestTls`
+and `proxyTls`), so CVE-2026-109383 does not apply to it; the two
+denial-of-service findings would only end a `node-gyp` header download from
+a malicious server. The
 production-like images are not affected: the edge `prod` target contains
 only the Caddy base and the built SPA (`/srv/www`), the `spa-build` stage is
 discarded, and api and db contain no Node.js. The scan reports 0
@@ -245,9 +266,12 @@ HIGH/CRITICAL for every runtime image.
 **Remediation:** none available. As of 2026-10-28 no npm release bundles
 a fixed undici (the newest, 11.21.1 and 12.2.1 of 2026-10-15, both bundle
 6.29.0, required by their `node-gyp` 12.4.0 and 13.0.0 as `^6.25.0`), and
-no Node.js release bundles a fixed npm (Node.js 24.22.1 bundles npm
-11.19.1, Node.js 26.12.1 npm 11.20.0). The finding stays reported for the
-web image; no exception was added.
+no Node.js release bundles a fixed npm (the newest Node.js 24, 24.22.2 of
+2026-10-27, bundles npm 11.19.1, like 24.22.1; the newest Node.js 26,
+26.13.0 of 2026-10-28, bundles npm 11.20.0). The findings stay reported for
+the web image. The web image is report-only and its scan does not read
+`security/trivyignore.yaml`, so no exception was added and none is listed
+in [Exceptions](#exceptions).
 
 **Re-evaluation trigger:** the next npm release, and every change of
 `NPM_VERSION` or `NODE_IMAGE`. Check the undici version inside the npm
@@ -257,8 +281,9 @@ in 7.x, or 8.12.2 or later in 8.x. The likely path is an npm release that
 bundles `node-gyp` 13.1.0 (published 2026-10-02), which requires undici
 `^8.4.1` instead of `^6.25.0`. Then update `NPM_VERSION` and `NPM_SHA256`
 in `docker/web/Dockerfile`, check that the web scan no longer reports
-CVE-2026-109869, and update this section; update `NODE_IMAGE` once a
-Node.js 24 image bundles such an npm (the edge `spa-build` stage).
+CVE-2026-109869, CVE-2026-109383 or CVE-2026-87018, and update this
+section; update `NODE_IMAGE` once a Node.js 24 image bundles such an npm
+(the edge `spa-build` stage).
 
 ## CVE-2026-92392: `curl` and `libcurl` (runtime images)
 
