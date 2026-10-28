@@ -527,7 +527,12 @@ $ fingerprint "$src" | diff "$backups/flowcrm-$ts.fingerprint" - && echo identic
 ```
 
 To go back, restore `flowcrm-before-restore-$pre.dump` the same way and
-compare with its fingerprint.
+compare with its fingerprint. If the `make up` after a restore fails, the
+working stack stays blocked (phase 7 above): the edge is stopped, an edge
+started by `bin/devenv` answers 503 except `/health/live` and
+`/health/ready` while `.runtime/gate/security-gate` exists, and
+`make status` reports `blocked` until a `make up` passes. The database keeps
+running, so the way back above still works.
 
 `--single-transaction` makes the restore all or nothing. Requests that
 arrive during it may fail; sessions in the restored data are those of the
