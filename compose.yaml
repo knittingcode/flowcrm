@@ -42,6 +42,10 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    # The security gate of bin/devenv (.runtime/gate, ADR-018): while its file
+    # exists the edge serves nothing but /health/live and /health/ready.
+    volumes:
+      - ${FLOWCRM_GATE_DIR:-./docker/edge/no-gate}:/run/flowcrm-gate:ro
     logging: *request-logs
     ports:
       - "${FLOWCRM_HTTP_BIND:-127.0.0.1}:${FLOWCRM_HTTP_PORT:?is set by bin/devenv; run make up}:8080"

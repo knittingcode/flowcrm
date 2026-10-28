@@ -250,7 +250,8 @@ apply unchanged to FND-004. Read-only commands (`status`, `url`, `ports`,
   needed. The names `Repository guard` and `Dev environment` must not change.
 - `tests/app/scan.sh` scans the built images with Trivy in the same job:
   runtime images fail on any HIGH or CRITICAL finding (exceptions only per
-  CVE, with expiry, in `security/trivyignore.yaml`); development images are
+  CVE, with expiry, in `security/trivyignore.yaml`, checked by
+  `scripts/ci/guard-trivyignore.sh` in `Repository guard`); development images are
   reported ([container vulnerabilities](../security/container-vulnerabilities.md)).
   Every scan must also inventory the expected package sources of the image,
   so an unrecognised image cannot pass as "no findings".

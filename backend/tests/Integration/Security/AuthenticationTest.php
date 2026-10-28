@@ -8,6 +8,7 @@ use App\Tests\Support\Http\ApiClient;
 use App\Tests\Support\Http\FpmApiTestCase;
 use App\Tests\Support\Security\Fixtures;
 use App\Tests\Support\Session\FpmServer;
+use App\Tests\Support\Session\SessionRows;
 use Symfony\Component\Uid\Uuid;
 
 /**
@@ -86,7 +87,8 @@ final class AuthenticationTest extends FpmApiTestCase
         $user = $this->fixtures->user('alan');
         $disabled = $this->fixtures->user('disabled');
         $this->fixtures->connection()->executeStatement('UPDATE users SET disabled_at = now() WHERE id = ?', [$disabled->id->toRfc4122()]);
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
 
         $answers = [];
         foreach ([
@@ -104,7 +106,7 @@ final class AuthenticationTest extends FpmApiTestCase
         }
 
         self::assertCount(1, array_unique(array_map(static fn (array $a): string => serialize($a), $answers)), 'one answer for every failure');
-        self::assertSame($sessions, $this->sessionCount(), 'a failed login stores no session');
+        self::assertSame($sessions, $rows->count(), 'a failed login stores no session');
     }
 
     public function testTheEmailAddressIsCaseInsensitive(): void
@@ -118,7 +120,8 @@ final class AuthenticationTest extends FpmApiTestCase
 
     public function testAnonymousSessionIntrospectionStartsNoSession(): void
     {
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
         $client = $this->client();
 
         $response = $client->get('/api/v1/auth/session');
@@ -126,14 +129,14 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertSame(200, $response->status());
         self::assertSame(['authenticated' => false], $response->json());
         self::assertSame([], $response->raw->header('Set-Cookie'));
-        self::assertSame($sessions, $this->sessionCount());
+        self::assertSame($sessions, $rows->count());
 
         $me = $client->get('/api/v1/me');
         self::assertSame(401, $me->status());
         self::assertSame('/problems/unauthenticated', $me->problem());
         self::assertSame(['type', 'title', 'status', 'instance', 'requestId'], array_keys($me->json()), 'no data in a 401');
         self::assertSame([], $me->raw->header('Set-Cookie'), 'a 401 starts no session');
-        self::assertSame($sessions, $this->sessionCount(), 'a 401 stores no session');
+        self::assertSame($sessions, $rows->count(), 'a 401 stores no session');
     }
 
     /**
@@ -143,7 +146,8 @@ final class AuthenticationTest extends FpmApiTestCase
      */
     public function testAnUnknownSessionIdIsAnsweredWithoutStoringASession(): void
     {
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
         $client = $this->client();
         $client->useSessionId(bin2hex(random_bytes(16)));
 
@@ -151,7 +155,7 @@ final class AuthenticationTest extends FpmApiTestCase
 
         self::assertSame(401, $me->status());
         self::assertNull($client->sessionId(), 'the cookie is expired');
-        self::assertSame($sessions, $this->sessionCount());
+        self::assertSame($sessions, $rows->count());
     }
 
     /** FCRM-002 AC-27: a replayed cookie after logout is a 401. */
@@ -434,10 +438,5 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertSame(403, $client->post('/api/v1/auth/logout')->status(), 'the token from before the login is no longer valid');
         $client->useCsrfToken($second);
         self::assertSame(204, $client->post('/api/v1/auth/logout')->status());
-    }
-
-    private function sessionCount(): int
-    {
-        return self::int($this->fixtures->connection()->fetchOne('SELECT count(*) FROM sessions'));
     }
 }
