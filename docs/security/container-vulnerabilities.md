@@ -41,8 +41,10 @@ downloaded on every run.
   percent-encoding), and all purls of an entry naming the same package
   (type, namespace and name), so one entry cannot also cover another package
   such as a second major version of a Go module; no two entries naming the
-  same package (purl without its version), whatever their ids, so one
-  package is never excepted under a second id or alias; `paths` with at
+  same package (purl without its version, compared without regard to case,
+  because Trivy matches a Go module path whatever its case), whatever their
+  ids, so one package is never excepted under a second id or alias;
+  `paths` with at
   least one value (without `paths` Trivy would apply the entry at any path
   in every gated image); non-blank values without wildcards in both
   lists (Trivy matches `paths` as glob patterns, so `*`, `?`, `[`, `]`, `{`
@@ -63,6 +65,11 @@ downloaded on every run.
   inner double quote in a quoted value (an escape could add a wildcard or
   continue the statement over `expired_at`).
   Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
+  Limit that depends on review: the guard knows only the aliases the
+  [Exceptions](#exceptions) table lists. Removing an alias from a row, or
+  adding a row for it, lets an entry under that alias pass the guard, so
+  every change to the first column of the table must be checked against the
+  advisory in review (the change is visible in the diff of this document).
 - The scan template prints every finding an exception suppressed as a
   `SUPPRESSED ignored <severity> <id> <package> <version>` line in the log
   of the gate scans (runtime images and the control scan), so an excepted

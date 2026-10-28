@@ -111,8 +111,10 @@ finding, so this finding blocks every pull request and `main`.
      entry must name its path and exactly one package with an exactly
      pinned purl; no package may appear in two entries, and an id that the
      exceptions table lists as an alias (the GHSA id of this CVE) is
-     rejected, because Trivy matches only the id it reports. An entry that
-     expires on or before the check date fails the guard.
+     rejected, because Trivy matches only the id it reports. The alias
+     check relies on the table, so a change to its first column is checked
+     in review. An entry that expires on or before the check date fails
+     the guard.
    - **Visibility:** the scan template prints the suppressed finding as
      `SUPPRESSED` in the edge-prod scan log. The edge `dev` report scan
      does not use the ignore file and keeps listing it.
