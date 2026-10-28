@@ -127,6 +127,18 @@ final class JsonLineFormatterTest extends TestCase
         self::assertStringContainsString('"'.$key.'":"/accounts?[redacted]"', $line);
     }
 
+    /**
+     * A fragment can carry the same data as a query, also without a query.
+     */
+    #[DataProvider('urlKeys')]
+    public function testEveryUrlKeyLosesTheFragmentOfAUrlWithoutAQuery(string $key): void
+    {
+        $line = $this->format('redirect', [$key => '/accounts#search=ada@example.test']);
+
+        self::assertStringNotContainsString('ada@example.test', $line);
+        self::assertStringContainsString('"'.$key.'":"/accounts?[redacted]"', $line);
+    }
+
     /** @return iterable<string, array{string}> */
     public static function urlKeys(): iterable
     {
