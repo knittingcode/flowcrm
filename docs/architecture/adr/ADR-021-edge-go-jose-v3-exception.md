@@ -90,11 +90,17 @@ finding, so this finding blocks every pull request and `main`.
      - edge service commands in Compose other than the exact `caddy run`
        form, entrypoints, YAML escapes, and mounts over `/etc` or the
        binary;
-     - edge Dockerfile stages that could link, copy or rename the binary.
+     - edge Dockerfile stages that could link, copy, rename or shadow the
+       binary (RUN other than `apk add`, WORKDIR, relative or variable
+       COPY destinations, anything else in a bin directory, PATH);
+     - quoted keys, flow mappings and non-canonical paths in Compose
+       files, and long-syntax mounts over `/etc` or a bin directory.
 
      Unknown Caddyfile constructs fail. Shell, YAML and Dockerfile text is
-     read line by line. The guard catches ordinary and accidental changes,
-     but not a deliberate evasion assembled at run time (see Consequences).
+     read line by line. Threat model: the guards stop accidental and casual
+     unsafe changes and make deliberate ones visible in review. A committer
+     can also change the guard itself, so they are not a boundary against
+     one (see Consequences).
    - **Adapted-configuration check**, in `tests/app/scan.sh`. It runs
      `caddy adapt` with the built binary in the built edge images and on
      the HTTPS test edge, and checks the JSON: the admin API is disabled,
@@ -128,9 +134,12 @@ finding, so this finding blocks every pull request and `main`.
   sets `CADDY_ADMIN` or a `{$VAR}` value, `docker cp`). They do not see
   `docker run --entrypoint` with another executable in a script outside
   Compose, a Caddy plugin added to `docker/edge/caddy/main.go`, or what an
-  `apk add` package installs. The adapted check does not apply Compose
-  mounts. These remain review items: every change under `docker/edge`,
-  `tests/app/https` or a Compose file is a review trigger below.
+  `apk add` package installs. They do not recognise a service that runs an
+  already built edge image under a tag without "caddy". The adapted check
+  does not apply Compose mounts. A committer can also edit the guards. So
+  review of every change under `docker/edge`, `tests/app/https`, the Compose
+  files and `scripts/ci` remains required, and such a change is a review
+  trigger below.
 - **Expiry:** on 2026-11-30 Trivy stops applying the entry, and the
   exception guard fails the `Repository guard` job, so every pull request
   is blocked until the exception is renewed after a new review or removed.
@@ -145,8 +154,8 @@ finding, so this finding blocks every pull request and `main`.
   - a Go vulnerability database entry with affected symbols, for a
     govulncheck check;
   - a severity change;
-  - any change under `docker/edge` or `tests/app/https`, to the edge
-    service in a Compose file, or a new Caddy plugin;
+  - any change under `docker/edge` or `tests/app/https`, to a Compose file,
+    to `scripts/ci`, or a new Caddy plugin;
   - a Trivy upgrade;
   - a deployment beyond the loopback-only development and test stacks.
 - **Exit criteria:** go-jose v3 is gone from `go version -m usr/bin/caddy`,

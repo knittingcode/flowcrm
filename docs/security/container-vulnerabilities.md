@@ -294,9 +294,14 @@ Trivy upgrade (the exception file format is experimental in Trivy).
 ### Edge configuration guard
 
 The finding is acceptable only while no edge configuration runs the code
-that parses untrusted JWS/JWK. Two checks enforce this. They catch
-ordinary and accidental changes and the obfuscations listed below, not every
-deliberate evasion (see "Known limits"):
+that parses untrusted JWS/JWK. Two checks enforce this.
+
+Threat model: the checks stop accidental and casual unsafe changes, and
+they make deliberate ones visible in review, because such a change has to
+use one of the forms listed under "Known limits". They are not a security
+boundary against a committer, who can also change the guard itself. Review
+of every change under `docker/edge`, `tests/app/https`, the Compose files
+and `scripts/ci` therefore remains required.
 
 - `scripts/ci/guard-edge-config.sh` (job `Repository guard`, regression
   suite `scripts/ci/tests/guard-edge-config.test.sh`) reads every tracked
@@ -329,20 +334,25 @@ deliberate evasion (see "Known limits"):
     with `--resume`, `--watch`, `--envfile` or an unknown flag; `CADDY_ADMIN`
     anywhere; a glob in a command line that matches the binary's name
     (`cadd?`);
-  - an edge service in Compose (it builds `docker/edge/Dockerfile`, runs a
-    caddy image, directly or through a `<<: *anchor` merge, or overrides
-    such a service) with an `entrypoint`, `extends`, or a `command` other
-    than exactly
+  - an edge service in Compose (it builds a Dockerfile with an edge runtime
+    stage or a Dockerfile the guard does not know, runs a caddy image,
+    directly or through a `<<: *anchor` merge, or overrides such a service)
+    with an `entrypoint`, `extends`, or a `command` other than exactly
     `["caddy", "run", "--config", "/etc/caddy/<path>", "--adapter", "caddyfile"]`;
-    a backslash anywhere in a Compose file (YAML escapes such as
-    `\u0063addy` would hide a command or a path); a mount over `/`, `/etc`,
-    `/usr` or a bin directory;
+  - in Compose files: a backslash anywhere (YAML escapes such as
+    `\u0063addy` would hide a command or a path); quoted keys; flow
+    mappings other than `{}`; paths with `//`, `/./` or `..`; a short or
+    long-syntax (`target:`) mount over `/`, `/etc`, `/etc/caddy`, `/usr` or
+    a bin directory, other than the read-only short mounts of tracked
+    files into `/etc/caddy`;
   - in the edge runtime stages of the Dockerfile (from the caddy image or a
     stage with files in `/etc/caddy`, and every stage built on them): a
     `RUN` other than a plain `apk add --no-cache <packages>`, a copy of the
     binary anywhere but `COPY --from=<stage> <path>/caddy /usr/bin/caddy`,
-    anything else in a bin directory, and `ENV PATH` or `SHELL`, so the
-    binary cannot be linked, copied or renamed;
+    anything else in a bin directory, a `COPY`/`ADD` destination that is
+    not an absolute literal path (relative to `WORKDIR`, built from an
+    `ARG`, or with `//`, `.` or `..`), `WORKDIR`, `ONBUILD`, and `ENV PATH`
+    or `SHELL`, so the binary cannot be linked, copied, renamed or shadowed;
   - a Caddy file that no start point uses, and a tracked JSON file that
     looks like a Caddy JSON configuration.
 - `tests/app/scan.sh` (job `Dev environment`) runs `caddy adapt` with the
@@ -356,15 +366,23 @@ deliberate evasion (see "Known limits"):
   has `automatic_https.disable`. A control image with an unsafe
   configuration must be rejected.
 
-Known limits. The guard reads Caddyfiles like Caddy does, but shell, YAML
-and Dockerfile text only line by line, and some evasions remain open:
+Known limits. The guard reads Caddyfiles like Caddy does. Shell, YAML and
+Dockerfile text it reads only line by line (block-style YAML with plain
+keys; anything else is rejected). The following evasions remain open
+deliberately:
 - commands and paths assembled at run time: shell variables, `eval`,
   `$(...)` in scripts, an `env_file:` that sets `CADDY_ADMIN` or a `{$VAR}`
   value, `docker cp` or `docker exec` with a variable command;
 - `docker run --entrypoint <other>` in a script, outside Compose (only
   caddy command words and globs that match its name are checked there);
 - Compose files are not merged as Compose merges them. Bind mounts count
-  for every edge stage, and an override is recognised by its service name;
+  for every edge stage, and an override is recognised by its service name.
+  A service that runs an already built edge image under a tag without
+  "caddy" (`image: flowcrm-edge:x`) is not recognised as an edge service;
+- executables the guard does not read: a wrapper script without a `.sh`
+  extension outside `bin/` is only a risk when something starts it. Compose
+  edge commands and edge Dockerfile commands cannot, but a script's
+  `docker run --entrypoint` can (see above);
 - a Caddy plugin added to `docker/edge/caddy/main.go`, or a package an
   `apk add` installs.
 
