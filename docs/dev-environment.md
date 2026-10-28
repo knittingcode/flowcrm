@@ -604,6 +604,9 @@ U-09) and fails if:
 - any `docker ... prune` appears (`image`, `system`, `builder`, `buildx`
   or any other prune).
 
+A line that ends in a backslash continues on the next line: the check joins
+such lines first, so a command split over several lines is checked as one
+line. A fixture checks that removals and prunes split this way are found.
 These are text checks: a removal written so that it does not match them
 (for example through a variable holding the command) is not detected.
 
