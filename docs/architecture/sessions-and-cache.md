@@ -127,8 +127,10 @@ fails instead of writing.
 Requests that do not use the session are unaffected. An `/api` request that
 uses the session fails with a 500 problem document without details; the
 connection attempt is abandoned after 5 seconds. `backend/openapi.yaml`
-declares this answer (`SessionUnavailable`) on every route that reads the
-session; `/api/v1/system/status` reports the database itself with 503.
+declares this answer on every route that reads the session: as
+`SessionUnavailable` on the read routes, and as `InternalError` (the same
+problem schema) on login, logout and the password change;
+`/api/v1/system/status` reports the database itself with 503.
 
 ### Connections
 
