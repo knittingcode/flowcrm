@@ -593,8 +593,13 @@ Application suites (`tests/app/`), each in its own Compose projects:
   development images, which are reported; each scan must inventory the
   expected package sources (Alpine packages, Composer, the Caddy binary,
   Node packages), and control scans prove the gate fails on a vulnerable
-  image and on an image without inventoried packages (see
-  [security/container-vulnerabilities.md](security/container-vulnerabilities.md)).
+  image and on an image without inventoried packages; it also adapts the
+  edge configurations (prod, dev, HTTPS test edge) with the built Caddy
+  binary and rejects admin, config persistence, PKI, issuers, ACME and the
+  `acme_server` handler, with a control image that must fail (see
+  [security/container-vulnerabilities.md](security/container-vulnerabilities.md),
+  "Edge configuration guard"; the static half is
+  `scripts/ci/guard-edge-config.sh` in `Repository guard`).
 - `backend.sh` (BE-01 to BE-18): PHP 8.5 runtime, `composer validate` and
   `composer audit`, PHP-CS-Fixer, PHPStan (level max), migrations from an
   empty database, `doctrine:schema:validate`, a full down/up migration round
