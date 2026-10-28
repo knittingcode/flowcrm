@@ -3,8 +3,8 @@
 # Unit tests for bin/devenv logic that needs no Docker: configuration
 # validation, candidate order, runtime-state parsing and writing, failure
 # classification, project naming, the per-checkout lock (including real
-# processes in other locales and time zones and an orphaned recorded child)
-# and a self-check of the result tally.
+# processes in other locales and time zones and an orphaned recorded child),
+# the login check of the stack suite and a self-check of the result tally.
 #
 # Usage: tests/devenv/unit.sh
 
@@ -946,6 +946,410 @@ unset -f docker
 eval "$saved_compose_op"
 eval "$saved_compose"
 ROLES=$saved_roles RUNTIME_DIR=$saved_runtime SECRETS_DIR=$saved_secrets_dir
+
+# --- U-19 edge recovery after a rotation fails closed (FND-009E)
+# restore_edge with fake lower layers: try_edge (Compose), gate_blocks and
+# wait_http (what the edge answers), the edge's running state and compose_op
+# stop. The rotation has recorded the gate (with "edge": it was serving), as
+# protect_for does. The gate must stay recorded until the edge answers
+# readiness, the edge must be seen blocking while gated, and a failure must
+# leave the gate (with the reason), no running edge, and exit 2.
+saved_fns=$(declare -f try_edge wait_http gate_blocks edge_state compose compose_op)
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR saved_port=$STATE_PORT
+# shellcheck disable=SC2031 # read here, in the main shell
+saved_state=$STATE_STATUS
+RUNTIME_DIR=$work/u19-runtime GATE_DIR=$work/u19-runtime/gate STATE_STATUS=valid STATE_PORT=18555
+GATE_FILE=$GATE_DIR/security-gate
+mkdir -p "$GATE_DIR"
+# The fake edge's state is in files: restore_edge runs in a subshell (it may exit).
+fake_running() { cat "$work/u19-running" 2>/dev/null || echo false; }
+try_edge() {
+  printf 'try gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u19-calls"
+  LAST_ERROR="compose output" LAST_FAILURE="docker compose exited with status 1; its error is shown above"
+  [ "$FAKE_START" = failed ] && return 2
+  [ "$FAKE_START" = conflict ] && { LAST_FAILURE="port 18555 is in use"; return 1; }
+  echo true >"$work/u19-running"
+  [ "$FAKE_START" = killed ] && exit 137 # interrupted right after the edge started
+  return "$FAKE_TRY"
+}
+gate_blocks() { printf 'blocks gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u19-calls"; [ "$FAKE_BLOCKS" = yes ]; }
+wait_http() { printf 'ready gate=%s\n' "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u19-calls"; [ "$FAKE_READY" = yes ]; }
+edge_state() { EDGE_RUNNING=$(fake_running); }
+compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(fake_running)" = true ] && printf 'edge-id\n'; return 0; }
+compose_op() {
+  if [ "$1" = run ]; then printf 'preflight\n' >>"$work/u19-calls"; [ "${FAKE_SEES:-yes}" = yes ]; return; fi
+  [ "$1" = stop ] || return 0
+  printf 'stop %s\n' "$2" >>"$work/u19-calls"
+  [ "$FAKE_STOP" = fails ] && return 1
+  echo false >"$work/u19-running"
+}
+u19() { # name start(created|failed|killed) try-rc blocks ready stop(ok|fails) expected-exit
+  local out r
+  rm -f "$work/u19-calls" "$work/u19-running"
+  printf 'rotating the password of flowcrm_app\nedge\n' >"$GATE_FILE"
+  FAKE_START=$2 FAKE_TRY=$3 FAKE_BLOCKS=$4 FAKE_READY=$5 FAKE_STOP=$6
+  out=$( (restore_edge edge "the password of flowcrm_app was rotated and verified") 2>&1)
+  r=$?
+  U19_OUT=$out U19_RUNNING=$(fake_running)
+  U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_GATE_EDGE=$(grep -cx edge "$GATE_FILE" 2>/dev/null)
+  U19_CALLS=$(paste -sd ';' - <"$work/u19-calls" 2>/dev/null)
+  [ "$r" = "$7" ]
+  result "U-19 $1: exit $7" $? "(got $r: $out)"
+}
+u19 "the edge comes back, blocks while gated, then answers readiness" created 0 yes yes ok 0
+[ ! -e "$GATE_FILE" ] && [ "$U19_RUNNING" = true ] && [ "$U19_CALLS" = "preflight;try gate=yes;blocks gate=yes;ready gate=yes" ] &&
+  case $U19_OUT in *"serves again on port 18555"*) true ;; *) false ;; esac
+result "U-19 the gate stays recorded while the edge starts and is checked, and is cleared only after it is ready" $? "(calls [$U19_CALLS])"
+u19 "Compose cannot create the edge" failed 2 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"was rotated and verified, but the edge did not serve again on port 18555"*) true ;; *) false ;; esac &&
+  case $U19_OUT in *"compose output"*) true ;; *) false ;; esac
+result "U-19 a failed creation keeps the gate (reason, edge line), keeps what was done and shows Compose's error" $? "(gate [$U19_GATE])"
+u19 "the saved port is taken by another program" conflict 1 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"did not serve again on port 18555 (port 18555 is in use"*) true ;; *) false ;; esac
+result "U-19 a port conflict (try_edge 1) is a failed return like any other: the gate is kept with try_edge's reason" $? "(gate [$U19_GATE])"
+FAKE_SEES=no
+u19 "the edge image does not enforce the gate (or cannot read it)" created 0 yes yes ok "$EX_DOCKER"
+FAKE_SEES=yes
+[ "$U19_RUNNING" = false ] && [ "$U19_CALLS" = preflight ] && [ "$U19_GATE_EDGE" = 1 ] && case $U19_GATE in *"its image does not enforce the security gate"*"run make up"*) true ;; *) false ;; esac
+result "U-19 an edge that would not see the gate is never started; the gate is kept and points to make up" $? "(calls [$U19_CALLS], gate [$U19_GATE])"
+u19 "the edge container runs but is not healthy" created 2 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && [ -n "$U19_GATE" ] && ! grep '^stop' "$work/u19-calls" | grep -vqx "stop $EDGE"
+result "U-19 an unhealthy started edge is stopped (only the edge) and the gate kept" $? "(calls [$U19_CALLS])"
+u19 "Compose reports success before the edge is ready" created 0 yes no ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && case $U19_GATE in *"does not answer"*) true ;; *) false ;; esac
+result "U-19 an edge that Compose accepted but that does not answer readiness never serves" $? "(gate [$U19_GATE])"
+u19 "the edge does not block while gated" created 0 no yes ok "$EX_DOCKER"
+[ "$U19_RUNNING" = false ] && case $U19_CALLS in *ready*) false ;; *) true ;; esac && case $U19_GATE in *"does not block requests while the security gate is recorded"*) true ;; *) false ;; esac
+result "U-19 an edge not seen blocking while gated is stopped before readiness is trusted" $? "(calls [$U19_CALLS], gate [$U19_GATE])"
+u19 "the edge cannot be stopped, but the gate blocks it" created 0 yes no fails "$EX_DOCKER"
+[ "$U19_RUNNING" = true ] && [ -f "$GATE_FILE" ] && case $U19_OUT in *"does not answer"*"could not be stopped, but it answers only with the gate's 503 (checked)"*) true ;; *) false ;; esac
+result "U-19 a failed stop keeps the original failure, says the stop failed and that blocking was checked" $? "($U19_OUT)"
+u19 "the edge cannot be stopped and does not block" created 0 no no fails "$EX_DOCKER"
+[ -f "$GATE_FILE" ] && case $U19_OUT in *"WARNING: the started edge could not be stopped and was not seen blocking requests; stop the stack now: make down"*) true ;; *) false ;; esac
+result "U-19 a failed stop of an edge not seen blocking does not claim it is blocked" $? "($U19_OUT)"
+u19 "interrupted right after the edge started" killed 0 yes yes ok 137
+[ "$U19_RUNNING" = true ] && [ "$U19_GATE" = "rotating the password of flowcrm_app" ] && [ "$U19_GATE_EDGE" = 1 ]
+result "U-19 an interruption after the edge started leaves the gate recorded (so the edge serves only its health paths)" $? "(gate [$U19_GATE])"
+STATE_STATUS=invalid
+u19 "no saved port: nothing to restore" created 0 yes yes ok 0
+[ ! -e "$work/u19-calls" ] && [ ! -e "$GATE_FILE" ]
+result "U-19 without an edge to restore the gate is cleared and nothing is started" $?
+STATE_STATUS=valid
+# serve_edge alone (also used by make up to restore the previous edge after a
+# port failure, with no gate): a started edge that does not answer readiness
+# is stopped by serve_edge itself; no gate check without a gate.
+rm -f "$work/u19-calls" "$work/u19-running" "$GATE_FILE"
+FAKE_START=created FAKE_TRY=0 FAKE_BLOCKS=no FAKE_READY=no FAKE_STOP=ok
+serve_edge 18555 >/dev/null 2>&1
+r=$?
+[ "$r" = 1 ] && [ "$(fake_running)" = false ] && [ "$(grep -cx "stop $EDGE" "$work/u19-calls" 2>/dev/null)" = 1 ] &&
+  ! grep -q '^blocks' "$work/u19-calls" && case $EDGE_FAILURE in *"does not answer"*"the started edge was stopped"*) true ;; *) false ;; esac
+result "U-19 serve_edge without a gate stops an edge that does not answer readiness and says so" $? "(r $r, failure [$EDGE_FAILURE])"
+rm -f "$work/u19-calls" "$work/u19-running"
+FAKE_READY=yes
+serve_edge 18555 >/dev/null 2>&1 && [ "$(fake_running)" = true ] && ! grep -q '^stop' "$work/u19-calls"
+result "U-19 serve_edge keeps an edge that answers readiness" $?
+eval "$saved_fns"
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir STATE_STATUS=$saved_state STATE_PORT=$saved_port
+
+# --- U-20 the gate is stored where the edge can read it (FND-009E)
+# The edge's unprivileged user must see the gate or it would serve: the
+# directory is 0755 and every record 0644, written by rename; a gate left at
+# the old place (.runtime/security-gate) by an earlier version is moved, and
+# read-only commands see it until then.
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
+RUNTIME_DIR=$work/u20/.runtime GATE_DIR=$work/u20/.runtime/gate
+GATE_FILE=$GATE_DIR/security-gate
+mkdir -p "$RUNTIME_DIR"
+printf 'an older gate\nedge\n' >"$RUNTIME_DIR/security-gate"
+chmod 0600 "$RUNTIME_DIR/security-gate"
+[ "$(gate_record)" = "$RUNTIME_DIR/security-gate" ]
+result "U-20 a gate at the old place is still reported before it is moved" $?
+(ensure_runtime_dir) && [ "$(mode_of "$GATE_DIR")" = 755 ] && [ -f "$GATE_FILE" ] && [ ! -e "$RUNTIME_DIR/security-gate" ] &&
+  [ "$(mode_of "$GATE_FILE")" = 644 ] && [ "$(cat "$GATE_FILE")" = "$(printf 'an older gate\nedge')" ]
+result "U-20 the gate directory is 0755 and an old gate is moved into it, readable (0644)" $?
+printf 'a new reason\n' | write_gate && [ "$(mode_of "$GATE_FILE")" = 644 ] && [ "$(head -n 1 "$GATE_FILE")" = "a new reason" ] &&
+  [ -z "$(find "$GATE_DIR" -name '.security-gate.*')" ]
+result "U-20 write_gate replaces the record by rename, readable, with no temporary file left" $?
+# A write that fails part-way (here: the input cannot be read) must leave the
+# earlier record exactly as it was: its reason is what make status reports
+# after an unrecorded gate, and its "edge" line lets a rotation restore the
+# edge. Writing the record in place would truncate it first.
+printf 'the earlier reason\nedge\n' | write_gate
+inode_of() { stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"; }
+before_ino=$(inode_of "$GATE_FILE")
+mkdir -p "$work/u20/unreadable-input"
+r=0
+write_gate <"$work/u20/unreadable-input" 2>/dev/null || r=$?
+[ "$r" != 0 ] && [ "$(cat "$GATE_FILE")" = "$(printf 'the earlier reason\nedge')" ] &&
+  [ "$(inode_of "$GATE_FILE")" = "$before_ino" ] && [ -z "$(find "$GATE_DIR" -name '.security-gate.*')" ]
+result "U-20 a write_gate that fails part-way keeps the earlier record unchanged (same file, reason and edge line) and leaves no temporary file" $? "(r $r, record [$(tr '\n' '|' <"$GATE_FILE")])"
+gate_clear
+[ ! -e "$GATE_FILE" ] && ! gate_record >/dev/null
+result "U-20 gate_clear removes the record" $?
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
+
+# --- U-21 gate_blocks reads the edge's real answer (FND-009E)
+# Against one-shot local listeners: only the gate's own 503 counts as
+# blocked, not any other 503 and not a 200.
+cat >"$work/u21-serve.py" <<'PY'
+import socket, sys
+status, body = sys.argv[2], sys.argv[3]
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0)); s.listen(1)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+c, _ = s.accept(); c.settimeout(5)
+# Read the whole request and close gracefully: closing with unread data
+# makes the kernel send a reset, which can discard the answer before the
+# client reads it.
+request = b""
+while b"\r\n\r\n" not in request:
+    chunk = c.recv(4096)
+    if not chunk:
+        break
+    request += chunk
+c.sendall(("HTTP/1.1 %s\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n%s" % (status, body)).encode())
+c.shutdown(socket.SHUT_WR)
+try:
+    while c.recv(4096):
+        pass
+except OSError:
+    pass
+c.close(); s.close()
+PY
+u21() { # name status body expected(0 blocked|1 not)
+  local pf=$work/u21.port i=0 r
+  rm -f "$pf"
+  python3 "$work/u21-serve.py" "$pf" "$2" "$3" &
+  bg_pids="$bg_pids $!"
+  while [ ! -s "$pf" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  gate_blocks "$(cat "$pf")"
+  r=$?
+  [ "$r" = "$4" ]
+  result "U-21 $1" $? "(gate_blocks returned $r)"
+}
+u21 "the gate's 503 is blocked" "503 Service Unavailable" "FlowCRM is blocked by its security gate: run make status" 0
+u21 "another 503 is not the gate" "503 Service Unavailable" "upstream unavailable" 1
+u21 "a 200 is not blocked" "200 OK" "<!doctype html>" 1
+
+# --- U-22 a gate that cannot be recorded is reported, never silent (FND-009E)
+# gate_failed and cancel_db_op (fake Compose: no running edge, the cancel
+# call fails) with a gate directory that cannot be written: the failure to
+# record the gate is reported on stderr, gate_failed still reports the
+# original failure with its exit code, and cancel_db_op returns non-zero.
+# The report says whether make status and make url still show the stack as
+# blocked: not when no gate is recorded; yes, with the earlier reason, when a
+# gate recorded before (here: a failing write next to an existing record) is
+# still in place.
+# Controls: the same calls with a writable gate directory record the gate.
+saved_fns=$(declare -f compose compose_op)
+saved_write_gate=$(declare -f write_gate)
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
+compose() { return 0; }
+compose_op() { [ "$1" != exec ]; }
+u22_paths() { # writable(yes|no|old)
+  RUNTIME_DIR=$work/u22-$1/.runtime GATE_DIR=$work/u22-$1/.runtime/gate
+  GATE_FILE=$GATE_DIR/security-gate
+  mkdir -p "$RUNTIME_DIR"
+  # A regular file where the directory should be: unwritable even for root.
+  if [ "$1" = no ]; then : >"$GATE_DIR"; else mkdir -p "$GATE_DIR"; fi
+  [ "$1" != old ] || printf 'the earlier reason\nedge\n' >"$GATE_FILE"
+}
+u22_reported() { # output: "blocked" with the earlier reason, or "unblocked"
+  case $1 in
+    *"do not report the stack as blocked"*) printf unblocked ;;
+    *"an earlier gate is still recorded, so make status and make url report the stack as blocked, but with its reason (the earlier reason)"*) printf blocked ;;
+    *) printf none ;;
+  esac
+}
+for w in no old yes; do
+  u22_paths "$w"
+  # A gate write that fails while an earlier gate is recorded (disk full,
+  # for example): the earlier record stays.
+  if [ "$w" = old ]; then write_gate() { cat >/dev/null; return 1; }; else eval "$saved_write_gate"; fi
+  out=$( (gate_failed "$EX_SAFETY" "the roles of the test project are inconsistent") 2>&1)
+  r=$?
+  rec=$(head -n 1 "$GATE_FILE" 2>/dev/null)
+  case $out in *"security gate could not be recorded"*) said=yes ;; *) said=no ;; esac
+  if [ "$w" = no ]; then
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = yes ] && [ -z "$rec" ] && [ "$(u22_reported "$out")" = unblocked ] &&
+      case $out in *"devenv: ERROR: the roles of the test project are inconsistent"*) true ;; *) false ;; esac
+    result "U-22 gate_failed reports an unrecordable gate on stderr and still fails with the original error" $? "(exit $r: $out)"
+  elif [ "$w" = old ]; then
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = yes ] && [ "$rec" = "the earlier reason" ] && [ "$(u22_reported "$out")" = blocked ] &&
+      case $out in *"devenv: ERROR: the roles of the test project are inconsistent"*) true ;; *) false ;; esac
+    result "U-22 gate_failed with an earlier gate still recorded says the stack is still reported as blocked, with the earlier reason" $? "(exit $r: $out)"
+  else
+    [ "$r" = "$EX_SAFETY" ] && [ "$said" = no ] && [ "$rec" = "the roles of the test project are inconsistent" ]
+    result "U-22 control: gate_failed records the gate when it can and does not report a failure" $? "(exit $r: $out)"
+  fi
+  rm -f "$GATE_FILE" 2>/dev/null
+  [ "$w" != old ] || printf 'the earlier reason\nedge\n' >"$GATE_FILE"
+  DB_OP_ID=u22-op
+  out=$( (cancel_db_op) 2>&1)
+  r=$?
+  rec=$(head -n 1 "$GATE_FILE" 2>/dev/null)
+  case $out in *"security gate could not be recorded"*) said=yes ;; *) said=no ;; esac
+  if [ "$w" = no ]; then
+    [ "$r" != 0 ] && [ "$said" = yes ] && [ -z "$rec" ] && [ "$(u22_reported "$out")" = unblocked ] &&
+      case $out in *"stack is blocked"*) false ;; *) true ;; esac
+    result "U-22 cancel_db_op reports an unrecordable gate, does not claim the stack is blocked, and returns non-zero" $? "(exit $r: $out)"
+  elif [ "$w" = old ]; then
+    [ "$r" != 0 ] && [ "$said" = yes ] && [ "$rec" = "the earlier reason" ] && [ "$(u22_reported "$out")" = blocked ]
+    result "U-22 cancel_db_op with an earlier gate still recorded says the stack is still reported as blocked, with the earlier reason" $? "(exit $r: $out)"
+  else
+    [ "$r" = 0 ] && [ "$said" = no ] && case $rec in *"u22-op"*"could not be confirmed as ended"*) true ;; *) false ;; esac
+    result "U-22 control: cancel_db_op records the gate when it can" $? "(exit $r: $out)"
+  fi
+done
+DB_OP_ID=
+eval "$saved_fns"
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
+
+# --- U-23 protection before a change fails closed (FND-009E)
+# protect_for with a fake Compose (the edge's state is in a file, because
+# protect_for may exit): the gate is recorded before a serving edge is
+# stopped, so a command killed in between leaves it blocked; an edge that
+# cannot be stopped, or a gate that cannot be recorded, stops the command
+# before anything changes (and an unrecorded gate stops nothing either).
+# cancel_db_op keeps the "edge" line, so a rotation can restore the edge.
+# gate_clear also removes a gate left at the old place. edge_sees_gate runs
+# a one-off container that publishes no port, with the gate directory
+# mounted, and checks both the rule and that the gate is readable.
+saved_fns=$(declare -f compose compose_op run_op write_gate)
+saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
+compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(cat "$work/u23-running" 2>/dev/null)" = true ] && printf 'edge-id\n'; return 0; }
+compose_op() {
+  [ "$1" = exec ] && return 1 # cancel_db_op: the cancellation is not confirmed
+  [ "$1" = stop ] || return 0
+  printf 'stop %s gate=%s\n' "$2" "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u23-calls"
+  [ "$U23_STOP" = fails ] && return 1
+  echo false >"$work/u23-running"
+}
+u23() { # name gate-dir(dir|file) stop(ok|fails)
+  RUNTIME_DIR=$work/u23-$1/.runtime GATE_DIR=$work/u23-$1/.runtime/gate
+  GATE_FILE=$GATE_DIR/security-gate
+  mkdir -p "$RUNTIME_DIR"
+  if [ "$2" = file ]; then : >"$GATE_DIR"; else mkdir -p "$GATE_DIR"; fi
+  rm -f "$work/u23-calls"
+  echo true >"$work/u23-running"
+  U23_STOP=$3
+  U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
+  U23_RC=$?
+  U23_CALLS=$(paste -sd ";" - 2>/dev/null <"$work/u23-calls")
+  U23_GATE=$(paste -sd ";" - 2>/dev/null <"$GATE_FILE")
+}
+u23 ok dir ok
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  [ "$(cat "$work/u23-running")" = false ]
+result "U-23 protect_for records the gate (with the edge line) before it stops the serving edge" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE])"
+u23 stuck dir fails
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the edge cannot be stopped; the gate stays recorded" $? "(exit $U23_RC: $U23_OUT)"
+u23 unwritable file ok
+[ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ "$(cat "$work/u23-running")" = true ] &&
+  case $U23_OUT in *"could not record the security gate; nothing was changed"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command, changing nothing, when the gate cannot be recorded" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
+# cancel_db_op on a serving edge, unconfirmed cancellation.
+RUNTIME_DIR=$work/u23-cancel/.runtime GATE_DIR=$work/u23-cancel/.runtime/gate GATE_FILE=$work/u23-cancel/.runtime/gate/security-gate
+mkdir -p "$GATE_DIR"
+echo true >"$work/u23-running"
+rm -f "$work/u23-calls"
+U23_STOP=ok DB_OP_ID=u23-op
+(cancel_db_op) >/dev/null 2>&1
+r=$?
+DB_OP_ID=
+[ "$r" = 0 ] && [ "$(sed -n 2p "$GATE_FILE" 2>/dev/null)" = edge ] && [ "$(paste -sd ';' - <"$work/u23-calls")" = "stop edge gate=yes" ]
+result "U-23 cancel_db_op records the edge line and the gate before it stops the serving edge" $? "(exit $r, gate [$(paste -sd ';' - <"$GATE_FILE" 2>/dev/null)])"
+# gate_clear with a gate at both places (an older version recorded one at
+# .runtime/security-gate, a newer one in .runtime/gate).
+printf 'new\n' >"$GATE_FILE"
+printf 'old\n' >"$RUNTIME_DIR/security-gate"
+gate_clear
+[ ! -e "$GATE_FILE" ] && [ ! -e "$RUNTIME_DIR/security-gate" ] && ! gate_record >/dev/null
+result "U-23 gate_clear also removes a gate left at the old place" $?
+# edge_sees_gate: the arguments and environment of its one Docker Compose
+# call (the real compose_op, with run_op faked).
+eval "$saved_fns"
+run_op() { { printf 'FLOWCRM_GATE_DIR=%s\n' "${FLOWCRM_GATE_DIR-unset}"; printf '%s\n' "$@"; } >"$work/u23-run"; }
+(LOCK_HELD=1 COMPOSE_PORT=18555 && edge_sees_gate)
+grep -qx "FLOWCRM_GATE_DIR=$GATE_DIR" "$work/u23-run" && grep -qx run "$work/u23-run" && grep -qx -- --rm "$work/u23-run" &&
+  grep -qx -- --no-deps "$work/u23-run" && ! grep -Eqx -- '--service-ports|-p|--publish(=.*)?' "$work/u23-run" &&
+  grep -qF 'grep -q "blocked by its security gate" /etc/caddy/common.caddy' "$work/u23-run" &&
+  grep -qF 'test -r /run/flowcrm-gate/security-gate' "$work/u23-run"
+result "U-23 edge_sees_gate: one-off edge container with the gate directory, no published port, checks the rule and that the gate is readable" $? "($(paste -sd ' ' - <"$work/u23-run"))"
+eval "$saved_fns"
+RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
+
+# --- U-24 make up recognises an edge that does not enforce the gate (FND-009E)
+# edge_mounts_gate with a fake docker inspect: only an edge that mounts this
+# checkout's .runtime/gate at /run/flowcrm-gate enforces the gate (Docker
+# Desktop may show the source with a prefix); an edge with the empty
+# docker/edge/no-gate or without the mount (created before FND-009E or by a
+# plain docker compose up) does not, and make up must recreate it. The
+# fixture stack has no gate.
+saved_fns=$(declare -f docker)
+saved_stack=$STACK
+docker() { [ "$1" = inspect ] && printf '%s\n' "$U24_SRC"; }
+u24() { # name stack source expected(0|1)
+  local r
+  STACK=$2 U24_SRC=$3 EDGE_ID=edge-id
+  edge_mounts_gate
+  r=$?
+  [ "$r" = "$4" ]
+  result "U-24 $1" $? "(got $r)"
+}
+u24 "the edge mounts .runtime/gate: it enforces the gate" app "$GATE_DIR" 0
+u24 "the same with a Docker Desktop prefix" app "/host_mnt$GATE_DIR" 0
+u24 "the edge mounts docker/edge/no-gate: recreate it" app "$ROOT/docker/edge/no-gate" 1
+u24 "the edge has no gate mount: recreate it" app "" 1
+u24 "another checkout's gate directory: recreate it" app "$GATE_DIR-other" 1
+u24 "the fixture stack has no gate" fixture "" 0
+STACK=$saved_stack
+unset -f docker
+[ -z "$saved_fns" ] || eval "$saved_fns"
+
+# --- U-25 the login check of the stack suite (tests/app/stack.sh): a login
+# counts by its result row alone, so a psql warning on stderr can neither
+# fail a working new password nor make a working old one look refused; any
+# other answer is reported by its last line. STACK_SH=<path> checks a copy.
+stack_sh=${STACK_SH:-"$here/../app/stack.sh"}
+u25_fns=$(sed -n '/^login_result() {/,/^}/p; /^login_ok() {/p' "$stack_sh")
+u25() { # name mode password-file expected("result/login_ok")
+  local got
+  got=$(
+    A=unused U25_MODE=$2
+    # shellcheck disable=SC2329 # called by the evaluated stack.sh functions
+    cid() { echo db-id; }
+    # shellcheck disable=SC2329
+    docker() {
+      case $U25_MODE in
+        (row) echo 1 ;;
+        (row-warning) echo 1; echo 'psql: warning: a notice' >&2 ;;
+        (other-row) echo 10 ;;
+        (refused) echo 'psql: error: FATAL:  password authentication failed for user "flowcrm_owner"' >&2; return 2 ;;
+        (no-db) echo 'Error response from daemon: No such container: db-id' >&2; return 1 ;;
+        (silent) return 1 ;;
+      esac
+    }
+    eval "$u25_fns"
+    printf '%s/' "$(login_result owner "$3")"
+    if login_ok owner "$3"; then echo true; else echo false; fi
+  )
+  expect_eq "U-25 $1" "$4" "$got"
+}
+mkdir -p "$work/out"
+printf 'secret\n' >"$work/u25.pw"
+: >"$work/u25.empty"
+u25 "a returned row is a login" row "$work/u25.pw" ok/true
+u25 "a psql warning on stderr does not hide a returned row" row-warning "$work/u25.pw" ok/true
+u25 "another row is not a login" other-row "$work/u25.pw" 10/false
+u25 "a refused password is reported by psql's last line" refused "$work/u25.pw" 'psql: error: FATAL:  password authentication failed for user "flowcrm_owner"/false'
+u25 "a docker error is not a login" no-db "$work/u25.pw" 'Error response from daemon: No such container: db-id/false'
+u25 "no answer is not a login" silent "$work/u25.pw" no-output/false
+u25 "an empty password file is not a login" row "$work/u25.empty" no-file/false
+u25 "a missing password file is not a login" row "$work/u25.missing" no-file/false
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
