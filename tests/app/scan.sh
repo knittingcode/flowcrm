@@ -26,11 +26,15 @@ TRIVY_IMAGE=aquasec/trivy:0.67.2@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fe
 # The PostgreSQL base image with its gosu binary (see docker/db/Dockerfile).
 CONTROL_IMAGE=postgres:18.6-alpine3.24@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
 IGNORE_FILE=$APP_REPO/security/trivyignore.yaml
-# One line per scanned target (class, type, path, number of packages) and
-# one per finding: severity, CVE, package, installed and fixed versions, target.
+# One line per scanned target (class, type, path, number of packages), one
+# per finding: severity, CVE, package, installed and fixed versions, target,
+# and one per finding suppressed by an exception of the ignore file (gate
+# scans run with --show-suppressed, which changes the output only, not the
+# exit code), so an excepted finding stays visible in the log.
 # shellcheck disable=SC2016 # a Go template, not shell expansion
 TEMPLATE='{{- range . }}{{- $t := .Target }}TARGET {{ .Class }} {{ .Type }} {{ $t }} pkgs={{ len .Packages }}
 {{ range .Vulnerabilities }}{{ .Severity }} {{ .VulnerabilityID }} {{ .PkgName }} {{ .InstalledVersion }} fixed={{ if .FixedVersion }}{{ .FixedVersion }}{{ else }}none{{ end }} in={{ $t }}
+{{ end }}{{ range .ModifiedFindings }}SUPPRESSED {{ .Status }} {{ .Finding.Severity }} {{ .Finding.VulnerabilityID }} {{ .Finding.PkgName }} {{ .Finding.InstalledVersion }} in={{ $t }} by={{ .Source }}
 {{ end }}{{- end }}'
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-scan.XXXXXX") || exit 2
@@ -74,7 +78,7 @@ scan() {
   shift 2
   docker save -o "$work/images/$archive" "$tag:$name" || { bad "SC $name: could not export the image"; return; }
   if [ "$mode" = gate ]; then
-    trivy "$archive" --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --format template --template "$TEMPLATE" >"$log" 2>&1
+    trivy "$archive" --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --show-suppressed --format template --template "$TEMPLATE" >"$log" 2>&1
     rc=$?
     if [ "$rc" = 0 ]; then ok "SC $name (runtime): no HIGH or CRITICAL vulnerabilities"; else bad "SC $name (runtime): HIGH or CRITICAL vulnerabilities (exit $rc)"; fi
   else
@@ -84,8 +88,8 @@ scan() {
   fi
   inventoried "$log" "$@"
   v "SC $name: Trivy inventoried the expected package sources ($*)" $?
-  say "      $(grep -cE '^(HIGH|CRITICAL) ' "$log") HIGH/CRITICAL findings in $name"
-  grep -E '^(HIGH|CRITICAL) |FATAL|ERROR' "$log" | sed 's/^/      /' | head -n 40
+  say "      $(grep -cE '^(HIGH|CRITICAL) ' "$log") HIGH/CRITICAL findings in $name, $(grep -c '^SUPPRESSED ' "$log") suppressed by an exception"
+  grep -E '^(HIGH|CRITICAL|SUPPRESSED) |FATAL|ERROR' "$log" | sed 's/^/      /' | head -n 40
   rm -f "$work/images/$archive"
 }
 
@@ -118,7 +122,7 @@ v "SC control: an image without inventoried packages is rejected" $?
 if ! docker image inspect "$CONTROL_IMAGE" >/dev/null 2>&1; then docker pull -q "$CONTROL_IMAGE" >/dev/null; fi
 need "prepare the control image" docker tag "$CONTROL_IMAGE" "$tag:control" || { tally_finish; exit; }
 docker save -o "$work/images/control.tar" "$tag:control"
-trivy control.tar --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --format template --template "$TEMPLATE" >"$work/control.log" 2>&1
+trivy control.tar --severity HIGH,CRITICAL --exit-code 1 --ignorefile /policy/trivyignore.yaml --show-suppressed --format template --template "$TEMPLATE" >"$work/control.log" 2>&1
 rc=$?
 [ "$rc" = 1 ] && grep -q 'in=usr/local/bin/gosu' "$work/control.log"
 v "SC control: the gate rejects the known-vulnerable PostgreSQL base image" $? "(exit $rc)"

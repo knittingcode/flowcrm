@@ -55,6 +55,12 @@ downloaded on every run.
   inner double quote in a quoted value (an escape could add a wildcard or
   continue the statement over `expired_at`).
   Its regression suite is `scripts/ci/tests/guard-trivyignore.test.sh`.
+- The gate scans (runtime images and the control scan) run with
+  `--show-suppressed`, and the scan log lists every finding an exception
+  suppressed as a `SUPPRESSED ignored <severity> <id> <package> <version>`
+  line, so an excepted finding stays visible in CI. The option changes the
+  output only, not the exit code. The development-image scans do not read
+  the exception file and report the finding as usual.
 - A control scan of the unmodified PostgreSQL base image (with its `gosu`)
   must fail; it proves the gate is not passing vacuously.
 - Every scan must report the package sources expected for the image (Alpine
