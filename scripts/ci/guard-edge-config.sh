@@ -38,10 +38,16 @@
 #     Compose files contain no backslash (YAML escapes), no quoted key, no
 #     flow mapping but {}, no path with //, /./ or .., and no short or
 #     long-syntax (target:) mount over /, /etc, /usr or a bin directory;
+#     anchors only on top-level x-* keys, aliases only as "<<: *name" and
+#     "logging: *name", tags only !reset/!override, ${VAR} only in ports, a
+#     short volume source and a top-level secret file, and no configs,
+#     content, dockerfile_inline or secrets from the environment;
 #   - edge runtime stages of a Dockerfile only RUN "apk add --no-cache
 #     <packages>", copy the binary only to /usr/bin/caddy, put nothing else
 #     in a bin directory, use only absolute literal COPY/ADD destinations,
-#     no WORKDIR or ONBUILD, and do not change PATH or SHELL; command lines
+#     no WORKDIR, ONBUILD or ADD, copy only to /etc/caddy/<file>,
+#     /usr/bin/caddy or below /srv, and do not change PATH or SHELL; no
+#     Dockerfile has a parser directive other than syntax=; command lines
 #     contain no glob that matches the binary's name;
 #   - no tracked Caddy file is unused by these start points, and no
 #     tracked JSON file looks like a Caddy JSON configuration.
@@ -217,6 +223,23 @@ words() {
 
 ST_FROM=() DL_STAGE=() DL_WHERE=() DL_INSTR=() DL_TEXT=()
 for df in ${DOCKERFILES[@]+"${DOCKERFILES[@]}"}; do
+  # Parser directives (# key=value before the first instruction) change how
+  # BuildKit reads the file (escape= changes line continuation): only
+  # syntax= is accepted, so the guard reads the file as BuildKit does.
+  awk '{ sub(/\r$/, ""); if (NR == 1) sub(/^\xef\xbb\xbf/, "") }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*#/ {
+      t = $0; sub(/^[[:space:]]*#[[:space:]]*/, "", t)
+      if (t ~ /^[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/) {
+        k = t; sub(/[[:space:]]*=.*/, "", k)
+        if (tolower(k) != "syntax") print NR "\t" $0
+      }
+      next }
+    { exit }' "$top/$df" >"$tracked.dir"
+  while IFS=$'\t' read -r ln text; do
+    report "$df:$ln" "Dockerfile parser directive other than syntax= (escape= or check= change how the file is read)" "$text"
+  done <"$tracked.dir"
+  rm -f "$tracked.dir"
   stage='' has_caddy_copy=no cmd_lines=''
   while IFS=$'\t' read -r ln text; do
     [[ $text =~ ^[[:space:]]*(#|$) ]] && continue
@@ -342,22 +365,102 @@ for ((k = 0; k < ${#DL_STAGE[@]}; k++)); do
         report "$where" "COPY or ADD in an edge runtime stage needs an absolute literal destination (no relative path, variable, //, . or ..)" "$text"
         continue
       fi
+      if [ "${DL_INSTR[$k]}" = add ]; then
+        report "$where" "ADD in an edge runtime stage (it extracts archives and fetches URLs; use COPY)" "$text"
+        continue
+      fi
       if [[ $dest =~ $bin_dir_re ]] || [ "${src##*/}" = caddy ]; then
         case $text in
           [Cc][Oo][Pp][Yy]' --from='*' '*/caddy' /usr/bin/caddy') [ "${src##*/}" = caddy ] && [ "${#w[@]}" -eq 3 ] || report "$where" "only the Caddy binary may be copied into a bin directory, to /usr/bin/caddy" "$text" ;;
           *) report "$where" "only 'COPY --from=<stage> <path>/caddy /usr/bin/caddy' may place the binary or anything in a bin directory of an edge runtime stage" "$text" ;;
         esac
       fi
+      # Only these destinations: a file in /etc/caddy (checked above as a
+      # Caddy file), the binary at /usr/bin/caddy, and the site below /srv.
+      case ${dest%/} in
+        /etc/caddy/?* | /usr/bin/caddy | /srv/?*) ;;
+        *)
+          report "$where" "COPY destination in an edge runtime stage outside /etc/caddy/<file>, /usr/bin/caddy and /srv/<path> (an ancestor such as / or /etc would replace /etc/caddy or a bin directory)" "$text"
+          ;;
+      esac
       ;;
   esac
 done
 
+# compose_line_rules <file> <line number> <line>: YAML features that would
+# let a value reach a service without the line checks seeing it. Allowed
+# are exactly the forms the repository uses:
+#   - anchors only on top-level x-* keys ("x-name: &name");
+#   - aliases only as "<<: *name" (one alias, no list) and "logging: *name";
+#   - tags only !reset and !override;
+#   - ${VAR} interpolation only in ports, in the source of a short volume
+#     mount with a literal target ("- ${VAR...}:/path[:mode]"), and in the
+#     file of a top-level secret;
+#   - no configs, no content (inline configs or secrets), no
+#     dockerfile_inline, and top-level secrets only from a file.
+CTX_IND=() CTX_KEY=()
+compose_line_rules() {
+  local f=$1 n=$2 l=$3 ind body key path k item=no v
+  body=${l#"${l%%[! ]*}"}
+  [ -n "$body" ] || return 0
+  ind=$((${#l} - ${#body}))
+  case $body in '---'* | '...'*) report "$f:$n" "YAML document marker in a Compose file (one document only)" "$l"; return ;; esac
+  if [[ $body =~ ^-([[:space:]]+|$) ]]; then
+    item=yes
+    body=${body#-}
+    v=${body#"${body%%[! ]*}"}
+    ind=$((ind + 1 + ${#body} - ${#v}))
+    body=$v
+  fi
+  key=''
+  if [[ $body =~ ^([A-Za-z0-9_.<-]+):([[:space:]]|$) ]]; then key=${BASH_REMATCH[1]}; fi
+  # Pop to the parent of this line, then push its key.
+  while [ "${#CTX_IND[@]}" -gt 0 ] && [ "${CTX_IND[${#CTX_IND[@]} - 1]}" -ge "$ind" ]; do
+    unset 'CTX_IND[${#CTX_IND[@]}-1]' 'CTX_KEY[${#CTX_KEY[@]}-1]'
+  done
+  path=''
+  for ((k = 0; k < ${#CTX_KEY[@]}; k++)); do path="$path${CTX_KEY[$k]}."; done
+  if [ -n "$key" ]; then CTX_IND+=("$ind") CTX_KEY+=("$key"); fi
+  case $key in
+    configs | content | dockerfile_inline | environment)
+      case $key in environment) [ "${path%%.*}" = secrets ] || key='' ;; esac
+      [ -n "$key" ] && report "$f:$n" "Compose $key is not supported (an inline or external config could replace /etc/caddy or the binary)" "$l"
+      ;;
+  esac
+  if [[ $body =~ (^|[[:space:]:,\[])\&[A-Za-z0-9_.-]+ ]]; then
+    [ "$ind" -eq 0 ] && [[ $body =~ ^x-[A-Za-z0-9_.-]+:[[:space:]]+\&[A-Za-z0-9_.-]+[[:space:]]*$ ]] ||
+      report "$f:$n" "YAML anchor in a Compose file (only on a top-level x-* key)" "$l"
+  fi
+  if [[ $body =~ (^|[[:space:]:,\[])\*[A-Za-z0-9_.-]+ ]]; then
+    [[ $body =~ ^(\<\<|logging):[[:space:]]+\*[A-Za-z0-9_.-]+[[:space:]]*$ ]] && [ "$item" = no ] ||
+      report "$f:$n" "YAML alias in a Compose file (only '<<: *name' and 'logging: *name')" "$l"
+  fi
+  if [[ $body =~ (^|[[:space:]:,\[])\!+([A-Za-z0-9_.-]*) ]]; then
+    case ${BASH_REMATCH[2]} in reset | override) ;; *) report "$f:$n" "YAML tag in a Compose file (only !reset and !override)" "$l" ;; esac
+  fi
+  case $body in
+    *'$'*)
+      v=no
+      case $path in *ports.) [ "$item" = yes ] && v=yes ;; esac
+      case $path in
+        *volumes.)
+          [ "$item" = yes ] && [[ $body =~ ^\"?\$\{[A-Za-z_][A-Za-z0-9_]*(:?[-?][^}\$]*)?\}[^:\$\"]*:/[^:\$\"]+(:[a-z,]+)?\"?[[:space:]]*$ ]] && v=yes ;;
+      esac
+      [ "$path" = "secrets.${path#secrets.}" ] && [ "$key" = file ] && [ "${path//[!.]/}" = .. ] && v=yes
+      [ "$v" = yes ] || report "$f:$n" "interpolation in a Compose file outside ports, a volume source and a secret file (it could change an image, command, mount or build)" "$l"
+      ;;
+  esac
+}
+
 for cf in ${COMPOSES[@]+"${COMPOSES[@]}"}; do
   ln=0
+  CTX_IND=() CTX_KEY=()
   while IFS= read -r line || [ -n "$line" ]; do
     ln=$((ln + 1))
     line=${line%$'\r'}
     [[ $line =~ ^[[:space:]]*# ]] && continue
+    case $line in *$'\t'*) report "$cf:$ln" "tab in a Compose file" "$line" ;; esac
+    compose_line_rules "$cf" "$ln" "$line"
     # YAML escapes (\u0063addy, \x2F) would hide a command or a path from
     # these line checks; Compose decodes them.
     case $line in *"\\"*) report "$cf:$ln" "backslash in a Compose file (YAML escapes are not supported)" "$line" ;; esac

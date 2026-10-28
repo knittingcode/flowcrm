@@ -462,6 +462,75 @@ base
 subst compose.yaml "    networks: [front, back]" "    networks: [front, back]${NL}    entrypoint: [\"sh\"]"
 expect "HIGH-R1: <<: anchor merge resolves (edge with merged hardening)" 1 "entrypoint of the edge service edge"
 
+# --- SEC-042M final audit (M-1, M-2, L-1) ----------------------------------------------
+base
+put docker/edge/evil "x${NL}"
+subst compose.yaml "x-hardening: &hardening" "x-etc: &etcmount \"./docker/edge/evil:/etc:ro\"${NL}${NL}x-hardening: &hardening"
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - *etcmount"
+expect "M B1: YAML alias mount over /etc" 1 "YAML anchor in a Compose file"
+base
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - *etcmount"
+expect "YAML alias as a list item" 1 "YAML alias in a Compose file"
+base
+put docker/edge/evil "x${NL}"
+subst compose.yaml "$EDGE_VOL" "$EDGE_VOL${NL}      - ./docker/edge/evil:\${EDGE_ETC:-/etc}:ro"
+expect "M B2: interpolated short mount target \${X:-/etc}" 1 "interpolation in a Compose file"
+base
+subst "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - type: bind${NL}        source: ./tests/app/https/attacker${NL}        target: \${B:-/usr/bin}"
+expect "M B3: long-syntax target \${B:-/usr/bin}" 1 "interpolation in a Compose file"
+base
+subst compose.yaml "x-hardening: &hardening" "x-ep: &ep${NL}  entrypoint: [\"sh\", \"-c\", \"exec cadd\${Y:-y} run --resume\"]${NL}${NL}x-hardening: &hardening"
+subst compose.yaml "    <<: *hardening" "    <<: [*hardening, *ep]"
+expect "M B15: <<: with a list of aliases" 1 "YAML alias in a Compose file"
+base
+subst compose.yaml "x-hardening: &hardening" "x-ep: &ep${NL}  entrypoint: [\"sh\", \"-c\", \"exec cadd\${Y:-y} run --resume\"]${NL}${NL}x-hardening: &hardening"
+expect "M B15: interpolation in an x- anchor's entrypoint" 1 "interpolation in a Compose file"
+base
+put compose.extra.yaml "x-img: &edgeimg docker.io/library/cadd\${Y:-y}:2.11.7-alpine${NL}services:${NL}  side:${NL}    image: *edgeimg${NL}    configs:${NL}      - source: sidecfg${NL}        target: \${C:-/etc}/cadd\${Y:-y}/Caddyfile${NL}configs:${NL}  sidecfg:${NL}    content: |${NL}      {${NL}        admin 0.0.0.0:2019${NL}      }${NL}      :2015 {${NL}        acme_server${NL}      }${NL}"
+expect "M B9: aliased and interpolated caddy image with inline configs" 1 "Compose configs is not supported"
+base
+put compose.extra.yaml "services:${NL}  side:${NL}    image: *edgeimg${NL}"
+expect "alias as an image value" 1 "YAML alias in a Compose file"
+base
+put compose.extra.yaml "services:${NL}  side:${NL}    image: docker.io/library/cadd\${Y:-y}:2.11.7-alpine${NL}"
+expect "interpolated image" 1 "interpolation in a Compose file"
+base
+put compose.extra.yaml "services:${NL}  side:${NL}    image: busybox${NL}    command: [\"sh\", \"-c\", \"\$CMD\"]${NL}"
+expect "interpolation without braces in a command" 1 "interpolation in a Compose file"
+base
+put compose.extra.yaml "services:${NL}  side:${NL}    image: busybox${NL}    secrets: [s]${NL}secrets:${NL}  s:${NL}    content: \"acme_server\"${NL}"
+expect "inline secret content" 1 "Compose content is not supported"
+base
+put compose.extra.yaml "services:${NL}  side:${NL}    image: busybox${NL}secrets:${NL}  s:${NL}    environment: EVIL${NL}"
+expect "secret from an environment variable" 1 "Compose environment is not supported"
+base
+put compose.extra.yaml "services:${NL}  side:${NL}    image: busybox${NL}secrets:${NL}  s:${NL}    file: \${D:-/x}/s${NL}"
+expect "secret file with interpolation (the form the repository uses) is accepted" 0
+base
+put docker/edge/side.txt "acme_server${NL}"
+put compose.extra.yaml "services:${NL}  side2:${NL}    build:${NL}      context: .${NL}      dockerfile_inline: |${NL}        FROM docker.io/library/cadd\${Y:-y}:2.11.7-alpine${NL}        WORKDIR /etc${NL}        COPY docker/edge/side.txt cadd\${Y:-y}/Caddyfile${NL}"
+expect "M B10: build.dockerfile_inline" 1 "Compose dockerfile_inline is not supported"
+bad "YAML tag other than !reset and !override" "YAML tag in a Compose file" compose.prodlike.yaml "    ports: !reset []" "    ports: !!seq []"
+bad "tab in a Compose file" "tab in a Compose file" compose.prodlike.yaml "    ports: !reset []" "    ports:${TAB}!reset []"
+bad "YAML document marker" "YAML document marker" compose.prodlike.yaml "services:" "---${NL}services:"
+bad "anchor on a service key" "YAML anchor in a Compose file" compose.yaml "  edge:" "  edge: &edge"
+base
+put docker/edge/e.conf "$UNSAFE"
+subst "$DF" "# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e" "# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e${NL}# escape=\`"
+subst "$DF" "COPY --from=caddy-build /out/caddy /usr/bin/caddy" "COPY --from=caddy-build /out/caddy /usr/bin/caddy${NL}ENV HIDE=1\\${NL}RUN ln -s /usr/bin/caddy /usr/local/bin/edge && cd /etc && printf acme_server > caddy/x"
+expect "M B6: # escape=\` parser directive hides a RUN" 1 "Dockerfile parser directive other than syntax="
+bad "# check= parser directive" "Dockerfile parser directive other than syntax=" "$DF" "# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e" "# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e${NL}#  ESCAPE = \`"
+base
+put docker/edge/conf.tar "x"
+subst "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}ADD docker/edge/conf.tar /etc/"
+expect "M L-1 B4: ADD of an archive to /etc/ in an edge stage" 1 "ADD in an edge runtime stage"
+bad "M L-1 B5: COPY --from to /etc/ in an edge stage" "outside /etc/caddy/<file>, /usr/bin/caddy and /srv/<path>" "$DF" "COPY --from=spa-build /app/dist /srv/www" "COPY --from=spa-build /app/dist /srv/www${NL}COPY --from=spa-build /gen/ /etc/"
+bad "COPY to / in an edge stage" "outside /etc/caddy/<file>, /usr/bin/caddy and /srv/<path>" "$DF" "COPY --from=spa-build /app/dist /srv/www" "COPY --from=spa-build /app/dist /"
+bad "COPY to /usr/local/lib in an edge stage" "outside /etc/caddy/<file>, /usr/bin/caddy and /srv/<path>" "$DF" "COPY --from=spa-build /app/dist /srv/www" "COPY --from=spa-build /app/dist /usr/local/lib/x"
+base
+subst "$DF" "COPY --from=spa-build /app/dist /srv/www" "COPY --from=spa-build /app/dist /srv/www${NL}COPY --from=spa-build /app/dist/index.html /srv/extra/index.html"
+expect "COPY below /srv in an edge stage is accepted" 0
+
 # --- Globs that match the binary's name ---------------------------------------------------
 base
 put tests/app/extra.sh "#!/bin/sh${NL}docker run --rm img sh -c 'cp /usr/bin/cadd? /tmp/e && /tmp/e run --resume'${NL}"
