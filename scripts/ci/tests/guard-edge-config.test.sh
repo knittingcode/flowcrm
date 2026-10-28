@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+#
+# Regression tests for scripts/ci/guard-edge-config.sh and
+# scripts/ci/edge-adapted-config.jq. Every guard case runs in its own
+# temporary Git repository holding copies of the repository's edge files
+# (Dockerfile, Caddyfiles, Compose files, scan.sh) with one unsafe change;
+# the repository under test is only read. The adapted-config cases run the
+# jq check on JSON fixtures (tests/app/scan.sh runs it on the built images).
+#
+# Usage: guard-edge-config.test.sh
+# GUARD=<path> or ADAPTED=<path> runs the suite against another
+# implementation (used for mutation tests).
+
+set -u
+
+here=$(cd "$(dirname "$0")" && pwd)
+guard=${GUARD:-"$here/../guard-edge-config.sh"}
+adapted=${ADAPTED:-"$here/../edge-adapted-config.jq"}
+real=$(git -C "$here" rev-parse --show-toplevel) || exit 2
+work=$(mktemp -d "${TMPDIR:-/tmp}/guard-edge-config-tests.XXXXXX") || exit 2
+trap 'rm -rf "$work"' EXIT
+# Never let Git discover a repository above the fixtures.
+export GIT_CEILING_DIRECTORIES=$work
+
+NL=$'\n'
+TAB=$'\t'
+CR=$'\r'
+REAL=(docker/edge/Dockerfile docker/edge/Caddyfile.dev docker/edge/Caddyfile.prod docker/edge/common.caddy
+  tests/app/https/Caddyfile tests/app/https/compose.https.yaml compose.yaml compose.prodlike.yaml tests/app/scan.sh)
+P=docker/edge/Caddyfile.prod
+D=docker/edge/Caddyfile.dev
+C=docker/edge/common.caddy
+H=tests/app/https/Caddyfile
+HC=tests/app/https/compose.https.yaml
+DF=docker/edge/Dockerfile
+pass=0
+fail=0
+case_no=0
+
+new_repo() {
+  case_no=$((case_no + 1))
+  repo="$work/repo-$case_no"
+  git init -q "$repo" || exit 2
+}
+
+# base: a new repository with copies of the real edge files.
+base() {
+  local f
+  new_repo
+  for f in "${REAL[@]}"; do
+    mkdir -p "$repo/$(dirname "$f")"
+    cp "$real/$f" "$repo/$f" || exit 2
+  done
+  git -C "$repo" add -f -- "${REAL[@]}" || exit 2
+}
+
+# put <path> <content>: write the file and add it to the index.
+put() {
+  mkdir -p "$repo/$(dirname "$1")"
+  printf '%s' "$2" >"$repo/$1"
+  git -C "$repo" add -f -- "$1" || exit 2
+}
+
+# subst <path> <from> <to>: replace every literal <from> (one line) by <to>.
+subst() {
+  FROM=$2 TO=$3 awk 'BEGIN { f = ENVIRON["FROM"]; t = ENVIRON["TO"] }
+    { out = ""; s = $0
+      while ((i = index(s, f)) > 0) { out = out substr(s, 1, i - 1) t; s = substr(s, i + length(f)) }
+      print out s }' "$repo/$1" >"$work/subst" || exit 2
+  if cmp -s "$work/subst" "$repo/$1"; then
+    echo "HARNESS ERROR: '$2' not found in $1" >&2
+    exit 2
+  fi
+  cat "$work/subst" >"$repo/$1"
+}
+
+# expect <name> <expected-exit> [message]: the guard's exit status, and
+# the message (a fixed string) must appear in its output.
+expect() {
+  local name=$1 want=$2 msg=${3-} got
+  "$guard" "$repo" >"$work/out" 2>&1
+  got=$?
+  if [ "$got" -eq "$want" ] && { [ -z "$msg" ] || grep -qF -- "$msg" "$work/out"; }; then
+    pass=$((pass + 1))
+    printf 'PASS  %-74s exit=%s\n' "$name" "$got"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %-74s exit=%s want=%s%s\n' "$name" "$got" "$want" "${msg:+ message=$msg}"
+    sed 's/^/      | /' "$work/out"
+  fi
+}
+
+# bad <name> <message> <path> <from> <to>: one substitution, must fail.
+bad() {
+  base
+  subst "$3" "$4" "$5"
+  expect "$1" 1 "$2"
+}
+
+SITE=':8080 {'
+GLOBAL='	persist_config off'
+
+# --- Accepted ------------------------------------------------------------------
+repo=$real
+expect "actual repository" 0 "3 entry configurations checked"
+"$guard" "$real" >"$work/out" 2>&1
+for e in "/etc/caddy/Caddyfile in stage dev" "/etc/caddy/Caddyfile in stage prod" "/etc/caddy/https/Caddyfile in stage prod"; do
+  if grep -qF "$e" "$work/out"; then
+    pass=$((pass + 1))
+    printf 'PASS  %-74s\n' "actual repository checks $e"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %-74s\n' "actual repository checks $e"
+    sed 's/^/      | /' "$work/out"
+  fi
+done
+base
+expect "copy of the actual edge files" 0
+base
+subst "$P" "$SITE" "# acme_server, pki and tls internal in a comment are ignored${NL}$SITE"
+expect "acme_server, pki, tls internal in a comment are ignored" 0
+base
+subst "$P" "	admin off" "	\"admin\" \"off\""
+expect "quoted admin off (same tokens for Caddy)" 0
+base
+subst "$P" "	admin off" "	admin off${CR}"
+subst "$P" "	auto_https off" "	auto_https off${CR}"
+expect "CRLF line endings" 0
+
+# --- acme_server, pki, issuers, anywhere -------------------------------------
+bad "acme_server in the production site" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	acme_server"
+bad "acme_server in a handle block of the dev site" "ACME server (acme_server" "$D" "		reverse_proxy web:5173" "		acme_server"
+bad "acme_server in an imported snippet (common.caddy baseline)" "ACME server (acme_server" "$C" "(baseline) {" "(baseline) {${NL}	acme_server"
+bad "acme_server in a snippet nobody imports" "ACME server (acme_server" "$C" "(php) {" "(unused) {${NL}	acme_server${NL}}${NL}${NL}(php) {"
+bad "acme_server in the HTTPS test edge" "ACME server (acme_server" "$H" "	import app" "	import app${NL}	acme_server"
+bad "upper-case ACME_SERVER" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	ACME_SERVER"
+bad "quoted \"acme_server\" directive" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	\"acme_server\""
+bad "backtick-quoted acme_server directive" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	\`acme_server\`"
+bad "acme_server split by a CR (Caddy drops CR)" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	acme_${CR}server"
+bad "acme_server inside a route matcher block" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	route /acme/* {${NL}		acme_server${NL}	}"
+bad "acme_server as part of a token (a#acme_server)" "ACME server (acme_server" "$P" "$SITE" "$SITE${NL}	respond a#acme_server"
+bad "pki global option" "PKI app (pki" "$P" "$GLOBAL" "$GLOBAL${NL}	pki {${NL}		ca local${NL}	}"
+bad "local_certs global option" "local_certs (internal issuer" "$P" "$GLOBAL" "$GLOBAL${NL}	local_certs"
+bad "acme_ca global option" "certificate issuance or ACME client (acme_ca)" "$P" "$GLOBAL" "$GLOBAL${NL}	acme_ca https://ca.example/dir"
+bad "acme_dns global option" "certificate issuance or ACME client (acme_dns)" "$P" "$GLOBAL" "$GLOBAL${NL}	acme_dns cloudflare x"
+bad "cert_issuer global option" "certificate issuance or ACME client (cert_issuer)" "$P" "$GLOBAL" "$GLOBAL${NL}	cert_issuer zerossl x"
+bad "on_demand_tls global option" "certificate issuance or ACME client (on_demand_tls)" "$P" "$GLOBAL" "$GLOBAL${NL}	on_demand_tls {${NL}		ask http://x${NL}	}"
+bad "email global option (not on the allow-list)" "global option is not on the edge allow-list" "$P" "$GLOBAL" "$GLOBAL${NL}	email ops@example.test"
+bad "servers global option (not on the allow-list)" "global option is not on the edge allow-list" "$P" "$GLOBAL" "$GLOBAL${NL}	servers {${NL}		protocols h1${NL}	}"
+bad "tls internal" "tls must be exactly" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls internal"
+bad "tls internal: internal is rejected too" "internal issuer (tls internal" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls internal"
+bad "tls with an ACME e-mail" "tls must be exactly" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls ops@example.test"
+bad "tls block with issuer acme" "certificate issuance or ACME client (issuer)" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls {${NL}		issuer acme${NL}	}"
+bad "tls files plus a block" "tls must be exactly" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls /a.crt /a.key {${NL}		protocols tls1.3${NL}	}"
+bad "tls arguments continued over an escaped newline" "tls must be exactly" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls \\${NL}		/a.crt /a.key extra"
+bad "tls on_demand" "certificate issuance or ACME client (on_demand)" "$H" "	tls /run/flowcrm-https/edge.crt /run/flowcrm-https/edge.key" "	tls {${NL}		on_demand${NL}	}"
+bad "zerossl issuer in a reverse_proxy block" "certificate issuance or ACME client (zerossl)" "$P" "$SITE" "$SITE${NL}	reverse_proxy x {${NL}		transport http {${NL}			tls_client_auth zerossl${NL}		}${NL}	}"
+
+# --- Global options --------------------------------------------------------------
+bad "admin with an address" "global option must be exactly 'admin off'" "$P" "	admin off" "	admin localhost:2019"
+bad "admin off with a block" "global option must be exactly 'admin off'" "$P" "	admin off" "	admin off {${NL}		origins x${NL}	}"
+bad "upper-case admin OFF (Caddy reads it as an address)" "global option must be exactly 'admin off'" "$D" "	admin off" "	admin OFF"
+bad "admin missing" "global option 'admin off' is missing" "$P" "	admin off" ""
+bad "auto_https missing" "global option 'auto_https off' is missing" "$D" "	auto_https off" ""
+bad "persist_config missing" "global option 'persist_config off' is missing" "$P" "	persist_config off" ""
+bad "auto_https disable_redirects" "global option must be exactly 'auto_https off'" "$P" "	auto_https off" "	auto_https disable_redirects"
+bad "admin twice (admin off, then an address)" "global option admin appears twice" "$P" "	admin off" "	admin off${NL}	admin :2019"
+bad "comment ending in a backslash joins the next line" "global option must be exactly 'admin off'" "$P" "	admin off" "	admin off # note \\"
+bad "second global options block" "more than one global options block" "$P" "$SITE" "{${NL}	admin localhost:2019${NL}}${NL}$SITE"
+bad "second global options block in the HTTPS test edge" "more than one global options block" "$H" "https://flowcrm.test:8443 {" "{${NL}	admin :2019${NL}}${NL}https://flowcrm.test:8443 {"
+base
+subst "$D" "	admin off" "	admin localhost:2019"
+expect "unsafe dev global block (dev image)" 1 "/etc/caddy/Caddyfile in stage dev"
+base
+subst "$P" "	admin off" "	admin localhost:2019"
+expect "unsafe production global block also fails the HTTPS test edge" 1 "(/etc/caddy/https/Caddyfile in stage prod"
+base
+put "$P" "import /etc/caddy/common.caddy${NL}${NL}(app) {${NL}	import baseline${NL}}${NL}${NL}:8080 {${NL}	import app${NL}}${NL}${NL}{${NL}	admin off${NL}	auto_https off${NL}	persist_config off${NL}}${NL}"
+expect "global options block after a site block" 1 "the global options block is not the first block"
+base
+put "$P" "import /etc/caddy/common.caddy${NL}${NL}(app) {${NL}	import baseline${NL}}${NL}${NL}:8080 {${NL}	import app${NL}}${NL}"
+expect "no global options block" 1 "no global options block"
+bad "global options block in common.caddy, before the real one" "more than one global options block" "$C" "(php) {" "{${NL}	admin :2019${NL}}${NL}${NL}(php) {"
+
+# --- Placeholders, snippets, imports, unsupported syntax -------------------------
+bad "{\$VAR} environment placeholder" "environment placeholder {\$...}" "$P" "	admin off" "	admin {\$CADDY_ADMIN_OFF:off}"
+bad "{\$VAR} as a directive" "environment placeholder {\$...}" "$P" "$SITE" "$SITE${NL}	{\$EXTRA}"
+bad "{\$VAR} hidden in a comment" "environment placeholder {\$...}" "$C" "(php) {" "# {\$EVIL}${NL}(php) {"
+bad "{env.VAR} placeholder" "environment placeholder {env.*}" "$P" "$SITE" "$SITE${NL}	respond {env.SECRET}"
+bad "snippet argument placeholder" "snippet arguments or blocks are not supported" "$C" "(php) {" "(php) {${NL}	{args[0]}"
+bad "snippet {block} placeholder" "snippet arguments or blocks are not supported" "$C" "(php) {" "(php) {${NL}	{block}"
+bad "import with arguments" "import must have exactly one argument" "$P" "	import baseline" "	import baseline acme_srv"
+bad "import with a block" "import must have exactly one argument" "$P" "	import baseline" "	import baseline {${NL}		x y${NL}	}"
+bad "unresolved import (missing file)" "import does not resolve" "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/common.caddy${NL}import /etc/caddy/missing.caddy"
+bad "unresolved import (undefined snippet)" "import does not resolve" "$P" "	import baseline" "	import nosuchsnippet"
+bad "import glob that matches nothing" "import does not resolve" "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/common.caddy${NL}import /etc/caddy/conf.d/*.caddy"
+bad "import glob with two wildcards" "more than one wildcard" "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/*/*.caddy"
+bad "import of a host path outside the container files" "import does not resolve" "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/common.caddy${NL}import ../../srv/x.caddy"
+bad "re-import of common.caddy redeclares its snippets" "redeclaration of snippet" "$C" "(php) {" "import /etc/caddy/common.caddy${NL}(php) {"
+base
+put docker/edge/loop.caddy "import /etc/caddy/loop.caddy${NL}"
+subst "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}COPY docker/edge/loop.caddy /etc/caddy/loop.caddy"
+subst "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/common.caddy${NL}import /etc/caddy/loop.caddy"
+expect "import cycle (a file that imports itself)" 1 "import cycle?"
+bad "heredoc" "heredoc (<<) is not supported" "$P" "$SITE" "$SITE${NL}	respond <<EOF${NL}	x${NL}	EOF"
+bad "named route" "named routes (&(name)) are not supported" "$P" "$SITE" "&(r) {${NL}	respond x${NL}}${NL}$SITE"
+bad "invoke of a named route" "named routes (invoke) are not supported" "$P" "$SITE" "$SITE${NL}	invoke r"
+bad "site address without a brace" "top-level line must be" "$P" "$SITE" ":8080"
+bad "non-breaking space before acme_server (Caddy splits there)" "only printable ASCII" "$P" "$SITE" "$SITE${NL}	"$'\xc2\xa0'"acme_server"
+
+base
+put docker/edge/extra.caddy "(extra) {${NL}	acme_server${NL}}${NL}"
+subst "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}COPY docker/edge/extra.caddy /etc/caddy/extra.caddy"
+subst "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/*.caddy"
+subst "$P" "	import baseline" "	import baseline${NL}	import extra"
+expect "unsafe snippet reached through an import glob" 1 "ACME server (acme_server"
+base
+put docker/edge/extra.caddy "{${NL}	admin localhost:2019${NL}}${NL}"
+subst "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}COPY docker/edge/extra.caddy /etc/caddy/extra.caddy"
+subst "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/*.caddy"
+expect "global block injected through an import glob" 1 "more than one global options block"
+base
+put docker/edge/.hidden.caddy "{${NL}	admin localhost:2019${NL}}${NL}"
+subst "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy /etc/caddy/common.caddy${NL}COPY docker/edge/.hidden.caddy /etc/caddy/.hidden.caddy"
+subst "$P" "import /etc/caddy/common.caddy" "import /etc/caddy/*.caddy"
+expect "import glob *.caddy skips dot files, as Caddy does" 0
+
+# --- Discovery of configurations ----------------------------------------------------
+base
+put docker/edge/Caddyfile.staging "{${NL}	admin off${NL}	auto_https off${NL}	persist_config off${NL}}${NL}:8080 {${NL}	respond ok${NL}}${NL}"
+expect "tracked Caddyfile that no start point uses" 1 "Caddy file not copied or mounted"
+base
+put docker/edge/caddy.json '{"admin":{"disabled":true}}'
+expect "Caddy JSON configuration file" 1 "Caddy JSON configuration"
+base
+put config/edge.json '{"apps":{"http":{}}}'
+expect "JSON file with an apps key" 1 "looks like a Caddy JSON configuration"
+base
+put frontend/tsconfig.json '{"compilerOptions":{"strict":true}}'
+expect "unrelated JSON files are accepted" 0
+new_repo
+put README.md "text${NL}"
+expect "no tracked Caddy configuration (inspection error)" 2
+mkdir -p "$work/not-a-repo"
+repo=$work/not-a-repo
+expect "not a Git repository (inspection error)" 2
+
+# --- Start points: Dockerfile ---------------------------------------------------------
+bad "Dockerfile CMD override in the edge" "CMD or ENTRYPOINT in an edge Dockerfile" "$DF" "COPY docker/edge/Caddyfile.dev /etc/caddy/Caddyfile" "COPY docker/edge/Caddyfile.dev /etc/caddy/Caddyfile${NL}CMD [\"caddy\", \"run\", \"--config\", \"/etc/caddy/Caddyfile\", \"--adapter\", \"caddyfile\"]"
+bad "Dockerfile ENTRYPOINT with --resume" "caddy run --resume" "$DF" "COPY docker/edge/Caddyfile.dev /etc/caddy/Caddyfile" "COPY docker/edge/Caddyfile.dev /etc/caddy/Caddyfile${NL}ENTRYPOINT [\"caddy\", \"run\", \"--resume\"]"
+bad "Dockerfile ENV CADDY_ADMIN" "CADDY_ADMIN would set the admin API address" "$DF" "USER 65534:65534" "ENV CADDY_ADMIN=0.0.0.0:2019${NL}USER 65534:65534"
+bad "Dockerfile RUN writes /etc/caddy" "only COPY may write to /etc/caddy" "$DF" "USER 65534:65534" "RUN echo '{\$X}' >> /etc/caddy/Caddyfile${NL}USER 65534:65534"
+bad "Dockerfile ADD into /etc/caddy" "ADD into /etc/caddy is not supported" "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "ADD docker/edge/common.caddy /etc/caddy/common.caddy"
+bad "Dockerfile COPY --from into /etc/caddy" "COPY --from into /etc/caddy is not supported" "$DF" "COPY docker/edge/Caddyfile.prod /etc/caddy/Caddyfile" "COPY --from=spa-build /app/Caddyfile /etc/caddy/Caddyfile"
+bad "Dockerfile COPY of a directory into /etc/caddy" "not a tracked file" "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/ /etc/caddy/"
+bad "Dockerfile COPY of two files into /etc/caddy" "must copy exactly one file" "$DF" "COPY docker/edge/common.caddy /etc/caddy/common.caddy" "COPY docker/edge/common.caddy docker/edge/Caddyfile.dev /etc/caddy/"
+bad "Dockerfile RUN over a line continuation writes /etc/caddy" "only COPY may write" "$DF" "USER 65534:65534" "RUN true \\${NL}  && cp /tmp/x /etc/caddy/Caddyfile${NL}USER 65534:65534"
+bad "edge stage without a Caddyfile (base image default config)" "has Caddy files but no tracked /etc/caddy/Caddyfile" "$DF" "FROM caddy-base AS dev" "FROM caddy-base AS bare${NL}${NL}FROM caddy-base AS dev"
+bad "Dockerfile RUN caddy reload" "caddy subcommand not allowed" "$DF" "USER 65534:65534" "RUN caddy reload --config /etc/caddy/Caddyfile${NL}USER 65534:65534"
+
+# --- Start points: Compose, scripts, Makefile, workflows --------------------------------
+base
+subst compose.yaml "    networks: [front, back]" "    environment:${NL}      CADDY_ADMIN: 0.0.0.0:2019${NL}    networks: [front, back]"
+expect "CADDY_ADMIN in the edge's Compose environment" 1 "CADDY_ADMIN would set the admin API address"
+bad "--resume in a Compose command" "caddy run --resume" "$HC" "\"--adapter\", \"caddyfile\"]" "\"--adapter\", \"caddyfile\", \"--resume\"]"
+bad "-r (short --resume) in a Compose command" "caddy run --resume" "$HC" "\"--adapter\", \"caddyfile\"]" "\"--adapter\", \"caddyfile\", \"-r\"]"
+bad "--watch in a Compose command" "caddy run --watch" "$HC" "\"--adapter\", \"caddyfile\"]" "\"--adapter\", \"caddyfile\", \"--watch\"]"
+bad "--envfile in a Compose command" "caddy run --envfile" "$HC" "\"--adapter\", \"caddyfile\"]" "\"--adapter\", \"caddyfile\", \"--envfile\", \"/run/x\"]"
+bad "--config outside /etc/caddy" "--config must be a literal path below /etc/caddy" "$HC" "\"/etc/caddy/https/Caddyfile\"" "\"/srv/Caddyfile\""
+bad "--config=/etc/caddy/... no image or mount provides" "no edge stage provides" "$HC" "\"--config\", \"/etc/caddy/https/Caddyfile\"" "\"--config=/etc/caddy/other/Caddyfile\""
+bad "--config with a variable" "--config must be a literal path" "$HC" "\"/etc/caddy/https/Caddyfile\"" "\"\$CONFIG\""
+bad "--adapter json" "needs --adapter caddyfile" "$HC" "\"--adapter\", \"caddyfile\"" "\"--adapter\", \"json\""
+bad "no --adapter (a non-Caddyfile name would be read as JSON)" "needs --adapter caddyfile" "$HC" ", \"--adapter\", \"caddyfile\"" ""
+bad "no --config (./Caddyfile or the autosave)" "without --config" "$HC" "\"--config\", \"/etc/caddy/https/Caddyfile\", " ""
+bad "unknown caddy run flag" "unknown flag for caddy run" "$HC" "\"--adapter\", \"caddyfile\"]" "\"--adapter\", \"caddyfile\", \"--resume-from\"]"
+bad "caddy start in a Compose command" "caddy subcommand not allowed" "$HC" "[\"caddy\", \"run\"" "[\"caddy\", \"start\""
+bad "Compose command as a block sequence" "unsupported YAML form" "$HC" "    command: [\"caddy\", \"run\", \"--config\", \"/etc/caddy/https/Caddyfile\", \"--adapter\", \"caddyfile\"]" "    command:${NL}      - caddy${NL}      - run${NL}      - --resume"
+bad "Compose command flow sequence continued on the next line" "unsupported YAML form" "$HC" "\"--adapter\", \"caddyfile\"]" "\"--adapter\",${NL}      \"caddyfile\", \"--resume\"]"
+bad "Compose command plain scalar continued on the next line" "continues on the next line" "$HC" "    command: [\"caddy\", \"run\", \"--config\", \"/etc/caddy/https/Caddyfile\", \"--adapter\", \"caddyfile\"]" "    command: caddy run --config /etc/caddy/https/Caddyfile --adapter caddyfile${NL}      --resume"
+bad "Compose mount into /etc/caddy without :ro" "must be read-only" "$HC" "Caddyfile:/etc/caddy/https/Caddyfile:ro" "Caddyfile:/etc/caddy/https/Caddyfile"
+bad "Compose mount of an untracked file into /etc/caddy" "not a tracked file" "$HC" "./tests/app/https/Caddyfile:/etc/caddy/https/Caddyfile:ro" "./tests/app/https/evil:/etc/caddy/https/Caddyfile:ro"
+bad "Compose long-syntax mount into /etc/caddy" "unsupported reference to /etc/caddy" "$HC" "      - ./tests/app/https/attacker:/srv/attacker:ro" "      - type: bind${NL}        source: ./x${NL}        target: /etc/caddy/Caddyfile"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}docker exec edge caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile${NL}"
+expect "caddy reload in a script" 1 "caddy subcommand not allowed"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}docker run --rm \\${NL}  img caddy run --config /etc/caddy/Caddyfile \\${NL}  --adapter caddyfile --resume${NL}"
+expect "--resume after a shell line continuation" 1 "caddy run --resume"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}docker run --rm -v \"\$PWD/evil:/etc/caddy/Caddyfile:ro\" img caddy run --config /etc/caddy/Caddyfile --adapter caddyfile${NL}"
+expect "docker run mounting another file over /etc/caddy/Caddyfile" 1 "mount into /etc/caddy that is not a Compose-mounted"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}docker run --rm --mount type=bind,src=./x,target=/etc/caddy/Caddyfile img${NL}"
+expect "docker run --mount into /etc/caddy" 1 "--mount into /etc/caddy is not supported"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}docker compose run --entrypoint caddy edge reload${NL}"
+expect "--entrypoint caddy with another subcommand" 1 "caddy subcommand not allowed"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}/usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile -w${NL}"
+expect "absolute /usr/bin/caddy with -w" 1 "caddy run --watch"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}sh -c 'caddy run --config=/etc/caddy/Caddyfile --adapter=caddyfile --resume'${NL}"
+expect "caddy run --resume inside sh -c '...'" 1 "caddy run --resume"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}export CADDY_ADMIN=localhost:2019${NL}"
+expect "export CADDY_ADMIN in a script" 1 "CADDY_ADMIN would set"
+base
+put Makefile "serve:${NL}${TAB}caddy file-server --listen :8080${NL}"
+expect "caddy file-server in the Makefile" 1 "caddy subcommand not allowed"
+base
+put .github/workflows/edge.yml "jobs:${NL}  x:${NL}    steps:${NL}      - run: caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --resume${NL}"
+expect "caddy run --resume in a workflow" 1 "caddy run --resume"
+base
+put bin/edge "#!/bin/sh${NL}exec caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile --pretty${NL}"
+expect "caddy adapt with allowed flags in bin/ is accepted" 0
+base
+put tests/app/extra.sh "#!/bin/sh${NL}echo 'the caddy edge'${NL}"
+expect "prose with the word caddy fails closed (unknown subcommand)" 1 "caddy subcommand not allowed"
+base
+put tests/app/extra.sh "#!/bin/sh${NL}# caddy run --resume is never used here${NL}"
+expect "caddy command in a full-line comment is ignored" 0
+
+# --- Adapted JSON (scripts/ci/edge-adapted-config.jq) ---------------------------------------
+SAFE='{"admin":{"disabled":true,"config":{"persist":false}},"logging":{"logs":{"default":{}}},"apps":{"http":{"servers":{"srv0":{"listen":[":8080"],"routes":[{"handle":[{"handler":"file_server"}]}],"automatic_https":{"disable":true}}}}}}'
+# adapted_case <name> <expect-violation-substring or ''> <jq expression applied to SAFE>
+adapted_case() {
+  local name=$1 want=$2 out rc
+  printf '%s' "$SAFE" | jq "$3" >"$work/adapted.json" || exit 2
+  out=$(jq -r -f "$adapted" "$work/adapted.json" 2>&1)
+  rc=$?
+  if { [ -z "$want" ] && [ "$rc" -eq 0 ] && [ -z "$out" ]; } ||
+    { [ -n "$want" ] && [ -n "$out" ] && printf '%s\n' "$out" | grep -qF -- "$want"; }; then
+    pass=$((pass + 1))
+    printf 'PASS  %-74s\n' "adapted: $name"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %-74s want=%s\n' "adapted: $name" "${want:-no violation}"
+    printf '%s\n' "$out" | sed 's/^/      | /'
+  fi
+}
+if ! command -v jq >/dev/null 2>&1; then
+  fail=$((fail + 1))
+  echo "FAIL  jq is required for the adapted-config cases"
+else
+  adapted_case "safe configuration" "" '.'
+  adapted_case "safe HTTPS test edge (certificates from files)" "" '.apps.tls = {"certificates":{"load_files":[{"certificate":"/c","key":"/k"}]}}'
+  adapted_case "admin enabled" "admin.disabled is not true" 'del(.admin.disabled)'
+  adapted_case "admin with a listen address" "admin has other settings: listen" '.admin.listen = "localhost:2019"'
+  adapted_case "admin config load" "admin.config has other settings" '.admin.config.load = {"module":"http"}'
+  adapted_case "persist_config on" "admin.config.persist is not false" '.admin.config.persist = true'
+  adapted_case "persist_config missing" "admin.config.persist is not false" 'del(.admin.config)'
+  adapted_case "pki app" "apps.pki is configured" '.apps.pki = {"certificate_authorities":{"local":{}}}'
+  adapted_case "other app" "apps other than http and tls: layer4" '.apps.layer4 = {}'
+  adapted_case "tls automation with an internal issuer" "apps.tls.automation is configured (issuer modules: internal)" '.apps.tls = {"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}}'
+  adapted_case "tls automation with acme and zerossl issuers" "issuer modules found: acme, zerossl" '.apps.tls = {"automation":{"policies":[{"issuers":[{"module":"acme"},{"module":"zerossl"}]}]}}'
+  adapted_case "tls other than certificates" "apps.tls has settings other than certificates" '.apps.tls = {"session_tickets":{}}'
+  adapted_case "certificates other than load_files" "apps.tls.certificates other than load_files" '.apps.tls = {"certificates":{"automate":["x"]}}'
+  adapted_case "acme_server handler, nested in a subroute" "acme_server handler found (1x)" '.apps.http.servers.srv0.routes[0].handle = [{"handler":"subroute","routes":[{"handle":[{"handler":"acme_server"}]}]}]'
+  adapted_case "issuer key anywhere" "certificate issuance settings found: issuers" '.apps.http.servers.srv0.x = {"issuers":[]}'
+  adapted_case "on_demand anywhere" "certificate issuance settings found: on_demand" '.apps.http.servers.srv0.tls_connection_policies = [{"on_demand":true}]'
+  adapted_case "automatic HTTPS on" "automatic_https.disable is not true" 'del(.apps.http.servers.srv0.automatic_https)'
+  adapted_case "second server with automatic HTTPS" "servers.srv1.automatic_https.disable is not true" '.apps.http.servers.srv1 = {"listen":[":8443"]}'
+  adapted_case "no servers" "no apps.http.servers" '.apps.http.servers = {}'
+  adapted_case "storage setting" "top-level settings other than admin, apps and logging: storage" '.storage = {"module":"file_system"}'
+  adapted_case "not an object" "not a JSON object" '[.]'
+fi
+
+# Output safety: crafted names and values stay on escaped, indented lines.
+base
+put "docker/edge/a${NL}::error::x.caddy" "::warning::x${NL}"
+"$guard" "$repo" >"$work/out" 2>&1
+if grep -q '^::' "$work/out"; then
+  fail=$((fail + 1))
+  printf 'FAIL  %-74s\n' "crafted path and value printed on escaped lines"
+  sed 's/^/      | /' "$work/out"
+else
+  pass=$((pass + 1))
+  printf 'PASS  %-74s\n' "crafted path and value printed on escaped lines"
+fi
+
+echo
+echo "TOTAL $((pass + fail)) passed=$pass failed=$fail"
+[ "$fail" -eq 0 ]
