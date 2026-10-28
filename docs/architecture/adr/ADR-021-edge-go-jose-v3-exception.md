@@ -102,8 +102,11 @@ finding, so this finding blocks every pull request and `main`.
      `acme_server` handler, automatic HTTPS is off and persistence is off.
      An unsafe control configuration must be rejected.
    - **Stricter exception guard**, `scripts/ci/guard-trivyignore.sh`. Every
-     entry must name exactly one package with an exactly pinned purl, and an
-     entry that expires on or before the check date fails the guard.
+     entry must name its path and exactly one package with an exactly
+     pinned purl; no package may appear in two entries, and an id that the
+     exceptions table lists as an alias (the GHSA id of this CVE) is
+     rejected, because Trivy matches only the id it reports. An entry that
+     expires on or before the check date fails the guard.
    - **Visibility:** the suppressed finding is printed as `SUPPRESSED` in
      the edge-prod scan log. The edge `dev` report scan does not use the
      ignore file and keeps listing it.

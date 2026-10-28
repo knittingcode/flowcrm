@@ -20,7 +20,8 @@ export GUARD_TODAY=2026-10-24
 
 NL=$'\n'
 HEADER="# Exceptions (fixture).${NL}#${NL}"
-DOC="# Container vulnerabilities${NL}${NL}CVE-2026-0001 and GHSA-xjj6-f33q-929c are documented here.${NL}"
+TABLE="| Id | Package |${NL}|---|---|${NL}"
+DOC="# Container vulnerabilities${NL}${NL}## Exceptions${NL}${NL}${TABLE}| CVE-2026-0001 | example |${NL}| GHSA-xjj6-f33q-929c | undici |${NL}${NL}## Other${NL}"
 pass=0
 fail=0
 case_no=0
@@ -41,10 +42,10 @@ expect() {
   run "$1" "$2" "$repo"
 }
 
-# expect_error <name> <message> <trivyignore content>: exit 1, and the
-# report names the expected violation (not only some other one).
+# expect_error <name> <message> <trivyignore content> [doc content]: exit
+# 1, and the report names the expected violation (not only some other one).
 expect_error() {
-  fixture "$3"
+  fixture "$3" ${4+"$4"}
   run "$1" 1 "$repo" "$2"
 }
 
@@ -90,7 +91,9 @@ run "the repository's own exception file" 0 "$real"
 expect "no exceptions" 0 "${HEADER}vulnerabilities: []${NL}"
 expect "no exceptions, CRLF line endings" 0 "# c"$'\r'"${NL}vulnerabilities: []"$'\r'"${NL}"
 expect "one documented entry" 0 "${HEADER}vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}"
-expect "a GHSA entry with purls and no paths" 0 "vulnerabilities:${NL}$(entry GHSA-xjj6-f33q-929c 2026-11-30 '' "$STATEMENT" '    purls: ["pkg:npm/undici@6.29.0"]')${NL}"
+expect "a GHSA entry with purls" 0 "vulnerabilities:${NL}$(entry GHSA-xjj6-f33q-929c 2026-11-30 '    paths: ["usr/local/lib/node_modules/npm/node_modules/undici/package.json"]' "$STATEMENT" '    purls: ["pkg:npm/undici@6.29.0"]')${NL}"
+# Without paths Trivy applies the entry at every path of every gated image.
+expect_error "purls and no paths" "no paths" "vulnerabilities:${NL}$(entry GHSA-xjj6-f33q-929c 2026-11-30 '' "$STATEMENT" '    purls: ["pkg:npm/undici@6.29.0"]')${NL}"
 expect "expiry exactly 90 days ahead" 0 "vulnerabilities:${NL}$(entry CVE-2026-0001 2027-01-22)${NL}"
 # An expired entry used to pass because Trivy no longer applies it; it now
 # fails, so an exception is renewed after a review or removed, not kept.
@@ -111,7 +114,7 @@ expect "entry not listed in the docs" 1 "vulnerabilities:${NL}$(entry CVE-2026-0
 expect "a key repeated in an entry (a parser taking the first would apply 2099)" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2099-01-01)${NL}    expired_at: 2026-12-01${NL}"
 expect "paths repeated in an entry" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}    paths: [\"other\"]${NL}"
 expect "a blank path" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: [" "]')${NL}"
-expect "the same key in two entries" 0 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}$(entry GHSA-xjj6-f33q-929c 2026-12-02)${NL}"
+expect "the same key in two entries" 0 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}$(entry GHSA-xjj6-f33q-929c 2026-12-02 '    paths: ["usr/local/bin/other"]' "$STATEMENT" '    purls: ["pkg:npm/undici@6.29.0"]')${NL}"
 expect "unknown key in an entry" 1 "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01)${NL}    severity: HIGH${NL}"
 expect "another top-level section" 1 "vulnerabilities: []${NL}misconfigurations:${NL}  - id: AVD-DS-0001${NL}"
 expect "section without entries" 1 "vulnerabilities:${NL}"
@@ -159,7 +162,7 @@ go_jose() { # [purls-line] [expired_at]
 expect "one package at an exact version, with paths" 0 "vulnerabilities:${NL}$(go_jose)${NL}"
 expect "one package at two exact versions" 0 "vulnerabilities:${NL}$(go_jose "$(purls "$J3@v3.0.4" "$J3@v3.0.5")")${NL}"
 expect "a Go pseudo-version and an Alpine package version" 0 \
-  "vulnerabilities:${NL}$(go_jose "$(purls "$J3@v0.0.0-20260101000000-0123456789ab")")${NL}$(entry GHSA-xjj6-f33q-929c 2026-11-30 '' "$STATEMENT" "$(purls 'pkg:apk/alpine/curl@8.22.0-r0')")${NL}"
+  "vulnerabilities:${NL}$(go_jose "$(purls "$J3@v0.0.0-20260101000000-0123456789ab")")${NL}$(entry GHSA-xjj6-f33q-929c 2026-11-30 '    paths: ["usr/lib/libcurl.so.4"]' "$STATEMENT" "$(purls 'pkg:apk/alpine/curl@8.22.0-r0')")${NL}"
 expect_error "paths only, no purls (would also hide the v4 finding)" "no purls" "vulnerabilities:${NL}$(go_jose '')${NL}"
 expect_error "an empty purls list" "purls must be a list" "vulnerabilities:${NL}$(go_jose '    purls: []')${NL}"
 expect_error "a purl without a version (matches every version)" "purl is not" "vulnerabilities:${NL}$(go_jose "$(purls "$J3")")${NL}"
@@ -182,6 +185,32 @@ expect_error "a valid purl next to one without a version" "purl is not" "vulnera
 expect "expiry the day after the check" 0 "vulnerabilities:${NL}$(go_jose "$(purls "$J3@v3.0.5")" 2026-10-25)${NL}"
 expect_error "expiry on the day of the check" "expired_at is not after 2026-10-24" "vulnerabilities:${NL}$(go_jose "$(purls "$J3@v3.0.5")" 2026-10-24)${NL}"
 expect_error "an expired entry next to a valid one" "expired_at is not after" "vulnerabilities:${NL}$(go_jose)${NL}$(entry GHSA-xjj6-f33q-929c 2026-10-23)${NL}"
+# One entry per package and per vulnerability (audit LOW-2): Trivy matches
+# only the id it reports, so the alias of an excepted CVE must not carry a
+# second entry, and no package may be excepted twice under different ids.
+ALIAS_DOC="# Container vulnerabilities${NL}${NL}CVE-2026-116587 / GHSA-mgcc-cww5-fp2q in prose.${NL}${NL}## Exceptions${NL}${NL}${TABLE}| CVE-2026-116587 (GHSA-mgcc-cww5-fp2q) | go-jose v3 |${NL}| CVE-2026-0001 | example |${NL}| CVE-2026-0003 (GHSA-xjj6-f33q-929c, GHSA-2222-3333-4444) | two aliases |${NL}${NL}## Other${NL}${NL}| CVE-2026-0002 | outside the table |${NL}"
+jose() { # id purl [expired_at]
+  entry "$1" "${3-2026-11-30}" '    paths: ["usr/bin/caddy"]' "$STATEMENT" "$(purls "$2")"
+}
+expect "the real go-jose entry with the real table form" 0 "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
+expect_error "the GHSA alias of an excepted CVE with the v4 purl" "id is listed as an alias of CVE-2026-116587" \
+  "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose GHSA-mgcc-cww5-fp2q "$J4@v4.1.5")${NL}" "$ALIAS_DOC"
+expect_error "the GHSA alias alone (Trivy reports the CVE)" "id is listed as an alias of CVE-2026-116587" \
+  "vulnerabilities:${NL}$(jose GHSA-mgcc-cww5-fp2q "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
+expect_error "the second of two aliases" "id is listed as an alias of CVE-2026-0003" \
+  "vulnerabilities:${NL}$(jose GHSA-2222-3333-4444 "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
+expect_error "an id mentioned only in prose, not in the table" "not listed in the Exceptions table" \
+  "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}" "# Container vulnerabilities${NL}${NL}No exception for CVE-2026-116587.${NL}"
+expect_error "an id in a table of another section" "not listed in the Exceptions table" \
+  "vulnerabilities:${NL}$(jose CVE-2026-0002 "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
+expect_error "the same package under two ids" "package already excepted by the entry at line 2" \
+  "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose CVE-2026-0001 "$J3@v3.0.4")${NL}" "$ALIAS_DOC"
+expect_error "the same package and version under two ids" "package already excepted" \
+  "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose CVE-2026-0001 "$J3@v3.0.5")${NL}" "$ALIAS_DOC"
+expect "two ids for two different packages" 0 \
+  "vulnerabilities:${NL}$(jose CVE-2026-116587 "$J3@v3.0.5")${NL}$(jose CVE-2026-0001 "$J4@v4.1.5")${NL}" "$ALIAS_DOC"
+expect_error "an empty paths list" "paths must be a list" "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: []')${NL}"
+expect_error "a blank path only" "paths must be a list" "vulnerabilities:${NL}$(entry CVE-2026-0001 2026-12-01 '    paths: ["  "]')${NL}"
 mkdir -p "$work/nofile" && git init -q "$work/nofile" || exit 2
 run "missing exception file" 2 "$work/nofile"
 mkdir -p "$work/nogit"

@@ -2,14 +2,16 @@
 #
 # The gate fails on every HIGH or CRITICAL finding in a runtime image. An
 # entry here is allowed only for one specific CVE that cannot be fixed yet,
-# with the evidence for the risk decision in `statement`, the affected
-# package as `purls` with exact versions (one package per entry; Trivy then
-# applies the entry only to those versions), the affected path, and an
+# under the id Trivy reports (the CVE, not an alias), with the evidence for
+# the risk decision in `statement`, the affected package as `purls` with
+# exact versions (one package per entry and one entry per package; Trivy
+# then applies the entry only to those versions), the affected `paths`, and an
 # `expired_at` date after today and no more than 90 days ahead, so the
 # decision is reviewed again. From its expired_at day on, Trivy no longer
 # applies the entry and scripts/ci/guard-trivyignore.sh fails until it is
-# renewed after a new review or removed. Each entry is also listed in
-# docs/security/container-vulnerabilities.md. No broad or permanent rules.
+# renewed after a new review or removed. Each entry is also listed in the
+# Exceptions table of docs/security/container-vulnerabilities.md. No broad
+# or permanent rules.
 # An exception does not fix the vulnerable code; it only stops the gate
 # from failing on that finding.
 #

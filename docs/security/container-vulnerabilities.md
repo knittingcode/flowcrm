@@ -30,18 +30,25 @@ downloaded on every run.
   code: it only stops the gate from failing on that one finding.
   `scripts/ci/guard-trivyignore.sh` (job `Repository guard`) enforces these
   rules on the file: one CVE or GHSA id per entry, no duplicate id and no
-  key twice in one entry; `purls` with at least one value, each of the form
+  key twice in one entry; the id is the one Trivy reports (the CVE when one
+  exists: Trivy matches only that id, not its aliases), so an id listed as an
+  alias in the first column of the [Exceptions](#exceptions) table, as in
+  `CVE-2026-116587 (GHSA-mgcc-cww5-fp2q)`, is rejected; `purls` with at least one value, each of the form
   `pkg:<type>/<namespace>/<name>@<version>` with a lowercase type and an
   exact version (no purl without a version, which Trivy would apply to every
   version; no range, list or blank; no qualifiers, subpath or
   percent-encoding), and all purls of an entry naming the same package
   (type, namespace and name), so one entry cannot also cover another package
-  such as a second major version of a Go module; `paths` optional, but if
-  given with at least one value; non-blank values without wildcards in both
+  such as a second major version of a Go module; no two entries naming the
+  same package (purl without its version), whatever their ids, so one
+  package is never excepted under a second id or alias; `paths` with at
+  least one value (without `paths` Trivy would apply the entry at any path
+  in every gated image); non-blank values without wildcards in both
   lists (Trivy matches `paths` as glob patterns, so `*`, `?`, `[`, `]`, `{`
   and `}` are all rejected); a non-empty `statement`; a valid `expired_at`
-  after the day of the check and no more than 90 days after it; the id
-  mentioned in this document; and only the documented form (any other
+  after the day of the check and no more than 90 days after it; the id at
+  the start of a row of the [Exceptions](#exceptions) table (a mention
+  elsewhere in this document does not count); and only the documented form (any other
   section or key fails). Trivy stops applying an entry at 00:00 UTC of its
   `expired_at` day, and from that day on the guard fails too, so an expired
   exception breaks the `Repository guard` job until it is renewed after a
