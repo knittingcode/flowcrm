@@ -431,8 +431,9 @@ bare file name, so the backup directory can be moved or copied as a whole.
 `shasum -c` resolves that name in the current directory, so every check
 below runs it in `$backups` (in a subshell, from any directory):
 `(cd "$backups" && shasum -a 256 -c "<file>.sha256")` prints `<file>: OK`
-and exits 0, or names the file as `FAILED` and exits 1. `sha256sum` and
-`sha256sum -c` work the same way.
+and exits 0, or names the file as `FAILED` and exits 1. Where `shasum` is
+missing, `sha256sum` and `sha256sum -c` replace `shasum -a 256` and
+`shasum -a 256 -c`; they write and read the same file format.
 
 ### 2b. Or take a volume archive
 
