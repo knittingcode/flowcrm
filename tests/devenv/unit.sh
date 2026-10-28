@@ -1543,6 +1543,27 @@ for f in backend.sh prodlike.sh stack.sh; do
   result "U-26 $f removes the untagged images of its own Compose project" $?
 done
 
+# Every runner passes remove_images only its run's own prefix, and each
+# prefix variable is assigned once, from a hash of the run's temporary
+# directory: a wider prefix (flowcrm-scan-, flowcrm-e2e:, postgres) would
+# remove the names of other runs or of shared base images.
+u26_calls=$(cd "$here/../app" && grep -oE 'remove_images [^;]*' -- *.sh | grep -v '^lib\.sh:' | sort | paste -sd ';' -)
+expect_eq "U-26 the runners call remove_images only with their run's prefix" \
+  'backend.sh:remove_images "$project-";frontend.sh:remove_images "$image";prodlike.sh:remove_images "$e2e_image";prodlike.sh:remove_images "$project-";scan.sh:remove_images "$tag:";stack.sh:remove_images "$(project_of "$d")-";stack.sh:remove_images "$e2e_image"' \
+  "$u26_calls"
+for u26_def in \
+  'backend.sh project=$(project_of "$APP_REPO")-test-$(sha6 "$work")' \
+  'prodlike.sh project=$(project_of "$APP_REPO")-prod-$(sha6 "$work")' \
+  'prodlike.sh e2e_image=flowcrm-e2e:$(sha6 "$work")' \
+  'stack.sh e2e_image=flowcrm-e2e:$(sha6 "$work")' \
+  'frontend.sh image=flowcrm-web-check:$(sha6 "$work")' \
+  'scan.sh tag=flowcrm-scan-$(sha6 "$work")'; do
+  f=${u26_def%% *} def=${u26_def#* }
+  hits=$(grep -nE "^[[:space:]]*(local[[:space:]]+)?${def%%=*}=" "$here/../app/$f")
+  [ "$(printf '%s\n' "$hits" | cut -d: -f2-)" = "$def" ]
+  result "U-26 $f assigns ${def%%=*} once, unique to the run" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
+done
+
 # Guards against other image removals in tests/app/*.sh and tests/devenv/*.sh
 # (the grep pattern lines of these guards and of U-09 excluded): the Docker
 # image removal commands (image rm, image remove, rmi) only in

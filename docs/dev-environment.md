@@ -597,7 +597,12 @@ not touched.
 `tests/devenv/unit.sh` (U-26) checks both helpers with a fake Docker that
 removes every name of an image removed by ID or with force, and checks that
 `backend.sh`, `prodlike.sh` and `stack.sh` call `remove_untagged_images` with
-their own project. It also checks every `tests/app/*.sh` and
+their own project. It checks that each runner calls `remove_images` only
+with its run's prefix (`$project-`, `$(project_of "$d")-` for the temporary
+checkouts of `stack.sh`, `$e2e_image`, `$image`, `$tag:`), and that each of
+these variables is assigned once, from a hash of the run's temporary
+directory (`flowcrm-scan-<run>`, `flowcrm-web-check:<run>`,
+`flowcrm-e2e:<run>`, `<project>-test-<run>`, `<project>-prod-<run>`). It also checks every `tests/app/*.sh` and
 `tests/devenv/*.sh` file (excluding its own grep pattern lines and those of
 U-09) and fails if:
 
