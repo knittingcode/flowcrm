@@ -1548,13 +1548,15 @@ done
 # image removal commands (image rm, image remove, rmi) only in
 # tests/app/lib.sh and never with a force option anywhere in the command; no
 # Compose down that removes images (its rmi option); no prune command of any
-# kind (image, system, builder, ...). A line ending in a backslash (an odd
-# number of them) is joined with the next one first, so a command continued
-# over several lines is checked as one line, numbered by its first line.
-u26_pat_rm='docker[[:space:]]+([^|;&]*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))([[:space:]]|$)'
-u26_pat_force='docker[[:space:]]+([^|;&]*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))[[:space:]]([^|;&]*[[:space:]])?(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)'
+# kind (image, system, builder, ...). A command ends at "|", ";" or a "&"
+# that is not part of a redirection (">&", "<&", "&>"). A line ending in a
+# backslash (an odd number of them) is joined with the next one first, so a
+# command continued over several lines is checked as one line, numbered by
+# its first line.
+u26_pat_rm='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))([[:space:]]|$)'
+u26_pat_force='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))[[:space:]](([^|;&]|[<>]&|&>)*[[:space:]])?(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)'
 u26_pat_rmi='--rmi([[:space:]=]|$)'
-u26_pat_prune='docker[[:space:]]+([^|;&]*[[:space:]])?prune([[:space:]]|$)'
+u26_pat_prune='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?prune([[:space:]]|$)'
 u26_lines() { # files...: every line as "file:line:text", continuation lines joined
   awk '
     function flush() { if (pending) print file ":" start ":" buf; pending = 0 }
@@ -1585,7 +1587,9 @@ u26_guard "no prune command of any kind" "$u26_pat_prune"
 # Self-check of the guards on a fixture: removals continued over several
 # lines are found, numbered by their first line; a continued command that is
 # no removal, and a line ending in an escaped backslash, are not joined into
-# a hit. (The command name is in a variable so that this file has no match.)
+# a hit; a force option after a redirection (2>&1, &>) belongs to the
+# removal, one after && does not. (The command name is in a variable so that
+# this file has no match.)
 u26_dk=docker
 cat >"$work/u26-fixture.sh" <<EOF
 $u26_dk \\
@@ -1599,12 +1603,15 @@ a\\\\
 $u26_dk rmi z
 $u26_dk image \\
   prune -f
+$u26_dk image rm y 2>&1 -f
+$u26_dk image rm y &>/dev/null --force
+$u26_dk image rm y && rm -f z
 EOF
 u26_hits() { # pattern: first line numbers of the fixture's matching lines
   u26_lines "$work/u26-fixture.sh" | grep -E -- "$1" | cut -d: -f2 | paste -sd ' ' -
 }
-expect_eq "U-26 guard self-check: a forced removal continued over lines is found" "1 3" "$(u26_hits "$u26_pat_force")"
-expect_eq "U-26 guard self-check: a removal continued over lines is found" "1 3 9" "$(u26_hits "$u26_pat_rm")"
+expect_eq "U-26 guard self-check: a forced removal over lines or after a redirection is found" "1 3 12 13" "$(u26_hits "$u26_pat_force")"
+expect_eq "U-26 guard self-check: a removal continued over lines is found" "1 3 9 12 13 14" "$(u26_hits "$u26_pat_rm")"
 expect_eq "U-26 guard self-check: a prune continued over lines is found" "10" "$(u26_hits "$u26_pat_prune")"
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)

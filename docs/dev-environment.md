@@ -599,14 +599,16 @@ U-09) and fails if:
 - `docker image rm`, `docker image remove` or `docker rmi` appears outside
   `tests/app/lib.sh`;
 - one of these commands has `-f`, a short option group containing `f`, or
-  `--force` anywhere in the same command (up to `|`, `;` or `&`);
+  `--force` anywhere in the same command (up to `|`, `;` or a `&` that is
+  not part of a redirection such as `2>&1` or `&>`);
 - `--rmi` appears (Compose `down --rmi`);
 - any `docker ... prune` appears (`image`, `system`, `builder`, `buildx`
   or any other prune).
 
 A line that ends in a backslash continues on the next line: the check joins
 such lines first, so a command split over several lines is checked as one
-line. A fixture checks that removals and prunes split this way are found.
+line. A fixture checks that removals and prunes split this way, and a force
+option after a redirection, are found.
 These are text checks: a removal written so that it does not match them
 (for example through a variable holding the command) is not detected.
 
