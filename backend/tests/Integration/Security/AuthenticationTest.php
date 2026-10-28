@@ -8,6 +8,7 @@ use App\Tests\Support\Http\ApiClient;
 use App\Tests\Support\Http\FpmApiTestCase;
 use App\Tests\Support\Security\Fixtures;
 use App\Tests\Support\Session\FpmServer;
+use App\Tests\Support\Session\SessionRows;
 use Symfony\Component\Uid\Uuid;
 
 /**
@@ -86,7 +87,8 @@ final class AuthenticationTest extends FpmApiTestCase
         $user = $this->fixtures->user('alan');
         $disabled = $this->fixtures->user('disabled');
         $this->fixtures->connection()->executeStatement('UPDATE users SET disabled_at = now() WHERE id = ?', [$disabled->id->toRfc4122()]);
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
 
         $answers = [];
         foreach ([
@@ -104,7 +106,7 @@ final class AuthenticationTest extends FpmApiTestCase
         }
 
         self::assertCount(1, array_unique(array_map(static fn (array $a): string => serialize($a), $answers)), 'one answer for every failure');
-        self::assertSame($sessions, $this->sessionCount(), 'a failed login stores no session');
+        self::assertSame($sessions, $rows->count(), 'a failed login stores no session');
     }
 
     public function testTheEmailAddressIsCaseInsensitive(): void
@@ -118,7 +120,8 @@ final class AuthenticationTest extends FpmApiTestCase
 
     public function testAnonymousSessionIntrospectionStartsNoSession(): void
     {
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
         $client = $this->client();
 
         $response = $client->get('/api/v1/auth/session');
@@ -126,14 +129,14 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertSame(200, $response->status());
         self::assertSame(['authenticated' => false], $response->json());
         self::assertSame([], $response->raw->header('Set-Cookie'));
-        self::assertSame($sessions, $this->sessionCount());
+        self::assertSame($sessions, $rows->count());
 
         $me = $client->get('/api/v1/me');
         self::assertSame(401, $me->status());
         self::assertSame('/problems/unauthenticated', $me->problem());
         self::assertSame(['type', 'title', 'status', 'instance', 'requestId'], array_keys($me->json()), 'no data in a 401');
         self::assertSame([], $me->raw->header('Set-Cookie'), 'a 401 starts no session');
-        self::assertSame($sessions, $this->sessionCount(), 'a 401 stores no session');
+        self::assertSame($sessions, $rows->count(), 'a 401 stores no session');
     }
 
     /**
@@ -143,7 +146,8 @@ final class AuthenticationTest extends FpmApiTestCase
      */
     public function testAnUnknownSessionIdIsAnsweredWithoutStoringASession(): void
     {
-        $sessions = $this->sessionCount();
+        $rows = SessionRows::snapshot($this->fixtures->connection());
+        $sessions = $rows->count();
         $client = $this->client();
         $client->useSessionId(bin2hex(random_bytes(16)));
 
@@ -151,7 +155,7 @@ final class AuthenticationTest extends FpmApiTestCase
 
         self::assertSame(401, $me->status());
         self::assertNull($client->sessionId(), 'the cookie is expired');
-        self::assertSame($sessions, $this->sessionCount());
+        self::assertSame($sessions, $rows->count());
     }
 
     /** FCRM-002 AC-27: a replayed cookie after logout is a 401. */
@@ -234,15 +238,75 @@ final class AuthenticationTest extends FpmApiTestCase
         $client = $this->client();
         $client->login($user->email, $user->password);
         $id = (string) $client->sessionId();
+        $connection = $this->fixtures->connection();
+        $row = $connection->fetchAssociative("SELECT encode(sess_data, 'hex') AS data, sess_lifetime, sess_time FROM sessions WHERE sess_id = ?", [$id]);
+        self::assertIsArray($row);
 
         self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        self::assertNull($this->sessionData($id), 'the session row is deleted with the disable');
 
+        // A session stored after the disable (a login that was already past
+        // its checks) still ends on its next request.
+        $connection->executeStatement("INSERT INTO sessions (sess_id, sess_data, sess_lifetime, sess_time) VALUES (?, decode(?, 'hex'), ?, ?)", [$id, $row['data'], $row['sess_lifetime'], $row['sess_time']]);
         self::assertSame(401, $client->get('/api/v1/me')->status());
         self::assertNull($this->sessionData($id), 'the session is invalidated');
         self::assertSame(401, $this->client()->post('/api/v1/auth/login', ['email' => $user->email, 'password' => $user->password])->status());
 
         self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
         $this->client()->login($user->email, $user->password);
+    }
+
+    /**
+     * Disabling ends every session at once (ADR-019): enabling the user
+     * again, with no request in between, does not bring a session back.
+     * Sessions of other users stay.
+     */
+    public function testReEnablingAUserDoesNotRestoreTheirSessions(): void
+    {
+        $user = $this->fixtures->user('reenabled');
+        $bystander = $this->fixtures->user('bystander');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $second = $this->client();
+        $second->login($user->email, $user->password);
+        $unrelated = $this->client();
+        $unrelated->login($bystander->email, $bystander->password);
+
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        self::assertNull($this->sessionData($client->sessionId()), 'the session row is deleted with the disable');
+        self::assertNull($this->sessionData($second->sessionId()), 'the session row is deleted with the disable');
+        self::assertNotNull($this->sessionData($unrelated->sessionId()), 'another user\'s session row stays');
+        self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
+
+        self::assertSame(401, $client->get('/api/v1/me')->status(), 'a session from before the disable stays ended');
+        self::assertSame(401, $second->get('/api/v1/me')->status(), 'every session of the user ends');
+        self::assertSame(200, $unrelated->get('/api/v1/me')->status(), 'sessions of other users stay');
+        self::assertSame(200, $this->client()->login($user->email, $user->password)->status(), 'the enabled user can log in again');
+    }
+
+    /**
+     * A login that was in flight during the disable can store its session
+     * after the disable deleted the rows. Enabling the user ends every
+     * session too (none can be valid: a disabled user cannot log in), so such
+     * a session is not revived by the enable.
+     */
+    public function testEnablingAUserEndsASessionStoredAfterTheDisable(): void
+    {
+        $user = $this->fixtures->user('late');
+        $client = $this->client();
+        $client->login($user->email, $user->password);
+        $id = (string) $client->sessionId();
+        $connection = $this->fixtures->connection();
+        $row = $connection->fetchAssociative("SELECT encode(sess_data, 'hex') AS data, sess_lifetime, sess_time FROM sessions WHERE sess_id = ?", [$id]);
+        self::assertIsArray($row);
+
+        self::assertSame(0, $this->console('flowcrm:user:disable', ['email' => $user->email])->getStatusCode());
+        $connection->executeStatement("INSERT INTO sessions (sess_id, sess_data, sess_lifetime, sess_time) VALUES (?, decode(?, 'hex'), ?, ?)", [$id, $row['data'], $row['sess_lifetime'], $row['sess_time']]);
+        self::assertSame(0, $this->console('flowcrm:user:enable', ['email' => $user->email])->getStatusCode());
+
+        self::assertSame(401, $client->get('/api/v1/me')->status(), 'the late session is not revived');
+        self::assertNull($this->sessionData($id), 'no row of the late session is left');
+        self::assertSame(200, $this->client()->login($user->email, $user->password)->status(), 'the enabled user logs in again');
     }
 
     /** A password reset ends the sessions but leaves the user's memberships and their roles as they were. */
@@ -374,10 +438,5 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertSame(403, $client->post('/api/v1/auth/logout')->status(), 'the token from before the login is no longer valid');
         $client->useCsrfToken($second);
         self::assertSame(204, $client->post('/api/v1/auth/logout')->status());
-    }
-
-    private function sessionCount(): int
-    {
-        return self::int($this->fixtures->connection()->fetchOne('SELECT count(*) FROM sessions'));
     }
 }

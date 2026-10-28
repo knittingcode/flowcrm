@@ -179,6 +179,49 @@ describe('App', () => {
     expect(calls.find((c) => c.path === '/api/v1/auth/logout')?.headers['X-CSRF-Token']).toBe('token-1');
   });
 
+  describe('a sign-out that does not complete keeps the user signed in and says so', () => {
+    const failures: [string, () => Response][] = [
+      ['the connection fails', () => {
+        throw new TypeError('Failed to fetch');
+      }],
+      ['the API answers 500', () => problem(500, 'internal-error')],
+      ['the edge answers 502', () => new Response(null, { status: 502 })],
+      ['the CSRF token is refused again after reading the session', () => problem(403, 'csrf-invalid')],
+    ];
+    it.each(failures)('when %s', async (_, answer) => {
+      fakeApi({
+        'GET /api/v1/auth/session': json(200, session()),
+        'GET /api/v1/organizations/org-a': organization(['organization.view', 'membership.list']),
+        'GET /api/v1/organizations/org-a/members?page=1': members,
+        'POST /api/v1/auth/logout': answer,
+      });
+      renderAt('/o/org-a');
+
+      await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent('Signing out did not complete. You may still be signed in, so try again.');
+      expect(screen.getByRole('button', { name: 'Sign out' })).toBeEnabled();
+      expect(screen.getByRole('heading', { name: 'Alpha' })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: 'Sign in' })).not.toBeInTheDocument();
+    });
+  });
+
+  it('treats a 401 to the sign-out as a session that has already ended', async () => {
+    fakeApi({
+      'GET /api/v1/auth/session': json(200, session()),
+      'GET /api/v1/organizations/org-a': organization(['organization.view', 'membership.list']),
+      'GET /api/v1/organizations/org-a/members?page=1': members,
+      'POST /api/v1/auth/logout': problem(401, 'unauthenticated'),
+      'GET /api/v1/system/status': status,
+    });
+    renderAt('/o/org-a');
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }));
+
+    expect(await screen.findByRole('heading', { name: 'Sign in' })).toBeInTheDocument();
+    expect(screen.queryByText('Signing out did not complete', { exact: false })).not.toBeInTheDocument();
+  });
+
   it('shows a forbidden answer without data', async () => {
     fakeApi({
       'GET /api/v1/auth/session': json(200, session()),
