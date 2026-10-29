@@ -214,9 +214,9 @@ images include the fix. No exception was added.
 
 Three HIGH advisories for undici, published in the NVD on 2026-10-15
 (before the npm 11.21.1 remediation of 2026-10-21) but added to the GitHub
-Advisory Database only after it (dates in the table),
-and found by the scans of `main`, not by a change of the project. All three are fixed in undici 6.29.1, 7.30.1 and 8.12.2, and the
-scan of `main` at 1badf76 (run 40745073009, 2026-10-28) reports each of
+Advisory Database only after it (dates in the table), and found by the
+scans of `main`, not by a change of the project. All three are fixed in
+undici 6.29.1, 7.30.1 and 8.12.2, and the scan of `main` at 1badf76 (run 40745073009, 2026-10-28) reports each of
 them once for web `dev`, as
 `HIGH <id> undici 6.29.0 fixed=6.29.1, 7.30.1, 8.12.2 in=Node.js`:
 
