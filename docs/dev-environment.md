@@ -428,14 +428,23 @@ command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
 - macOS: `sandbox-exec` denies:
   - every connect to a Unix socket;
   - TCP beyond loopback, and to loopback ports 22, 2375 and 2376;
-  - writes under `$HOME`, where Docker Desktop keeps its disk image;
-  - `open`, `osascript`, `launchctl` and `ssh`, and access to Launch
-    Services and Apple Events, so that no program is started outside the
-    sandbox.
+  - TCP to every loopback port that was already listening when the suite
+    started, such as a local agent, an IDE, a published container port or
+    a socket proxy;
+  - writes anywhere except under `$TMPDIR`, `/tmp` (bash 3.2 writes its
+    here-documents there) and `/dev`. This covers `$HOME`, where Docker
+    Desktop keeps its disk image, and places whose programs run outside the
+    sandbox later, such as Homebrew's prefix and `/Applications`. If
+    `$TMPDIR` is under `$HOME`, the suite is refused (exit 125);
+  - `open`, `osascript`, `launchctl` and `ssh`, job submission to launchd,
+    and access to Launch Services and Apple Events, so that no program is
+    started outside the sandbox. A re-signed copy of one of these programs
+    can run, but launchd, Launch Services and Apple Events still refuse it,
+    and the network routes of `ssh` are denied above.
 
-  The profile filters these routes; it is not a complete jail. Other
-  loopback ports stay open for the tests, and the probe asks each listening
-  port whether it is an engine.
+  The profile filters these routes; it is not a complete jail. Loopback
+  ports that the suite opens itself stay reachable, and the probe asks each
+  listening port whether it is an engine.
 - Linux: `sudo unshare` gives a network namespace with only loopback and an
   empty tmpfs over `/run`; the suite then runs as the calling user without
   supplementary groups (no `docker` group) and with `no_new_privs`. This
@@ -453,7 +462,10 @@ command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
   and is not counted, in CI as well as locally; the U-16 mode checks still
   run.
 - On Linux the probe finds an engine socket owned by the calling user only
-  in the places listed above.
+  in the places listed above. Writes are not restricted on Linux, so a
+  mutant could change files that run later outside the isolation. CI
+  runners are discarded after each job; on a developer machine, run
+  mutants only with read-only payloads (see below).
 
 - macOS applies a sandbox inside another only if the profiles are
   identical, so the suites cannot run inside a different sandbox: they are
@@ -475,6 +487,10 @@ into the file.
 - The control runs the same mutant under a copy of `unit.sh` without the
   re-execution, behind an outer guard that leaves only the canary
   reachable. The mutant must reach the canary.
+- Without a mutant, plain commands inside `no-docker.sh` must not reach a
+  loopback port that was listening before it started, while a port they
+  open themselves stays reachable. On macOS they must also be unable to
+  write under `$HOME` or next to `$TMPDIR`.
 
 Mutation testing:
 
