@@ -518,7 +518,8 @@ run, so several runs from one checkout do not interfere.
   otherwise it is stopped, the gate is recorded again and the command
   fails), a security gate that cannot be recorded (reported on stderr,
   never a success), the Makefile interface
-  (targets and the commands they run) and checks that the result tally
+  (targets and the commands they run), the test runners' image removal
+  (by name only, see "Removing test images") and checks that the result tally
   detects failed and lost results.
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
   Makefile targets against real Docker in temporary checkout copies. It uses
@@ -542,6 +543,113 @@ run, so several runs from one checkout do not interfere.
 
 Both suites run locally on macOS (Docker Desktop, bash 3.2) and in GitHub
 Actions on Ubuntu (Docker Engine, bash 5) in the `Dev environment` job.
+
+### Removing test images
+
+The suites remove their images with `remove_images` in `tests/app/lib.sh`:
+by name, never by image ID and never with `--force`. An image ID can carry
+several names (`scan.sh` re-tags the pinned PostgreSQL base image as its
+control image, and `docker tag` can give any name to an existing ID), and
+`docker image rm -f <ID>` deletes every one of them. Removing a name
+deletes the image only when it was the last name. `remove_images PREFIX`:
+
+- removes only the names that start with the run's prefix (`<project>-` of
+  the run's Compose project, or the run's `repository:tag`);
+- when the image also has another name, removes only the run's name and
+  reports the other names;
+- keeps, and reports, an image used by any container;
+- refuses an empty prefix, characters outside image names and any prefix
+  that could match this checkout's development stack (`<project>-<service>`)
+  other than a run project (`<project>-test-<run>-`, `<project>-prod-<run>-`);
+- prints one line per call with the number of names removed and kept.
+
+A rebuild within a run (`stack.sh` rebuilds a checkout after editing it)
+moves the name to the new image. With Docker's classic image store the
+previous image stays untagged (`<none>`), which a removal by name cannot
+reach. With the containerd image store (Docker Desktop) a rebuild with
+BuildKit or Compose drops the previous image, even while a container still
+uses it; there an untagged image is left only when `docker tag` moves a name
+to another image. The runners with a Compose
+project of their own (`backend.sh`, `prodlike.sh` and, for each temporary
+checkout, `stack.sh`) therefore also call `remove_untagged_images PROJECT`
+after `remove_images`. It:
+
+- selects only images that are untagged and carry the run's project label:
+  `docker image ls -q --no-trunc --filter dangling=true --filter
+  label=com.docker.compose.project=PROJECT`;
+- removes each by ID without `--force`: an untagged image has no name that
+  could belong to someone else, and Docker refuses to remove an image that a
+  container uses or that has child images;
+- skips, and reports, an image that got a name after it was listed or that a
+  container uses, and reports every image Docker refused;
+- refuses an empty project name, one that is not a Compose project name
+  (lowercase letters, digits, `_` and `-`, starting with a letter or digit),
+  and any name the prefix check above refuses as `PROJECT-`, which includes
+  this checkout's development stack;
+- prints one line per call with the number of images removed and kept.
+
+`frontend.sh`, `scan.sh` and the browser test image (`flowcrm-e2e:<run>`)
+build with `docker build` and no Compose project label. Each of their tags
+is built once per run, so they leave no untagged image of their own; any
+untagged image without the label is left alone. BuildKit's build cache is
+not touched.
+
+`tests/devenv/unit.sh` (U-26) checks both helpers with a fake Docker that
+removes every name of an image removed by ID or with force, and checks that
+`backend.sh`, `prodlike.sh` and `stack.sh` call `remove_untagged_images` with
+their own project. It checks that each runner calls `remove_images` only
+with its run's prefix (`$project-`, `$(project_of "$d")-` for the temporary
+checkouts of `stack.sh`, `$e2e_image`, `$image`, `$tag:`), and that each of
+these variables is assigned once, from a hash of the run's temporary
+directory (`flowcrm-scan-<run>`, `flowcrm-web-check:<run>`,
+`flowcrm-e2e:<run>`, `<project>-test-<run>`, `<project>-prod-<run>`). It also checks every `tests/app/*.sh` and
+`tests/devenv/*.sh` file (excluding its own grep pattern lines and those of
+U-09) and fails if:
+
+- `docker image rm`, `docker image remove` or `docker rmi` appears outside
+  `tests/app/lib.sh`;
+- one of these commands has `-f`, a short option group containing `f`, or
+  `--force` anywhere in the same command (up to `|`, `;` or a `&` that is
+  not part of a redirection such as `2>&1` or `&>`);
+- `--rmi` appears (Compose `down --rmi`);
+- any `docker ... prune` appears (`image`, `system`, `builder`, `buildx`
+  or any other prune).
+
+A line that ends in a backslash continues on the next line: the check joins
+such lines first, so a command split over several lines is checked as one
+line. A fixture checks that removals and prunes split this way, and a force
+option after a redirection, are found.
+These are text checks: a removal written so that it does not match them
+(for example through a variable holding the command) is not detected.
+
+To remove leftover test images by hand (for example after a runner was
+killed with `SIGKILL`), list the candidates of one run project, check that
+every name of each image belongs to it and remove them by name:
+
+```console
+$ docker image ls --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep '^flowcrm-<hash>-test-<run>-'
+$ docker image inspect --format '{{.RepoTags}}' flowcrm-<hash>-test-<run>-api:latest
+$ docker image rm flowcrm-<hash>-test-<run>-api:latest
+```
+
+Then remove that project's untagged images by ID, without `-f`:
+
+```console
+$ docker image ls -q --no-trunc --filter dangling=true --filter label=com.docker.compose.project=flowcrm-<hash>-test-<run>
+$ docker image rm <ID>
+```
+
+Do not remove a named image by ID, and do not remove images with `-f`,
+with `docker image prune -a` or `docker system prune -a`, or through bulk
+removal of "unused" images in Docker Desktop: these also delete other projects' images, including the
+development stack's. A running container does not keep its image's name:
+with the containerd image store (Docker Desktop), a `make up` that rebuilds
+an unchanged image gives it a new image ID (BuildKit's attestation index
+changes) while the platform image stays the same, so Compose keeps the
+running container. The container then refers to the previous ID, and the
+name points to an image that no container uses. A bulk removal of unused
+images deletes such names of the development stack; its containers keep
+running, and the next `make up` rebuilds the images.
 
 The interface the future application stack has to provide is described in
 [architecture/development-lifecycle-contract.md](architecture/development-lifecycle-contract.md).
