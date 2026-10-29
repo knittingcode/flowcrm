@@ -126,7 +126,12 @@ fails instead of writing.
 
 Requests that do not use the session are unaffected. An `/api` request that
 uses the session fails with a 500 problem document without details; the
-connection attempt is abandoned after 5 seconds. `backend/openapi.yaml`
+connection attempt is abandoned after 5 seconds. Without a session cookie,
+`GET /api/v1/auth/session` uses no session and still answers 200
+(anonymous), but an anonymous safe-method request without
+`X-Requested-With` to a route that needs a login starts one (the firewall
+records the requested URL before its 401) and therefore answers the 500
+instead of the 401. `backend/openapi.yaml`
 declares this answer on every route that reads the session: as
 `SessionUnavailable` on the read routes, and as `InternalError` (the same
 problem schema) on login, logout and the password change;
@@ -383,6 +388,7 @@ Tests:
 |---|---|
 | `backend/tests/Integration/Session/FpmSessionTest.php` | through a real PHP-FPM and the real database: stateless routes, with and without a session cookie, answer at once while the sessions table is exclusively locked, set no cookie and store nothing; the session ID has 128 bits and never appears in a body; cookie attributes over HTTP and HTTPS; idle expiry stored; data survives a PHP-FPM restart; unknown, malformed and expired IDs are replaced, never adopted; `migrate` deletes the old row; `invalidate` deletes the row and expires the cookie; two concurrent requests of one session do not lose an update; a request waiting for a locked session fails after 5 s with a problem document and its request ID, keeps the session ID (any `Set-Cookie` repeats the same ID and attributes) and other cookies, closes its connection, and the session continues afterwards; a worker past `request_terminate_timeout` is killed and releases the lock; without the database only session routes fail, as problem documents without details; no session ID in PHP-FPM output |
 | `backend/tests/Integration/Security/SessionStoreOutageTest.php` | with a session cookie and the database unavailable, `/auth/session`, `/me` and every organization read answer 500 `internal-error` as the specification declares (checked against `backend/openapi.yaml`); the status route answers 503 |
+| `backend/tests/Integration/Security/SessionStoreOutageWithoutCookieTest.php` | without a session cookie and with the database unavailable, `/auth/session` answers 200 anonymous and sets no cookie, and `/me` answers 500 `internal-error` instead of 401 and sets no cookie (checked against `backend/openapi.yaml`) |
 | `backend/tests/Integration/Session/PdoSessionHandlerTest.php` | the configured handler: transactional lock mode on its own connection; `lock_timeout` 5 s on the session connection only; write, read and destroy, including binary data; unknown and expired IDs invalid; garbage collection deletes only expired rows; a second request waits for the lock; **negative control:** without the lock an update is lost |
 | `backend/tests/Integration/Session/FpmServerTest.php` | the harness: a request without an answer fails at its deadline with diagnostics and its client process is killed; stopping ends the master and every worker; the master leads a process group of its own; the workers of a master killed from outside are still found and stopped |
 | `backend/tests/Integration/Cache/DatabaseCacheTest.php` | `cache.app` is `DoctrineDbalAdapter`; items in `cache_items` with their TTL; hit, expiry, deletion; namespaces of two pools isolated; clearing touches no other table; prune removes only expired items; reserved key characters rejected; an unreachable database gives logged misses |

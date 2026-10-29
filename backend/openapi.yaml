@@ -408,10 +408,18 @@ components:
             $ref: '#/components/schemas/Problem'
     SessionUnavailable:
       description: |
-        The session could not be read: the database is not available, or
-        another request of the same session held it for 5 seconds. A problem
-        document of type internal-error without details; the request changed
-        nothing.
+        The session could not be read or started: the database is not
+        available, or another request of the same session held it for longer
+        than the session lock timeout of 5 seconds. A problem document of
+        type internal-error without details; the request changed nothing.
+
+        A request that sends a session cookie reads its session. Without a
+        cookie, GET /api/v1/auth/session reads none and answers 200
+        (anonymous) also while the database is not available. A safe-method
+        request without X-Requested-With to a route that needs a login still
+        starts a session without a cookie (the firewall records the
+        requested URL before its 401), so it can get this answer instead of
+        the 401 while the database is not available.
       content:
         application/problem+json:
           schema:

@@ -404,3 +404,6 @@ is checked against `backend/openapi.yaml`.
   Docker CPU and memory limits; measure again on the target hardware.
 - An anonymous request to a route that requires a login still opens and
   discards a session in PostgreSQL before its 401 (nothing is stored).
+  While the database is not available, an anonymous safe-method request
+  without `X-Requested-With` to such a route therefore answers 500 instead
+  of 401.
