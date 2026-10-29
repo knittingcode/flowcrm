@@ -10,8 +10,8 @@ denies them inside the macOS sandbox). Otherwise exit 0 only if
         loopback port 2375 and to a non-loopback address are refused by
         the sandbox (EPERM), not merely unanswered; no loopback port that
         was listening before the sandbox started (NO_DOCKER_HELD_PORTS)
-        can be connected to; and no file can be created under $HOME or
-        next to $TMPDIR;
+        can be connected to; and no file can be created under $HOME, next
+        to $TMPDIR or in /tmp;
       Linux: no_new_privs is set, no supplementary group is held, the
         network namespace has only the loopback interface, and /run is a
         tmpfs without any socket;
@@ -116,7 +116,7 @@ def check_mechanism_darwin():
            + (": reached " + " ".join(reached) if reached else ""))
     home = os.path.realpath(os.path.expanduser("~"))
     tmp = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
-    for where, d in (("under $HOME", home), ("outside $TMPDIR", os.path.dirname(tmp))):
+    for where, d in (("under $HOME", home), ("outside $TMPDIR", os.path.dirname(tmp)), ("in /tmp", "/private/tmp")):
         report(not_writable(d), f"macOS sandbox denies writes {where} ({d})")
 
 
@@ -195,7 +195,10 @@ def walk_sockets(roots, limit=20000):
 def listening_ports(strict=False):
     """(host, port) of TCP ports listening on loopback or on all addresses.
 
-    strict: raise instead of returning an incomplete list (macOS)."""
+    strict (macOS): raise instead of returning a list that may be
+    incomplete. The list is accepted, even empty, only if netstat succeeded,
+    printed its column header and every LISTEN row has a parsable local
+    address."""
     ports = set()
     if sys.platform == "darwin":
         try:
@@ -203,16 +206,24 @@ def listening_ports(strict=False):
             if run.returncode != 0:
                 raise OSError(f"netstat exited with {run.returncode}")
             out = run.stdout
+            if strict and not any(line.split()[:4] == ["Proto", "Recv-Q", "Send-Q", "Local"]
+                                  for line in out.splitlines()):
+                raise OSError("netstat printed no column header")
         except (OSError, subprocess.SubprocessError):
             if strict:
                 raise
             out = ""
         for line in out.splitlines():
             f = line.split()
-            if len(f) >= 6 and f[-1] == "LISTEN":
-                host, _, port = f[3].rpartition(".")
-                if host in ("127.0.0.1", "::1", "*") and port.isdigit():
-                    ports.add(("::1" if host == "::1" else "127.0.0.1", int(port)))
+            if not f or f[-1] != "LISTEN":
+                continue
+            host, _, port = f[3].rpartition(".") if len(f) >= 6 else ("", "", "")
+            if not host or not port.isdigit():
+                if strict:
+                    raise OSError(f"unparsable netstat LISTEN row: {line.strip()}")
+                continue
+            if host in ("127.0.0.1", "::1", "*"):
+                ports.add(("::1" if host == "::1" else "127.0.0.1", int(port)))
     else:
         for name in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:

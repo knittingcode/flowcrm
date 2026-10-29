@@ -17,10 +17,14 @@
 #          (ssh and the Docker API ports) and to every loopback port that
 #          was listening before the command started (local services: an
 #          agent, an IDE, a published container port or a socket proxy);
-#          nothing can be written except under $TMPDIR, /tmp and /dev (not
-#          $HOME, where Docker Desktop keeps its disk image, nor Homebrew's
-#          prefix or /Applications, whose programs run outside the sandbox
-#          later);
+#          the list of those ports must be complete, or the command is
+#          refused; nothing can be written except under $TMPDIR, /dev and
+#          bash 3.2's here-document files in /tmp (not $HOME, where Docker
+#          Desktop keeps its disk image, nor Homebrew's prefix,
+#          /Applications or other tools' files in /tmp, which run or are
+#          read outside the sandbox later), so $TMPDIR must not be /tmp or
+#          under it or under $HOME; no preference can be written through
+#          cfprefsd and no keystroke injected into the terminal (TIOCSTI);
 #          open, osascript, launchctl and ssh cannot run, and jobs cannot be
 #          submitted to launchd, nor Launch Services or Apple Events used
 #          (the known ways to have a program started outside the sandbox).
@@ -99,11 +103,15 @@ case $(uname -s) in
     done
     home=$(cd -P "$HOME" && pwd -P) || refuse "cannot resolve \$HOME"
     tmp=$(cd -P "${TMPDIR:-/tmp}" && pwd -P) || refuse "cannot resolve the temporary directory"
-    # The command may write only under $TMPDIR, /tmp (bash 3.2 writes its
-    # here-documents there whatever $TMPDIR is) and /dev: programs outside
-    # the sandbox run files from $HOME, Homebrew's prefix or /Applications.
+    # The command may write only under $TMPDIR and /dev, and in /tmp only
+    # the here-document files of bash 3.2 (sh-thd*, which it creates there
+    # whatever $TMPDIR is): programs outside the sandbox run files from
+    # $HOME, Homebrew's prefix, /Applications or other tools' directories in
+    # /tmp (agent scratchpads, for example). So $TMPDIR must be a directory
+    # of its own: not /, not under $HOME and not /tmp or under it.
     case $tmp/ in
-      / | "$home"/*) refuse "the temporary directory $tmp is / or under \$HOME" ;;
+      / | "$home"/* | /private/tmp/* | /tmp/*)
+        refuse "the temporary directory $tmp is /, /tmp or under /tmp or \$HOME; set TMPDIR to a private directory (the macOS default under /var/folders)" ;;
     esac
     case $tmp in *[!A-Za-z0-9/._-]*) refuse "unexpected character in the temporary directory $tmp" ;; esac
     # Local services that were listening before the command started (an
@@ -123,8 +131,10 @@ case $(uname -s) in
 (allow network-outbound (remote ip \"localhost:*\"))
 (deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
 (deny file-write*)
-(allow file-write* (subpath \"$tmp\") (subpath \"/private/tmp\") (subpath \"/dev\"))
+(allow file-write* (subpath \"$tmp\") (subpath \"/dev\") (literal \"/private/tmp\") (regex #\"^/private/tmp/sh-thd[^/]*\$\"))
 (deny file-write* (subpath \"$home\"))
+(deny user-preference-write)
+(deny file-ioctl (ioctl-command #x80017472))
 (deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/bin/launchctl\") (literal \"/usr/bin/ssh\"))
 (deny job-creation)
 (deny lsopen)
