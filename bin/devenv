@@ -50,6 +50,8 @@ DB_OP_ID=
 OP_STDIN=
 # Time limit in seconds of the next run_op call (default none).
 OP_TIMEOUT=
+# Exit status of the edge stop in stop_edge_after (empty: nothing stopped).
+EDGE_STOP_RC=
 
 log() { printf 'devenv: %s\n' "$*" >&2; }
 
@@ -946,6 +948,8 @@ gate_failed() { # exit-code message
   elif [ -n "$EDGE_STOP_RC" ]; then
     if gate_blocks; then
       log "WARNING: could not confirm that the edge of $PROJECT stopped after a failed security gate (docker compose stop exited with status $EDGE_STOP_RC); it answers only with the gate's 503 (checked); stop it with make down"
+    elif [ "$listed" = no ] && [ "$EDGE_STOP_RC" = 0 ]; then
+      log "WARNING: the state of the edge of $PROJECT is unknown after a failed security gate: docker compose stop succeeded, but without a listing it cannot be confirmed that the edge stopped, and it was not seen blocking requests; check make status, and if the edge runs, stop the stack: make down"
     else
       log "WARNING: could not confirm that the edge of $PROJECT stopped after a failed security gate (docker compose stop exited with status $EDGE_STOP_RC), and it was not seen blocking requests; stop the stack now: make down"
     fi
