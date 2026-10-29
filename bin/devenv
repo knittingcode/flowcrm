@@ -649,8 +649,10 @@ cancel_db_op() {
   # Unconfirmed: the operation may still be alive (for example while the db
   # container cannot be reached) and commit later. Fail closed until a
   # make up has ended it, or found it finished, and passed every check.
-  local edge=''
-  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  # A failed listing is never taken for "no edge" (see stop_edge_after).
+  local edge='' ids listed=yes
+  ids=$(compose ps --quiet "$EDGE" 2>/dev/null) || listed=no
+  if [ -n "$ids" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
   local recorded=yes
   printf '%s\n' "an interrupted database operation ($id) could not be confirmed as ended; make up ends it (or finds it finished) and checks the roles and privileges before the stack is served again" ${edge:+"$edge"} | write_gate || recorded=no
   if [ "$recorded" = yes ]; then
@@ -658,12 +660,10 @@ cancel_db_op() {
   else
     log "ERROR: could not confirm that the interrupted database operation ended (exit $rc), and the security gate could not be recorded in $GATE_FILE; $(gate_unrecorded_status): stop the stack (make down) and run make up"
   fi
-  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
-    if compose_op stop "$EDGE" >/dev/null 2>&1; then
-      log "stopped the edge: an interrupted database operation may still be running"
-    else
-      log "WARNING: could not stop the edge of $PROJECT; stop the stack with make down"
-    fi
+  if stop_edge_after "$listed" "$ids" "an interrupted database operation may still be running"; then
+    log "stopped the edge: an interrupted database operation may still be running"
+  elif [ -n "$EDGE_STOP_RC" ]; then
+    log "WARNING: could not confirm that the edge of $PROJECT stopped (docker compose stop exited with status $EDGE_STOP_RC); stop the stack with make down"
   fi
   [ "$recorded" = yes ]
 }
@@ -931,25 +931,47 @@ db_roles() { # command...
 # port are kept for the recovery. The reason is recorded for make status
 # and make url; the next make up that passes every gate removes it.
 gate_failed() { # exit-code message
-  local id edge=''
-  id=$(compose ps --quiet "$EDGE" 2>/dev/null | head -n 1)
-  if [ -n "$id" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  local ids listed=yes edge=''
+  # A failed listing is never taken for "no edge" (see stop_edge_after).
+  ids=$(compose ps --quiet "$EDGE" 2>/dev/null) || listed=no
+  if [ -n "$ids" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
   # Fail closed: the original failure is still reported (and its exit code
   # kept), but never without saying that the gate is not recorded.
   local recorded=yes
   { printf '%s\n' "$2" | head -c 300 | tr -d '\n'; printf '\n'; [ -z "$edge" ] || printf 'edge\n'; } | write_gate || recorded=no
   [ "$recorded" = yes ] ||
     log "ERROR: the security gate could not be recorded in $GATE_FILE; $(gate_unrecorded_status): stop the stack (make down) until make up passes"
-  if [ -n "$id" ]; then
-    if compose_op stop "$EDGE" >/dev/null 2>&1; then
-      log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"
-    elif gate_blocks; then
-      log "WARNING: could not stop the edge of $PROJECT after a failed security gate; it answers only with the gate's 503 (checked); stop it with make down"
+  if stop_edge_after "$listed" "$ids" "after a failed security gate"; then
+    log "stopped the edge: the stack failed a security gate and no longer serves requests (the database and its volume are kept)"
+  elif [ -n "$EDGE_STOP_RC" ]; then
+    if gate_blocks; then
+      log "WARNING: could not confirm that the edge of $PROJECT stopped after a failed security gate (docker compose stop exited with status $EDGE_STOP_RC); it answers only with the gate's 503 (checked); stop it with make down"
     else
-      log "WARNING: could not stop the edge of $PROJECT after a failed security gate, and it was not seen blocking requests; stop the stack now: make down"
+      log "WARNING: could not confirm that the edge of $PROJECT stopped after a failed security gate (docker compose stop exited with status $EDGE_STOP_RC), and it was not seen blocking requests; stop the stack now: make down"
     fi
   fi
   die "$1" "$2"
+}
+
+# After the gate was recorded by gate_failed or cancel_db_op: stop the edge
+# listed before (listed=yes, its IDs) and confirm it with edges_stopped.
+# A listing that failed (listed=no) is never taken for "no edge": it is
+# reported, and the edge is stopped anyway, which cannot be confirmed
+# without IDs. The "edge" line is not added for an unknown state; the
+# recorded gate blocks either way. Returns 0 when the stop was confirmed;
+# otherwise EDGE_STOP_RC is the stop's exit status, or empty when no edge
+# was listed (nothing to stop).
+stop_edge_after() { # listed(yes|no) ids why
+  EDGE_STOP_RC=
+  if [ "$1" = no ]; then
+    log "WARNING: could not list the containers of $PROJECT, so it is not known whether its edge serves ($3); stopping it anyway"
+  elif [ -z "$2" ]; then
+    return 1
+  fi
+  compose_op stop "$EDGE" >/dev/null 2>&1
+  EDGE_STOP_RC=$?
+  # shellcheck disable=SC2086 # one container ID per word
+  [ "$1" = yes ] && edges_stopped $2
 }
 
 # Before anything changes roles, passwords, ownership or grants (role
@@ -983,9 +1005,12 @@ protect_for() { # reason
 
 # Whether each container (ID) is stopped or removed. docker container
 # inspect reads the container itself, not the list behind docker compose
-# ps. Any other answer, or any other error, counts as running.
+# ps. Any other answer, or any other error, counts as running, and a call
+# without IDs fails.
 edges_stopped() { # id...
   local id s
+  # No ID confirms nothing.
+  [ "$#" -gt 0 ] || return 1
   for id in "$@"; do
     if s=$(docker container inspect -f '{{.State.Running}}' "$id" 2>&1); then
       [ "$s" = false ] || return 1

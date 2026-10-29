@@ -1221,7 +1221,12 @@ RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 # (seen in CI, ST-50) does not fail the command, a container that still
 # runs or cannot be inspected does, with the stop's exit status and error,
 # and a listing that fails stops the command before anything changes.
-saved_fns=$(declare -f compose compose_op run_op write_gate)
+# gate_failed and cancel_db_op (after the gate is recorded) never take a
+# failed listing for "no edge" either: they report it and stop the edge
+# anyway, and they report a stop as done only once docker inspect confirms
+# it; gate_failed keeps the original failure's exit code and message.
+# edges_stopped without IDs confirms nothing.
+saved_fns=$(declare -f compose compose_op run_op write_gate gate_blocks)
 saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
 compose() {
   [ "$1 $2 $3" = "ps --quiet edge" ] || return 0
@@ -1245,10 +1250,13 @@ docker() {
   case $(cat "$work/u23-running") in
     true | false) cat "$work/u23-running" ;;
     removed) echo 'Error response from daemon: No such container: edge-id' >&2 && return 1 ;;
+    gone) echo 'Error: No such object: edge-id' >&2 && return 1 ;;
     *) echo 'error during connect: the daemon cannot be reached' >&2 && return 1 ;;
   esac
 }
-u23() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|unknown) [stale-list(yes) [ps(fails)]]]
+# The edge answers the gate's 503 only with U23_BLOCKS=yes (no network).
+gate_blocks() { [ "${U23_BLOCKS-}" = yes ]; }
+u23_setup() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|gone|unknown) [stale-list(yes) [ps(fails) [gate-503(yes)]]]]
   RUNTIME_DIR=$work/u23-$1/.runtime GATE_DIR=$work/u23-$1/.runtime/gate
   GATE_FILE=$GATE_DIR/security-gate
   mkdir -p "$RUNTIME_DIR"
@@ -1256,11 +1264,17 @@ u23() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|un
   rm -f "$work/u23-calls"
   echo true >"$work/u23-running"
   echo true >"$work/u23-listed"
-  U23_STOP=$3 U23_AFTER=${4:-false} U23_STALE=${5:-} U23_PS=${6:-}
-  U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
-  U23_RC=$?
+  U23_STOP=$3 U23_AFTER=${4:-false} U23_STALE=${5:-} U23_PS=${6:-} U23_BLOCKS=${7:-}
+}
+u23_collect() {
   U23_CALLS=$(paste -sd ";" - 2>/dev/null <"$work/u23-calls")
   U23_GATE=$(paste -sd ";" - 2>/dev/null <"$GATE_FILE")
+}
+u23() { # as u23_setup; runs protect_for
+  u23_setup "$@"
+  U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
+  U23_RC=$?
+  u23_collect
 }
 u23 ok dir ok
 [ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
@@ -1271,6 +1285,9 @@ u23 stale dir ok false yes
   case $U23_OUT in *"stopped the edge before changing the database"*) true ;; *) false ;; esac
 result "U-23 protect_for goes on when the stopped edge is still listed for a moment (docker inspect: not running)" $? "(exit $U23_RC: $U23_OUT)"
 u23 removed dir ok removed
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ]
+result "U-23 protect_for goes on when the edge container is gone after the stop (No such container)" $? "(exit $U23_RC: $U23_OUT)"
+u23 gone dir ok gone
 [ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ]
 result "U-23 protect_for goes on when the edge container is gone after the stop (No such object)" $? "(exit $U23_RC: $U23_OUT)"
 u23 stuck dir fails
@@ -1293,17 +1310,69 @@ u23 unwritable file ok
 [ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ "$(cat "$work/u23-running")" = true ] &&
   case $U23_OUT in *"could not record the security gate; nothing was changed"*) true ;; *) false ;; esac
 result "U-23 protect_for stops the command, changing nothing, when the gate cannot be recorded" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
-# cancel_db_op on a serving edge, unconfirmed cancellation.
+# edges_stopped without IDs (docker would answer 99 if it were asked).
+! edges_stopped
+result "U-23 edges_stopped without a container ID confirms nothing" $?
+# gate_failed on a serving edge (the original failure: exit 2 and its message).
+u23_gf() { # as u23_setup
+  u23_setup "$@"
+  U23_OUT=$( (gate_failed "$EX_DOCKER" "the u23 check failed") 2>&1)
+  U23_RC=$?
+  u23_collect
+}
+u23_gf_reports() { # the original failure is reported with its exit code
+  [ "$U23_RC" = "$EX_DOCKER" ] && case $U23_OUT in *"devenv: ERROR: the u23 check failed") true ;; *) false ;; esac
+}
+u23_gf gf-ok dir ok
+u23_gf_reports && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "the u23 check failed;edge" ] &&
+  case $U23_OUT in *"stopped the edge: the stack failed a security gate"*) true ;; *) false ;; esac
+result "U-23 gate_failed records the gate (with the edge line), stops the serving edge and reports the original failure" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE]: $U23_OUT)"
+u23_gf gf-unlisted dir ok false '' fails
+u23_gf_reports && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "the u23 check failed" ] &&
+  [ "$(cat "$work/u23-running")" = false ] &&
+  case $U23_OUT in *"WARNING: could not list the containers of"*"not known whether its edge serves"*"stopping it anyway"*) true ;; *) false ;; esac &&
+  case $U23_OUT in *"stopped the edge:"*) false ;; *) true ;; esac
+result "U-23 gate_failed stops the edge although it cannot be listed (never taken for no edge), says so, and keeps the original failure" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE]: $U23_OUT)"
+u23_gf gf-still-running dir returns
+u23_gf_reports && [ "$U23_CALLS" = "stop edge gate=yes" ] &&
+  case $U23_OUT in *"stopped the edge:"*) false ;; *"could not confirm that the edge of"*"stopped after a failed security gate (docker compose stop exited with status 0), and it was not seen blocking requests; stop the stack now: make down"*) true ;; *) false ;; esac
+result "U-23 gate_failed does not claim a stopped edge when the stop succeeded but the edge still runs" $? "(exit $U23_RC: $U23_OUT)"
+u23_gf gf-blocking dir fails false '' '' yes
+u23_gf_reports && case $U23_OUT in *"could not confirm that the edge of"*"(docker compose stop exited with status 1); it answers only with the gate's 503 (checked)"*) true ;; *) false ;; esac
+result "U-23 gate_failed with an edge that cannot be stopped but answers the gate's 503 says so" $? "(exit $U23_RC: $U23_OUT)"
+u23_setup gf-no-edge dir ok
+echo false >"$work/u23-listed"
+U23_OUT=$( (gate_failed "$EX_DOCKER" "the u23 check failed") 2>&1)
+U23_RC=$?
+u23_collect
+u23_gf_reports && [ -z "$U23_CALLS" ] && [ "$U23_GATE" = "the u23 check failed" ] &&
+  case $U23_OUT in *WARNING*) false ;; *) true ;; esac
+result "U-23 control: gate_failed without a listed edge records the gate and stops nothing" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
+# cancel_db_op, unconfirmed cancellation (each case sets up its own state).
+u23_cancel() { # as u23_setup
+  u23_setup "$@"
+  DB_OP_ID=u23-op
+  U23_OUT=$( (cancel_db_op) 2>&1)
+  U23_RC=$?
+  DB_OP_ID=
+  u23_collect
+}
+u23_cancel cancel dir ok
+[ "$U23_RC" = 0 ] && [ "$(sed -n 2p "$GATE_FILE" 2>/dev/null)" = edge ] && [ "$U23_CALLS" = "stop edge gate=yes" ] &&
+  case $U23_OUT in *"stopped the edge: an interrupted database operation may still be running"*) true ;; *) false ;; esac
+result "U-23 cancel_db_op records the edge line and the gate before it stops the serving edge" $? "(exit $U23_RC, gate [$U23_GATE]: $U23_OUT)"
+u23_cancel cancel-unlisted dir ok false '' fails
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$(cat "$work/u23-running")" = false ] &&
+  case $U23_GATE in *"u23-op"*"could not be confirmed as ended"*) true ;; *) false ;; esac &&
+  case $U23_OUT in *"WARNING: could not list the containers of"*"stopping it anyway"*) true ;; *) false ;; esac &&
+  case $U23_OUT in *"stopped the edge:"*) false ;; *) true ;; esac
+result "U-23 cancel_db_op stops the edge although it cannot be listed (never taken for no edge) and says so" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE]: $U23_OUT)"
+u23_cancel cancel-still-running dir returns
+[ "$U23_CALLS" = "stop edge gate=yes" ] &&
+  case $U23_OUT in *"stopped the edge:"*) false ;; *"WARNING: could not confirm that the edge of"*"stopped (docker compose stop exited with status 0); stop the stack with make down"*) true ;; *) false ;; esac
+result "U-23 cancel_db_op does not claim a stopped edge when the stop succeeded but the edge still runs" $? "(exit $U23_RC: $U23_OUT)"
+# gate_clear below uses the gate of the first cancel case.
 RUNTIME_DIR=$work/u23-cancel/.runtime GATE_DIR=$work/u23-cancel/.runtime/gate GATE_FILE=$work/u23-cancel/.runtime/gate/security-gate
-mkdir -p "$GATE_DIR"
-echo true >"$work/u23-running"
-rm -f "$work/u23-calls"
-U23_STOP=ok DB_OP_ID=u23-op
-(cancel_db_op) >/dev/null 2>&1
-r=$?
-DB_OP_ID=
-[ "$r" = 0 ] && [ "$(sed -n 2p "$GATE_FILE" 2>/dev/null)" = edge ] && [ "$(paste -sd ';' - <"$work/u23-calls")" = "stop edge gate=yes" ]
-result "U-23 cancel_db_op records the edge line and the gate before it stops the serving edge" $? "(exit $r, gate [$(paste -sd ';' - <"$GATE_FILE" 2>/dev/null)])"
 # gate_clear with a gate at both places (an older version recorded one at
 # .runtime/security-gate, a newer one in .runtime/gate).
 printf 'new\n' >"$GATE_FILE"
