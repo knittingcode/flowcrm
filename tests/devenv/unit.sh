@@ -803,12 +803,9 @@ chmod 0644 "$SECRETS_DIR/db_password"
 r=$(secrets_rc exists)
 [ "$r" = 0 ] && [ "$(mode_of "$SECRETS_DIR")" = 700 ] && [ "$(mode_of "$SECRETS_DIR/db_password")" = 444 ]
 result "U-16 a too-open secrets directory and secret file are tightened (0700, 0444)" $? "(rc $r)"
-if sudo -n -u nobody true 2>/dev/null; then
-  if sudo -n -u nobody cat "$SECRETS_DIR/db_password" >/dev/null 2>&1; then r=1; else r=0; fi
-  result "U-16 another local user (nobody) cannot read a secret" $r
-else
-  printf 'INFO  U-16 cross-user read check needs passwordless sudo (runs in CI); permissions checked above\n'
-fi
+# That another local user cannot read a secret needs sudo, which does not
+# work in the isolation: tests/devenv/cross-user.sh owns that check (CU-xx).
+printf 'INFO  U-16 cross-user read check: tests/devenv/cross-user.sh (outside the isolation); permissions checked above\n'
 rm -f "$SECRETS_DIR/db_password"
 r=$(secrets_rc exists)
 [ "$r" = "$EX_SAFETY" ] && [ ! -e "$SECRETS_DIR/db_password" ] && grep -q "db-data was initialised with it" "$work/secrets.err" &&
