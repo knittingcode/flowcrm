@@ -414,6 +414,11 @@ Changing a rule means reviewing the reason above.
 
 ## Deferred hardening items
 
+- No service has CPU, memory or PID limits, the edge included, so a flood
+  or a CPU-heavy request on the edge can also slow the api and db on the
+  same host (ADR-021, residual risk). Edge limits are proposed in
+  [ADR-022](../architecture/adr/ADR-022-edge-resource-limits.md); they are
+  not implemented and need an owner decision.
 - `framework.trusted_hosts` is not configured: behind the edge, Symfony
   builds absolute URLs (for example the trailing-slash redirect of
   `/api/v1/system/status/`) from the request's `Host` header. Required before
