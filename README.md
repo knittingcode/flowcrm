@@ -152,11 +152,11 @@ $ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" e
 $ docker compose -p "$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .runtime/dev.env)" run --rm --no-deps migrate php bin/console doctrine:migrations:status
 ```
 
-New tables are invisible to the API by default: the migration that creates an object must grant its runtime privileges explicitly, and `backend/config/database/runtime-privileges.yaml` must list it. `make up` runs `bin/console app:database:verify-privileges --runtime` after the migrations and stops with exit 6 on any difference; a stack that was already running is then no longer served (its edge is stopped, `make status` reports `blocked`) until a `make up` passes ([ADR-018](docs/architecture/adr/ADR-018-database-roles.md)).
+New tables are invisible to the API by default: the migration that creates an object must grant its runtime privileges explicitly, and `backend/config/database/runtime-privileges.yaml` must list it. `make up` runs `bin/console app:database:verify-privileges --runtime` after the migrations and stops on any difference (`bin/devenv` exits 6, `make` exits 2); a stack that was already running is then no longer served (its edge is stopped, `make status` reports `blocked`) until a `make up` passes ([ADR-018](docs/architecture/adr/ADR-018-database-roles.md)).
 
 ### Upgrading a database created before the role separation
 
-A volume initialised before the role separation has only the superuser and is refused by `make up` (exit 6, nothing is started or converted). Upgrade it once, explicitly:
+A volume initialised before the role separation has only the superuser and is refused by `make up` (`bin/devenv` exits 6, `make` exits 2; nothing is started or converted). Upgrade it once, explicitly:
 
 ```console
 $ make db-upgrade-roles
