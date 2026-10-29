@@ -492,9 +492,11 @@ $ fingerprint "$chk" | diff "$backups/flowcrm-volume-$ts.fingerprint" - && echo 
 
 The rehearsal passed when the checksum is `OK`, `make up` exits 0 and
 `diff` prints nothing. `make up` fails (`make` exits 2) on a database whose
-roles or runtime privileges do not match (`bin/devenv up` exits 6) or whose
-migrations fail (exit 2); it applies pending migrations, so a backup taken
-at an older migration than the checkout fails the `diff`. Then remove the rehearsal project and its volume:
+roles or runtime privileges do not match (`bin/devenv up` itself exits 6)
+or whose migrations fail (`bin/devenv up` itself exits 2); it applies
+pending migrations, so a backup taken at an older migration than the
+checkout fails the `diff`. Then remove the rehearsal project and its
+volume:
 
 ```console
 $ make down
