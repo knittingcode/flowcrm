@@ -431,21 +431,47 @@ command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
   - TCP beyond loopback, and to loopback ports 22, 2375 and 2376;
   - TCP to every loopback port that was already listening when the suite
     started, such as a local agent, an IDE, a published container port or
-    a socket proxy;
-  - writes anywhere except under `$TMPDIR`, `/tmp` (bash 3.2 writes its
-    here-documents there) and `/dev`. This covers `$HOME`, where Docker
-    Desktop keeps its disk image, and places whose programs run outside the
-    sandbox later, such as Homebrew's prefix and `/Applications`. If
-    `$TMPDIR` is under `$HOME`, the suite is refused (exit 125);
+    a socket proxy. The list comes from `netstat`. If `netstat` fails,
+    prints no column header or prints a LISTEN row that cannot be parsed,
+    the suite is refused (exit 125). An empty list is accepted only when
+    `netstat` printed its header and no LISTEN row;
+  - writes anywhere except under `$TMPDIR` and `/dev`, and in `/tmp` the
+    `sh-thd*` here-document files of bash 3.2, which it creates there
+    whatever `$TMPDIR` is. This covers `$HOME`, where Docker Desktop keeps
+    its disk image, and places whose files are run or read outside the
+    sandbox later: Homebrew's prefix, `/Applications` and other tools'
+    directories in `/tmp`, such as agent scratchpads. `$TMPDIR` must
+    therefore be a directory of its own. If it is `/`, `/tmp`, under `/tmp`
+    or under `$HOME`, the suite is refused (exit 125). The macOS default
+    under `/var/folders` is fine;
+  - hard links do not get around this. Measured: a link from `$TMPDIR` to
+    a file in a write-denied place is refused;
+  - preference writes through `cfprefsd` (`defaults write`), which would
+    otherwise reach `~/Library/Preferences` although `$HOME` is
+    write-denied;
+  - `TIOCSTI` on the terminal, which would otherwise let a command inject
+    keystrokes into the shell that started the suite;
   - `open`, `osascript`, `launchctl` and `ssh`, job submission to launchd,
     and access to Launch Services and Apple Events, so that no program is
     started outside the sandbox. A re-signed copy of one of these programs
     can run, but launchd, Launch Services and Apple Events still refuse it,
     and the network routes of `ssh` are denied above.
 
-  The profile filters these routes; it is not a complete jail. Loopback
-  ports that the suite opens itself stay reachable, and the probe asks each
-  listening port whether it is an engine.
+  The profile filters these routes; it is not a complete jail. Known
+  residual routes:
+  - loopback ports that the suite opens itself stay reachable. So does a
+    service that starts listening after the suite started; the probe asks
+    each listening port whether it is an engine only at the start;
+  - a command can still create `sh-thd*` files or directories in `/tmp`.
+    bash creates its own here-document files exclusively, so at worst a
+    later here-document of another shell fails;
+  - signals to the user's processes outside the sandbox are allowed. A
+    command could stop Docker Desktop, but not change its objects;
+  - login items and background tasks are registered through Launch
+    Services, Apple Events or launchd, which are denied. Their other
+    interfaces were not measured;
+  - the write check next to `$TMPDIR` proves nothing when the directory
+    holding `$TMPDIR` is not writable by the user anyway.
 - Linux: `sudo unshare` gives a network namespace with only loopback and an
   empty tmpfs over `/run`; the suite then runs as the calling user without
   supplementary groups (no `docker` group) and with `no_new_privs`. This
@@ -491,7 +517,10 @@ into the file.
 - Without a mutant, plain commands inside `no-docker.sh` must not reach a
   loopback port that was listening before it started, while a port they
   open themselves stays reachable. On macOS they must also be unable to
-  write under `$HOME` or next to `$TMPDIR`.
+  write under `$HOME`, next to `$TMPDIR` or in `/tmp`, while bash 3.2
+  here-documents still work. They must not be able to write a preference
+  or use `TIOCSTI` either. An incomplete port list and `TMPDIR=/tmp` must
+  be refused.
 
 Mutation testing:
 
