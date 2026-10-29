@@ -19,6 +19,10 @@
 set -u
 
 here=$(cd -P "$(dirname "$0")" && pwd -P)
+# The suite sources and runs bin/devenv, or a modified or mutated copy of
+# it, so it runs only where no container engine can be reached.
+"$here/../../scripts/ci/no-docker.sh" --check >/dev/null 2>&1 ||
+  exec "$here/../../scripts/ci/no-docker.sh" "$BASH" "$here/unit.sh" "$@"
 # DEVENV=<path> runs the suite against another copy (mutation checks).
 devenv_script=${DEVENV:-"$here/../../bin/devenv"}
 # shellcheck source=../../bin/devenv
