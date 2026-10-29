@@ -36,7 +36,7 @@ done
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-stack.XXXXXX") || exit 2
 work=$(cd -P "$work" && pwd -P)
-mkdir -p "$work/out"
+(umask 077 && mkdir -p "$work/out")
 : >"$work/checkouts"
 : >"$work/holders"
 tally_init "$work/tally"
@@ -67,9 +67,13 @@ final_cleanup() {
   done <"$work/checkouts"
   remove_images "$e2e_image"
 }
-trap 'final_cleanup; rm -rf "$work"' EXIT
+trap 'chmod 0700 "$work" 2>/dev/null; final_cleanup; rm -rf "$work"' EXIT
 
 # --- helpers ----------------------------------------------------------------
+
+# A copy of a secret for later comparison, readable only by this user (the
+# secrets themselves are 0444 in a 0700 directory; cp -p would keep 0444).
+keep_secret() { cp "$1" "$2" && chmod 0600 "$2"; }
 
 new_checkout() { # name -> sets CO
   CO=$work/$1
@@ -628,7 +632,7 @@ lifecycle() { # -> one line
 # Interrupted after the pending password was written: the database still
 # has the current one, the stack keeps serving; running the command again
 # finishes the rotation.
-cp -p "$sd/db_app_password" "$work/app.0"
+keep_secret "$sd/db_app_password" "$work/app.0"
 rot a-rot1 app rotate-after-pending
 r1_pending=$(perm "$(pend app)")
 r1_current=$(login_ok app "$sd/db_app_password" && echo ok)
@@ -643,7 +647,7 @@ v "ST-50 rotation interrupted after the pending password (SIGTERM): the current 
 
 # Interrupted after the database got the new password, before the file was
 # replaced: the abort gives the database the current password back.
-cp -p "$sd/db_app_password" "$work/app.1"
+keep_secret "$sd/db_app_password" "$work/app.1"
 rot a-rot2 app rotate-after-db
 r2_db=$(login_ok app "$(pend app)" && echo pending)
 r2_old=$(login_ok app "$sd/db_app_password" && echo current)
@@ -667,7 +671,7 @@ say "      INFO  a running container saw a secret file replaced on the host as: 
 
 # Owner rotation, interrupted after the database change and resumed; the
 # migrate job proves the login, the old owner password is refused.
-cp -p "$sd/db_owner_password" "$work/owner.0"
+keep_secret "$sd/db_owner_password" "$work/owner.0"
 rot a-rot4 owner rotate-after-db
 rot a-rot4b owner
 # Every condition is evaluated and reported, so a failure says which one.
@@ -684,11 +688,11 @@ v "ST-50 owner rotation interrupted after the database change and resumed: the m
 
 # Repeated rotations, and a failed recreation of the api (it does not get
 # healthy): the rotation reports it; after the cause is fixed, make up serves.
-cp -p "$sd/db_app_password" "$work/app.2"
+keep_secret "$sd/db_app_password" "$work/app.2"
 r5_before=$(lifecycle)
 rot a-rot5 app
 r5_after=$(lifecycle)
-cp -p "$sd/db_app_password" "$work/app.3"
+keep_secret "$sd/db_app_password" "$work/app.3"
 cp -p "$A/backend/public/index.php" "$work/index.php.kept"
 printf '<?php syntax error\n' >"$A/backend/public/index.php"
 r6_before=$(lifecycle)
@@ -872,7 +876,7 @@ $(sed 's/^/      | /' "$work/out/a-up-legacy.err" | tail -n 5)"
 # session holds the operations' advisory lock): the interrupted transaction
 # is ended before the command exits, and nothing commits later.
 docker exec -d -e PGAPPNAME=st-holder "$(cid "$A" db)" psql -U flowcrm -d flowcrm -c 'SELECT pg_advisory_lock(1179796833)' -c 'SELECT pg_sleep(120)'
-cp -p "$sd/db_app_password" "$work/app.4"
+keep_secret "$sd/db_app_password" "$work/app.4"
 (cd "$A" && ROLE=app exec ./bin/devenv rotate-db-password) >"$work/out/a-rot7.out" 2>"$work/out/a-rot7.err" &
 rot7=$!
 i=0
@@ -923,7 +927,7 @@ paused_interrupt() { # label: rotation blocked on the advisory lock, db paused, 
 }
 
 # The new make up ends the old operation; it never commits.
-cp -p "$sd/db_app_password" "$work/app.5"
+keep_secret "$sd/db_app_password" "$work/app.5"
 paused_interrupt a-unconf
 u_old=$OLD_OP
 (cd "$A" && exec ./bin/devenv up) >"$work/out/a-unconf-up.out" 2>"$work/out/a-unconf-up.err" &
@@ -1028,7 +1032,7 @@ killed_rotation() { # label: rotation blocked on the advisory lock, then SIGKILL
 # never committed); then the abort runs and the edge serves again.
 get "$PA" /health/ready
 k_before=$CODE
-cp -p "$sd/db_app_password" "$work/app.6"
+keep_secret "$sd/db_app_password" "$work/app.6"
 killed_rotation a-kill1
 k1_edge=$K_EDGE
 k1_blocked=$(blocked_now a-kill1 && echo yes)
@@ -1323,15 +1327,21 @@ v "ST-34 a too-open secrets directory is restored to 0700 by make up" $?
 # Cross-user read check. The work directory is 0700 (mktemp -d), so nobody
 # would be refused by it and not by the secrets' own modes: the check would
 # pass whatever those modes are. For the check only, the work directory is
-# opened to 0711 (traverse, no listing; restored to 0700 right after), and a
-# control file (0444, in a 0755 directory next to the secrets directory, so
-# it shares every parent) must be readable by nobody. A denial counts only
-# after a passed control and only as "Permission denied". While it is 0711,
-# another user who knows a path below the work directory can read files of
-# this run that are not 0700/0600 themselves: copies of the repository, logs
-# and responses of these throwaway test stacks; every secrets directory
-# stays 0700. Commands as nobody are fixed binaries on fixed paths, with an
-# empty environment (env -i: C locale messages), run from /.
+# opened to 0711 (traverse, no listing; restored to 0700 right after and by
+# the EXIT trap), and a control file (0444, in a 0755 directory next to the
+# secrets directory, so it shares every parent) must be readable by nobody.
+# A denial counts only after a passed control and only as "Permission
+# denied". Before the work directory is opened, its own files are made
+# 0600: the copies of secrets (keep_secret) already are, out/ is 0700, and
+# the rest (curl body and headers, logs, lists) are closed here. While it is
+# 0711, another user who knows a path can still read what is open below the
+# checkout directories: copies of the repository and the runtime state of
+# the test stacks (dev.env, gate), never the secrets directories (0700) or
+# backups (0700). Commands as nobody are fixed binaries on fixed paths, with
+# an empty environment (env -i: C locale messages), run from /.
+# The control needs every parent of the work directory to be traversable by
+# nobody: on macOS ${TMPDIR} is a 0700 per-user directory, so run the suite
+# with TMPDIR=/tmp there, or the control fails (in CI the base is /tmp).
 as_nobody() { (cd / && sudo -n -u nobody -- /usr/bin/env -i "$@") >/dev/null 2>"$work/nobody.err"; }
 nobody_err() { head -c 2000 "$work/nobody.err" | tr '\n' ' ' | tr -cd '[:print:]'; }
 modes_up() { # path: the mode of it and of every parent, for a failed control
@@ -1345,7 +1355,8 @@ modes_up() { # path: the mode of it and of every parent, for a failed control
 }
 if (cd / && sudo -n -u nobody -- /usr/bin/env -i /usr/bin/true) 2>/dev/null; then
   ctl=$A/.runtime/st34-control
-  { mkdir "$ctl" && chmod 0755 "$ctl" && printf 'control\n' >"$ctl/file" && chmod 0444 "$ctl/file" && chmod 0711 "$work"; }
+  { mkdir "$ctl" && chmod 0755 "$ctl" && printf 'control\n' >"$ctl/file" && chmod 0444 "$ctl/file" &&
+    find "$work" -maxdepth 1 -type f -exec chmod go-rwx {} + && chmod 0700 "$work/out" && chmod 0711 "$work"; }
   need "ST-34 cross-user control prepared" [ $? = 0 ] || { tally_finish; exit; }
   as_nobody /bin/cat "$ctl/file"
   r=$?
