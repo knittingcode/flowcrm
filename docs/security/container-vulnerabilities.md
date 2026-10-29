@@ -278,8 +278,9 @@ in [Exceptions](#exceptions).
 tarball (`package/node_modules/undici/package.json`), not only npm's
 version: it is fixed only if it is 6.29.1 or later in 6.x, 7.30.1 or later
 in 7.x, or 8.12.2 or later in 8.x. The likely path is an npm release that
-bundles `node-gyp` 13.1.0 (published 2026-10-02), which requires undici
-`^8.4.1` instead of `^6.25.0`. Then update `NPM_VERSION` and `NPM_SHA256`
+bundles `node-gyp` 13.0.1 or later (13.0.1 of 2026-07-02 up to the newest,
+13.1.0 of 2026-10-02), which requires undici `^8.4.1` instead of
+`^6.25.0`. Then update `NPM_VERSION` and `NPM_SHA256`
 in `docker/web/Dockerfile`, check that the web scan no longer reports
 CVE-2026-109869, CVE-2026-109383 or CVE-2026-87018, and update this
 section; update `NODE_IMAGE` once a Node.js 24 image bundles such an npm
