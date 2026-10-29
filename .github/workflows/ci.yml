@@ -85,7 +85,7 @@ jobs:
         run: >-
           docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
           koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
-          -x bin/devenv tests/devenv/unit.sh tests/devenv/integration.sh tests/devenv/tally.sh
+          -x bin/devenv tests/devenv/unit.sh tests/devenv/cross-user.sh tests/devenv/integration.sh tests/devenv/tally.sh
           tests/app/lib.sh tests/app/backend.sh tests/app/frontend.sh tests/app/stack.sh tests/app/prodlike.sh tests/app/scan.sh
           docker/api/entrypoint.sh docker/api/healthcheck.sh docker/db/flowcrm-db-roles docker/db/initdb-roles.sh
 
@@ -111,6 +111,9 @@ jobs:
 
       - name: Allocator unit tests
         run: tests/devenv/unit.sh
+
+      - name: Secrets unreadable by another local user (trusted, outside the isolation)
+        run: tests/devenv/cross-user.sh
 
       - name: Allocator integration tests (real Docker)
         run: tests/devenv/integration.sh
