@@ -413,6 +413,82 @@ $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
 $ make test-app                                  # application: the four suites below
 ```
 
+### Isolation from Docker
+
+`tests/devenv/unit.sh` and the guard regression suites in
+`scripts/ci/tests/` run code under test, including a modified or mutated
+copy of it (`DEVENV=`, `GUARD=`, `ADAPTED=` or an edited file). They run it
+only where no container engine can be reached: each re-executes itself under
+`scripts/ci/no-docker.sh`, so a command in that code cannot touch the
+images, containers, volumes, networks or build cache of the machine, however
+it reaches Docker (the CLI on `PATH` or by absolute path, a nested shell or
+command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
+`curl --unix-socket` or a raw socket).
+
+- macOS: `sandbox-exec` denies:
+  - every connect to a Unix socket;
+  - TCP beyond loopback, and to loopback ports 22, 2375 and 2376;
+  - writes under `$HOME`, where Docker Desktop keeps its disk image;
+  - `open`, `osascript`, `launchctl` and `ssh`, and access to Launch
+    Services and Apple Events, so that no program is started outside the
+    sandbox.
+
+  The profile filters these routes; it is not a complete jail. Other
+  loopback ports stay open for the tests, and the probe asks each listening
+  port whether it is an engine.
+- Linux: `sudo unshare` gives a network namespace with only loopback and an
+  empty tmpfs over `/run`; the suite then runs as the calling user without
+  supplementary groups (no `docker` group) and with `no_new_privs`. This
+  needs passwordless sudo.
+- `DOCKER_*` and similar variables are removed and `DOCKER_CONFIG` is an
+  empty directory.
+- Before the suite runs, `scripts/ci/no-docker-probe.py` checks from inside
+  that the mechanism is in effect and that no engine answers on any endpoint
+  it finds: the usual socket paths, the Docker contexts, `DOCKER_HOST`, the
+  sockets under `/run`, `/var/run`, `/tmp`, `$TMPDIR` and `~/.docker`,
+  ports 2375 and 2376 and every listening loopback port. If the isolation cannot be applied or proven, the
+  suite does not run (exit 125).
+- Setuid programs cannot run inside, so `sudo` is unavailable. The U-16
+  check that another local user cannot read a secret therefore prints INFO
+  and is not counted, in CI as well as locally; the U-16 mode checks still
+  run.
+- On Linux the probe finds an engine socket owned by the calling user only
+  in the places listed above.
+
+- macOS applies a sandbox inside another only if the profiles are
+  identical, so the suites cannot run inside a different sandbox: they are
+  refused (exit 125).
+
+`scripts/ci/tests/no-docker.test.sh` checks this with a mutated `bin/devenv`
+whose commands reach Docker in more than 20 ways, both as `DEVENV` and edited
+into the file.
+
+- The mutant only reads (`docker version`, `GET /version`); a pre-flight
+  check refuses to run if it contains anything else.
+- Its target is a canary engine of the test, which answers like Docker and
+  records every request. Two cases name the real socket paths.
+- On macOS, `unit.sh` runs on the host as a developer would run it. The
+  mutant must run to its end with no request reaching the canary and no
+  answer from the real socket paths.
+- On Linux, `unit.sh` runs behind `no-docker.sh`, where the canary is a
+  reachable engine, so `unit.sh` must refuse.
+- The control runs the same mutant under a copy of `unit.sh` without the
+  re-execution, behind an outer guard that leaves only the canary
+  reachable. The mutant must reach the canary.
+
+Mutation testing:
+
+- Run a mutated copy of `bin/devenv` or of a guard only through these
+  suites.
+- Use payloads that only read or only print. Never use a destructive Docker
+  command (prune, forced removal, `down -v`, `--rmi`), not even in isolation.
+- `tests/devenv/integration.sh` and the `tests/app/` suites use the real
+  Docker daemon on purpose, so never run them on a mutated copy.
+  `integration.sh` refuses a `DEVENV` that differs from `bin/devenv`, but no
+  suite can tell an edited checkout from a mutated one.
+- BE-18 mutates a copy of the backend inside the api test container, which
+  has no Docker socket.
+
 Application suites (`tests/app/`), each in its own Compose projects:
 
 - `scan.sh` (SC-xx): Trivy scans of the runtime images (production-like api
