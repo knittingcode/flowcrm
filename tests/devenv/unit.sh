@@ -1216,24 +1216,47 @@ RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 # gate_clear also removes a gate left at the old place. edge_sees_gate runs
 # a one-off container that publishes no port, with the gate directory
 # mounted, and checks both the rule and that the gate is readable.
+# Whether the edge stopped is asked of the container itself (docker
+# inspect): a listing that still shows it right after a successful stop
+# (seen in CI, ST-50) does not fail the command, a container that still
+# runs or cannot be inspected does, with the stop's exit status and error,
+# and a listing that fails stops the command before anything changes.
 saved_fns=$(declare -f compose compose_op run_op write_gate)
 saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
-compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(cat "$work/u23-running" 2>/dev/null)" = true ] && printf 'edge-id\n'; return 0; }
+compose() {
+  [ "$1 $2 $3" = "ps --quiet edge" ] || return 0
+  [ "$U23_PS" = fails ] && return 1
+  [ "$(cat "$work/u23-listed" 2>/dev/null)" = true ] && printf 'edge-id\n'
+  return 0
+}
 compose_op() {
   [ "$1" = exec ] && return 1 # cancel_db_op: the cancellation is not confirmed
   [ "$1" = stop ] || return 0
   printf 'stop %s gate=%s\n' "$2" "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u23-calls"
-  [ "$U23_STOP" = fails ] && return 1
-  echo false >"$work/u23-running"
+  case $U23_STOP in
+    fails) echo 'Error response from daemon: cannot stop container: edge-id' >&2 && return 1 ;;
+    returns) return 0 ;; # exit 0, but the container still runs
+  esac
+  echo "$U23_AFTER" >"$work/u23-running"
+  [ "$U23_STALE" = yes ] || echo false >"$work/u23-listed"
 }
-u23() { # name gate-dir(dir|file) stop(ok|fails)
+docker() {
+  [ "$1 $2 $3 $4 $5" = "container inspect -f {{.State.Running}} edge-id" ] || return 99
+  case $(cat "$work/u23-running") in
+    true | false) cat "$work/u23-running" ;;
+    removed) echo 'Error response from daemon: No such container: edge-id' >&2 && return 1 ;;
+    *) echo 'error during connect: the daemon cannot be reached' >&2 && return 1 ;;
+  esac
+}
+u23() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|unknown) [stale-list(yes) [ps(fails)]]]
   RUNTIME_DIR=$work/u23-$1/.runtime GATE_DIR=$work/u23-$1/.runtime/gate
   GATE_FILE=$GATE_DIR/security-gate
   mkdir -p "$RUNTIME_DIR"
   if [ "$2" = file ]; then : >"$GATE_DIR"; else mkdir -p "$GATE_DIR"; fi
   rm -f "$work/u23-calls"
   echo true >"$work/u23-running"
-  U23_STOP=$3
+  echo true >"$work/u23-listed"
+  U23_STOP=$3 U23_AFTER=${4:-false} U23_STALE=${5:-} U23_PS=${6:-}
   U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
   U23_RC=$?
   U23_CALLS=$(paste -sd ";" - 2>/dev/null <"$work/u23-calls")
@@ -1243,10 +1266,29 @@ u23 ok dir ok
 [ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
   [ "$(cat "$work/u23-running")" = false ]
 result "U-23 protect_for records the gate (with the edge line) before it stops the serving edge" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE])"
+u23 stale dir ok false yes
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"stopped the edge before changing the database"*) true ;; *) false ;; esac
+result "U-23 protect_for goes on when the stopped edge is still listed for a moment (docker inspect: not running)" $? "(exit $U23_RC: $U23_OUT)"
+u23 removed dir ok removed
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ]
+result "U-23 protect_for goes on when the edge container is gone after the stop (No such object)" $? "(exit $U23_RC: $U23_OUT)"
 u23 stuck dir fails
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] && [ "$(cat "$work/u23-running")" = true ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed (docker compose stop exited with status 1: Error response from daemon: cannot stop container: edge-id)"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the edge cannot be stopped, with the stop's exit status and error; the gate stays recorded" $? "(exit $U23_RC: $U23_OUT)"
+u23 still-running dir returns
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed (docker compose stop exited with status 0)"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the stop succeeded but the edge still runs" $? "(exit $U23_RC: $U23_OUT)"
+u23 uninspectable dir ok unknown
 [ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
   case $U23_OUT in *"could not be stopped, so the database was not changed"*) true ;; *) false ;; esac
-result "U-23 protect_for stops the command when the edge cannot be stopped; the gate stays recorded" $? "(exit $U23_RC: $U23_OUT)"
+result "U-23 protect_for stops the command when the edge's state cannot be inspected after the stop" $? "(exit $U23_RC: $U23_OUT)"
+u23 unlisted dir ok false '' fails
+[ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ ! -e "$GATE_FILE" ] && [ "$(cat "$work/u23-running")" = true ] &&
+  case $U23_OUT in *"could not list the containers of"*"the database was not changed"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command, changing nothing, when the edge cannot be listed (never taken for no edge)" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
 u23 unwritable file ok
 [ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ "$(cat "$work/u23-running")" = true ] &&
   case $U23_OUT in *"could not record the security gate; nothing was changed"*) true ;; *) false ;; esac
@@ -1280,6 +1322,7 @@ grep -qx "FLOWCRM_GATE_DIR=$GATE_DIR" "$work/u23-run" && grep -qx run "$work/u23
   grep -qF 'test -r /run/flowcrm-gate/security-gate' "$work/u23-run"
 result "U-23 edge_sees_gate: one-off edge container with the gate directory, no published port, checks the rule and that the gate is readable" $? "($(paste -sd ' ' - <"$work/u23-run"))"
 eval "$saved_fns"
+unset -f docker
 RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 
 # --- U-24 make up recognises an edge that does not enforce the gate (FND-009E)
@@ -1350,6 +1393,290 @@ u25 "a docker error is not a login" no-db "$work/u25.pw" 'Error response from da
 u25 "no answer is not a login" silent "$work/u25.pw" no-output/false
 u25 "an empty password file is not a login" row "$work/u25.empty" no-file/false
 u25 "a missing password file is not a login" row "$work/u25.missing" no-file/false
+
+# --- U-26 test cleanup removes images by name, untagged ones of the run by ID (tests/app/lib.sh)
+# remove_images and remove_untagged_images with a fake docker that keeps
+# image names ("name id"), images ("id compose-project", "-" for none) and
+# containers ("container image-id") in files. Like Docker at its most
+# destructive, removing an image ID (or forcing) drops every name of that
+# image. remove_images may remove only names starting with the prefix, never
+# by ID or forced; an image that also has another name keeps it; an image
+# used by a container is kept; a prefix that would match the development
+# stack is refused. remove_untagged_images may remove only the untagged
+# images labelled with the run's project, by ID and never forced.
+mkdir -p "$work/fakeimg"
+cat >"$work/fakeimg/docker" <<'FAKE'
+#!/bin/sh
+d=$FAKE_IMG
+echo "$*" >>"$d/calls"
+named() { awk -v i="$1" '$2 == i { f = 1 } END { exit !f }' "$d/names"; }
+used() { awk -v i="$1" '$2 == i { f = 1 } END { exit !f }' "$d/containers"; }
+drop_image() { awk -v i="$1" '$1 != i' "$d/images" >"$d/images.new" && mv "$d/images.new" "$d/images"; }
+case "$1 $2" in
+  "ps -aq"*) cut -d' ' -f1 "$d/containers" ;;
+  "inspect -f")
+    shift 3
+    for c in "$@"; do awk -v c="$c" '$1 == c { print $2 }' "$d/containers"; done ;;
+  "image ls")
+    shift 2
+    case $1 in
+      --format) cut -d' ' -f1 "$d/names"; exit 0 ;;
+    esac
+    # image IDs, filtered like Docker: dangling=true (no name) and
+    # label=com.docker.compose.project=P. IDs in "stale" are listed as
+    # dangling although they have a name (named after the listing).
+    dangling= project=
+    for a in "$@"; do
+      case $a in
+        -q | --no-trunc | --filter) ;;
+        dangling=true) dangling=1 ;;
+        label=com.docker.compose.project=*) project=${a#label=com.docker.compose.project=} ;;
+        *) echo "unexpected: docker image ls $*" >&2; exit 99 ;;
+      esac
+    done
+    while read -r i l; do
+      [ -z "$project" ] || [ "$l" = "$project" ] || continue
+      [ -z "$dangling" ] || ! named "$i" || grep -qxF "$i" "$d/stale" || continue
+      echo "$i"
+    done <"$d/images" ;;
+  "image inspect")
+    ref=$5
+    id=$(awk -v r="$ref" '$1 == r { print $2 }' "$d/names")
+    [ -n "$id" ] || id=$(awk -v r="$ref" '$1 == r { print $1 }' "$d/images")
+    [ -n "$id" ] || exit 1
+    case $4 in
+      *RepoTags*) awk -v i="$id" '$2 == i { print $1 }' "$d/names" ;;
+      *) echo "$id" ;;
+    esac ;;
+  "image rm")
+    shift 2
+    force=0
+    case " $* " in *' -f '* | *' --force '*) force=1 ;; esac
+    for a in "$@"; do
+      case $a in
+        -f | --force) continue ;;
+      esac
+      id=$(awk -v r="$a" '$1 == r { print $2 }' "$d/names")
+      if [ -n "$id" ] && [ "$force" = 0 ]; then
+        # By name: only this name goes, and the image with its last name;
+        # refused for the last name of an image a container uses.
+        if [ "$(awk -v i="$id" '$2 == i' "$d/names" | wc -l)" -eq 1 ] && used "$id"; then
+          echo "conflict: image is being used by a container" >&2
+          exit 1
+        fi
+        awk -v r="$a" '$1 != r' "$d/names" >"$d/names.new" && mv "$d/names.new" "$d/names"
+        named "$id" || drop_image "$id"
+        continue
+      fi
+      # By ID or forced: every name of the image goes, and the image.
+      [ -n "$id" ] || id=$a
+      if ! named "$id" && ! awk -v i="$id" '$1 == i { f = 1 } END { exit !f }' "$d/images"; then
+        echo "No such image: $a" >&2
+        exit 1
+      fi
+      if [ "$force" = 0 ] && { used "$id" || grep -qxF "$id" "$d/refuse"; }; then
+        echo "conflict: unable to delete $id (must be forced)" >&2
+        exit 1
+      fi
+      awk -v i="$id" '$2 != i' "$d/names" >"$d/names.new" && mv "$d/names.new" "$d/names"
+      drop_image "$id"
+    done ;;
+  *) echo "unexpected: docker $*" >&2; exit 99 ;;
+esac
+FAKE
+chmod +x "$work/fakeimg/docker"
+u26_dev=$( . "$here/../app/lib.sh" && project_of "$APP_REPO")
+u26_run=flowcrm-aaaaaa-test-bbbbbb
+u26_other=flowcrm-aaaaaa-test-bbbbbc
+u26() { # function argument: run it on a fresh fixture; prints its output and status
+  rm -rf "$work/img" && mkdir -p "$work/img"
+  printf '%s\n' \
+    "$u26_run-api:latest sha256:01" \
+    "$u26_run-db:latest sha256:02" "$u26_dev-db:latest sha256:02" \
+    "$u26_run-edge:latest sha256:03" \
+    "$u26_dev-edge:latest sha256:04" "$u26_dev-api:latest sha256:05" \
+    "$u26_other-api:latest sha256:06" \
+    "flowcrm-scan-cccccc:control sha256:07" "postgres@sha256:07 sha256:07" \
+    "flowcrm-scan-cccccc:db sha256:08" \
+    "x-$u26_run-api:latest sha256:09" "$u26_run-api:<none> sha256:0a" \
+    "late:1 sha256:17" >"$work/img/names"
+  # sha256:1x have no name (dangling): 11 and 16 of the run (16 has a child
+  # image, so Docker refuses it), 12 of the run but used by a container,
+  # 13 of the development stack, 14 of another run, 15 without a project,
+  # 17 of the run and listed as dangling but named since.
+  printf '%s\n' \
+    "sha256:01 $u26_run" "sha256:02 $u26_run" "sha256:03 $u26_run" \
+    "sha256:04 $u26_dev" "sha256:05 $u26_dev" "sha256:06 $u26_other" \
+    "sha256:07 -" "sha256:08 -" "sha256:09 -" "sha256:0a $u26_run" \
+    "sha256:11 $u26_run" "sha256:12 $u26_run" "sha256:13 $u26_dev" \
+    "sha256:14 $u26_other" "sha256:15 -" "sha256:16 $u26_run" "sha256:17 $u26_run" >"$work/img/images"
+  printf '%s\n' "c-run-edge sha256:03" "c-dev-api sha256:05" "c-run-old sha256:12" >"$work/img/containers"
+  echo sha256:16 >"$work/img/refuse"
+  echo sha256:17 >"$work/img/stale"
+  : >"$work/img/calls"
+  # shellcheck disable=SC2031 # the suite's PATH, only read: the fake docker comes first
+  PATH=$work/fakeimg:$PATH FAKE_IMG=$work/img "$BASH" -c '. "$1" && "$2" "$3"; echo "rc=$?"' u26 "$here/../app/lib.sh" "$1" "$2" 2>&1
+}
+u26_names() { cut -d' ' -f1 "$work/img/names" | sort | paste -sd ' ' -; }
+u26_images() { cut -d' ' -f1 "$work/img/images" | sort | paste -sd ' ' -; }
+u26 true '' >/dev/null
+u26_all_names=$(u26_names)
+u26_all_images=$(u26_images)
+u26_unforced() { ! grep -E '^image rm( .*)? (-[a-zA-Z]*f[a-zA-Z]*|--force|sha256:[^ ]*)( |$)' "$work/img/calls" >/dev/null; }
+u26_without() { # words... : the fixture's names without them
+  printf '%s\n' "$u26_all_names" | tr ' ' '\n' | grep -vxF "$(printf '%s\n' "$@")" | sort | paste -sd ' ' -
+}
+
+out=$(u26 remove_images "$u26_run-")
+expect_eq "U-26 the run's names are removed, all others kept" \
+  "$(u26_without "$u26_run-api:latest" "$u26_run-db:latest")" "$(u26_names)"
+u26_unforced
+result "U-26 removal is by name, never by ID and never forced" $? "($(paste -sd ';' - <"$work/img/calls"))"
+! grep -qF '<none>' "$work/img/calls"
+result "U-26 a <none> name is never removed" $? "($(paste -sd ';' - <"$work/img/calls"))"
+printf '%s\n' "$out" | grep -qF "image $u26_run-db:latest is also named $u26_dev-db:latest: only the name $u26_run-db:latest is removed"
+result "U-26 an image that also has another name is reported and keeps it" $? "($out)"
+printf '%s\n' "$out" | grep -qF "KEPT image $u26_run-edge:latest (sha256:03): used by a container"
+result "U-26 an image used by a container is kept and reported" $? "($out)"
+printf '%s\n' "$out" | grep -qxF "      images $u26_run-*: 2 names removed, 1 kept"
+result "U-26 the names removed and kept are counted" $? "($out)"
+
+out=$(u26 remove_images "flowcrm-scan-cccccc:")
+expect_eq "U-26 scan: the re-tagged base image keeps its own name" \
+  "$(u26_without flowcrm-scan-cccccc:control flowcrm-scan-cccccc:db)" "$(u26_names)"
+u26_unforced
+result "U-26 scan: removal is by name, never by ID and never forced" $? "($(paste -sd ';' - <"$work/img/calls"))"
+
+for p in '' flowcrm- "$u26_dev" "$u26_dev-" "$u26_dev-a" "$u26_dev-db" "$u26_dev-test-bbbbbb-api" 'flowcrm-*' 'x y'; do
+  out=$(u26 remove_images "$p")
+  [ "$(u26_names)" = "$u26_all_names" ] && ! grep -q '^image rm' "$work/img/calls" && printf '%s\n' "$out" | grep -qx 'rc=1'
+  r=$?
+  result "U-26 prefix $(show "$p") is refused: nothing removed" $r "($out)"
+done
+
+out=$(u26 remove_images "$u26_dev-test-bbbbbb-")
+[ "$(u26_names)" = "$u26_all_names" ] && printf '%s\n' "$out" | grep -qx 'rc=0'
+result "U-26 a run project of this checkout (<dev>-test-<run>-) is accepted" $? "($out)"
+
+# remove_untagged_images: only sha256:11 goes; every name stays.
+out=$(u26 remove_untagged_images "$u26_run")
+expect_eq "U-26 untagged: only the run project's unused untagged image is removed" \
+  "$(printf '%s\n' "$u26_all_images" | tr ' ' '\n' | grep -vxF sha256:11 | sort | paste -sd ' ' -)" "$(u26_images)"
+expect_eq "U-26 untagged: every name is kept" "$u26_all_names" "$(u26_names)"
+! grep '^image rm' "$work/img/calls" | grep -vxE 'image rm sha256:1[16]' >/dev/null
+result "U-26 untagged: removal by ID of the run's untagged images only, never forced" $? "($(paste -sd ';' - <"$work/img/calls"))"
+grep -qxF "image ls -q --no-trunc --filter dangling=true --filter label=com.docker.compose.project=$u26_run" "$work/img/calls"
+result "U-26 untagged: images are selected as dangling and labelled with the run project" $? "($(paste -sd ';' - <"$work/img/calls"))"
+printf '%s\n' "$out" | grep -qF "KEPT untagged image sha256:12: used by a container" &&
+  printf '%s\n' "$out" | grep -qF "KEPT untagged image sha256:16: Docker refused to remove it" &&
+  printf '%s\n' "$out" | grep -qF "KEPT image sha256:17: it has a name (late:1)" &&
+  printf '%s\n' "$out" | grep -qxF "      untagged images of $u26_run: 1 removed, 3 kept"
+result "U-26 untagged: kept images are reported and counted" $? "($out)"
+
+for p in '' "$u26_dev" flowcrm "$u26_dev-test" Flowcrm-x 'flowcrm-*' 'a/b' 'x y' -x; do
+  out=$(u26 remove_untagged_images "$p")
+  [ "$(u26_images)" = "$u26_all_images" ] && ! grep -q '^image rm' "$work/img/calls" && printf '%s\n' "$out" | grep -qx 'rc=1'
+  r=$?
+  result "U-26 untagged: project $(show "$p") is refused: nothing removed" $r "($out)"
+done
+
+# Every runner with a Compose project of its own removes its untagged images.
+for f in backend.sh prodlike.sh stack.sh; do
+  grep -qE '^[[:space:]]*remove_untagged_images "\$(project|\(project_of "\$d"\))"$' "$here/../app/$f"
+  result "U-26 $f removes the untagged images of its own Compose project" $?
+done
+
+# Every runner passes remove_images only its run's own prefix, and each
+# prefix variable is assigned once, from a hash of the run's temporary
+# directory: a wider prefix (flowcrm-scan-, flowcrm-e2e:, postgres) would
+# remove the names of other runs or of shared base images.
+u26_calls=$(cd "$here/../app" && grep -oE 'remove_images [^;]*' -- *.sh | grep -v '^lib\.sh:' | sort | paste -sd ';' -)
+expect_eq "U-26 the runners call remove_images only with their run's prefix" \
+  'backend.sh:remove_images "$project-";frontend.sh:remove_images "$image";prodlike.sh:remove_images "$e2e_image";prodlike.sh:remove_images "$project-";scan.sh:remove_images "$tag:";stack.sh:remove_images "$(project_of "$d")-";stack.sh:remove_images "$e2e_image"' \
+  "$u26_calls"
+for u26_def in \
+  'backend.sh project=$(project_of "$APP_REPO")-test-$(sha6 "$work")' \
+  'prodlike.sh project=$(project_of "$APP_REPO")-prod-$(sha6 "$work")' \
+  'prodlike.sh e2e_image=flowcrm-e2e:$(sha6 "$work")' \
+  'stack.sh e2e_image=flowcrm-e2e:$(sha6 "$work")' \
+  'frontend.sh image=flowcrm-web-check:$(sha6 "$work")' \
+  'scan.sh tag=flowcrm-scan-$(sha6 "$work")'; do
+  f=${u26_def%% *} def=${u26_def#* }
+  hits=$(grep -nE "^[[:space:]]*(local[[:space:]]+)?${def%%=*}=" "$here/../app/$f")
+  [ "$(printf '%s\n' "$hits" | cut -d: -f2-)" = "$def" ]
+  result "U-26 $f assigns ${def%%=*} once, unique to the run" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
+done
+
+# Guards against other image removals in tests/app/*.sh and tests/devenv/*.sh
+# (the grep pattern lines of these guards and of U-09 excluded): the Docker
+# image removal commands (image rm, image remove, rmi) only in
+# tests/app/lib.sh and never with a force option anywhere in the command; no
+# Compose down that removes images (its rmi option); no prune command of any
+# kind (image, system, builder, ...). A command ends at "|", ";" or a "&"
+# that is not part of a redirection (">&", "<&", "&>"). A line ending in a
+# backslash (an odd number of them) is joined with the next one first, so a
+# command continued over several lines is checked as one line, numbered by
+# its first line.
+u26_pat_rm='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))([[:space:]]|$)'
+u26_pat_force='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))[[:space:]](([^|;&]|[<>]&|&>)*[[:space:]])?(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)'
+u26_pat_rmi='--rmi([[:space:]=]|$)'
+u26_pat_prune='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?prune([[:space:]]|$)'
+u26_lines() { # files...: every line as "file:line:text", continuation lines joined
+  awk '
+    function flush() { if (pending) print file ":" start ":" buf; pending = 0 }
+    FNR == 1 { flush() }
+    {
+      if (pending) buf = buf " " $0
+      else { file = FILENAME; start = FNR; buf = $0; pending = 1 }
+      if (match(buf, /\\+$/) && RLENGTH % 2 == 1) buf = substr(buf, 1, length(buf) - 1)
+      else flush()
+    }
+    END { flush() }' "$@"
+}
+u26_grep() { # pattern: matching lines of the test scripts, the guards' own excluded
+  u26_lines "$here"/../app/*.sh "$here"/*.sh | grep -E -- "$1" |
+    grep -vE "^[^:]*/unit\.sh:[0-9]+:[[:space:]]*((if )?grep -nE '|u26_pat_[a-z]+=)"
+}
+u26_guard() { # name pattern [filter]
+  local hits
+  hits=$(u26_grep "$2" | { if [ -n "${3-}" ]; then grep -vE "$3"; else cat; fi; })
+  [ -z "$hits" ]
+  result "U-26 test scripts: $1" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
+}
+u26_guard "images are removed only in tests/app/lib.sh" "$u26_pat_rm" '^[^:]*/app/lib\.sh:'
+u26_guard "no image removal with -f or --force" "$u26_pat_force"
+u26_guard "no Compose down that removes images" "$u26_pat_rmi"
+u26_guard "no prune command of any kind" "$u26_pat_prune"
+
+# Self-check of the guards on a fixture: removals continued over several
+# lines are found, numbered by their first line; a continued command that is
+# no removal, and a line ending in an escaped backslash, are not joined into
+# a hit; a force option after a redirection (2>&1, &>) belongs to the
+# removal, one after && does not. (The command name is in a variable so that
+# this file has no match.)
+u26_dk=docker
+cat >"$work/u26-fixture.sh" <<EOF
+$u26_dk \\
+  rmi -f x
+$u26_dk image \\
+  rm \\
+  --force x
+$u26_dk \\
+  ps -a
+a\\\\
+$u26_dk rmi z
+$u26_dk image \\
+  prune -f
+$u26_dk image rm y 2>&1 -f
+$u26_dk image rm y &>/dev/null --force
+$u26_dk image rm y && rm -f z
+EOF
+u26_hits() { # pattern: first line numbers of the fixture's matching lines
+  u26_lines "$work/u26-fixture.sh" | grep -E -- "$1" | cut -d: -f2 | paste -sd ' ' -
+}
+expect_eq "U-26 guard self-check: a forced removal over lines or after a redirection is found" "1 3 12 13" "$(u26_hits "$u26_pat_force")"
+expect_eq "U-26 guard self-check: a removal continued over lines is found" "1 3 9 12 13 14" "$(u26_hits "$u26_pat_rm")"
+expect_eq "U-26 guard self-check: a prune continued over lines is found" "10" "$(u26_hits "$u26_pat_prune")"
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
