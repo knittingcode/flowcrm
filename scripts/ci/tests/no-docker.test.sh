@@ -26,6 +26,9 @@
 #     only if it is identical, so the harness's own isolation cannot be
 #     tested behind the guard. Should that isolation fail, the read-only
 #     payload would reach the real daemon, which the cases detect.
+# T-06 and T-07 run plain commands, no mutant, inside no-docker.sh: they
+# check the write limits (macOS) and that loopback ports listening before
+# the isolation started cannot be reached from inside it.
 # This suite itself runs no docker command.
 #
 # Usage: no-docker.test.sh
@@ -51,7 +54,11 @@ home=$(cd -P "$HOME" && pwd -P)
 nonce=$$-$(date +%s)
 canary=$work/canary.sock
 home_marker=$home/.flowcrm-no-docker-test-$nonce
-trap 'rm -f "$home_marker"; rm -rf "$work"' EXIT
+# Next to $TMPDIR: writable by the user, outside what the sandbox allows.
+tmp=$(cd -P "${TMPDIR:-/tmp}" && pwd -P)
+[ -n "$tmp" ] && [ "$tmp" != / ] || exit 2
+outside_marker=$(dirname "$tmp")/.flowcrm-no-docker-test-$nonce
+trap 'rm -f "$home_marker" "$outside_marker"; rm -rf "$work"' EXIT
 pass=0
 fail=0
 
@@ -306,6 +313,51 @@ NO_DOCKER_ACTIVE=1 "$root/scripts/ci/no-docker.sh" touch "$work/t02" >/dev/null 
 r=$?
 [ "$r" -eq 125 ] && [ ! -e "$work/t02" ]
 result "T-02 claimed but unproven isolation (NO_DOCKER_ACTIVE outside it): refused, command not run" $? "(rc $r)"
+
+# --- T-06/T-07 plain commands (no mutant) inside no-docker.sh
+if [ "$(uname -s)" = Darwin ]; then
+  "$root/scripts/ci/no-docker.sh" /bin/sh -c 'touch "$1" "$2" 2>/dev/null; : >"$3"' _ \
+    "$home_marker" "$outside_marker" "$work/t06" >/dev/null 2>&1
+  r=$?
+  [ "$r" -eq 0 ] && [ -e "$work/t06" ] && [ ! -e "$home_marker" ] && [ ! -e "$outside_marker" ]
+  result "T-06 writes only under \$TMPDIR: not under \$HOME, not next to \$TMPDIR" $? "(rc $r)"
+  rm -f "$home_marker" "$outside_marker"
+else
+  echo "INFO  T-06 skipped: on Linux writes are not restricted (see docs/dev-environment.md)"
+fi
+cat >"$work/t07.py" <<'PY'
+import socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(4)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+time.sleep(60)
+PY
+python3 -I "$work/t07.py" "$work/t07.port" &
+t07pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$work/t07.port" ] && break; sleep 0.2; done
+t07=$("$root/scripts/ci/no-docker.sh" python3 -I -c '
+import socket, sys
+def reach(port):
+    s = socket.socket()
+    s.settimeout(2)
+    try:
+        s.connect(("127.0.0.1", port))
+        return "reached"
+    except OSError:
+        return "refused"
+    finally:
+        s.close()
+own = socket.socket()
+own.bind(("127.0.0.1", 0))
+own.listen(1)
+print(reach(int(sys.argv[1])), reach(own.getsockname()[1]))
+' "$(cat "$work/t07.port" 2>/dev/null || echo 0)" 2>/dev/null)
+r=$?
+kill "$t07pid" 2>/dev/null
+wait "$t07pid" 2>/dev/null
+[ "$r" -eq 0 ] && [ -s "$work/t07.port" ] && [ "$t07" = "refused reached" ]
+result "T-07 a loopback port listening before the isolation is unreachable, one opened inside it is reachable" $? "(rc $r: $t07)"
 
 # --- T-03/T-04 the harness against the mutant
 check_safe() { # name
