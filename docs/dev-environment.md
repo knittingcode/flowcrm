@@ -545,7 +545,12 @@ test runs there:
 
 - The checkout's own `bin/devenv`, never a copy named by an input, runs
   `ensure_secrets` under `no-docker.sh`, with its runtime directory in a new
-  directory below `/tmp` and a fake `docker` that reports no volume.
+  directory below `/var/tmp` and a fake `docker` that reports no volume.
+  That directory is the isolated step's `TMPDIR`: on macOS the sandbox lets
+  it write only there and in `/dev`. `/var/tmp` is used because it is
+  `1777` on Linux and macOS; the macOS `$TMPDIR` is `0700`, so `nobody`
+  could not reach anything below it, and the macOS isolation denies writes
+  to `/tmp` and refuses a `TMPDIR` below it.
 - Outside the isolation the script checks the result only as data (file
   type, owner, modes `0700`/`0444`), then runs fixed commands as `nobody`
   on fixed paths with an empty environment (`/usr/bin/env -i`): `/bin/ls`
@@ -569,11 +574,14 @@ test runs there:
   writes, creates, executes or reads a file there: those paths are only
   tested and `stat`ed, and read by `nobody`. Error output is kept in
   variables, and the result tally is in a new directory made after the
-  isolated step, outside the temporary directory.
+  isolated step in the caller's own `$TMPDIR`, outside the temporary
+  directory.
 - Neither isolation ends processes that the isolated step leaves behind.
-  Such a process stays isolated, but it could still change a result, race
-  the new tally directory below `$TMPDIR`, or keep the step waiting on its
-  output until the CI job times out.
+  Such a process stays isolated, but it could still change a result or keep
+  the step waiting on its output until the CI job times out. On macOS it
+  cannot write the tally, which is outside its sandbox; on Linux the
+  isolation does not restrict file writes, but such a process has no more
+  file access than the caller.
 - It certifies committed code and is not a mutation harness: it refuses
   (exit 64) arguments, `DEVENV`, `GUARD`, `ADAPTED`, a run inside
   `no-docker.sh`, a directory that is not a Git checkout, and local

@@ -10,7 +10,7 @@
 # caller's privileges outside the isolation:
 #   1. The checkout's own bin/devenv (never a copy named by DEVENV or any
 #      other input) runs ensure_secrets under scripts/ci/no-docker.sh, with
-#      its runtime directory in a fresh directory below /tmp and a fake
+#      its runtime directory in a fresh directory below /var/tmp and a fake
 #      docker that reports no volume.
 #   2. Outside the isolation, this script checks the result as data (file
 #      type, owner, modes; never the contents) and then runs only fixed
@@ -85,11 +85,14 @@ if ! probe_err=$(sudo -n -u nobody -- /usr/bin/env -i /usr/bin/true 2>&1); then
   exit 0
 fi
 
-# Below /tmp, not $TMPDIR: on macOS $TMPDIR is a 0700 per-user directory, so
-# nobody could not reach anything below it and the check would pass for the
-# wrong reason. The parents of the runtime directory are 0755 for the same
-# reason; the control file below proves it.
-base=$(mktemp -d /tmp/flowcrm-cross-user.XXXXXX) || exit 2
+# Below /var/tmp (1777 on Linux and macOS), not $TMPDIR: on macOS $TMPDIR is
+# a 0700 per-user directory, so nobody could not reach anything below it and
+# the check would pass for the wrong reason. Not /tmp either: the macOS
+# isolation denies writes there and refuses a TMPDIR below it. The parents
+# of the runtime directory are 0755 for the same reason; the control file
+# below proves it. The isolated step gets this directory as its TMPDIR, the
+# only place (with /dev) where the macOS sandbox lets it write.
+base=$(mktemp -d /var/tmp/flowcrm-cross-user.XXXXXX) || exit 2
 base=$(cd -P "$base" && pwd -P) || exit 2
 tally_dir=
 trap 'rm -rf "$base" ${tally_dir:+"$tally_dir"}' EXIT
@@ -114,9 +117,10 @@ printf '#!/bin/sh\nexit 1\n' >"$base/bin/docker" && chmod 0755 "$base/bin/docker
 # (which the macOS sandbox would not let it write). The trusted part
 # therefore never writes, creates or reads a file below $base after this
 # step: error output is kept in variables (the last 4000 bytes) and the
-# tally is in a directory made after this step, outside $base.
+# tally is in a directory made after this step, outside $base, in the
+# caller's own TMPDIR (which the macOS sandbox does not let it write).
 # shellcheck disable=SC2016 # expanded by the isolated shell
-gen_err=$({ "$root/scripts/ci/no-docker.sh" "$BASH" -c '
+gen_err=$({ TMPDIR=$base "$root/scripts/ci/no-docker.sh" "$BASH" -c '
   set -u
   . "$1" || exit 2
   FLOWCRM_STACK=app
