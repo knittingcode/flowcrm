@@ -13,16 +13,22 @@
 #
 # Isolation:
 #   macOS  sandbox-exec: every connect to a Unix socket is denied, as is TCP
-#          to anything but loopback and to loopback ports 22, 2375 and 2376
-#          (ssh and the Docker API ports); nothing under $HOME can be
-#          written (Docker Desktop keeps its disk image there); open,
-#          osascript, launchctl and ssh cannot run and Launch Services and
-#          Apple Events cannot be reached (the known ways to have a program
-#          started outside the sandbox). The profile filters these routes;
-#          it is not a complete jail. Setuid programs cannot run in the sandbox, so
-#          ps is an unprivileged, ad-hoc signed copy. Loopback TCP to other
-#          ports stays open for the tests; the probe asks every listening
-#          port whether it is an engine (a socket proxy, for example).
+#          to anything but loopback, to loopback ports 22, 2375 and 2376
+#          (ssh and the Docker API ports) and to every loopback port that
+#          was listening before the command started (local services: an
+#          agent, an IDE, a published container port or a socket proxy);
+#          nothing can be written except under $TMPDIR, /tmp and /dev (not
+#          $HOME, where Docker Desktop keeps its disk image, nor Homebrew's
+#          prefix or /Applications, whose programs run outside the sandbox
+#          later);
+#          open, osascript, launchctl and ssh cannot run, and jobs cannot be
+#          submitted to launchd, nor Launch Services or Apple Events used
+#          (the known ways to have a program started outside the sandbox).
+#          The profile filters these routes; it is not a complete jail.
+#          Setuid programs cannot run in the sandbox, so ps is an
+#          unprivileged, ad-hoc signed copy. Loopback ports the command
+#          opens itself stay reachable for the tests; the probe asks every
+#          listening port whether it is an engine.
 #   Linux  sudo unshare: a network namespace with only loopback and a mount
 #          namespace with an empty tmpfs over /run (and /var/run), then the
 #          calling user without supplementary groups (no docker group) and
@@ -91,15 +97,38 @@ case $(uname -s) in
     for i in "${!envargs[@]}"; do
       case ${envargs[$i]} in PATH=*) envargs[i]="PATH=$work/bin:${envargs[$i]#PATH=}" ;; esac
     done
-    home=$(cd -P "$HOME" && pwd -P)
+    home=$(cd -P "$HOME" && pwd -P) || refuse "cannot resolve \$HOME"
+    tmp=$(cd -P "${TMPDIR:-/tmp}" && pwd -P) || refuse "cannot resolve the temporary directory"
+    # The command may write only under $TMPDIR, /tmp (bash 3.2 writes its
+    # here-documents there whatever $TMPDIR is) and /dev: programs outside
+    # the sandbox run files from $HOME, Homebrew's prefix or /Applications.
+    case $tmp/ in
+      / | "$home"/*) refuse "the temporary directory $tmp is / or under \$HOME" ;;
+    esac
+    case $tmp in *[!A-Za-z0-9/._-]*) refuse "unexpected character in the temporary directory $tmp" ;; esac
+    # Local services that were listening before the command started (an
+    # agent, an IDE, a published container port or a socket proxy) are not
+    # the command's: it may connect only to loopback ports it opens itself.
+    listening=$(python3 -I "$probe" --listening) || refuse "cannot list the listening TCP ports"
+    held=""
+    for port in $listening; do
+      case $port in *[!0-9]* | "") refuse "unexpected port $port" ;; esac
+      held="$held (remote ip \"localhost:$port\")"
+    done
+    envargs+=("NO_DOCKER_HELD_PORTS=$(printf '%s' "$listening" | tr '\n' ' ')")
     profile="(version 1)
 (allow default)
 (deny network-outbound (remote unix-socket))
 (deny network-outbound (remote ip))
 (allow network-outbound (remote ip \"localhost:*\"))
-(deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\"))
+(deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
+(deny file-write*)
+(allow file-write* (subpath \"$tmp\") (subpath \"/private/tmp\") (subpath \"/dev\"))
 (deny file-write* (subpath \"$home\"))
 (deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/bin/launchctl\") (literal \"/usr/bin/ssh\"))
+(deny job-creation)
+(deny lsopen)
+(deny appleevent-send)
 (deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.coreservices.appleevents\") (global-name-regex #\"^com\\.apple\\.lsd\\.\"))"
     sandbox-exec -p "$profile" /usr/bin/env -i "${envargs[@]}" "$BASH" "$here/no-docker.sh" --inner "$@"
     ;;

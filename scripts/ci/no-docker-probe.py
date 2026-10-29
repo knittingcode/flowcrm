@@ -1,12 +1,17 @@
 """Prove that this process cannot reach a container engine.
 
 Run by scripts/ci/no-docker.sh inside its isolation, before the command it
-protects, and by `no-docker.sh --check`. Exit 0 only if
+protects, and by `no-docker.sh --check`. `--listening` only prints the TCP
+ports listening on loopback or on all addresses, one per line (no-docker.sh
+denies them inside the macOS sandbox). Otherwise exit 0 only if
 
   - the isolation mechanism is in effect in this process:
       macOS: a connect to a Unix socket of our own and a TCP connect to
         loopback port 2375 and to a non-loopback address are refused by
-        the sandbox (EPERM), not merely unanswered;
+        the sandbox (EPERM), not merely unanswered; no loopback port that
+        was listening before the sandbox started (NO_DOCKER_HELD_PORTS)
+        can be connected to; and no file can be created under $HOME or
+        next to $TMPDIR;
       Linux: no_new_privs is set, no supplementary group is held, the
         network namespace has only the loopback interface, and /run is a
         tmpfs without any socket;
@@ -102,6 +107,44 @@ def check_mechanism_darwin():
         os.rmdir(d)
     report(denied(socket.AF_INET, ("127.0.0.1", 2375)), "macOS sandbox denies loopback port 2375")
     report(denied(socket.AF_INET, ("192.0.2.1", 2375)), "macOS sandbox denies non-loopback TCP")
+    if not ok:
+        # Not sandboxed: write nothing and connect to nothing else.
+        return
+    held = os.environ.get("NO_DOCKER_HELD_PORTS", "").split()
+    reached = [p for p in held if p.isdigit() and connects(("127.0.0.1", int(p)))]
+    report(not reached, f"macOS sandbox denies the {len(held)} loopback ports listening before it started"
+           + (": reached " + " ".join(reached) if reached else ""))
+    home = os.path.realpath(os.path.expanduser("~"))
+    tmp = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
+    for where, d in (("under $HOME", home), ("outside $TMPDIR", os.path.dirname(tmp))):
+        report(not_writable(d), f"macOS sandbox denies writes {where} ({d})")
+
+
+def connects(address):
+    """True if a TCP connect succeeds; nothing is sent."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect(address)
+    except OSError:
+        return False
+    finally:
+        s.close()
+    return True
+
+
+def not_writable(directory):
+    """True if a new file cannot be created in directory."""
+    path = os.path.join(directory, f".no-docker-probe-{os.getpid()}")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+    os.close(fd)
+    os.unlink(path)
+    return False
 
 
 def check_mechanism_linux():
@@ -149,13 +192,20 @@ def walk_sockets(roots, limit=20000):
                     pass
 
 
-def listening_ports():
-    """(host, port) of TCP ports listening on loopback or on all addresses."""
+def listening_ports(strict=False):
+    """(host, port) of TCP ports listening on loopback or on all addresses.
+
+    strict: raise instead of returning an incomplete list (macOS)."""
     ports = set()
     if sys.platform == "darwin":
         try:
-            out = subprocess.run(["netstat", "-an", "-p", "tcp"], capture_output=True, text=True, timeout=10).stdout
+            run = subprocess.run(["netstat", "-an", "-p", "tcp"], capture_output=True, text=True, timeout=10)
+            if run.returncode != 0:
+                raise OSError(f"netstat exited with {run.returncode}")
+            out = run.stdout
         except (OSError, subprocess.SubprocessError):
+            if strict:
+                raise
             out = ""
         for line in out.splitlines():
             f = line.split()
@@ -219,6 +269,15 @@ def endpoints():
 
 
 def main():
+    if sys.argv[1:] == ["--listening"]:
+        # For no-docker.sh, before the isolation: the ports to deny inside it.
+        try:
+            ports = listening_ports(strict=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"no-docker: cannot list the listening ports: {e}", file=sys.stderr)
+            return 1
+        print("\n".join(sorted({str(port) for _, port in ports}, key=int)))
+        return 0
     if sys.platform == "darwin":
         check_mechanism_darwin()
     elif sys.platform.startswith("linux"):
