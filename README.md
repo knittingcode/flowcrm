@@ -120,7 +120,7 @@ $ docker exec -it "$api" php bin/console flowcrm:organization:create --name='Exa
 | `make test-devenv` | Port allocator unit and real-Docker tests (fixture stack) |
 | `make test-app` | Backend, frontend and application-stack tests |
 
-Port selection, configuration (`FLOWCRM_HTTP_PORT`, `FLOWCRM_PORT_RANGE`, …) and exit codes are described in [docs/dev-environment.md](docs/dev-environment.md).
+Port selection, configuration (`FLOWCRM_HTTP_PORT`, `FLOWCRM_PORT_RANGE`, …) and exit codes are described in [docs/dev-environment.md](docs/dev-environment.md). The exit codes in this README (for example 6) are those of `bin/devenv`; when it fails, `make` itself exits 2, so run `bin/devenv <command>` (for example `bin/devenv up`) to see them.
 
 ### Endpoints
 
