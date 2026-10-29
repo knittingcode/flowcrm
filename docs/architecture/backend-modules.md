@@ -14,7 +14,7 @@ lists the rules and how they are enforced.
 | `Activities` | tasks | planned |
 | `Reporting` | dashboard queries; no tables of its own | planned |
 | `Audit` | audit writer and queries | `AuditEvent` entity (FND-007) and the audit writer `AuditTrail` (FND-010B) |
-| `Shared` | small cross-cutting code: health checks, API status, problem details, request IDs; later `Clock`, UUIDv7 and `Money` | implemented |
+| `Shared` | small cross-cutting code: health checks, API status, problem details, request IDs; later `Clock`, UUIDv7 and `Money` | implemented; also the request-origin check of unsafe requests, JSON bodies, pagination, transactions, JSON logging with redaction, and the runtime privilege check (`app:database:verify-privileges`) |
 
 Modules without code exist only as rules in `backend/deptrac.modules.yaml`;
 their namespaces are created by the tasks that implement them. No
