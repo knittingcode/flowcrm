@@ -26,9 +26,10 @@
 #     only if it is identical, so the harness's own isolation cannot be
 #     tested behind the guard. Should that isolation fail, the read-only
 #     payload would reach the real daemon, which the cases detect.
-# T-06 and T-07 run plain commands, no mutant, inside no-docker.sh: they
-# check the write limits (macOS) and that loopback ports listening before
-# the isolation started cannot be reached from inside it.
+# T-06 to T-10 run plain commands, no mutant, inside no-docker.sh: they
+# check the write limits, the complete held-port list, the refusal of a
+# shared $TMPDIR, preferences and TIOCSTI (macOS), and that loopback ports
+# listening before the isolation started cannot be reached from inside it.
 # This suite itself runs no docker command.
 #
 # Usage: no-docker.test.sh
@@ -58,7 +59,8 @@ home_marker=$home/.flowcrm-no-docker-test-$nonce
 tmp=$(cd -P "${TMPDIR:-/tmp}" && pwd -P)
 [ -n "$tmp" ] && [ "$tmp" != / ] || exit 2
 outside_marker=$(dirname "$tmp")/.flowcrm-no-docker-test-$nonce
-trap 'rm -f "$home_marker" "$outside_marker"; rm -rf "$work"' EXIT
+tmp_marker=/private/tmp/.flowcrm-no-docker-test-$nonce
+trap 'rm -f "$home_marker" "$outside_marker" "$tmp_marker"; rm -rf "$work"' EXIT
 pass=0
 fail=0
 
@@ -316,14 +318,65 @@ result "T-02 claimed but unproven isolation (NO_DOCKER_ACTIVE outside it): refus
 
 # --- T-06/T-07 plain commands (no mutant) inside no-docker.sh
 if [ "$(uname -s)" = Darwin ]; then
-  "$root/scripts/ci/no-docker.sh" /bin/sh -c 'touch "$1" "$2" 2>/dev/null; : >"$3"' _ \
-    "$home_marker" "$outside_marker" "$work/t06" >/dev/null 2>&1
+  "$root/scripts/ci/no-docker.sh" /bin/bash -c 'touch "$1" "$2" "$3" 2>/dev/null; cat >"$4" <<EOF
+here-document
+EOF' _ "$home_marker" "$outside_marker" "$tmp_marker" "$work/t06" >/dev/null 2>&1
   r=$?
-  [ "$r" -eq 0 ] && [ -e "$work/t06" ] && [ ! -e "$home_marker" ] && [ ! -e "$outside_marker" ]
-  result "T-06 writes only under \$TMPDIR: not under \$HOME, not next to \$TMPDIR" $? "(rc $r)"
-  rm -f "$home_marker" "$outside_marker"
+  [ "$r" -eq 0 ] && [ "$(cat "$work/t06" 2>/dev/null)" = here-document ] &&
+    [ ! -e "$home_marker" ] && [ ! -e "$outside_marker" ] && [ ! -e "$tmp_marker" ]
+  result "T-06 writes only under \$TMPDIR (bash 3.2 here-documents work): not under \$HOME, next to \$TMPDIR or in /tmp" $? "(rc $r)"
+  rm -f "$home_marker" "$outside_marker" "$tmp_marker"
+
+  # T-08: the held-port list must be complete. A netstat without its column
+  # header, or with a LISTEN row that cannot be parsed, refuses; one with
+  # the header and no LISTEN row is a provably empty list.
+  mkdir -p "$work/t08"
+  t08() { # name netstat-output expected-rc
+    printf '#!/bin/sh\nprintf "%%b" %s\n' "'$2'" >"$work/t08/netstat"
+    chmod +x "$work/t08/netstat"
+    rm -f "$work/t08/ran"
+    PATH=$work/t08:$PATH "$root/scripts/ci/no-docker.sh" /usr/bin/touch "$work/t08/ran" >/dev/null 2>&1
+    r=$?
+    if [ "$3" -eq 0 ]; then
+      [ "$r" -eq 0 ] && [ -e "$work/t08/ran" ]
+    else
+      [ "$r" -eq 125 ] && [ ! -e "$work/t08/ran" ]
+    fi
+    result "T-08 $1" $? "(rc $r)"
+  }
+  hdr='Active Internet connections (including servers)\nProto Recv-Q Send-Q  Local Address          Foreign Address        (state)\n'
+  t08 "netstat without its column header: refused, command not run" 'tcp4 0 0 127.0.0.1.1 *.* LISTEN\n' 125
+  t08 "an unparsable LISTEN row: refused, command not run" "${hdr}tcp4 0 0 garbage *.* LISTEN\n" 125
+  t08 "header and no LISTEN row: an empty list is accepted" "${hdr}tcp4 0 0 127.0.0.1.1 127.0.0.1.2 ESTABLISHED\n" 0
+
+  # T-09: $TMPDIR must be a directory of its own, not /tmp.
+  TMPDIR=/tmp "$root/scripts/ci/no-docker.sh" /usr/bin/touch "$work/t09" >/dev/null 2>&1
+  r=$?
+  [ "$r" -eq 125 ] && [ ! -e "$work/t09" ]
+  result "T-09 TMPDIR=/tmp: refused, command not run" $? "(rc $r)"
+
+  # T-10: no preference written through cfprefsd, no keystroke injected
+  # into the terminal (TIOCSTI), run in a pseudo-terminal of its own.
+  t10_domain=com.flowcrm.no-docker-test-$nonce
+  "$root/scripts/ci/no-docker.sh" /usr/bin/defaults write "$t10_domain" k v >/dev/null 2>&1
+  t10_pref=$(defaults read "$t10_domain" k 2>/dev/null)
+  defaults delete "$t10_domain" >/dev/null 2>&1
+  rm -f "$home/Library/Preferences/$t10_domain.plist"
+  [ -z "$t10_pref" ]
+  result "T-10 defaults write inside the isolation changes no preference" $?
+  t10=$(script -q /dev/null "$root/scripts/ci/no-docker.sh" python3 -I -c '
+import fcntl, os
+fd = os.open("/dev/tty", os.O_RDWR)
+try:
+    fcntl.ioctl(fd, 0x80017472, b" ")
+    print("t10-injected")
+except OSError as e:
+    print("t10-denied", e.errno)
+' </dev/null 2>/dev/null | tr -d '\r')
+  case $t10 in *"t10-denied 1"*) r=0 ;; *) r=1 ;; esac
+  result "T-10 TIOCSTI on the controlling terminal is denied" $r "($(printf '%s' "$t10" | grep t10-))"
 else
-  echo "INFO  T-06 skipped: on Linux writes are not restricted (see docs/dev-environment.md)"
+  echo "INFO  T-06, T-08, T-09, T-10 skipped: macOS sandbox profile only (on Linux writes are not restricted, see docs/dev-environment.md)"
 fi
 cat >"$work/t07.py" <<'PY'
 import socket, sys, time
