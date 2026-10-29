@@ -396,11 +396,13 @@ perm() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
 leak=0
+# The secret is the pattern file of grep (never an argument: argv is visible
+# to other local users in the process list); an empty secret counts as a leak.
 for f in db_password db_owner_password db_app_password app_secret; do
-  s=$(cat "$sd/$f")
+  [ -s "$sd/$f" ] || leak=1
   for p in /health/live /health/ready /api/v1/system/status /api/v1/x; do
     get "$PA" "$p"
-    grep -q -- "$s" "$BODY" "$HEADERS" && leak=1
+    grep -qF -f "$sd/$f" "$BODY" "$HEADERS" && leak=1
   done
 done
 [ "$(perm "$sd")" = 700 ] && [ "$(perm "$sd/db_password")" = 444 ] && [ "$(perm "$sd/app_secret")" = 444 ] &&
@@ -475,7 +477,9 @@ need "seed synthetic users and organizations with the operator console" seed_e2e
 
   api_log=$(docker logs "$(cid "$A" api)" 2>&1)
   edge_log=$(docker logs "$(cid "$A" edge)" 2>&1)
-  ! printf '%s\n%s\n' "$api_log" "$edge_log" | grep -qF -e "$E2E_PASSWORD" -e "$E2E_REP_EMAIL" -e "$sid" -e "$token" &&
+  # The patterns reach grep through a file descriptor (printf is a builtin),
+  # not argv; an empty value is an empty pattern and matches, as before.
+  ! printf '%s\n%s\n' "$api_log" "$edge_log" | grep -qF -f <(printf '%s\n' "$E2E_PASSWORD" "$E2E_REP_EMAIL" "$sid" "$token") &&
     printf '%s\n' "$api_log" | grep -q '"event":"login_failed"' && printf '%s\n' "$api_log" | grep -q '"event":"login_succeeded"'
   v "ST-73 the security log records the logins with pseudonyms; no password, e-mail address, session ID or CSRF token in any log" $?
 }
@@ -598,7 +602,9 @@ rot() { # label role [fault] [command]
 login_result() { # role password-file
   local out msg
   [ -s "$2" ] || { echo "no-file"; return; }
-  out=$(docker exec -e PGPASSWORD="$(cat "$2")" "$(cid "$A" db)" \
+  # docker takes PGPASSWORD from its own environment (-e NAME): the value is
+  # never in an argument, where the process list would show it.
+  out=$(PGPASSWORD=$(cat "$2") docker exec -e PGPASSWORD "$(cid "$A" db)" \
     sh -c 'psql -X -w -h "$(hostname -i | cut -d" " -f1)" -U "flowcrm_$0" -d flowcrm -tAc "SELECT 1"' "$1" 2>"$work/out/login.err")
   if printf '%s\n' "$out" | grep -qx 1; then echo ok; return; fi
   msg=$({ cat "$work/out/login.err"; printf '%s\n' "$out"; } | sed '/^[[:space:]]*$/d' | tail -n 1 | cut -c1-160)
