@@ -960,16 +960,39 @@ gate_failed() { # exit-code message
 # url report it, and only a command that finished with every check passed
 # clears it (gate_clear). The first line is the reason; the line "edge"
 # records that the edge was serving, so a rotation can restore it.
+# A failed listing is never taken for "no edge". Whether the edge stopped
+# is checked on the containers listed before the stop (edges_stopped), not
+# with a new listing: right after docker compose stop returned, the list
+# can still show the stopped container as running.
 protect_for() { # reason
-  local edge=''
-  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
+  local edge='' ids rc
+  ids=$(compose ps --quiet "$EDGE" 2>/dev/null) ||
+    die $EX_SAFETY "could not list the containers of $PROJECT, so it is not known whether its edge serves; the database was not changed; stop the stack with make down"
+  if [ -n "$ids" ] || grep -qx edge "$GATE_FILE" 2>/dev/null; then edge=edge; fi
   printf '%s\n' "$1" ${edge:+"$edge"} | write_gate || die $EX_SAFETY "could not record the security gate; nothing was changed"
-  if [ -n "$(compose ps --quiet "$EDGE" 2>/dev/null)" ]; then
-    compose_op stop "$EDGE" >/dev/null 2>&1
-    [ -z "$(compose ps --quiet "$EDGE" 2>/dev/null)" ] ||
-      die $EX_SAFETY "the edge of $PROJECT could not be stopped, so the database was not changed; stop the stack with make down"
+  if [ -n "$ids" ]; then
+    new_tmp edge-stop
+    compose_op stop "$EDGE" >/dev/null 2>"$TMP_FILE"
+    rc=$?
+    # shellcheck disable=SC2086 # one container ID per word
+    edges_stopped $ids ||
+      die $EX_SAFETY "the edge of $PROJECT could not be stopped, so the database was not changed (docker compose stop exited with status $rc$(tail -n 1 "$TMP_FILE" | tr -cd '[:print:]' | head -c 200 | sed 's/^./: &/')); stop the stack with make down"
     log "stopped the edge before changing the database (${1}); it serves again once every check passed"
   fi
+}
+
+# Whether each container (ID) is stopped or removed. docker container
+# inspect reads the container itself, not the list behind docker compose
+# ps. Any other answer, or any other error, counts as running.
+edges_stopped() { # id...
+  local id s
+  for id in "$@"; do
+    if s=$(docker container inspect -f '{{.State.Running}}' "$id" 2>&1); then
+      [ "$s" = false ] || return 1
+    else
+      case $s in *"No such object"* | *"No such container"*) ;; *) return 1 ;; esac
+    fi
+  done
 }
 
 gate_clear() { rm -f "$GATE_FILE" "$RUNTIME_DIR/security-gate"; }
