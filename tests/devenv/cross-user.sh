@@ -14,14 +14,17 @@
 #      docker that reports no volume.
 #   2. Outside the isolation, this script checks the result as data (file
 #      type, owner, modes; never the contents) and then runs only fixed
-#      commands as nobody on fixed paths: /bin/cat FILE and /bin/ls DIR.
+#      commands as nobody on fixed paths, with an empty environment:
+#      /usr/bin/env -i /bin/cat FILE and /usr/bin/env -i /bin/ls DIR. A
+#      denial counts only as "Permission denied" after a passed control.
 # A control file that this script makes in a 0755 directory next to the
 # secrets directory, and that nobody must be able to read, proves that the
 # path is reachable for nobody and that the read check detects an exposed
 # file.
 #
-# The check needs passwordless sudo. Without it the suite prints INFO and
-# exits 0, except in CI (CI=true), where that is a failure.
+# The check needs passwordless sudo. Without it the suite prints INFO (CU-01
+# to CU-04 NOT RUN, no PASS) and exits 0, except in CI (CI=true), where that
+# is a failure (CU-00).
 #
 # It certifies the committed code, so it refuses (exit 64) when DEVENV,
 # GUARD, ADAPTED or NO_DOCKER_ACTIVE is set, outside a Git checkout, and
@@ -63,13 +66,20 @@ git -C "$root" -c core.fsmonitor=false diff --no-ext-diff --no-textconv --quiet 
 # shellcheck source=tally.sh
 . "$here/tally.sh"
 
+# Printable text of at most 2000 bytes of standard input, on one line: error
+# output goes into the log this way (never a secret, which is never read).
+clean() { head -c 2000 | tr '\n' ' ' | tr -cd '[:print:]'; }
+
 cd / || exit 64
-if ! sudo -n -u nobody -- /usr/bin/true 2>/dev/null; then
+# Every command as nobody is a fixed absolute binary on fixed arguments, with
+# an empty environment (env -i: nothing of the caller passes, and messages
+# are in the C locale).
+if ! probe_err=$(sudo -n -u nobody -- /usr/bin/env -i /usr/bin/true 2>&1); then
   if [ "${CI-}" = true ]; then
-    printf 'FAIL  CU-00 passwordless sudo to the user nobody is required in CI\n'
+    printf 'FAIL  CU-00 passwordless sudo to the user nobody is required in CI (%s)\n' "$(printf '%s' "$probe_err" | clean)"
     exit 1
   fi
-  printf 'INFO  CU cross-user read check needs passwordless sudo to the user nobody (runs in CI); skipped\n'
+  printf 'INFO  CU-01 to CU-04 NOT RUN: the cross-user read check needs passwordless sudo to the user nobody (runs in CI)\n'
   exit 0
 fi
 
@@ -122,18 +132,44 @@ for name in $names; do
   { [ ! -L "$f" ] && [ -f "$f" ] && [ -s "$f" ] && [ -O "$f" ] && [ "$(mode_of "$f")" = 444 ]; } || ok=1
 done
 result "CU-01 the checkout's bin/devenv created the secrets in the isolation (directory 0700, regular files 0444)" $ok \
-  "(rc $rc: $(head -c 2000 "$base/generate.err" | tr '\n' ' ' | tr -cd '[:print:]'))"
+  "(rc $rc: $(clean <"$base/generate.err"))"
+generated=$ok
 
-as_nobody() { sudo -n -u nobody -- "$@" >/dev/null 2>&1; }
+# Stdout is discarded (it would be a secret), stderr kept for the result.
+as_nobody() { sudo -n -u nobody -- /usr/bin/env -i "$@" >/dev/null 2>"$base/nobody.err"; }
+modes_up() { # path: the mode of it and of every parent, for a failed control
+  local p=$1 out=
+  while :; do
+    out="$out $p=$(mode_of "$p")"
+    [ "$p" != / ] || break
+    p=$(dirname "$p")
+  done
+  printf '%s' "${out# }"
+}
 
-as_nobody /bin/cat "$rt/control/file"
-result "CU-02 control: nobody can read a 0444 file in a 0755 directory next to the secrets directory (the path is reachable and the read check detects an exposed file)" $?
+reachable=1
+if as_nobody /bin/cat "$rt/control/file"; then reachable=0; fi
+result "CU-02 control: nobody can read a 0444 file in a 0755 directory next to the secrets directory (the path is reachable and the read check detects an exposed file)" $reachable \
+  "(as nobody: $(clean <"$base/nobody.err"); modes: $(modes_up "$rt/control/file"))"
 
-if as_nobody /bin/ls "$secrets_dir"; then r=1; else r=0; fi
-result "CU-03 nobody cannot list the secrets directory" $r
+# A denial counts only if the secrets were generated (CU-01), the control
+# was read (CU-02) and the command failed with "Permission denied": any
+# other failure, such as sudo itself failing, is not a denial.
+denied() { # name command path
+  if [ "$generated" != 0 ] || [ "$reachable" != 0 ]; then
+    fail_result "$1 (not checked: CU-01 or CU-02 failed)"
+  elif as_nobody "$2" "$3"; then
+    fail_result "$1 (nobody succeeded)"
+  elif grep -q 'Permission denied' "$base/nobody.err"; then
+    pass_result "$1"
+  else
+    fail_result "$1 (failed, but not with Permission denied: $(clean <"$base/nobody.err"))"
+  fi
+}
+
+denied "CU-03 nobody cannot list the secrets directory" /bin/ls "$secrets_dir"
 for name in $names; do
-  if as_nobody /bin/cat "$secrets_dir/$name"; then r=1; else r=0; fi
-  result "CU-04 nobody cannot read the secret $name" $r
+  denied "CU-04 nobody cannot read the secret $name" /bin/cat "$secrets_dir/$name"
 done
 # Nothing here changes, follows or executes a path that the isolated code
 # could have replaced (such as a symbolic link to a file of the caller):

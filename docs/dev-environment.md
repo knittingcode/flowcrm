@@ -503,12 +503,17 @@ test runs there:
   directory below `/tmp` and a fake `docker` that reports no volume.
 - Outside the isolation the script checks the result only as data (file
   type, owner, modes `0700`/`0444`), then runs fixed commands as `nobody`
-  on fixed paths: `/bin/ls` of the directory and `/bin/cat` of each secret.
+  on fixed paths with an empty environment (`/usr/bin/env -i`): `/bin/ls`
+  of the directory and `/bin/cat` of each secret.
 - A control makes a pass meaningful: `nobody` must be able to read a
   `0444` file that the script puts in a `0755` directory next to the
   secrets directory. This proves that the path is reachable (below a `0700`
   directory such as the macOS `$TMPDIR` every read would fail) and that the
-  read check detects an exposed file.
+  read check detects an exposed file. If the control fails, its result
+  shows the error and the mode of every parent directory.
+- A denial counts only if the secrets were generated (CU-01), the control
+  passed (CU-02) and the command failed with `Permission denied`; any other
+  failure, such as `sudo` itself failing, makes the result a failure.
 - Nothing outside the isolation changes, follows or executes a path that the
   isolated code could have replaced; those paths are only tested, `stat`ed
   and read by `nobody`.
@@ -516,8 +521,8 @@ test runs there:
   (exit 64) arguments, `DEVENV`, `GUARD`, `ADAPTED`, a run inside
   `no-docker.sh`, a directory that is not a Git checkout, and local
   changes to `bin/devenv`, itself, `tally.sh`, `no-docker.sh` or the probe.
-- Without passwordless sudo to `nobody` it prints INFO and exits 0; in CI
-  (`CI=true`) that is a failure.
+- Without passwordless sudo to `nobody` it prints INFO (CU-01 to CU-04 not
+  run, no PASS) and exits 0; in CI (`CI=true`) that is a failure (CU-00).
 
 Application suites (`tests/app/`), each in its own Compose projects:
 
