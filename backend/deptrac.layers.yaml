@@ -1,6 +1,7 @@
 # Layers inside every module (FCRM-003 section E): Http -> Application ->
 # Domain; Infrastructure implements interfaces of Domain and Application.
-# A module's public Api may use Domain types (identifiers, value objects).
+# The layer rules allow Api -> Domain, but deptrac.modules.yaml allows an Api
+# namespace only Shared, so an Api uses no Domain type.
 # Domain uses no framework HTTP and no persistence code except the Doctrine
 # mapping attributes (an accepted trade-off) and Doctrine collections;
 # Application and Api use no framework HTTP. Module boundaries:

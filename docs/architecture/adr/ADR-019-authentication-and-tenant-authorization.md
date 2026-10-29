@@ -3,6 +3,7 @@
 - **Status:** accepted for FCRM-FND-010B, amended by the FCRM-FND-010V security gate (the role matrix is provisional, see below)
 - **Related:** FCRM-002 (REQ-001 to REQ-006, NFR-001, NFR-002, NFR-005 to NFR-007, NFR-012, TI-01 to TI-13, BR-32, BR-33, section H), FCRM-003 sections G, H and I, C-05 and C-07, ADR-004 (tenant enforcement), ADR-005 (authentication and sessions), ADR-006 (REST conventions), ADR-007 (no Redis), ADR-017 (edge routing), ADR-018 (database roles)
 - **Design:** FCRM-FND-010A; details in [authentication](../authentication.md)
+- **Amended:** 2026-10-25 by PR #26 (decision 4, see [Amendments](#amendments))
 
 ## Context
 
@@ -42,6 +43,8 @@ membership on every request.
    session ends on its next request when the user is disabled or gone, the
    password was changed anywhere else, or 8 hours passed since the login;
    the idle timeout stays 30 minutes.
+   *Amended on 2026-10-25: disabling a user also deletes the user's
+   sessions at once, see [Amendments](#amendments).*
 5. **Request forgery:** before the firewall, every unsafe `/api` request
    needs an `application/json` body (415 otherwise), an `Origin` equal to
    the request's own origin (or, without `Origin`, a `Referer` of that
@@ -104,6 +107,23 @@ another's permissions.
 | `membership.view_email` | yes | yes | no | not specified in FCRM-002; provisional |
 
 Tenant mutations and membership management are not part of FND-010B.
+
+## Amendments
+
+- **2026-10-25, PR #26** (`fix(auth): invalidate sessions when disabling
+  users`, decision 4): the per-request check alone did not end a session
+  that made no request while its user was disabled; after
+  `flowcrm:user:enable` that session worked again. Since then,
+  `flowcrm:user:disable` deletes every stored session of the user at once,
+  in the same transaction as the change and its audit event, and
+  `flowcrm:user:enable` deletes them again, so a session stored by a login
+  that was in flight during the disable is not revived either. A stored
+  session belongs to a user when its data holds the user's ID; the
+  `sessions` table still has no user column. The per-request check stays
+  for a session stored after the disable; a removed user and a password
+  changed elsewhere still end a session on its next request. Details:
+  [authentication](../authentication.md#login-and-sessions) and
+  [operator console](../authentication.md#operator-console).
 
 ## Deviations, with reasons
 
