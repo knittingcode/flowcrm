@@ -17,10 +17,12 @@
 #      commands as nobody on fixed paths, with an empty environment:
 #      /usr/bin/env -i /bin/cat FILE and /usr/bin/env -i /bin/ls DIR. A
 #      denial counts only as "Permission denied" after a passed control.
+#      It never writes, creates or reads a file below the directory that
+#      the isolated code was given (which that code could have replaced).
 # A control file that this script makes in a 0755 directory next to the
-# secrets directory, and that nobody must be able to read, proves that the
-# path is reachable for nobody and that the read check detects an exposed
-# file.
+# secrets directory, and that nobody must be able to read (and the
+# directory list), proves that the path is reachable for nobody and that
+# both checks detect an exposed file.
 #
 # The check needs passwordless sudo. Without it the suite prints INFO (CU-01
 # to CU-04 NOT RUN, no PASS) and exits 0, except in CI (CI=true), where that
@@ -89,8 +91,8 @@ fi
 # reason; the control file below proves it.
 base=$(mktemp -d /tmp/flowcrm-cross-user.XXXXXX) || exit 2
 base=$(cd -P "$base" && pwd -P) || exit 2
-trap 'rm -rf "$base"' EXIT
-tally_init "$base/tally"
+tally_dir=
+trap 'rm -rf "$base" ${tally_dir:+"$tally_dir"}' EXIT
 
 result() { # name ok(0|1) [detail]
   if [ "$2" -eq 0 ]; then pass_result "$1"; else fail_result "$1${3:+ $3}"; fi
@@ -107,8 +109,14 @@ printf '#!/bin/sh\nexit 1\n' >"$base/bin/docker" && chmod 0755 "$base/bin/docker
   chmod 0444 "$rt/control/file"; } || exit 2
 
 # --- part 1, isolated: the checkout's bin/devenv generates the secrets
+# The isolated code knows $base and runs as the caller, so it can replace
+# anything below it, for example with a symbolic link to a file under $HOME
+# (which the macOS sandbox would not let it write). The trusted part
+# therefore never writes, creates or reads a file below $base after this
+# step: error output is kept in variables (the last 4000 bytes) and the
+# tally is in a directory made after this step, outside $base.
 # shellcheck disable=SC2016 # expanded by the isolated shell
-"$root/scripts/ci/no-docker.sh" "$BASH" -c '
+gen_err=$({ "$root/scripts/ci/no-docker.sh" "$BASH" -c '
   set -u
   . "$1" || exit 2
   FLOWCRM_STACK=app
@@ -117,8 +125,11 @@ printf '#!/bin/sh\nexit 1\n' >"$base/bin/docker" && chmod 0755 "$base/bin/docker
   GATE_DIR=$2/gate GATE_FILE=$2/gate/security-gate
   PATH=$3:$PATH
   ensure_secrets
-' cross-user "$root/bin/devenv" "$rt" "$base/bin" 2>"$base/generate.err"
+' cross-user "$root/bin/devenv" "$rt" "$base/bin" 2>&1 >/dev/null | tail -c 4000
+  exit "${PIPESTATUS[0]}"; })
 rc=$?
+tally_dir=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-cross-user-tally.XXXXXX") || exit 2
+tally_init "$tally_dir/tally"
 
 # --- part 2, outside the isolation: checks as data, then fixed reads as nobody
 mode_of() { # GNU stat first: its -f means file system status
@@ -132,11 +143,11 @@ for name in $names; do
   { [ ! -L "$f" ] && [ -f "$f" ] && [ -s "$f" ] && [ -O "$f" ] && [ "$(mode_of "$f")" = 444 ]; } || ok=1
 done
 result "CU-01 the checkout's bin/devenv created the secrets in the isolation (directory 0700, regular files 0444)" $ok \
-  "(rc $rc: $(clean <"$base/generate.err"))"
+  "(rc $rc: $(printf '%s' "$gen_err" | tail -c 2000 | clean))"
 generated=$ok
 
-# Stdout is discarded (it would be a secret), stderr kept for the result.
-as_nobody() { sudo -n -u nobody -- /usr/bin/env -i "$@" >/dev/null 2>"$base/nobody.err"; }
+# Stdout is discarded (it would be a secret); stderr is kept in nobody_err.
+as_nobody() { nobody_err=$(sudo -n -u nobody -- /usr/bin/env -i "$@" 2>&1 >/dev/null); }
 modes_up() { # path: the mode of it and of every parent, for a failed control
   local p=$1 out=
   while :; do
@@ -147,10 +158,12 @@ modes_up() { # path: the mode of it and of every parent, for a failed control
   printf '%s' "${out# }"
 }
 
+# Both commands of the negative checks must work on the control, so that
+# neither can pass because the command itself cannot run as nobody.
 reachable=1
-if as_nobody /bin/cat "$rt/control/file"; then reachable=0; fi
-result "CU-02 control: nobody can read a 0444 file in a 0755 directory next to the secrets directory (the path is reachable and the read check detects an exposed file)" $reachable \
-  "(as nobody: $(clean <"$base/nobody.err"); modes: $(modes_up "$rt/control/file"))"
+if as_nobody /bin/cat "$rt/control/file" && as_nobody /bin/ls "$rt/control"; then reachable=0; fi
+result "CU-02 control: nobody can read a 0444 file in, and list, a 0755 directory next to the secrets directory (the path is reachable and the checks detect an exposed file)" $reachable \
+  "(as nobody: $(printf '%s' "$nobody_err" | clean); modes: $(modes_up "$rt/control/file"))"
 
 # A denial counts only if the secrets were generated (CU-01), the control
 # was read (CU-02) and the command failed with "Permission denied": any
@@ -160,10 +173,10 @@ denied() { # name command path
     fail_result "$1 (not checked: CU-01 or CU-02 failed)"
   elif as_nobody "$2" "$3"; then
     fail_result "$1 (nobody succeeded)"
-  elif grep -q 'Permission denied' "$base/nobody.err"; then
+  elif case $nobody_err in *'Permission denied'*) true ;; *) false ;; esac; then
     pass_result "$1"
   else
-    fail_result "$1 (failed, but not with Permission denied: $(clean <"$base/nobody.err"))"
+    fail_result "$1 (failed, but not with Permission denied: $(printf '%s' "$nobody_err" | clean))"
   fi
 }
 
@@ -171,8 +184,10 @@ denied "CU-03 nobody cannot list the secrets directory" /bin/ls "$secrets_dir"
 for name in $names; do
   denied "CU-04 nobody cannot read the secret $name" /bin/cat "$secrets_dir/$name"
 done
-# Nothing here changes, follows or executes a path that the isolated code
-# could have replaced (such as a symbolic link to a file of the caller):
-# the paths are only tested, stat'ed and read by nobody.
+# Nothing here writes, creates, follows into a write or executes a path that
+# the isolated code could have replaced (such as a symbolic link to a file
+# of the caller): those paths are only tested and stat'ed, and read by
+# nobody. CU-04 is denied by the 0700 directory: the secret files are 0444
+# by design (the containers' unprivileged users read the bind mount).
 
 tally_finish ""

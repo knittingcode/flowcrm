@@ -523,16 +523,28 @@ test runs there:
   of the directory and `/bin/cat` of each secret.
 - A control makes a pass meaningful: `nobody` must be able to read a
   `0444` file that the script puts in a `0755` directory next to the
-  secrets directory. This proves that the path is reachable (below a `0700`
+  secrets directory, and to list that directory. This proves that the path is reachable (below a `0700`
   directory such as the macOS `$TMPDIR` every read would fail) and that the
   read check detects an exposed file. If the control fails, its result
   shows the error and the mode of every parent directory.
 - A denial counts only if the secrets were generated (CU-01), the control
   passed (CU-02) and the command failed with `Permission denied`; any other
   failure, such as `sudo` itself failing, makes the result a failure.
-- Nothing outside the isolation changes, follows or executes a path that the
-  isolated code could have replaced; those paths are only tested, `stat`ed
-  and read by `nobody`.
+- CU-04 is denied by the `0700` secrets directory, not by the file mode:
+  the secret files are `0444` by design, so that the containers'
+  unprivileged users can read the bind-mounted copy. CU-01 checks both
+  modes as data.
+- The isolated code runs as the caller and knows the temporary directory,
+  so it could replace anything in it, for example with a symbolic link to a
+  file under `$HOME`. After it returns, nothing outside the isolation
+  writes, creates, executes or reads a file there: those paths are only
+  tested and `stat`ed, and read by `nobody`. Error output is kept in
+  variables, and the result tally is in a new directory made after the
+  isolated step, outside the temporary directory.
+- Neither isolation ends processes that the isolated step leaves behind.
+  Such a process stays isolated, but it could still change a result, race
+  the new tally directory below `$TMPDIR`, or keep the step waiting on its
+  output until the CI job times out.
 - It certifies committed code and is not a mutation harness: it refuses
   (exit 64) arguments, `DEVENV`, `GUARD`, `ADAPTED`, a run inside
   `no-docker.sh`, a directory that is not a Git checkout, and local
