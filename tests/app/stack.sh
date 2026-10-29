@@ -1320,9 +1320,50 @@ chmod 0755 "$A/.runtime/secrets"
 dv a-perm "$A" up
 [ "$(rc_of a-perm)" = 0 ] && [ "$(perm "$A/.runtime/secrets")" = 700 ]
 v "ST-34 a too-open secrets directory is restored to 0700 by make up" $?
-if sudo -n -u nobody true 2>/dev/null; then
-  if sudo -n -u nobody cat "$A/.runtime/secrets/db_password" >/dev/null 2>&1; then r=1; else r=0; fi
-  v "ST-34 another local user cannot read the secrets" $r
+# Cross-user read check. The work directory is 0700 (mktemp -d), so nobody
+# would be refused by it and not by the secrets' own modes: the check would
+# pass whatever those modes are. For the check only, the work directory is
+# opened to 0711 (traverse, no listing; restored to 0700 right after), and a
+# control file (0444, in a 0755 directory next to the secrets directory, so
+# it shares every parent) must be readable by nobody. A denial counts only
+# after a passed control and only as "Permission denied". While it is 0711,
+# another user who knows a path below the work directory can read files of
+# this run that are not 0700/0600 themselves: copies of the repository, logs
+# and responses of these throwaway test stacks; every secrets directory
+# stays 0700. Commands as nobody are fixed binaries on fixed paths, with an
+# empty environment (env -i: C locale messages), run from /.
+as_nobody() { (cd / && sudo -n -u nobody -- /usr/bin/env -i "$@") >/dev/null 2>"$work/nobody.err"; }
+nobody_err() { head -c 2000 "$work/nobody.err" | tr '\n' ' ' | tr -cd '[:print:]'; }
+modes_up() { # path: the mode of it and of every parent, for a failed control
+  local p=$1 out=
+  while :; do
+    out="$out $p=$(perm "$p")"
+    [ "$p" != / ] || break
+    p=$(dirname "$p")
+  done
+  printf '%s' "${out# }"
+}
+if (cd / && sudo -n -u nobody -- /usr/bin/env -i /usr/bin/true) 2>/dev/null; then
+  ctl=$A/.runtime/st34-control
+  { mkdir "$ctl" && chmod 0755 "$ctl" && printf 'control\n' >"$ctl/file" && chmod 0444 "$ctl/file" && chmod 0711 "$work"; }
+  need "ST-34 cross-user control prepared" [ $? = 0 ] || { tally_finish; exit; }
+  as_nobody /bin/cat "$ctl/file"
+  r=$?
+  v "ST-34 control: another local user can read a 0444 file in a 0755 directory next to the secrets (the path is reachable and the read check detects an exposed file)" $r \
+    "as nobody: $(nobody_err); modes: $(modes_up "$ctl/file")"
+  if [ "$r" != 0 ]; then
+    bad "ST-34 another local user cannot read the secrets" "not checked: the control failed"
+  elif as_nobody /bin/cat "$A/.runtime/secrets/db_password"; then
+    bad "ST-34 another local user cannot read the secrets" "nobody read it; secrets directory $(perm "$A/.runtime/secrets"), file $(perm "$A/.runtime/secrets/db_password")"
+  elif grep -q 'Permission denied' "$work/nobody.err"; then
+    ok "ST-34 another local user cannot read the secrets"
+  else
+    bad "ST-34 another local user cannot read the secrets" "failed, but not with Permission denied: $(nobody_err)"
+  fi
+  chmod 0700 "$work"
+  rm -rf "$ctl"
+elif [ "${CI-}" = true ]; then
+  bad "ST-34 another local user cannot read the secrets" "passwordless sudo to the user nobody is required in CI"
 else
   say "      INFO ST-34 cross-user read check needs passwordless sudo (runs in CI)"
 fi
