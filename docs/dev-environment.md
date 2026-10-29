@@ -272,9 +272,10 @@ Every command acts only on this checkout's project. It refuses (exit 6) when:
   directory.
 
 No command removes volumes or runs global cleanup such as `docker system
-prune`. To delete this checkout's data, remove the volume explicitly:
-`docker volume rm flowcrm-<hash>_state-data` (the name is shown by
-`make status`).
+prune`. To delete this checkout's data, stop the stack (`make down`) and
+remove the volume explicitly: `docker volume rm flowcrm-<hash>_db-data` for
+the application stack, `flowcrm-<hash>_state-data` for the fixture
+(`make status` shows the project name `flowcrm-<hash>`).
 
 ## Concurrency and interruption
 
