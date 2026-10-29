@@ -1216,24 +1216,47 @@ RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 # gate_clear also removes a gate left at the old place. edge_sees_gate runs
 # a one-off container that publishes no port, with the gate directory
 # mounted, and checks both the rule and that the gate is readable.
+# Whether the edge stopped is asked of the container itself (docker
+# inspect): a listing that still shows it right after a successful stop
+# (seen in CI, ST-50) does not fail the command, a container that still
+# runs or cannot be inspected does, with the stop's exit status and error,
+# and a listing that fails stops the command before anything changes.
 saved_fns=$(declare -f compose compose_op run_op write_gate)
 saved_runtime=$RUNTIME_DIR saved_gate=$GATE_FILE saved_gate_dir=$GATE_DIR
-compose() { [ "$1 $2 $3" = "ps --quiet edge" ] && [ "$(cat "$work/u23-running" 2>/dev/null)" = true ] && printf 'edge-id\n'; return 0; }
+compose() {
+  [ "$1 $2 $3" = "ps --quiet edge" ] || return 0
+  [ "$U23_PS" = fails ] && return 1
+  [ "$(cat "$work/u23-listed" 2>/dev/null)" = true ] && printf 'edge-id\n'
+  return 0
+}
 compose_op() {
   [ "$1" = exec ] && return 1 # cancel_db_op: the cancellation is not confirmed
   [ "$1" = stop ] || return 0
   printf 'stop %s gate=%s\n' "$2" "$([ -f "$GATE_FILE" ] && echo yes || echo no)" >>"$work/u23-calls"
-  [ "$U23_STOP" = fails ] && return 1
-  echo false >"$work/u23-running"
+  case $U23_STOP in
+    fails) echo 'Error response from daemon: cannot stop container: edge-id' >&2 && return 1 ;;
+    returns) return 0 ;; # exit 0, but the container still runs
+  esac
+  echo "$U23_AFTER" >"$work/u23-running"
+  [ "$U23_STALE" = yes ] || echo false >"$work/u23-listed"
 }
-u23() { # name gate-dir(dir|file) stop(ok|fails)
+docker() {
+  [ "$1 $2 $3 $4 $5" = "container inspect -f {{.State.Running}} edge-id" ] || return 99
+  case $(cat "$work/u23-running") in
+    true | false) cat "$work/u23-running" ;;
+    removed) echo 'Error response from daemon: No such container: edge-id' >&2 && return 1 ;;
+    *) echo 'error during connect: the daemon cannot be reached' >&2 && return 1 ;;
+  esac
+}
+u23() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|unknown) [stale-list(yes) [ps(fails)]]]
   RUNTIME_DIR=$work/u23-$1/.runtime GATE_DIR=$work/u23-$1/.runtime/gate
   GATE_FILE=$GATE_DIR/security-gate
   mkdir -p "$RUNTIME_DIR"
   if [ "$2" = file ]; then : >"$GATE_DIR"; else mkdir -p "$GATE_DIR"; fi
   rm -f "$work/u23-calls"
   echo true >"$work/u23-running"
-  U23_STOP=$3
+  echo true >"$work/u23-listed"
+  U23_STOP=$3 U23_AFTER=${4:-false} U23_STALE=${5:-} U23_PS=${6:-}
   U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
   U23_RC=$?
   U23_CALLS=$(paste -sd ";" - 2>/dev/null <"$work/u23-calls")
@@ -1243,10 +1266,29 @@ u23 ok dir ok
 [ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
   [ "$(cat "$work/u23-running")" = false ]
 result "U-23 protect_for records the gate (with the edge line) before it stops the serving edge" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE])"
+u23 stale dir ok false yes
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"stopped the edge before changing the database"*) true ;; *) false ;; esac
+result "U-23 protect_for goes on when the stopped edge is still listed for a moment (docker inspect: not running)" $? "(exit $U23_RC: $U23_OUT)"
+u23 removed dir ok removed
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ]
+result "U-23 protect_for goes on when the edge container is gone after the stop (No such object)" $? "(exit $U23_RC: $U23_OUT)"
 u23 stuck dir fails
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] && [ "$(cat "$work/u23-running")" = true ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed (docker compose stop exited with status 1: Error response from daemon: cannot stop container: edge-id)"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the edge cannot be stopped, with the stop's exit status and error; the gate stays recorded" $? "(exit $U23_RC: $U23_OUT)"
+u23 still-running dir returns
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed (docker compose stop exited with status 0)"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the stop succeeded but the edge still runs" $? "(exit $U23_RC: $U23_OUT)"
+u23 uninspectable dir ok unknown
 [ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
   case $U23_OUT in *"could not be stopped, so the database was not changed"*) true ;; *) false ;; esac
-result "U-23 protect_for stops the command when the edge cannot be stopped; the gate stays recorded" $? "(exit $U23_RC: $U23_OUT)"
+result "U-23 protect_for stops the command when the edge's state cannot be inspected after the stop" $? "(exit $U23_RC: $U23_OUT)"
+u23 unlisted dir ok false '' fails
+[ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ ! -e "$GATE_FILE" ] && [ "$(cat "$work/u23-running")" = true ] &&
+  case $U23_OUT in *"could not list the containers of"*"the database was not changed"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command, changing nothing, when the edge cannot be listed (never taken for no edge)" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
 u23 unwritable file ok
 [ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ "$(cat "$work/u23-running")" = true ] &&
   case $U23_OUT in *"could not record the security gate; nothing was changed"*) true ;; *) false ;; esac
@@ -1280,6 +1322,7 @@ grep -qx "FLOWCRM_GATE_DIR=$GATE_DIR" "$work/u23-run" && grep -qx run "$work/u23
   grep -qF 'test -r /run/flowcrm-gate/security-gate' "$work/u23-run"
 result "U-23 edge_sees_gate: one-off edge container with the gate directory, no published port, checks the rule and that the gate is readable" $? "($(paste -sd ' ' - <"$work/u23-run"))"
 eval "$saved_fns"
+unset -f docker
 RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 
 # --- U-24 make up recognises an edge that does not enforce the gate (FND-009E)
