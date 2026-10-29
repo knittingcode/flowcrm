@@ -176,6 +176,8 @@ $ make up
 
 Keep `.runtime/secrets/` (and `.runtime/backups/`) as long as the volume exists: the database was initialised with those passwords. If one is lost, `make up` refuses to start rather than generating a non-matching password.
 
+To back up the development database and restore it (rehearsed in a separate project first), follow [Backup and restore of the development database](docs/dev-environment.md#backup-and-restore-of-the-development-database).
+
 ## Tests
 
 ```console
