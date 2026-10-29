@@ -49,6 +49,9 @@ jobs:
       - name: Run edge configuration guard regression tests
         run: scripts/ci/tests/guard-edge-config.test.sh
 
+      - name: Run test isolation regression tests
+        run: scripts/ci/tests/no-docker.test.sh
+
       - name: ShellCheck
         run: >-
           docker run --rm --network none -v "$PWD:/mnt:ro" -w /mnt
@@ -57,6 +60,7 @@ jobs:
           scripts/ci/guard-dockerfile-frontend.sh scripts/ci/tests/guard-dockerfile-frontend.test.sh
           scripts/ci/guard-trivyignore.sh scripts/ci/tests/guard-trivyignore.test.sh
           scripts/ci/guard-edge-config.sh scripts/ci/tests/guard-edge-config.test.sh
+          scripts/ci/no-docker.sh scripts/ci/tests/no-docker.test.sh
 
       - name: actionlint
         run: >-
