@@ -449,8 +449,9 @@ memberships are read on every request):
   again stay until it runs.
 - Garbage collection of sessions is probabilistic. On a quiet system,
   expired rows stay longer, but they can never be used.
-- Sessions and cache use the application's database role. Separate roles
-  are an open decision (see [data model](data-model.md#not-included-yet)).
+- Sessions and cache use the API's runtime role `flowcrm_app` (`SELECT,
+  INSERT, UPDATE, DELETE` on `sessions` and `cache_items`); ADR-018 gives
+  them no role of their own (see [data model](data-model.md#database-roles)).
 - `sess_lifetime`, `sess_time`, `item_lifetime` and `item_time` are 32-bit
   `INT` columns, as Symfony's components define them; Unix times exceed them
   in January 2038. This follows the framework's schema and is tracked
