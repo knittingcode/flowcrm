@@ -388,9 +388,9 @@ components:
         be written, a login creates no session, a password change changes
         nothing, and a logout still ends the session. When a request with a
         session cookie could not read its session (the database is not
-        available, or another request of the same session held it for 5
-        seconds), the request changed nothing: a logout has not ended the
-        session either.
+        available, or another request of the same session held it for
+        longer than the session lock timeout of 5 seconds), the request
+        changed nothing: a logout has not ended the session either.
       content:
         application/problem+json:
           schema:
@@ -409,9 +409,9 @@ components:
     SessionUnavailable:
       description: |
         The session could not be read: the database is not available, or
-        another request of the same session held it for 5 seconds. A problem
-        document of type internal-error without details; the request changed
-        nothing.
+        another request of the same session held it for longer than the
+        session lock timeout of 5 seconds. A problem document of type
+        internal-error without details; the request changed nothing.
       content:
         application/problem+json:
           schema:
