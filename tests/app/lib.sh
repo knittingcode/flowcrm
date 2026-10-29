@@ -144,7 +144,7 @@ remove_images() { # prefix
         kept=$((kept + 1))
       fi
     done
-    say "      images $prefix*: $removed names removed, $kept kept"
+    say "      images $prefix*: $removed name$([ "$removed" = 1 ] || printf s) removed, $kept kept"
   }
 }
 

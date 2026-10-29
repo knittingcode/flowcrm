@@ -604,21 +604,27 @@ these variables is assigned once, from a hash of the run's temporary
 directory (`flowcrm-scan-<run>`, `flowcrm-web-check:<run>`,
 `flowcrm-e2e:<run>`, `<project>-test-<run>`, `<project>-prod-<run>`). It also checks every `tests/app/*.sh` and
 `tests/devenv/*.sh` file (excluding its own grep pattern lines and those of
-U-09) and fails if:
+U-09), `bin/devenv` and the `Makefile`, and fails if:
 
 - `docker image rm`, `docker image remove` or `docker rmi` appears outside
   `tests/app/lib.sh`;
 - one of these commands has `-f`, a short option group containing `f`, or
-  `--force` anywhere in the same command (up to `|`, `;` or a `&` that is
-  not part of a redirection such as `2>&1` or `&>`);
+  `--force` in the same command (up to `|`, `;` or a `&` that is not part
+  of a redirection such as `2>&1` or `&>`);
 - `--rmi` appears (Compose `down --rmi`);
-- any `docker ... prune` appears (`image`, `system`, `builder`, `buildx`
-  or any other prune).
+- a `docker ... prune` appears in one command (`image`, `system`,
+  `builder`, `buildx` or any other prune).
 
+The force option and the word `prune` count only as whole words: they must
+be followed by the end of the line or by a character other than a letter, a
+digit, `_` or `-` (for example a space, `=`, `;`, `|`, `&`, `)` or a quote).
+So `-f;`, `--force)` and `prune|` are found, and `--forceful` and
+`prune-old` are not.
 A line that ends in a backslash continues on the next line: the check joins
 such lines first, so a command split over several lines is checked as one
-line. A fixture checks that removals and prunes split this way, and a force
-option after a redirection, are found.
+line. A fixture checks that removals and prunes split this way, a force
+option after a redirection, and the forms above are found, and that the
+look-alikes are not.
 These are text checks: a removal written so that it does not match them
 (for example through a variable holding the command) is not detected.
 

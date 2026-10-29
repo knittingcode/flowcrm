@@ -992,7 +992,7 @@ u19() { # name start(created|failed|killed) try-rc blocks ready stop(ok|fails) e
   r=$?
   U19_OUT=$out U19_RUNNING=$(fake_running)
   U19_GATE=$(head -n 1 "$GATE_FILE" 2>/dev/null) U19_GATE_EDGE=$(grep -cx edge "$GATE_FILE" 2>/dev/null)
-  U19_CALLS=$(paste -sd ';' - <"$work/u19-calls" 2>/dev/null)
+  U19_CALLS=$(paste -sd ';' - 2>/dev/null <"$work/u19-calls")
   [ "$r" = "$7" ]
   result "U-19 $1: exit $7" $? "(got $r: $out)"
 }
@@ -1607,20 +1607,24 @@ for u26_def in \
   result "U-26 $f assigns ${def%%=*} once, unique to the run" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
 done
 
-# Guards against other image removals in tests/app/*.sh and tests/devenv/*.sh
-# (the grep pattern lines of these guards and of U-09 excluded): the Docker
+# Guards against other image removals in tests/app/*.sh, tests/devenv/*.sh,
+# bin/devenv and the Makefile (the grep pattern lines of these guards and of
+# U-09 excluded): the Docker
 # image removal commands (image rm, image remove, rmi) only in
 # tests/app/lib.sh and never with a force option anywhere in the command; no
 # Compose down that removes images (its rmi option); no prune command of any
-# kind (image, system, builder, ...). A command ends at "|", ";" or a "&"
+# kind (image, system, builder, ...). An option or a prune counts when it
+# is followed by anything but a letter, digit, "_" or "-" (a space, "=",
+# ";", "|", "&", ")", a quote) or ends the line, so --forceful or
+# prune-old does not. A command ends at "|", ";" or a "&"
 # that is not part of a redirection (">&", "<&", "&>"). A line ending in a
 # backslash (an odd number of them) is joined with the next one first, so a
 # command continued over several lines is checked as one line, numbered by
 # its first line.
 u26_pat_rm='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))([[:space:]]|$)'
-u26_pat_force='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))[[:space:]](([^|;&]|[<>]&|&>)*[[:space:]])?(-[a-zA-Z]*f[a-zA-Z]*|--force)([[:space:]=]|$)'
+u26_pat_force='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?(rmi|image[[:space:]]+(rm|remove))[[:space:]](([^|;&]|[<>]&|&>)*[[:space:]])?(-[a-zA-Z]*f[a-zA-Z]*|--force)([^[:alnum:]_-]|$)'
 u26_pat_rmi='--rmi([[:space:]=]|$)'
-u26_pat_prune='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?prune([[:space:]]|$)'
+u26_pat_prune='docker[[:space:]]+(([^|;&]|[<>]&|&>)*[[:space:]])?prune([^[:alnum:]_-]|$)'
 u26_lines() { # files...: every line as "file:line:text", continuation lines joined
   awk '
     function flush() { if (pending) print file ":" start ":" buf; pending = 0 }
@@ -1634,14 +1638,14 @@ u26_lines() { # files...: every line as "file:line:text", continuation lines joi
     END { flush() }' "$@"
 }
 u26_grep() { # pattern: matching lines of the test scripts, the guards' own excluded
-  u26_lines "$here"/../app/*.sh "$here"/*.sh | grep -E -- "$1" |
+  u26_lines "$here"/../app/*.sh "$here"/*.sh "$devenv_script" "$here/../../Makefile" | grep -E -- "$1" |
     grep -vE "^[^:]*/unit\.sh:[0-9]+:[[:space:]]*((if )?grep -nE '|u26_pat_[a-z]+=)"
 }
 u26_guard() { # name pattern [filter]
   local hits
   hits=$(u26_grep "$2" | { if [ -n "${3-}" ]; then grep -vE "$3"; else cat; fi; })
   [ -z "$hits" ]
-  result "U-26 test scripts: $1" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
+  result "U-26 test scripts, bin/devenv, Makefile: $1" $? "($(printf '%s' "$hits" | paste -sd ';' -))"
 }
 u26_guard "images are removed only in tests/app/lib.sh" "$u26_pat_rm" '^[^:]*/app/lib\.sh:'
 u26_guard "no image removal with -f or --force" "$u26_pat_force"
@@ -1652,8 +1656,10 @@ u26_guard "no prune command of any kind" "$u26_pat_prune"
 # lines are found, numbered by their first line; a continued command that is
 # no removal, and a line ending in an escaped backslash, are not joined into
 # a hit; a force option after a redirection (2>&1, &>) belongs to the
-# removal, one after && does not. (The command name is in a variable so that
-# this file has no match.)
+# removal, one after && does not; a force option or a prune followed
+# directly by ";", "|", ")" or a quote is found, --forceful, prune-old and
+# pruned are not. (The command name is in a variable so that this file has
+# no match.)
 u26_dk=docker
 cat >"$work/u26-fixture.sh" <<EOF
 $u26_dk \\
@@ -1670,13 +1676,24 @@ $u26_dk image \\
 $u26_dk image rm y 2>&1 -f
 $u26_dk image rm y &>/dev/null --force
 $u26_dk image rm y && rm -f z
+$u26_dk image rm y -f; true
+$u26_dk rmi y -f|| true
+x=\$($u26_dk rmi y -f)
+$u26_dk image rm -f"y"
+($u26_dk image rm y --force)
+$u26_dk image rm y --forceful
+$u26_dk builder prune;
+x=\$($u26_dk image prune)
+$u26_dk system prune|cat
+$u26_dk image prune-old
+$u26_dk image pruned
 EOF
 u26_hits() { # pattern: first line numbers of the fixture's matching lines
   u26_lines "$work/u26-fixture.sh" | grep -E -- "$1" | cut -d: -f2 | paste -sd ' ' -
 }
-expect_eq "U-26 guard self-check: a forced removal over lines or after a redirection is found" "1 3 12 13" "$(u26_hits "$u26_pat_force")"
-expect_eq "U-26 guard self-check: a removal continued over lines is found" "1 3 9 12 13 14" "$(u26_hits "$u26_pat_rm")"
-expect_eq "U-26 guard self-check: a prune continued over lines is found" "10" "$(u26_hits "$u26_pat_prune")"
+expect_eq "U-26 guard self-check: a forced removal over lines or after a redirection is found" "1 3 12 13 15 16 17 18 19" "$(u26_hits "$u26_pat_force")"
+expect_eq "U-26 guard self-check: a removal continued over lines is found" "1 3 9 12 13 14 15 16 17 18 19 20" "$(u26_hits "$u26_pat_rm")"
+expect_eq "U-26 guard self-check: a prune continued over lines is found" "10 21 22 23" "$(u26_hits "$u26_pat_prune")"
 
 # --- U-12 tally self-check (negative controls for the result bookkeeping)
 tally_rc() { # snippet: exit status of a minimal suite running it
