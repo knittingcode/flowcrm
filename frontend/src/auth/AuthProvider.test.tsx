@@ -1,6 +1,7 @@
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fakeApi, json, problem, session } from '../test/fakeApi.ts';
+import { apiRequest, setCsrfToken } from '../api/client.ts';
+import { anonymous, type Call, fakeApi, json, problem, session } from '../test/fakeApi.ts';
 import { AuthProvider } from './AuthProvider.tsx';
 import { type Auth, useAuth } from './context.ts';
 
@@ -90,5 +91,129 @@ describe('AuthProvider logout', () => {
 
     await expect(outcome).rejects.toMatchObject({ status: 500 });
     expect(screen.getByTestId('state')).toHaveTextContent('authenticated');
+  });
+});
+
+/** The CSRF token header of the last request to `path`, or undefined when it was sent without one. */
+function lastToken(calls: Call[], path: string): string | undefined {
+  return calls.filter((c) => c.path === path).at(-1)?.headers['X-CSRF-Token'];
+}
+
+/*
+ * The in-memory CSRF token (ADR-019) belongs to one session. Once the
+ * session is over in the SPA, the next unsafe request (here: the next login)
+ * must go out without it; nothing refetches a token then. While the session
+ * may still be valid, the token is kept so that a retry can succeed.
+ */
+describe('AuthProvider CSRF token', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    setCsrfToken(null);
+  });
+
+  async function signIn(auth: () => Auth): Promise<void> {
+    await act(async () => {
+      await auth().login('ada@example.test', 'correct horse battery staple');
+    });
+  }
+
+  it('is not sent after a logout answered 204', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': json(200, session()),
+      'POST /api/v1/auth/logout': new Response(null, { status: 204 }),
+      'POST /api/v1/auth/login': json(200, session({ csrfToken: 'token-2' })),
+    });
+    const { auth } = renderProvider();
+    expect(await screen.findByText('authenticated')).toBeInTheDocument();
+    await act(async () => {
+      await auth().logout();
+    });
+    expect(screen.getByTestId('state')).toHaveTextContent('anonymous ended=false');
+
+    await signIn(auth);
+
+    expect(lastToken(calls, '/api/v1/auth/logout')).toBe('token-1');
+    expect(lastToken(calls, '/api/v1/auth/login')).toBeUndefined();
+  });
+
+  it('is not sent after a logout answered 401', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': json(200, session()),
+      'POST /api/v1/auth/logout': problem(401, 'unauthenticated'),
+      'POST /api/v1/auth/login': json(200, session({ csrfToken: 'token-2' })),
+    });
+    const { auth } = renderProvider();
+    expect(await screen.findByText('authenticated')).toBeInTheDocument();
+    await act(async () => {
+      await auth().logout();
+    });
+
+    await signIn(auth);
+
+    expect(lastToken(calls, '/api/v1/auth/login')).toBeUndefined();
+  });
+
+  it('is not sent after another request answered 401, as the session has ended on the server', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': json(200, session()),
+      'GET /api/v1/me': problem(401, 'unauthenticated'),
+      'POST /api/v1/auth/login': json(200, session({ csrfToken: 'token-2' })),
+    });
+    const { auth } = renderProvider();
+    expect(await screen.findByText('authenticated')).toBeInTheDocument();
+    await act(async () => {
+      await apiRequest('/api/v1/me', {}, () => null).catch(() => undefined);
+    });
+    expect(screen.getByTestId('state')).toHaveTextContent('anonymous ended=true');
+
+    await signIn(auth);
+
+    expect(lastToken(calls, '/api/v1/auth/login')).toBeUndefined();
+  });
+
+  it('is not sent after the session was read again as anonymous', async () => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': [json(200, session()), anonymous()],
+      'POST /api/v1/auth/login': json(200, session({ csrfToken: 'token-2' })),
+    });
+    const { auth } = renderProvider();
+    expect(await screen.findByText('authenticated')).toBeInTheDocument();
+    await act(async () => {
+      await auth().refresh();
+    });
+    expect(screen.getByTestId('state')).toHaveTextContent('anonymous ended=false');
+
+    await signIn(auth);
+
+    expect(lastToken(calls, '/api/v1/auth/login')).toBeUndefined();
+  });
+
+  const failures: [string, () => Response][] = [
+    [
+      'the connection fails',
+      () => {
+        throw new TypeError('Failed to fetch');
+      },
+    ],
+    ['the API answers 500', () => problem(500, 'internal-error')],
+  ];
+  it.each(failures)('is kept for the retry when a logout does not complete because %s', async (_, failure) => {
+    const calls = fakeApi({
+      'GET /api/v1/auth/session': json(200, session()),
+      'POST /api/v1/auth/logout': [failure, new Response(null, { status: 204 })],
+    });
+    const { auth } = renderProvider();
+    expect(await screen.findByText('authenticated')).toBeInTheDocument();
+    await act(async () => {
+      await auth().logout().catch(() => undefined);
+    });
+    expect(screen.getByTestId('state')).toHaveTextContent('authenticated');
+
+    await act(async () => {
+      await auth().logout();
+    });
+
+    expect(calls.filter((c) => c.path === '/api/v1/auth/logout').map((c) => c.headers['X-CSRF-Token'])).toEqual(['token-1', 'token-1']);
+    expect(screen.getByTestId('state')).toHaveTextContent('anonymous ended=false');
   });
 });
