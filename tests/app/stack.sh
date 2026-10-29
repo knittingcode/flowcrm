@@ -592,6 +592,23 @@ rot() { # label role [fault] [command]
   (cd "$A" && ROLE=$2 FLOWCRM_DEVENV_FAULT=${3-} ./bin/devenv "${4:-rotate-db-password}") >"$work/out/$1.out" 2>"$work/out/$1.err"
   echo $? >"$work/out/$1.rc"
 }
+# Diagnostics of a failed ST-50/ST-64 check, printed only when STATUS is not
+# 0: every edge container of checkout A (also stopped ones) and, for each
+# LABEL, the exit status and the last lines of that step's stderr (cut to
+# 300 characters). No secret value: bin/devenv's stderr names secret files
+# and roles, never their contents, and flowcrm-db-roles runs psql with
+# VERBOSITY terse (no statement text).
+rot_diag() { # status label...
+  local l
+  [ "$1" = 0 ] && return 0
+  shift
+  printf '\n      edge containers: [%s]' "$(docker ps -a --filter "label=com.docker.compose.project=$(project_of "$A")" --filter label=com.docker.compose.service=edge \
+    --format '{{.ID}} {{.State}} {{.Status}}' 2>/dev/null | head -n 3 | paste -sd ';' -)"
+  for l; do
+    printf '\n      %s: exit %s' "$l" "$(cat "$work/out/$l.rc" 2>/dev/null)"
+    [ -s "$work/out/$l.err" ] && printf '\n%s' "$(tail -n 8 "$work/out/$l.err" | cut -c1-300 | sed 's/^/      | /')"
+  done
+}
 # "ok" when the login returned the row (a line "1" on stdout, whatever psql
 # wrote to stderr), "no-file" for a missing or empty file, otherwise the
 # last line psql or docker reported (never a password), for diagnostics.
@@ -639,7 +656,8 @@ rot a-rot1b app
   [ "$(rc_of a-rot1b)" = 0 ] && err_has a-rot1b 'resuming the unfinished rotation' && [ ! -e "$(pend app)" ] &&
   ! cmp -s "$sd/db_app_password" "$work/app.0" && login_ok app "$sd/db_app_password" && ! login_ok app "$work/app.0" &&
   [ "$(perm "$sd/db_app_password")" = 444 ] && no_leftovers && until_ready "$PA" 200 30
-v "ST-50 rotation interrupted after the pending password (SIGTERM): the current password keeps working; running it again finishes it (new password logs in, old refused)" $? "$(tail -n 2 "$work/out/a-rot1b.err")"
+sr=$?
+v "ST-50 rotation interrupted after the pending password (SIGTERM): the current password keeps working; running it again finishes it (new password logs in, old refused)" $sr "$(tail -n 2 "$work/out/a-rot1b.err")$(rot_diag $sr a-rot1 a-rot1b)"
 
 # Interrupted after the database got the new password, before the file was
 # replaced: the abort gives the database the current password back.
@@ -651,7 +669,8 @@ rot a-rot2a app '' rotate-db-password-abort
 [ "$(rc_of a-rot2)" = 143 ] && [ "$r2_db" = pending ] && [ -z "$r2_old" ] &&
   [ "$(rc_of a-rot2a)" = 0 ] && err_has a-rot2a 'aborted the rotation' && [ ! -e "$(pend app)" ] &&
   cmp -s "$sd/db_app_password" "$work/app.1" && login_ok app "$sd/db_app_password" && no_leftovers && until_ready "$PA" 200 30
-v "ST-50 rotation interrupted after the database change (SIGTERM): the abort restores the current password (SCRAM login checked) and the stack serves" $? "$(tail -n 2 "$work/out/a-rot2a.err")"
+sr=$?
+v "ST-50 rotation interrupted after the database change (SIGTERM): the abort restores the current password (SCRAM login checked) and the stack serves" $sr "$(tail -n 2 "$work/out/a-rot2a.err")$(rot_diag $sr a-rot2 a-rot2a)"
 
 # Interrupted after the file was replaced, before the api was recreated: the
 # running api still mounts the replaced file; make up recreates it.
@@ -662,7 +681,8 @@ dv a-up-rot3 "$A" up
 [ "$(rc_of a-rot3)" = 143 ] && [ ! -e "$(pend app)" ] && login_ok app "$sd/db_app_password" &&
   [ "$(rc_of a-up-rot3)" = 0 ] && err_has a-up-rot3 'recreating api: its secret files changed' && until_ready "$PA" 200 30 &&
   console_in "$A" app:database:verify-privileges --runtime
-v "ST-50 rotation interrupted after the file replacement (SIGTERM): make up recreates the api that still mounts the replaced file, and it logs in" $? "mount=$r3_mount $(tail -n 2 "$work/out/a-up-rot3.err")"
+sr=$?
+v "ST-50 rotation interrupted after the file replacement (SIGTERM): make up recreates the api that still mounts the replaced file, and it logs in" $sr "mount=$r3_mount $(tail -n 2 "$work/out/a-up-rot3.err")$(rot_diag $sr a-rot3 a-up-rot3)"
 say "      INFO  a running container saw a secret file replaced on the host as: $r3_mount ($(docker info --format '{{.OperatingSystem}}' 2>/dev/null))"
 
 # Owner rotation, interrupted after the database change and resumed; the
@@ -710,14 +730,15 @@ dv a-up-rot6 "$A" up
   [ "$(rc_of a-status-rot6)" = 1 ] && grep -q '^blocked: ' "$work/out/a-status-rot6.out" &&
   login_ok app "$sd/db_app_password" && [ "$(rc_of a-up-rot6)" = 0 ] && until_ready "$PA" 200 30 &&
   console_in "$A" app:database:verify-privileges --runtime && no_leftovers
-v "ST-50 repeated rotations; a failed api recreation is reported (exit 2) and make up serves once the cause is fixed" $? \
+sr=$?
+v "ST-50 repeated rotations; a failed api recreation is reported (exit 2) and make up serves once the cause is fixed" $sr \
   "rotation 5 exit $(rc_of a-rot5), rotation 6 exit $(rc_of a-rot6), make up exit $(rc_of a-up-rot6)
       before 5: $r5_before
       after 5:  $r5_after
       before 6: $r6_before
       after 6:  $r6_after
 $(sed 's/^/      | /' "$work/out/a-rot5.err" | tail -n 15)
-$(sed 's/^/      | /' "$work/out/a-rot6.err" | tail -n 25)"
+$(sed 's/^/      | /' "$work/out/a-rot6.err" | tail -n 25)$(rot_diag $sr a-status-rot6 a-up-rot6)"
 # Always recorded (no values): which containers each rotation recreated.
 ev "rotation 5: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot5.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
 ev "rotation 6: $(grep -E '^devenv: (recreating|rotated|the edge|WARNING|ERROR)' "$work/out/a-rot6.err" | sed 's/^devenv: //; s/ (.*//' | paste -sd ';' -)"
@@ -745,10 +766,11 @@ dv a-up-rot7 "$A" up
   err_has a-rot7 'was rotated and verified, but the edge did not serve again' && [ -z "$r7_edge_ps" ] && [ "$r7_code" = 000 ] &&
   [ "$(rc_of a-status-rot7)" = 1 ] && grep -q '^blocked: .*did not serve again' "$work/out/a-status-rot7.out" &&
   [ "$(rc_of a-up-rot7)" = 0 ] && until_ready "$PA" 200 30 && no_leftovers
-v "ST-50 a verified rotation whose edge cannot get ready fails (exit 2): the started edge is stopped, nothing is served, the stack is blocked; make up serves once fixed" $? \
+sr=$?
+v "ST-50 a verified rotation whose edge cannot get ready fails (exit 2): the started edge is stopped, nothing is served, the stack is blocked; make up serves once fixed" $sr \
   "rotation exit $(rc_of a-rot7), edge container [$r7_edge_ps], GET / $r7_code, make up exit $(rc_of a-up-rot7)
 $(sed 's/^/      | /' "$work/out/a-rot7.err" | tail -n 12)
-$(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)"
+$(sed 's/^/      | /' "$work/out/a-status-rot7.out" | head -n 3)$(rot_diag $sr a-up-rot7)"
 
 # The security gate is enforced by the running edge itself (FND-009E): while
 # .runtime/gate/security-gate exists, every request but exactly /health/live
@@ -845,7 +867,8 @@ UK_GATE=$([ -f "$A/.runtime/gate/security-gate" ] && echo recorded || echo absen
 dv a-uk-up2 "$A" up
 [ "$(rc_of a-uk-rot)" = 137 ] && [ "$(rc_of a-uk-up)" = 137 ] && [ -n "$UK_EDGE" ] && [ "$UK_PROBE" = "$GATED" ] &&
   [ "$UK_GATE" = recorded ] && [ "$(rc_of a-uk-up2)" = 0 ] && until_ready "$PA" 200 30 && [ ! -e "$A/.runtime/gate/security-gate" ] && probe_until "$OPEN"
-v "ST-50 make up killed before its checks finished, while a started edge enforces the gate: the gate stays recorded, the edge serves only its health paths; make up serves" $? "rotation exit $(rc_of a-uk-rot), make up exit $(rc_of a-uk-up), edge [$UK_EDGE], gate $UK_GATE, probe: $UK_PROBE, make up $(rc_of a-uk-up2)"
+sr=$?
+v "ST-50 make up killed before its checks finished, while a started edge enforces the gate: the gate stays recorded, the edge serves only its health paths; make up serves" $sr "rotation exit $(rc_of a-uk-rot), make up exit $(rc_of a-uk-up), edge [$UK_EDGE], gate $UK_GATE, probe: $UK_PROBE, make up $(rc_of a-uk-up2)$(rot_diag $sr a-uk-rot a-uk-up a-uk-up2)"
 
 # An edge created without the gate directory (by bin/devenv before
 # FND-009E, or by a plain docker compose up) does not enforce the gate:
@@ -889,7 +912,8 @@ rot a-rot7a app '' rotate-db-password-abort
 [ "$r7_waiting" -lt 120 ] && [ "$r7_rc" = 143 ] && grep -q 'the interrupted database operation ended' "$work/out/a-rot7.err" &&
   [ "$r7_left" = 0 ] && [ "$r7_current" = ok ] && cmp -s "$sd/db_app_password" "$work/app.4" &&
   [ "$(rc_of a-rot7a)" = 0 ] && login_ok app "$sd/db_app_password" && no_leftovers && until_ready "$PA" 200 30
-v "ST-50 rotation interrupted while its transaction waits on a PostgreSQL lock: the session is ended before exit, no delayed commit, the abort restores a clean state" $? "rc=$r7_rc left=$r7_left current=$r7_current $(tail -n 2 "$work/out/a-rot7.err")"
+sr=$?
+v "ST-50 rotation interrupted while its transaction waits on a PostgreSQL lock: the session is ended before exit, no delayed commit, the abort restores a clean state" $sr "rc=$r7_rc left=$r7_left current=$r7_current $(tail -n 2 "$work/out/a-rot7.err")$(rot_diag $sr a-rot7a)"
 
 # --- unconfirmed cancellation (FND-009G) --------------------------------------
 # The cancellation of an interrupted operation cannot always be confirmed
@@ -1103,7 +1127,7 @@ dv a-kill4-up "$A" up
   [ "$k4_blocked" = yes ] && [ "$k4_migrated" = 1 ] && [ "$(rc_of a-kill4-up)" = 0 ] && until_ready "$PA" 200 30 &&
   [ ! -e "$A/.runtime/gate/security-gate" ]
 r64=$?
-v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $r64 "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked finish=$(rc_of a-kill3-finish) up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated recovery=$(rc_of a-kill4-up)"
+v "ST-64 SIGKILL after a committed change but before its verification (rotation, migrations): blocked, no edge; the rotation or make up verifies and serves again" $r64 "rot=$(rc_of a-kill3)/$k3_code/$k3_blocked finish=$(rc_of a-kill3-finish) up=$(rc_of a-kill4)/$k4_code/$k4_blocked/$k4_migrated recovery=$(rc_of a-kill4-up)$(rot_diag $r64 a-kill3)"
 [ "$r64" = 0 ] || { show_err a-kill3-finish; show_err a-kill4; show_err a-kill4-up; }
 
 # Recovery while PostgreSQL is temporarily unreachable: make up fails and
