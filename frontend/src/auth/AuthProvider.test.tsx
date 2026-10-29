@@ -36,6 +36,7 @@ function renderProvider(): { auth: () => Auth } {
 describe('AuthProvider logout', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    setCsrfToken(null);
   });
 
   it('resolves on a 401, as the session has already ended on the server, and is signed out', async () => {
