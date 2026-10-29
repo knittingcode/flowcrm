@@ -15,7 +15,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-frontend.XXXXXX") || exit 2
 tally_init "$work/tally"
 # Unique per run, so a concurrent run never removes this image.
 image=flowcrm-web-check:$(sha6 "$work")
-trap 'docker image rm "$image" >/dev/null 2>&1; rm -rf "$work"' EXIT
+trap 'remove_images "$image"; rm -rf "$work"' EXIT
 
 # check "label" command... (run in a throwaway container of the web image)
 check() {
