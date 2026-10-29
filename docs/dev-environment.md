@@ -429,17 +429,17 @@ command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
   - every connect to a Unix socket;
   - TCP beyond loopback, and to loopback ports 22, 2375 and 2376;
   - TCP to every loopback port that was already listening when the suite
-    started, such as a local agent, an IDE, a published container port or
-    a socket proxy. The list comes from `netstat`. If `netstat` fails,
-    prints no column header or prints a LISTEN row that cannot be parsed,
-    the suite is refused (exit 125). An empty list is accepted only when
+    started, such as a local development server, an IDE, a published
+    container port or a socket proxy. The list comes from `netstat`. If
+    `netstat` fails, prints no column header or prints a LISTEN row that
+    cannot be parsed, the suite is refused (exit 125). An empty list is accepted only when
     `netstat` printed its header and no LISTEN row;
   - writes anywhere except under `$TMPDIR` and `/dev`, and in `/tmp` the
     `sh-thd*` here-document files of bash 3.2, which it creates there
     whatever `$TMPDIR` is. This covers `$HOME`, where Docker Desktop keeps
     its disk image, and places whose files are run or read outside the
-    sandbox later: Homebrew's prefix, `/Applications` and other tools'
-    directories in `/tmp`, such as agent scratchpads. `$TMPDIR` must
+    sandbox later: Homebrew's prefix, `/Applications` and other programs'
+    temporary files in `/tmp`. `$TMPDIR` must
     therefore be a directory of its own. If it is `/`, `/tmp`, under `/tmp`
     or under `$HOME`, the suite is refused (exit 125). The macOS default
     under `/var/folders` is fine;

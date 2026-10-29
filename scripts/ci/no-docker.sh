@@ -15,8 +15,9 @@
 #   macOS  sandbox-exec: every connect to a Unix socket is denied, as is TCP
 #          to anything but loopback, to loopback ports 22, 2375 and 2376
 #          (ssh and the Docker API ports) and to every loopback port that
-#          was listening before the command started (local services: an
-#          agent, an IDE, a published container port or a socket proxy);
+#          was listening before the command started (local services: a
+#          development server, an IDE, a published container port or a
+#          socket proxy);
 #          the list of those ports must be complete, or the command is
 #          refused; nothing can be written except under $TMPDIR, /dev and
 #          bash 3.2's here-document files in /tmp (not $HOME, where Docker
@@ -106,17 +107,18 @@ case $(uname -s) in
     # The command may write only under $TMPDIR and /dev, and in /tmp only
     # the here-document files of bash 3.2 (sh-thd*, which it creates there
     # whatever $TMPDIR is): programs outside the sandbox run files from
-    # $HOME, Homebrew's prefix, /Applications or other tools' directories in
-    # /tmp (agent scratchpads, for example). So $TMPDIR must be a directory
-    # of its own: not /, not under $HOME and not /tmp or under it.
+    # $HOME, Homebrew's prefix, /Applications or other programs' temporary
+    # files in /tmp. So $TMPDIR must be a directory of its own: not /, not
+    # under $HOME and not /tmp or under it.
     case $tmp/ in
       / | "$home"/* | /private/tmp/* | /tmp/*)
         refuse "the temporary directory $tmp is /, /tmp or under /tmp or \$HOME; set TMPDIR to a private directory (the macOS default under /var/folders)" ;;
     esac
     case $tmp in *[!A-Za-z0-9/._-]*) refuse "unexpected character in the temporary directory $tmp" ;; esac
-    # Local services that were listening before the command started (an
-    # agent, an IDE, a published container port or a socket proxy) are not
-    # the command's: it may connect only to loopback ports it opens itself.
+    # Local services that were listening before the command started (a
+    # development server, an IDE, a published container port or a socket
+    # proxy) are not the command's: it may connect only to loopback ports it
+    # opens itself.
     listening=$(python3 -I "$probe" --listening) || refuse "cannot list the listening TCP ports"
     held=""
     for port in $listening; do
