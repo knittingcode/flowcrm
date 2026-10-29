@@ -1232,6 +1232,8 @@ compose() {
   [ "$1 $2 $3" = "ps --quiet edge" ] || return 0
   [ "$U23_PS" = fails ] && return 1
   [ "$(cat "$work/u23-listed" 2>/dev/null)" = true ] && printf 'edge-id\n'
+  # A second edge container (scaled edge), with its state in u23-second.
+  [ -z "$U23_SECOND" ] || printf 'edge-id2\n'
   return 0
 }
 compose_op() {
@@ -1246,9 +1248,17 @@ compose_op() {
   [ "$U23_STALE" = yes ] || echo false >"$work/u23-listed"
 }
 docker() {
-  [ "$1 $2 $3 $4 $5" = "container inspect -f {{.State.Running}} edge-id" ] || return 99
-  case $(cat "$work/u23-running") in
-    true | false) cat "$work/u23-running" ;;
+  local f
+  case "$# $1 $2 $3 $4 $5" in
+    "5 container inspect -f {{.State.Running}} edge-id") f=$work/u23-running ;;
+    "5 container inspect -f {{.State.Running}} edge-id2") [ -n "$U23_SECOND" ] || return 99; f=$work/u23-second ;;
+    *) return 99 ;;
+  esac
+  case $(cat "$f") in
+    true | false) cat "$f" ;;
+    # docker container inspect reports State.Running=true for a paused
+    # container (State.Paused is true as well).
+    paused) echo true ;;
     removed) echo 'Error response from daemon: No such container: edge-id' >&2 && return 1 ;;
     gone) echo 'Error: No such object: edge-id' >&2 && return 1 ;;
     *) echo 'error during connect: the daemon cannot be reached' >&2 && return 1 ;;
@@ -1256,7 +1266,7 @@ docker() {
 }
 # The edge answers the gate's 503 only with U23_BLOCKS=yes (no network).
 gate_blocks() { [ "${U23_BLOCKS-}" = yes ]; }
-u23_setup() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|gone|unknown) [stale-list(yes) [ps(fails) [gate-503(yes)]]]]
+u23_setup() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|removed|gone|paused|unknown) [stale-list(yes) [ps(fails) [gate-503(yes)]]]]
   RUNTIME_DIR=$work/u23-$1/.runtime GATE_DIR=$work/u23-$1/.runtime/gate
   GATE_FILE=$GATE_DIR/security-gate
   mkdir -p "$RUNTIME_DIR"
@@ -1264,17 +1274,21 @@ u23_setup() { # name gate-dir(dir|file) stop(ok|fails|returns) [after(false|remo
   rm -f "$work/u23-calls"
   echo true >"$work/u23-running"
   echo true >"$work/u23-listed"
-  U23_STOP=$3 U23_AFTER=${4:-false} U23_STALE=${5:-} U23_PS=${6:-} U23_BLOCKS=${7:-}
+  U23_STOP=$3 U23_AFTER=${4:-false} U23_STALE=${5:-} U23_PS=${6:-} U23_BLOCKS=${7:-} U23_SECOND=''
+  rm -f "$work/u23-second"
 }
 u23_collect() {
   U23_CALLS=$(paste -sd ";" - 2>/dev/null <"$work/u23-calls")
   U23_GATE=$(paste -sd ";" - 2>/dev/null <"$GATE_FILE")
 }
-u23() { # as u23_setup; runs protect_for
-  u23_setup "$@"
+u23_protect() {
   U23_OUT=$( (protect_for "rotating the password of flowcrm_app") 2>&1)
   U23_RC=$?
   u23_collect
+}
+u23() { # as u23_setup; runs protect_for
+  u23_setup "$@"
+  u23_protect
 }
 u23 ok dir ok
 [ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
@@ -1310,6 +1324,32 @@ u23 unwritable file ok
 [ "$U23_RC" = "$EX_SAFETY" ] && [ -z "$U23_CALLS" ] && [ "$(cat "$work/u23-running")" = true ] &&
   case $U23_OUT in *"could not record the security gate; nothing was changed"*) true ;; *) false ;; esac
 result "U-23 protect_for stops the command, changing nothing, when the gate cannot be recorded" $? "(exit $U23_RC, calls [$U23_CALLS]: $U23_OUT)"
+# Several edge containers: every listed ID is confirmed, not only the
+# first; the second one does not stop with docker compose stop here.
+u23_setup multi-running dir ok
+U23_SECOND=yes
+echo true >"$work/u23-second"
+u23_protect
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$(cat "$work/u23-running")" = false ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed (docker compose stop exited with status 0)"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when one of several edge containers still runs after the stop" $? "(exit $U23_RC: $U23_OUT)"
+u23_setup multi-stopped dir ok
+U23_SECOND=yes
+echo false >"$work/u23-second"
+u23_protect
+[ "$U23_RC" = 0 ] && [ "$U23_CALLS" = "stop edge gate=yes" ] &&
+  case $U23_OUT in *"stopped the edge before changing the database"*) true ;; *) false ;; esac
+result "U-23 control: protect_for goes on when every one of several edge containers stopped" $? "(exit $U23_RC: $U23_OUT)"
+# A paused edge: docker compose stop returned 0, but inspect reports
+# Running=true, which counts as running.
+u23 paused dir ok paused
+[ "$U23_RC" = "$EX_SAFETY" ] && [ "$U23_GATE" = "rotating the password of flowcrm_app;edge" ] &&
+  case $U23_OUT in *"could not be stopped, so the database was not changed (docker compose stop exited with status 0)"*) true ;; *) false ;; esac
+result "U-23 protect_for stops the command when the edge is paused after the stop (State.Running=true)" $? "(exit $U23_RC: $U23_OUT)"
+u23_setup paused-only dir ok
+echo paused >"$work/u23-running"
+! edges_stopped edge-id
+result "U-23 edges_stopped counts a paused edge as running" $?
 # edges_stopped without IDs (docker would answer 99 if it were asked).
 ! edges_stopped
 result "U-23 edges_stopped without a container ID confirms nothing" $?
@@ -1350,6 +1390,11 @@ result "U-23 gate_failed does not claim a stopped edge when the stop succeeded b
 u23_gf gf-blocking dir fails false '' '' yes
 u23_gf_reports && case $U23_OUT in *"could not confirm that the edge of"*"(docker compose stop exited with status 1); it answers only with the gate's 503 (checked)"*) true ;; *) false ;; esac
 result "U-23 gate_failed with an edge that cannot be stopped but answers the gate's 503 says so" $? "(exit $U23_RC: $U23_OUT)"
+u23_gf gf-unlisted-stop-fails dir fails false '' fails
+u23_gf_reports && [ "$U23_CALLS" = "stop edge gate=yes" ] && [ "$U23_GATE" = "the u23 check failed" ] &&
+  case $U23_OUT in *"WARNING: could not list the containers of"*"stopping it anyway"*) true ;; *) false ;; esac &&
+  case $U23_OUT in *"stopped the edge:"* | *"is unknown"*) false ;; *"could not confirm that the edge of"*"(docker compose stop exited with status 1), and it was not seen blocking requests; stop the stack now: make down"*) true ;; *) false ;; esac
+result "U-23 gate_failed with a failed listing and a failed stop reports both and keeps the original failure" $? "(exit $U23_RC, calls [$U23_CALLS], gate [$U23_GATE]: $U23_OUT)"
 u23_setup gf-no-edge dir ok
 echo false >"$work/u23-listed"
 U23_OUT=$( (gate_failed "$EX_DOCKER" "the u23 check failed") 2>&1)
