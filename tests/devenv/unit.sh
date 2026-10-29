@@ -113,6 +113,10 @@ expect_eq "U-03 all 20 range ports considered" 20 "$#"
 RUNTIME_DIR=$work/rt
 STATE_FILE=$RUNTIME_DIR/dev.env
 LOCK_DIR=$RUNTIME_DIR/lock
+# Every runtime path, so that nothing is written into the checkout's .runtime.
+SECRETS_DIR=$RUNTIME_DIR/secrets
+GATE_DIR=$RUNTIME_DIR/gate
+GATE_FILE=$GATE_DIR/security-gate
 mkdir -p "$RUNTIME_DIR"
 # Fixtures are written to $work/st first: piping into state_case would run it
 # in a subshell and lose its pass/fail counts.
