@@ -384,9 +384,13 @@ components:
             $ref: '#/components/schemas/ValidationProblem'
     InternalError:
       description: |
-        The operation could not be completed, for example because its audit
-        event could not be written: a login then creates no session, a
-        password change changes nothing, and a logout still ends the session.
+        The operation could not be completed. When its audit event could not
+        be written, a login creates no session, a password change changes
+        nothing, and a logout still ends the session. When a request with a
+        session cookie could not read its session (the database is not
+        available, or another request of the same session held it for 5
+        seconds), the request changed nothing: a logout has not ended the
+        session either.
       content:
         application/problem+json:
           schema:
