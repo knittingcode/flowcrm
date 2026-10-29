@@ -13,8 +13,10 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
 /**
- * Operator only: a disabled user cannot log in, and every session of the user
- * ends on its next request. Audited as user.disabled.
+ * Operator only: a disabled user cannot log in, and every stored session of
+ * the user is deleted at once, in the same transaction as the change and its
+ * audit event (user.disabled). A session stored afterwards by a login that
+ * was in flight ends on its next request.
  */
 #[AsCommand(name: 'flowcrm:user:disable', description: 'Disable a user: login fails and every session ends')]
 final class DisableUserCommand extends Command
