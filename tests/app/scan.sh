@@ -44,9 +44,10 @@ work=$(cd -P "$work" && pwd -P)
 mkdir -p "$work/cache" "$work/images"
 tally_init "$work/tally"
 tag=flowcrm-scan-$(sha6 "$work")
+# The control image is the PostgreSQL base image re-tagged as $tag:control:
+# removing by name keeps the base image, which other builds use.
 cleanup() {
-  local image
-  docker images -q "$tag" | sort -u | while read -r image; do docker image rm -f "$image" >/dev/null 2>&1; done
+  remove_images "$tag:"
   rm -rf "$work"
 }
 trap cleanup EXIT
