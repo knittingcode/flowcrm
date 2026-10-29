@@ -194,8 +194,8 @@ SHA-256 (`dd77c48eb845f4856c2cdba347cfb52bd877a2655a1ea48ff0c4796e3df9dd7b`,
 matching the registry's SHA-512 integrity); a wrong checksum fails the
 build. The web image had **0 HIGH/CRITICAL** after this remediation; it
 stays report-only because it is a development and test image. npm 11.21.1
-has three HIGH findings in its bundled undici, published later
-([undici](#cve-2026-109869-cve-2026-109383-cve-2026-87018-undici-bundled-with-npm-web-development-only)).
+has three HIGH findings in its bundled undici, added to the GitHub Advisory
+Database later ([undici](#cve-2026-109869-cve-2026-109383-cve-2026-87018-undici-bundled-with-npm-web-development-only)).
 
 ## CVE-2026-111497: `brotli-libs` (runtime images)
 
@@ -212,9 +212,10 @@ images include the fix. No exception was added.
 
 ## CVE-2026-109869, CVE-2026-109383, CVE-2026-87018: `undici` bundled with npm (web, development only)
 
-Three HIGH advisories for undici, all published after the npm 11.21.1
-remediation and found by the scans of `main`, not by a change of the
-project. All three are fixed in undici 6.29.1, 7.30.1 and 8.12.2, and the
+Three HIGH advisories for undici, published in the NVD on 2026-10-15
+(before the npm 11.21.1 remediation of 2026-10-21) but added to the GitHub
+Advisory Database only after it (dates in the table),
+and found by the scans of `main`, not by a change of the project. All three are fixed in undici 6.29.1, 7.30.1 and 8.12.2, and the
 scan of `main` at 1badf76 (run 40745073009, 2026-10-28) reports each of
 them once for web `dev`, as
 `HIGH <id> undici 6.29.0 fixed=6.29.1, 7.30.1, 8.12.2 in=Node.js`:
