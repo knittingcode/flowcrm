@@ -409,6 +409,7 @@ Its regression suite is `scripts/ci/tests/guard-dockerfile-frontend.test.sh`.
 ```console
 $ make test-devenv                               # allocator: unit + integration (fixture)
 $ tests/devenv/unit.sh                           # no Docker needed
+$ tests/devenv/cross-user.sh                     # secrets vs. another local user (passwordless sudo)
 $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
 $ make test-app                                  # application: the four suites below
 ```
@@ -449,9 +450,9 @@ command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
   ports 2375 and 2376 and every listening loopback port. If the isolation cannot be applied or proven, the
   suite does not run (exit 125).
 - Setuid programs cannot run inside, so `sudo` is unavailable. The U-16
-  check that another local user cannot read a secret therefore prints INFO
-  and is not counted, in CI as well as locally; the U-16 mode checks still
-  run.
+  check that another local user cannot read a secret is therefore not part
+  of `unit.sh` (which prints INFO and counts only the U-16 mode checks); it
+  belongs to `tests/devenv/cross-user.sh`, described below.
 - On Linux the probe finds an engine socket owned by the calling user only
   in the places listed above.
 
@@ -488,6 +489,35 @@ Mutation testing:
   suite can tell an edited checkout from a mutated one.
 - BE-18 mutates a copy of the backend inside the api test container, which
   has no Docker socket.
+
+Cross-user check of the secrets:
+
+`tests/devenv/cross-user.sh` (CU-xx, its own CI step in the `Dev
+environment` job) checks that the user `nobody` can neither list the
+secrets directory nor read a secret that `bin/devenv` generated. It needs
+`sudo`, so it runs outside the isolation, and is built so that no code under
+test runs there:
+
+- The checkout's own `bin/devenv`, never a copy named by an input, runs
+  `ensure_secrets` under `no-docker.sh`, with its runtime directory in a new
+  directory below `/tmp` and a fake `docker` that reports no volume.
+- Outside the isolation the script checks the result only as data (file
+  type, owner, modes `0700`/`0444`), then runs fixed commands as `nobody`
+  on fixed paths: `/bin/ls` of the directory and `/bin/cat` of each secret.
+- A control makes a pass meaningful: `nobody` must be able to read a
+  `0444` file that the script puts in a `0755` directory next to the
+  secrets directory. This proves that the path is reachable (below a `0700`
+  directory such as the macOS `$TMPDIR` every read would fail) and that the
+  read check detects an exposed file.
+- Nothing outside the isolation changes, follows or executes a path that the
+  isolated code could have replaced; those paths are only tested, `stat`ed
+  and read by `nobody`.
+- It certifies committed code and is not a mutation harness: it refuses
+  (exit 64) arguments, `DEVENV`, `GUARD`, `ADAPTED`, a run inside
+  `no-docker.sh`, a directory that is not a Git checkout, and local
+  changes to `bin/devenv`, itself, `tally.sh`, `no-docker.sh` or the probe.
+- Without passwordless sudo to `nobody` it prints INFO and exits 0; in CI
+  (`CI=true`) that is a failure.
 
 Application suites (`tests/app/`), each in its own Compose projects:
 
@@ -596,6 +626,9 @@ run, so several runs from one checkout do not interfere.
   never a success), the Makefile interface
   (targets and the commands they run) and checks that the result tally
   detects failed and lost results.
+- `tests/devenv/cross-user.sh` checks that another local user cannot list
+  or read the generated secrets (CU-01 to CU-04, 7 results; see "Cross-user check of
+  the secrets" under "Isolation from Docker").
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
   Makefile targets against real Docker in temporary checkout copies. It uses
   the 20-port block starting at `DEVENV_TEST_PORT_BASE` (default 8080) and
@@ -612,7 +645,7 @@ run, so several runs from one checkout do not interfere.
   and verifies that the lock is held until they end. PA-23 checks that an
   invalid Compose file fails with exit 2, keeps the verified state and tries
   no other port.
-- Both suites compare the printed PASS/FAIL records with their counters and
+- The suites compare the printed PASS/FAIL records with their counters and
   exit 2 on a mismatch; a scenario without results or a failed setup step
   counts as a failure.
 
