@@ -43,14 +43,16 @@
 #     sleep and must be ended by no-docker.sh (any left over are killed by
 #     pid only while their arguments carry the case's marker), attach a
 #     debugger to or read the memory map of this suite's own canary copies
-#     of /bin/sleep, read a pseudo-terminal of their own, or sleep.
+#     of /bin/sleep, read a pseudo-terminal of their own, run a bounded
+#     chain of forks of their own inside the isolation (T-30), remove the
+#     marker file of a run of their own (T-33), or sleep.
 # This suite itself runs no docker command.
 #
-# T-06, T-08 to T-15, T-21, T-22 and T-24 to T-29 are macOS only, T-16 to
+# T-06, T-08 to T-15, T-21, T-22 and T-24 to T-34 are macOS only, T-16 to
 # T-18 Linux only (each prints INFO on the other platform); T-19, T-20 and
 # T-23 are static and run on both. Each case says how it fails against the
-# no-docker.sh of 38b5ebd or dfb6ee4, which these cases were written to
-# catch.
+# no-docker.sh of 38b5ebd, dfb6ee4 or e8ed7ed, which these cases were
+# written to catch.
 #
 # Usage: no-docker.test.sh
 # HARNESS=<path> checks another copy of tests/devenv/unit.sh instead of the
@@ -109,6 +111,9 @@ tmp_marker=/private/tmp/.flowcrm-no-docker-test-$nonce
 t11_marker=$tmp/.flowcrm-no-docker-test-t11-$nonce
 cleanup() {
   rm -f "$home_marker" "$outside_marker" "$tmp_marker" "$t11_marker"
+  # T-21's canaries in the shared directories, only while they are ours.
+  [ -z "${t21a_ino-}" ] || python3 -I -c "$t21_file" remove "$t21a" "$t21a_dev" "$t21a_ino"
+  [ -z "${t21b_ino-}" ] || python3 -I -c "$t21_file" remove "$t21b" "$t21b_dev" "$t21b_ino"
   rm -rf "$work" "$ro" "$vt"
 }
 trap cleanup EXIT
@@ -275,7 +280,7 @@ run_case() {
         case $port in *[!0-9]* | "") echo "HARNESS ERROR: unexpected port $port" >&2; exit 2 ;; esac
         held="$held (remote ip \"localhost:$port\")"
       done
-      gmark=$(python3 -I "$root/scripts/ci/no-docker-probe.py" --markers "$ndtmp") || exit 2
+      gmark=$(python3 -I "$root/scripts/ci/no-docker-probe.py" --markers "$ndtmp" "$$") || exit 2
       case $gmark in "$ndtmp"/no-docker-mark.?*) ;; *) echo "HARNESS ERROR: unexpected marker directory $gmark" >&2; exit 2 ;; esac
       python3 -I "$root/scripts/ci/no-docker-probe.py" --supervise "$gmark" "$data/drive-started" - -- /usr/bin/sandbox-exec -p "(version 1)
 (allow default)
@@ -286,7 +291,7 @@ run_case() {
 (deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
 (deny file-write*)
 (allow file-write* (subpath \"$data\") (subpath \"$w\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\"))
-(deny file-read-data (literal \"$ndtmp/no-docker-mark/a\") (literal \"$gmark/a\"))
+(deny file-read-data (literal \"$gmark/a\"))
 (deny file-read* (regex #\"^/dev/ttys[0-9]+\$\"))
 (deny user-preference-write)
 (deny file-ioctl (ioctl-command #x80017472))
@@ -568,10 +573,46 @@ print("own-group", g.wait())
   # replaced from inside, and no new one can be created.
   # On dfb6ee4: the profile allowed writes to /private/tmp/sh-thd*, so every
   # operation on that canary succeeded.
-  t21a=/private/tmp/sh-thd-flowcrm-test-$nonce
-  t21b=/private/var/tmp/sh-thd-flowcrm-test-$nonce
+  # Both directories are shared with other users: each canary gets a
+  # random name and is created exclusively, without following a link; it
+  # is read and removed only while it is still the file created here
+  # (same device and inode, a regular file of ours).
+  t21_file='
+import os, secrets, stat, sys
+mode = sys.argv[1]
+def same(path, dev, ino):
+    st = os.lstat(path)
+    return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and (st.st_dev, st.st_ino) == (int(dev), int(ino))
+if mode == "create":
+    path = os.path.join(sys.argv[2], "sh-thd-flowcrm-test-" + secrets.token_hex(12))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.write(fd, b"original\n")
+    st = os.fstat(fd)
+    os.close(fd)
+    print(path, st.st_dev, st.st_ino)
+elif mode == "read":
+    path, dev, ino = sys.argv[2:5]
+    try:
+        if not same(path, dev, ino):
+            print("replaced")
+            sys.exit(0)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        print("same" if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (int(dev), int(ino)) and os.read(fd, 64) == b"original\n" else "changed")
+        os.close(fd)
+    except FileNotFoundError:
+        print("missing")
+elif mode == "remove":
+    path, dev, ino = sys.argv[2:5]
+    try:
+        if same(path, dev, ino):
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+'
+  read -r t21a t21a_dev t21a_ino < <(python3 -I -c "$t21_file" create /private/tmp) || exit 2
+  read -r t21b t21b_dev t21b_ino < <(python3 -I -c "$t21_file" create /private/var/tmp) || exit 2
+  case "$t21a $t21b" in /private/tmp/sh-thd-flowcrm-test-*" "/private/var/tmp/sh-thd-flowcrm-test-*) ;; *) echo "HARNESS ERROR: T-21 canaries not created" >&2; exit 2 ;; esac
   w21=$(new_work) || exit 2
-  for f in "$t21a" "$t21b"; do (umask 077 && printf 'original\n' >"$f") || exit 2; done
   t21=$("$nd" --work "$w21" python3 -I -c '
 import errno, os, sys
 w = sys.argv[1]
@@ -600,15 +641,19 @@ for path in sys.argv[2:]:
 ' "$w21" "$t21a" "$t21b" 2>/dev/null)
   r=$?
   t21_left=""
+  t21s=$(python3 -I -c "$t21_file" read "$t21a" "$t21a_dev" "$t21a_ino")
+  [ "$t21s" = same ] || t21_left="$t21_left $t21s:$t21a"
+  t21s=$(python3 -I -c "$t21_file" read "$t21b" "$t21b_dev" "$t21b_ino")
+  [ "$t21s" = same ] || t21_left="$t21_left $t21s:$t21b"
   for f in "$t21a" "$t21b"; do
-    [ "$(cat "$f" 2>/dev/null)" = original ] || t21_left="$t21_left changed:$f"
-    for x in "$f.moved" "$f.new"; do [ ! -e "$x" ] || t21_left="$t21_left $x"; done
+    for x in "$f.moved" "$f.new"; do [ ! -e "$x" ] && [ ! -L "$x" ] || t21_left="$t21_left $x"; done
   done
   printf '%s\n' "$t21" | grep '^t21 bad' | sed 's/^/INFO    /'
   [ "$r" -eq 0 ] && [ "$(printf '%s\n' "$t21" | grep -c '^t21 ok')" -eq 18 ] && [ -z "$t21_left" ]
   result "T-21 bash 3.2 here-document files (/private/tmp and /private/var/tmp sh-thd-*) cannot be written, replaced or created from inside" $? \
     "(rc $r, $(printf '%s\n' "$t21" | grep -c '^t21 ok') of 18 denied, changed or left:${t21_left:- none})"
-  rm -f "$t21a" "$t21b" "$t21a.moved" "$t21b.moved" "$t21a.new" "$t21b.new"
+  python3 -I -c "$t21_file" remove "$t21a" "$t21a_dev" "$t21a_ino"
+  python3 -I -c "$t21_file" remove "$t21b" "$t21b_dev" "$t21b_ino"
 
   # --- T-22 a file outside the run's directory cannot be changed through a
   # hard link, a symbolic link, a rename over it or an exchange (all on
@@ -707,6 +752,9 @@ if how == "kill-self":
 if how == "wait":
     open(w + "/pids", "a").write(f"{os.getpid()}\n")
     time.sleep(60)
+if how == "linger":
+    open(w + "/started", "w").write(f"{time.time():.3f}\n")
+    time.sleep(3)
 '
   t24_left() { # run-dir tag: the recorded pids that still run as the case's processes
     local p
@@ -827,6 +875,221 @@ ${t26_mark#"$ndtmp"/}
   t27 --orphans
   t27 --supervise
 
+  # --- T-30 to T-34 a run is reported done only when it is shown that none
+  # of its processes runs any more (B-1). no-docker-probe.py takes one copy
+  # of the process table at a time and needs a copy in which every process
+  # is shown not to be one of the run's, or was dead before that copy;
+  # otherwise the run fails with 125 and keeps its marker directory, and
+  # the next run refuses until that is shown.
+  # On e8ed7ed: one process table that happened to show no member ended
+  # the run as a success.
+  #
+  # T-30: a "hopper", each generation forking the next and ending, inside
+  # the sandbox: bounded (it ends by itself 18 s after it starts, or after
+  # 50000 generations) and recording a heartbeat in its run
+  # directory. The run must not be reported done while it hops; the next
+  # run must refuse while it hops; after it ended, a run starts again (and
+  # removes the old marker directory).
+  t30_hop='
+import os, sys, time
+beat, deadline = sys.argv[1], float(sys.argv[2])
+g = 0
+while g < 50000 and time.time() < deadline:
+    g += 1
+    if g % 100 == 0:
+        with open(beat, "a") as f:
+            f.write(f"{time.time():.3f} {g}\n")
+    if os.fork():
+        os._exit(0)
+'
+  t30_beats() { count_in . "$1"; }
+  w30=$(new_work) || exit 2
+  t30_end=$(($(date +%s) + 18))
+  t0=$(date +%s)
+  "$nd" --work "$w30" python3 -I -B -c "$t30_hop" "$w30/beat" "$t30_end" "t30-$nonce" >"$work/t30.out" 2>&1
+  r=$?
+  took=$(($(date +%s) - t0))
+  n0=$(t30_beats "$w30/beat")
+  sleep 1
+  n1=$(t30_beats "$w30/beat")
+  t30_hopping=no
+  [ "$n1" -gt "$n0" ] && t30_hopping=yes
+  w30b=$(new_work) || exit 2
+  "$nd" --work "$w30b" /usr/bin/touch "$w30b/ran" >"$work/t30b.out" 2>&1
+  r2=$?
+  # Still hopping after that run returned? Then it must have refused.
+  n2=$(t30_beats "$w30/beat")
+  sleep 1
+  t30_still=no
+  [ "$(t30_beats "$w30/beat")" -gt "$n2" ] && t30_still=yes
+  while [ "$(date +%s)" -le $((t30_end + 2)) ]; do sleep 1; done
+  w30c=$(new_work) || exit 2
+  "$nd" --work "$w30c" /usr/bin/touch "$w30c/ran" >"$work/t30c.out" 2>&1
+  r3=$?
+  # Not done while it hops: either the run failed (125, "could not be
+  # shown") or, if it ended anyway, the hopper had stopped.
+  { [ "$r" -eq 125 ] && grep -q 'could not be shown to have ended' "$work/t30.out"; } ||
+    { [ "$r" -ne 125 ] && [ "$t30_hopping" = no ]; }
+  t30_ok1=$?
+  [ "$t30_ok1" -eq 0 ] && [ "$n0" -gt 0 ] &&
+    { [ "$t30_still" = no ] || { [ "$r2" -eq 125 ] && [ ! -e "$w30b/ran" ]; }; } &&
+    [ "$r3" -eq 0 ] && [ -e "$w30c/ran" ]
+  result "T-30 a process that keeps forking and ending is never reported as ended; new runs refuse while it runs, and start after it ended" $? \
+    "(run rc $r after ${took}s, hopping afterwards $t30_hopping; next run rc $r2, hopping after it $t30_still; after its end rc $r3)"
+
+  # T-31: two runs at the same time, each leaving a daemon: both are
+  # reported done, neither refuses the other, each ends its own daemon.
+  w31a=$(new_work) || exit 2
+  w31b=$(new_work) || exit 2
+  "$nd" --work "$w31a" python3 -I -B -c "$t24_leaver" "$w31a" "t31a-$nonce" linger >"$work/t31a.out" 2>&1 &
+  t31pa=$!
+  "$nd" --work "$w31b" python3 -I -B -c "$t24_leaver" "$w31b" "t31b-$nonce" linger >"$work/t31b.out" 2>&1 &
+  t31pb=$!
+  wait "$t31pa"
+  ra=$?
+  wait "$t31pb"
+  rb=$?
+  sleep 0.5
+  la=$(t24_left "$w31a" "t31a-$nonce")
+  lb=$(t24_left "$w31b" "t31b-$nonce")
+  t24_clean "$w31a" "t31a-$nonce"
+  t24_clean "$w31b" "t31b-$nonce"
+  [ "$ra" -eq 0 ] && [ "$rb" -eq 0 ] && regular "$w31a/started" && regular "$w31b/started" &&
+    [ "$(count_in . "$w31a/pids")" -eq 4 ] && [ "$(count_in . "$w31b/pids")" -eq 4 ] && [ -z "$la$lb" ] &&
+    ! grep -q 'refused' "$work/t31a.out" "$work/t31b.out"
+  result "T-31 two runs at the same time each end their own processes and do not refuse each other" $? \
+    "(rc $ra and $rb, survivors:${la}${lb:- none})"
+
+  # T-32: unrelated processes that start and end while the run's
+  # processes are checked (here: this suite's own short-lived /usr/bin/true
+  # runs, outside) do not make the run fail: a process that ended before
+  # it could be checked is ended, not unknown, once a later copy of the
+  # table no longer has it.
+  w32=$(new_work) || exit 2
+  ( i=0; while [ "$i" -lt 3000 ]; do /usr/bin/true; i=$((i + 1)); done ) &
+  t32churn=$!
+  "$nd" --work "$w32" python3 -I -B -c "$t24_leaver" "$w32" "t32-$nonce" ok >"$work/t32.out" 2>&1
+  r=$?
+  # The churn must still have been running when the run ended.
+  t32_overlap=no
+  ps -o args= -p "$t32churn" 2>/dev/null | grep -q . && t32_overlap=yes
+  wait "$t32churn"
+  sleep 0.5
+  left=$(t24_left "$w32" "t32-$nonce")
+  t24_clean "$w32" "t32-$nonce"
+  [ "$r" -eq 0 ] && [ "$t32_overlap" = yes ] && [ "$(count_in . "$w32/pids")" -eq 4 ] && [ -z "$left" ]
+  result "T-32 processes that start and end outside meanwhile do not make the ending fail" $? \
+    "(rc $r, churn still running at the end $t32_overlap, survivors:${left:- none})"
+
+  # T-33: if the ending cannot be shown (here: this case removes the run's
+  # marker file A while the command waits, then sends TERM), the run fails
+  # (125), the supervisor's own child does not survive, and the marker
+  # directory is kept. The case then ends the leftovers it recorded (by
+  # pid, while their arguments carry its tag), removes that directory and
+  # checks that a new run starts.
+  w33=$(new_work) || exit 2
+  t33_before=$(cd "$ndtmp" && ls -d no-docker-mark.* 2>/dev/null)
+  python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' "$nd" --work "$w33" python3 -I -B -c "$t24_leaver" "$w33" "t33-$nonce" wait >"$work/t33.out" 2>&1 &
+  ndpid=$!
+  for _ in $(seq 1 100); do [ "$(count_in . "$w33/pids")" -ge 5 ] && regular "$w33/mark" && break; sleep 0.1; done
+  t33_mark=""
+  regular "$w33/mark" && t33_mark=$(cat "$w33/mark")
+  case ${t33_mark#"$ndtmp"/} in no-docker-mark.*[!A-Za-z0-9_]* | "$t33_mark") t33_mark="" ;; no-docker-mark.?*) ;; *) t33_mark="" ;; esac
+  case "
+$t33_before
+" in *"
+${t33_mark#"$ndtmp"/}
+"*) t33_mark="" ;; esac
+  [ -n "$t33_mark" ] && [ -d "$t33_mark" ] && [ ! -L "$t33_mark" ] && [ -f "$t33_mark/a" ] && [ ! -L "$t33_mark/a" ] &&
+    regular "$t33_mark/owner" && [ "$(cut -d' ' -f1 "$t33_mark/owner")" = "$ndpid" ] || t33_mark=""
+  t33_main=$(sed -n 5p "$w33/pids" 2>/dev/null | tr -cd '0-9')
+  r=none
+  if [ -n "$t33_mark" ] && ps -o args= -p "$ndpid" 2>/dev/null | grep -q -- no-docker; then
+    rm -f "$t33_mark/a"
+    kill -TERM "$ndpid"
+    wait "$ndpid"
+    r=$?
+  else
+    ps -o args= -p "$ndpid" 2>/dev/null | grep -q -- no-docker && kill -TERM "$ndpid"
+    wait "$ndpid" 2>/dev/null
+  fi
+  t33_child=gone
+  [ -n "$t33_main" ] && ps -o args= -p "$t33_main" 2>/dev/null | grep -q -- "t33-$nonce" && t33_child=alive
+  t33_kept=no
+  [ -n "$t33_mark" ] && [ -d "$t33_mark" ] && t33_kept=yes
+  t24_clean "$w33" "t33-$nonce"
+  [ -n "$t33_mark" ] && rm -rf "$t33_mark"
+  w33b=$(new_work) || exit 2
+  "$nd" --work "$w33b" /usr/bin/touch "$w33b/ran" >/dev/null 2>&1
+  r2=$?
+  [ "$r" = 125 ] && grep -q 'could not be shown to have ended' "$work/t33.out" && [ "$t33_child" = gone ] &&
+    [ "$t33_kept" = yes ] && [ "$r2" -eq 0 ] && [ -e "$w33b/ran" ]
+  result "T-33 an ending that cannot be shown fails the run (125), ends the supervisor's own child and keeps the marker" $? \
+    "(rc $r, command $t33_child, marker kept $t33_kept, next run rc $r2)"
+
+  # T-34: TERM to no-docker.sh at several moments of the start, while the
+  # command starts processes: each run ends within 15 s, as interrupted
+  # (143) or as not shown (125); none of the processes it recorded
+  # survives once the run ended or was ended through its marker.
+  t34_spawn='
+import os, sys, time
+w, tag = sys.argv[1], sys.argv[2]
+open(w + "/mark", "w").write(os.environ.get("NO_DOCKER_MARK", ""))
+SLEEP = [sys.executable, "-I", "-B", "-c", "import os, sys, time; open(sys.argv[1], \"a\").write(f\"{os.getpid()}\\n\"); time.sleep(30)", w + "/pids", tag]
+for _ in range(20):
+    if os.fork() == 0:
+        os.setsid()
+        os.execv(SLEEP[0], SLEEP)
+    time.sleep(0.05)
+time.sleep(30)
+'
+  t34_bad=""
+  for t34_delay in 0 0.1 0.3 0.8; do
+    w34=$(new_work) || exit 2
+    t34_before=$(cd "$ndtmp" && ls -d no-docker-mark.* 2>/dev/null)
+    python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' "$nd" --work "$w34" python3 -I -B -c "$t34_spawn" "$w34" "t34-$nonce" >"$work/t34.out" 2>&1 &
+    ndpid=$!
+    sleep "$t34_delay"
+    t0=$(date +%s)
+    ps -o args= -p "$ndpid" 2>/dev/null | grep -q -- no-docker && kill -TERM "$ndpid"
+    wait "$ndpid"
+    r=$?
+    took=$(($(date +%s) - t0))
+    sleep 0.5
+    left=$(t24_left "$w34" "t34-$nonce")
+    if [ "$r" -eq 125 ]; then
+      # Not shown: the kept marker directory of this run ends what is left.
+      # It is the one the command recorded, if that is a directory that did
+      # not exist before this iteration and whose owner record names this
+      # run's no-docker.sh (now gone); --end also refuses a directory whose
+      # owner still runs.
+      t34_mark=""
+      regular "$w34/mark" && t34_mark=$(cat "$w34/mark")
+      case ${t34_mark#"$ndtmp"/} in no-docker-mark.*[!A-Za-z0-9_]* | "$t34_mark") t34_mark="" ;; no-docker-mark.?*) ;; *) t34_mark="" ;; esac
+      case "
+$t34_before
+" in *"
+${t34_mark#"$ndtmp"/}
+"*) t34_mark="" ;; esac
+      if [ -n "$t34_mark" ] && [ -d "$t34_mark" ] && [ ! -L "$t34_mark" ] && regular "$t34_mark/owner" &&
+        [ "$(cut -d' ' -f1 "$t34_mark/owner")" = "$ndpid" ]; then
+        python3 -I "$root/scripts/ci/no-docker-probe.py" --end "$t34_mark" >/dev/null 2>&1
+      fi
+      sleep 0.5
+      left=$(t24_left "$w34" "t34-$nonce")
+    fi
+    t24_clean "$w34" "t34-$nonce"
+    case $r in 143 | 125) ;; *) t34_bad="$t34_bad delay$t34_delay:rc$r" ;; esac
+    [ "$took" -le 15 ] || t34_bad="$t34_bad delay$t34_delay:${took}s"
+    [ -z "$left" ] || t34_bad="$t34_bad delay$t34_delay:survivors$left"
+  done
+  [ -z "$t34_bad" ]
+  result "T-34 TERM while the command starts processes: every run ends in time and none of its processes survives" $? "(${t34_bad:- all ok})"
+
   # --- T-28 no debugger access to a process outside (A-M2). The canaries
   # are copies of /bin/sleep in this suite's directory, signed ad hoc with
   # get-task-allow, so that a debugger of the same user may attach to them;
@@ -904,7 +1167,7 @@ print(" ".join(out))
   [ "$t29" = "outside:read inside:denied 1" ]
   result "T-29 another terminal's device cannot be read from inside (control: it can from outside)" $? "($t29)"
 else
-  echo "INFO  T-06, T-08 to T-15, T-21, T-22, T-24 to T-29 skipped: macOS sandbox profile only"
+  echo "INFO  T-06, T-08 to T-15, T-21, T-22, T-24 to T-34 skipped: macOS sandbox profile only"
 fi
 
 # --- T-07 loopback ports listening before the isolation
