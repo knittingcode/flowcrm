@@ -34,10 +34,10 @@
 #          Events, login item or background task registration and no lookup
 #          of Docker's own services. When the command ends, or no-docker.sh
 #          gets SIGINT, SIGTERM, SIGHUP or SIGQUIT, every process left in the
-#          sandbox is killed (found by a marker of the run); a process left
-#          by a run that could not do that (SIGKILL) keeps new runs from
-#          starting. $TMPDIR must be the per-user directory under
-#          /private/var/folders.
+#          sandbox is killed (found by a marker of the run), or the run
+#          fails (125); a process left by a run that could not do that
+#          (SIGKILL, failure) keeps new runs from starting. $TMPDIR must be
+#          the per-user directory under /private/var/folders.
 #   Linux  sudo unshare: new network (loopback only), mount, pid, and IPC
 #          namespaces; empty tmpfs over /run, /var/run, /tmp, /var/tmp,
 #          /dev/shm and /sys/fs/cgroup, a fresh /dev/mqueue, every other mount
@@ -200,6 +200,24 @@ case $os in
       work=$(cd -P "$work" && pwd -P) || refuse "cannot resolve the temporary directory"
       trap 'rm -rf "$work"' EXIT
     fi
+    # The sandbox carries a marker of this run and one common to every run
+    # (a denied read of a file in each marker directory, which are in
+    # $tmp, outside everything the sandbox may write), by which
+    # no-docker-probe.py finds its processes from outside: a process cannot
+    # leave its sandbox, and every process it starts inherits it. A
+    # process left by an earlier run is ruled out before anything is
+    # written into the run's directory.
+    markdir=$(python3 -I "$probe" --markers "$tmp") || refuse "cannot make the marker of the run"
+    case $markdir in "$tmp"/no-docker-mark.?*) ;; *) refuse "unexpected marker directory $markdir" ;; esac
+    plain "$markdir" || refuse "unexpected character in the marker directory $markdir"
+    if [ -n "$given_work" ]; then
+      remove=-
+      trap 'rm -rf "$markdir"' EXIT
+    else
+      remove=$work
+      trap 'rm -rf "$work" "$markdir"' EXIT
+    fi
+    python3 -I "$probe" --orphans "$tmp" || refuse "cannot rule out a process left by an earlier isolated run"
     ;;
   Linux)
     # Only GitHub-hosted runners: the VM is discarded after the job, sudo
@@ -306,22 +324,6 @@ case $os in
     done
     envargs+=("NO_DOCKER_HELD_PORTS=$(printf '%s' "$listening" | tr '\n' ' ')" "NO_DOCKER_OUTER_PID=$$"
       "NO_DOCKER_USER_TMP=$tmp")
-    # The sandbox carries a marker of this run and one common to every run
-    # (a denied read of a file in each marker directory, which are in
-    # $tmp, outside everything the sandbox may write), by which
-    # no-docker-probe.py finds its processes from outside: a process cannot
-    # leave its sandbox, and every process it starts inherits it.
-    markdir=$(python3 -I "$probe" --markers "$tmp") || refuse "cannot make the marker of the run"
-    case $markdir in "$tmp"/no-docker-mark.?*) ;; *) refuse "unexpected marker directory $markdir" ;; esac
-    plain "$markdir" || refuse "unexpected character in the marker directory $markdir"
-    if [ -n "$given_work" ]; then
-      remove=-
-      trap 'rm -rf "$markdir"' EXIT
-    else
-      remove=$work
-      trap 'rm -rf "$work" "$markdir"' EXIT
-    fi
-    python3 -I "$probe" --orphans "$tmp" || refuse "cannot rule out a process left by an earlier isolated run"
     envargs+=("NO_DOCKER_MARK=$markdir")
     # File writes: the run's directory; of /dev only what shells and
     # interpreters open for writing (measured, docs/dev-environment.md).

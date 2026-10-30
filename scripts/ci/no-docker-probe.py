@@ -521,15 +521,18 @@ def darwin_supervise(markdir, started_file, remove, argv):
         except OSError as e:
             print(f"no-docker: cannot start the isolation: {e}", file=sys.stderr)
         try:
-            # A signal that came while it was being started is not lost: the
-            # wait is skipped.
-            waiting[0] = True
-            if child is not None and not caught:
-                status = child.wait()
+            try:
+                # A signal that came while it was being started is not
+                # lost: the wait is skipped.
+                waiting[0] = True
+                if child is not None and not caught:
+                    status = child.wait()
+            finally:
+                waiting[0] = False
         except Interrupted:
+            # Also when it arrives in the finally clause above (the handler
+            # clears waiting before it raises, so it raises only once).
             pass
-        finally:
-            waiting[0] = False
         try:
             ended = darwin_end(sbx)
             if child is not None:
@@ -543,13 +546,17 @@ def darwin_supervise(markdir, started_file, remove, argv):
             failure = str(e)
     finally:
         started = os.path.exists(started_file)
-        shutil.rmtree(markdir, ignore_errors=True)
+        # Kept when processes are left, so they can still be ended through
+        # it (--end MARKDIR).
+        if not failure:
+            shutil.rmtree(markdir, ignore_errors=True)
         if remove != "-":
             shutil.rmtree(remove, ignore_errors=True)
     if ended:
         print(f"no-docker: ended {ended} processes the command left running", file=sys.stderr)
     if failure:
-        return refused(f"processes of the isolated command could not all be ended: {failure}")
+        return refused(f"processes of the isolated command could not all be ended: {failure}; "
+                       f"end them with: python3 -I {os.path.abspath(__file__)} --end {markdir}")
     if not started:
         return refused(f"the isolation tool returned {status} without starting the command; the command was not run")
     if caught:
