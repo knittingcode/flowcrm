@@ -444,9 +444,11 @@ Supported platforms:
 | other systems | refused (exit 125) | — |
 | any platform as uid 0 | refused (exit 125) | — |
 
-Each property below is enforced by the sandbox or the kernel and checked
-from inside by `scripts/ci/no-docker-probe.py` before the command starts. If
-any check fails, a tool is missing, a mount fails, the profile is rejected or
+Each property below is enforced by the sandbox profile or the kernel. Before
+the command starts, `scripts/ci/no-docker-probe.py` checks from inside the
+ones each platform's section lists as checked; on macOS the others rest on
+`sandbox-exec` accepting the profile and on the regression tests. If any
+check fails, a tool is missing, a mount fails, the profile is rejected or
 the command was not started inside the isolation, the command does not run
 and the exit status is 125.
 
@@ -482,10 +484,11 @@ The `sandbox-exec` profile denies:
   column header or prints a LISTEN row that cannot be parsed, the run is
   refused. The probe connects to each held port;
 - file writes anywhere except in the run's directory, `/dev/null`,
-  `/dev/zero`, `/dev/tty`, `/dev/dtracehelper`, `/dev/fd/*` and the
-  `sh-thd*` here-document files of bash 3.2, which bash creates in `/tmp`
-  whatever `$TMPDIR` is. The probe checks that `$HOME`, the user's
-  temporary directory, `/tmp` and `/private/var/tmp` are not writable and
+  `/dev/zero`, `/dev/tty`, `/dev/dtracehelper` and `/dev/fd/*`. Nothing in
+  `/tmp` or `/private/var/tmp` is writable, so no file another process
+  keeps there can be changed, replaced or created from inside. The probe
+  checks that `$HOME`, the user's temporary directory, `/tmp`,
+  `/private/var/tmp` and an `sh-thd-*` file in `/tmp` are not writable and
   that `$TMPDIR` is. This `/dev` list was measured with bash 3.2, python3,
   `mktemp`, `/usr/bin/git`, `tests/devenv/unit.sh` and the guard suites.
   Writing to `/dev/random`, `/dev/urandom` and other terminals' `/dev/ttys*`
@@ -495,13 +498,71 @@ The `sandbox-exec` profile denies:
 - signals to any process outside the sandbox. Processes of the run can
   signal each other, including process groups. The probe sends signal 0 to
   `no-docker.sh` outside: EPERM;
+- debugging any process (`system-debug`): `ptrace(PT_ATTACHEXC)` fails with
+  EPERM, even against a process of the user that allows debuggers
+  (`get-task-allow`). Measured: without this rule the attach succeeds, and
+  a debugger could then stop, signal or end that process;
+- the task ports of processes outside the sandbox (control, inspect, read
+  and name ports), which debuggers and readers such as `vmmap` and `sample`
+  use. Measured: without the rule they read the memory map of such a
+  process from inside; with it they are refused, while they still work on
+  the command's own processes and `ps` still lists every process;
+- reading the devices of other terminals (`/dev/ttys*`), which would let
+  the command read what is typed in them. The command keeps its own
+  terminal through `/dev/tty` and the descriptors it inherits;
 - preference writes through `cfprefsd` and `TIOCSTI` on the terminal;
 - `open`, `osascript`, `launchctl` and `ssh`, job submission to launchd,
-  Launch Services and Apple Events;
+  Launch Services and Apple Events. Measured with a re-signed copy of
+  `launchctl` inside: `submit` and `bootstrap` of a job and `setenv` in the
+  user's launchd domain all fail, and no job or variable appears;
 - lookups of the services that register login items and background tasks
   (`com.apple.xpc.smd`, `com.apple.backgroundtaskmanagement*`,
   `com.apple.coreservices.sharedfilelistd*`) and of Docker Desktop's own
   services (`com.docker.*`, `com.electron.dockerdesktop.*`).
+
+bash 3.2, which is also `/bin/sh`, keeps each here-document and
+here-string in a temporary file, ignoring `$TMPDIR`: in `/private/var/tmp`,
+or in `/tmp` where `/var/tmp` is not writable, as inside a sandbox. Neither
+is writable inside, so a here-document fails there ("cannot create temp
+file for here document"). Measured: bash then falls back to the working
+directory, so one works only while the working directory is in the run's
+directory. The code that runs inside (`bin/devenv`, `tests/devenv/unit.sh`,
+the guard suites and the scripts they run) therefore uses none; T-20
+checks this statically.
+
+When the command ends, every process it left in the sandbox is ended: a
+plain background job, a daemon after `setsid` and a double fork, a
+`posix_spawn` child in a session of its own, a process group of its own.
+`no-docker.sh` hands its process to a supervisor in
+`scripts/ci/no-docker-probe.py`, which starts `sandbox-exec`, waits for it
+and then ends what is left. It finds those processes by a marker: the
+profile denies reading file `a` of a marker directory of the run (and of
+one common to every run), in `$TMPDIR` outside the run's directory, and
+leaves file `b` next to it alone. From outside, `sandbox_check()` asks how a
+process's sandbox would decide; a process is in the run's sandbox exactly
+when it is denied `a` and allowed `b`. Measured: an unsandboxed process is
+allowed both, other sandboxes decide both the same way, and the files must
+exist, or every process is "denied". A process cannot leave its sandbox,
+and every process it starts inherits it, however it detaches. The
+supervisor sends SIGKILL to each member as soon as it finds one, after
+reading its start time and membership again, and lists the processes again
+until there is none. A killed process cannot start another one, and
+nothing a member does can undo SIGKILL. The supervisor needs no new process
+to do this, so a command that uses up the processes it may start cannot
+stop it. It prints how many processes it ended. If a member cannot be ended
+within 10 seconds (for example one of another user), the run fails with
+status 125. SIGINT, SIGTERM, SIGHUP or SIGQUIT delivered to `no-docker.sh`
+end the command and everything it left at once, and the status is 128 plus
+the signal number; a signal the caller ignores stays ignored. The probe
+checks from inside that the sandbox carries both markers.
+
+SIGKILL of `no-docker.sh` (or a crash of the supervisor) cannot be handled:
+what the command left keeps running, still inside the sandbox with every
+limit above. Before each run, `no-docker.sh` therefore looks for processes
+of the common marker that run on their own (their supervisor is gone) and
+refuses to start while there is one, naming them. A concurrent run's own
+processes are under its supervisor and do not count, but a daemon it left
+does until it ends.
 
 Setuid programs cannot run in the sandbox, so `ps` is an ad-hoc signed copy
 and `sudo` is unavailable. The U-16 check that another local user cannot
@@ -629,33 +690,36 @@ them.
 
 #### Accepted residual risks
 
-- **macOS leftover processes.** Background processes of the command can
-  outlive it. They stay inside the sandbox, with every limit above, but
-  have an unbounded time for the routes below. Killing the run's process
-  group or session afterwards is a follow-up.
+- **SIGKILL of `no-docker.sh` (macOS).** Its supervisor cannot end what
+  the command left. Those processes stay in the sandbox, with every limit
+  above, until someone ends them or the user logs out; meanwhile no new
+  isolated run starts. Processes left by runs of a version without the
+  markers (before the supervisor) are not recognised: log out once after
+  updating.
+- **Process identity (macOS).** A process is signalled only after its
+  start time and membership were read again, microseconds before. A pid
+  reused within that window by a process outside could still be ended:
+  an availability risk, not a way out.
 - **Late listeners.** A loopback port that starts listening after the run
   started (on macOS) is reachable, as are the ports the command opens
-  itself. This includes a VM's port forward that starts later, or one
-  started while a leftover process still runs. The probe asks each
-  listening port whether it is an engine only at the start.
-- **Login items and launchd environment through copies (macOS).** The
-  services that register login items and background tasks are denied. A
-  re-signed copy of `launchctl` loses its entitlements. Whether such a copy
-  can still `setenv` in the user's launchd domain was not measured.
-- **Here-document files in `/tmp` (macOS).** bash 3.2, which is also
-  `/bin/sh`, writes every here-document to `/tmp/sh-thd*` whatever
-  `$TMPDIR` is. It creates the file, closes it, opens it again by name and
-  then removes it. Measured: without the `sh-thd*` allowance, here-documents
-  in the sandbox fail ("cannot create temp file for here document"), also
-  with `$TMPDIR` in the run's directory. So the allowance stays. Code in
-  the sandbox can therefore remove and recreate an `sh-thd*` file of a
-  bash 3.2 that runs outside the sandbox, between that bash's close and
-  reopen. That injects shell input into the outside script. The window is
-  short, but a leftover process (above) can wait for it. SBPL cannot limit
-  the rule to files the sandbox created itself.
-- **Terminals and the pasteboard (macOS).** Writes to other terminals'
-  devices are denied. The pasteboard (`pbcopy`) is not; using it needs a
-  person to paste.
+  itself. This includes a VM's port forward that starts later. The probe
+  asks each listening port whether it is an engine only at the start. The
+  other way round, a loopback port the command opens during the run can be
+  reached by programs outside, which may take its answers for those of a
+  local service (for example a readiness check of `bin/devenv` run at the
+  same time).
+- **Login items and launchd (macOS).** The services that register login
+  items and background tasks are denied, and launchd jobs and `setenv`
+  through a re-signed `launchctl` fail (measured). Services that launchd
+  starts on the command's behalf run outside the sandbox; they are limited
+  by the lookups and Apple Events denied above, not by the supervisor.
+- **Terminals and the pasteboard (macOS).** Reading and writing other
+  terminals' devices are denied. A process of the command can still make
+  itself the foreground process group of its own terminal while it runs.
+  The pasteboard (`pbcopy`) is not denied; using it needs a person to
+  paste.
+- **Reading other processes (macOS).** The environment and arguments of the
+  user's other processes are readable (`ps eww`), as are the user's files.
 - **Writes through other processes (macOS).** The file-write limit covers
   the command's own writes. Writes made for it by system services are
   limited by the launchd, Launch Services, Apple Events, preference and
@@ -707,7 +771,7 @@ private.
   `no-docker.test.sh`, or a script with the re-exec stanza. A step that
   mixes such commands with others fails;
 - the required jobs exist;
-- no job or step has an `if:` condition;
+- no job or step has an `if:` condition or a `continue-on-error:` key;
 - every other file that mentions `no-docker.sh` has the recognised re-exec
   stanza.
 
@@ -732,10 +796,14 @@ request.
 - Files that code under test could write are read only when they are
   regular files, so a planted FIFO or link cannot hang or redirect the
   test.
-- **T-14:** the helpers that the test runs outside any isolation, and the
-  mutant's text, are kept outside every directory that code under test can
-  write. Their sha256 is checked immediately before each such run. The
-  case also checks that a changed copy is detected and not run.
+- **T-14 and T-23:** the helpers that the test runs outside any isolation
+  (`canary.py`, `drive.sh`) and the mutant's text are tracked files in
+  `scripts/ci/tests/no-docker/`. Their sha256 values are constants in the
+  test, set when they were reviewed, and every copy is checked against
+  them immediately before each run outside, so a copy changed at any time
+  is never run. The copies are kept outside every directory that code
+  under test can write. T-14 checks that a changed copy is detected and not
+  run, and T-23 that the values are constants.
 
 The other cases run plain commands that only print, connect, write markers
 in the test's directories or send signal 0 or TERM to the test's own
@@ -745,15 +813,35 @@ in the test's directories or send signal 0 or TERM to the test's own
 - **T-01 and T-02:** `--check`, and a claimed but unproven isolation.
 - **T-07:** loopback ports that were already listening are unreachable,
   while ports opened inside are reachable.
-- **T-06 and T-08 to T-15, macOS only:**
-  - **T-06 and T-11:** the write limits;
+- **T-06, T-08 to T-15, T-21, T-22 and T-24 to T-29, macOS only:**
+  - **T-06 and T-11:** the write limits, including that a bash 3.2
+    here-document fails;
   - **T-08:** the complete port list;
   - **T-09 and T-12:** the `TMPDIR` allowlist;
   - **T-10:** preferences and `TIOCSTI`;
   - **T-13:** a canary outside cannot be signalled (EPERM) and survives,
     while the command's own child and process group can be signalled;
   - **T-14:** integrity of the helpers;
-  - **T-15:** `--work`, accepted and refused cases.
+  - **T-15:** `--work`, accepted and refused cases;
+  - **T-21:** canary files named like bash 3.2 here-document files in
+    `/tmp` and `/private/var/tmp` cannot be opened for writing, truncated,
+    removed, renamed, replaced or chmodded, and none can be created;
+  - **T-22:** a file outside the run's directory cannot be changed through
+    a hard link, a symbolic link, a rename over it or an exchange;
+  - **T-24:** four processes the command leaves (a background child, a
+    `setsid` daemon after a double fork, a `posix_spawn` child in a session
+    of its own, a process group of its own) are all ended, after a normal
+    end, a failed command and a command killed by SIGKILL;
+  - **T-25:** SIGINT, SIGTERM and SIGHUP to `no-docker.sh` end the command
+    and those four processes at once (status 128 plus the signal);
+  - **T-26:** after SIGKILL of `no-docker.sh`, its leftovers keep a new run
+    from starting (125) until they are ended through the run's marker;
+  - **T-27:** when the probe cannot make the markers, look for leftovers or
+    supervise, the command is not run;
+  - **T-28:** a debugger attach from inside to a test canary outside that
+    allows debuggers fails, while it works from outside;
+  - **T-29:** another terminal's device cannot be read from inside, while
+    it can from outside.
 - **T-16 to T-18, Linux only:**
   - **T-16:** a canary inside sees only the namespace's processes, cannot
     read `/proc/1/root` and cannot connect to any engine, session or host
@@ -769,6 +857,8 @@ in the test's directories or send signal 0 or TERM to the test's own
     a workspace outside `$HOME` and a caller without a `Runner.Worker`
     ancestor are refused.
 - **T-19:** the static CI order check, on both platforms.
+- **T-20:** a static check that the code run inside the isolation has no
+  here-document or here-string, on both platforms.
 
 The macOS cases run only on a developer's Mac: there is no macOS CI job.
 
