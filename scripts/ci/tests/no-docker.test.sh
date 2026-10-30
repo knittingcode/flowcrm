@@ -45,14 +45,20 @@
 #     debugger to or read the memory map of this suite's own canary copies
 #     of /bin/sleep, read a pseudo-terminal of their own, run a bounded
 #     chain of forks of their own inside the isolation (T-30), remove the
-#     marker file of a run of their own (T-33), or sleep.
+#     marker file of a run of their own (T-33), run a Unix socket listener
+#     of their own that accepts and reads nothing, outside the isolation,
+#     in the host network namespace or in a new one made for it with sudo
+#     unshare --net and running as the user (T-37), or sleep;
+#   - T-36 runs pure tests of the probe's rules: fixtures only, with every
+#     call that would read /proc, open a file or socket, run a program or
+#     fork made to raise.
 # This suite itself runs no docker command.
 #
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
-# T-18 Linux only (each prints INFO on the other platform); T-19, T-20 and
-# T-23 are static and run on both. Each case says how it fails against the
-# no-docker.sh of 38b5ebd, dfb6ee4 or e8ed7ed, which these cases were
-# written to catch.
+# T-18 and T-37 Linux only (each prints INFO on the other platform); T-19,
+# T-20, T-23 and T-36 are static or pure and run on both. Each case says
+# how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
+# 85cfb37, which these cases were written to catch.
 #
 # Usage: no-docker.test.sh
 # HARNESS=<path> checks another copy of tests/devenv/unit.sh instead of the
@@ -114,6 +120,12 @@ cleanup() {
   # T-21's canaries in the shared directories, only while they are ours.
   [ -z "${t21a_ino-}" ] || python3 -I -c "$t21_file" remove "$t21a" "$t21a_dev" "$t21a_ino"
   [ -z "${t21b_ino-}" ] || python3 -I -c "$t21_file" remove "$t21b" "$t21b_dev" "$t21b_ino"
+  # T-37's listeners, by their recorded pid, and its unlistable directories.
+  for f in "$work/t37n1.pid" "$work/t37n2.pid"; do
+    p=$(cat "$f" 2>/dev/null)
+    case $p in "" | *[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac
+  done
+  chmod 700 "$ro/t37n1" "$ro/t37n2" 2>/dev/null
   rm -rf "$work" "$ro" "$vt"
 }
 trap cleanup EXIT
@@ -364,10 +376,16 @@ result "T-00 the read-only lint rejects a payload with a non-read-only command (
 r=$?
 [ "$r" -ne 0 ]
 result "T-01 --check fails outside the isolation" $? "(rc $r)"
-NO_DOCKER_ACTIVE=1 "$nd" touch "$work/t02" >/dev/null 2>&1
+# Refused for the right reason: the probe's mechanism check failed, and
+# its part that writes and connects never ran.
+t02=$(NO_DOCKER_ACTIVE=1 "$nd" touch "$work/t02" 2>&1)
 r=$?
-[ "$r" -eq 125 ] && [ ! -e "$work/t02" ]
-result "T-02 claimed but unproven isolation (NO_DOCKER_ACTIVE outside it): refused, command not run" $? "(rc $r)"
+t02_after=$(printf '%s\n' "$t02" | grep -cE 'container engine answers|accepts a connection|writes to .* fail')
+[ "$r" -eq 125 ] && [ ! -e "$work/t02" ] &&
+  printf '%s\n' "$t02" | grep -q '^no-docker: refused: inside no-docker.sh, but the isolation check fails' &&
+  printf '%s\n' "$t02" | grep -q '^no-docker: FAIL ' && [ "$t02_after" -eq 0 ]
+result "T-02 claimed but unproven isolation (NO_DOCKER_ACTIVE outside it): refused by the mechanism check, command not run" $? \
+  "(rc $r, $(printf '%s\n' "$t02" | grep -c '^no-docker: FAIL ') failed checks, $t02_after lines of the write and connect part)"
 
 if [ "$os" = Darwin ]; then
   # --- T-06 plain commands (no mutant): the write limits. A bash 3.2
@@ -1262,8 +1280,8 @@ if [ "$os" = Linux ]; then
   # processes visible), and $HOME and the workspace were writable.
   cat >"$ro/t16.py" <<'PY'
 import errno, os, socket, sys
-ipc_host, out_tmp, out_shm, in_tmp, socklist, nonce = sys.argv[1:7]
-targets = sys.argv[7:]
+ipc_host, pid_host, out_tmp, out_shm, in_tmp, socklist, nonce = sys.argv[1:8]
+targets = sys.argv[8:]
 me = str(os.getuid())
 def say(good, text):
     print(("t16 ok   " if good else "t16 bad  ") + text)
@@ -1275,7 +1293,10 @@ def status(pid):
             st[k] = v.strip()
     return st
 st = status("self")
-say(len(st.get("NSpid", "").split()) >= 2, f"NSpid {st.get('NSpid')}")
+say(st.get("NSpid", "").split() == [str(os.getpid())], f"NSpid {st.get('NSpid')} is this pid alone (a /proc of its own pid namespace)")
+own = os.readlink("/proc/self/ns/pid")
+say(pid_host == "pid:[4026531836]" and own not in (pid_host, "pid:[4026531836]"),
+    f"a pid namespace below the caller's, the initial one ({own}; caller {pid_host})")
 s1 = status(1)
 say(s1["Uid"].split()[0] == "0" and s1["Name"] == "sh", f"pid 1 is the isolation's root shell ({s1['Name']}, uid {s1['Uid'].split()[0]})")
 others = []
@@ -1283,11 +1304,18 @@ for d in os.listdir("/proc"):
     if d.isdigit() and d != "1":
         try:
             s = status(d)
-        except OSError:
+        except OSError as e:
+            if e.errno not in (errno.ENOENT, errno.ESRCH):
+                others.append(f"{d}:unreadable")
             continue
         if any(u != me for u in s["Uid"].split()) or s["Name"] in ("systemd", "Runner.Worker", "Runner.Listener", "dockerd", "containerd"):
             others.append(f"{d}:{s['Name']}")
 say(not others, f"no foreign process visible ({' '.join(others) or 'none'})")
+with open("/proc/self/mountinfo") as f:
+    procs = [l.split() for l in f if l.split()[4] == "/proc"]
+hidden = [o for r in procs for o in r[5].split(",") + r[r.index("-") + 3].split(",")
+          if (o.startswith("hidepid=") and o not in ("hidepid=0", "hidepid=off")) or o.startswith("subset=")]
+say(len(procs) >= 1 and not hidden, f"/proc hides no process ({','.join(hidden) or 'no hidepid or subset'})")
 try:
     os.listdir("/proc/1/root")
     say(False, "/proc/1/root is not readable")
@@ -1375,7 +1403,7 @@ with open("/proc/net/unix", "rb") as f:
   t16_targets=("$home")
   for v in GITHUB_WORKSPACE RUNNER_TEMP; do [ -z "${!v-}" ] || t16_targets+=("${!v}"); done
   [ ! -d /opt/hostedtoolcache ] || t16_targets+=(/opt/hostedtoolcache)
-  t16=$("$nd" python3 -I "$ro/t16.py" "$(readlink /proc/self/ns/ipc)" "$t16_tmp" "$t16_shm" "$t16_in" \
+  t16=$("$nd" python3 -I "$ro/t16.py" "$(readlink /proc/self/ns/ipc)" "$(readlink /proc/self/ns/pid)" "$t16_tmp" "$t16_shm" "$t16_in" \
     "$ro/t16-sockets" "$nonce" "${t16_targets[@]}" 2>&1)
   r=$?
   printf '%s\n' "$t16" | grep '^t16 ' | sed 's/^/INFO    /'
@@ -1388,9 +1416,11 @@ with open("/proc/net/unix", "rb") as f:
   done
   [ ! -e "$t16_in" ] || t16_left="$t16_left /tmp"
   t16_ok=$(printf '%s\n' "$t16" | grep -c '^t16 ok')
-  [ "$r" -eq 0 ] && ! printf '%s\n' "$t16" | grep -q '^t16 bad' && [ "$t16_ok" -ge 12 ] && [ -z "$t16_left" ]
+  # Exactly one line per check: 14, and one per protected directory.
+  t16_want=$((14 + ${#t16_targets[@]}))
+  [ "$r" -eq 0 ] && ! printf '%s\n' "$t16" | grep -q '^t16 bad' && [ "$t16_ok" -eq "$t16_want" ] && [ -z "$t16_left" ]
   result "T-16 inside the isolation: private pids, no reachable socket, read-only \$HOME/workspace/RUNNER_TEMP, private /tmp, read-only mounts, masked cgroups, private IPC" $? \
-    "(rc $r, $t16_ok ok, markers left in:${t16_left:- none})"
+    "(rc $r, $t16_ok of $t16_want ok, markers left in:${t16_left:- none})"
   rm -f "$t16_tmp" "$t16_shm" "$t16_in"
 
   # --- T-17 no process survives the isolated command: a `setsid -f` canary
@@ -1422,7 +1452,8 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   t17c=t17c-$nonce
   "$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1; sleep 60; :' _ "$t17c" >/dev/null 2>&1 &
   t17pid=$!
-  for _ in $(seq 1 240); do pgrep -f -- "$t17c-in" >/dev/null && break; sleep 0.5; done
+  # Up to 200 s: longer than the 180 s the socket listing may take.
+  for _ in $(seq 1 400); do pgrep -f -- "$t17c-in" >/dev/null && break; sleep 0.5; done
   started=no
   pgrep -f -- "$t17c-in" >/dev/null && started=yes
   kill -TERM "$t17pid" 2>/dev/null
@@ -1435,6 +1466,67 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   [ "$started" = yes ] && [ "$left" -ne 0 ]
   result "T-17 TERM delivered to no-docker.sh itself kills every process inside the isolation" $? \
     "(canary started $started, rc $r, survivor $([ "$left" -eq 0 ] && echo yes || echo no))"
+
+  # --- T-37 a live Unix socket outside, where the old walk could not list
+  # it, is found and must not accept a connection inside: a listener of
+  # this suite (it accepts nothing and reads nothing) bound in a directory
+  # of mode 0311 under $ro (no listing, even for its owner; visible
+  # read-only inside). N1: in the host network namespace; N2: in a network
+  # namespace of its own (sudo unshare --net, then the runner's uid), so
+  # only the kernel's list of every namespace's sockets has it (mode fast).
+  # N0: the same file with its listener ended runs normally. The command is
+  # true. Listeners are ended by their recorded pid only.
+  # On 85cfb37: N2 ran the command (the walk does not see the socket and
+  # /proc/net/unix of the host network namespace does not list it).
+  cat >"$ro/t37.py" <<'PY'
+import os, socket, sys, time
+path, pidfile = sys.argv[1:3]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(64)
+with open(pidfile + ".tmp", "w") as f:
+    f.write(str(os.getpid()))
+os.rename(pidfile + ".tmp", pidfile)
+time.sleep(120)
+PY
+  t37_listen() { # dir pidfile [prefix command...]: start a listener on dir/s
+    local d=$1 pf=$2
+    shift 2
+    mkdir -m 700 "$d" || return 1
+    "$@" python3 -I "$ro/t37.py" "$d/s" "$pf" </dev/null >/dev/null 2>&1 &
+    for _ in $(seq 1 40); do [ -s "$pf" ] && break; sleep 0.25; done
+    [ -s "$pf" ] && [ -S "$d/s" ] && chmod 311 "$d"
+  }
+  t37_end() { # pidfile: end the listener recorded there
+    local p
+    p=$(cat "$1" 2>/dev/null)
+    case $p in "" | *[!0-9]*) return ;; esac
+    kill "$p" 2>/dev/null
+    for _ in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+    # Ended: the clean-up must not signal its pid again (it may be reused).
+    rm -f "$1"
+  }
+  t37_case() { # name dir pidfile mode-required
+    local out rc n
+    out=$("$nd" /usr/bin/true 2>&1)
+    rc=$?
+    n=$(printf '%s\n' "$out" | grep -c "^no-docker: FAIL none of the [0-9]* Unix sockets listed outside accepts a connection: .*$2/s (stream)")
+    printf '%s\n' "$out" | grep -E 'listing mode|Unix sockets listed' | sed 's/^/INFO    /'
+    [ "$rc" -eq 125 ] && [ "$n" -eq 1 ] && { [ -z "$4" ] || printf '%s\n' "$out" | grep -q "(mode fast;"; }
+    result "T-37 $1: a live socket outside, in a directory that cannot be listed, is refused inside" $? \
+      "(rc $rc, named $n times${4:+, mode fast required})"
+  }
+  t37_listen "$ro/t37n1" "$work/t37n1.pid"
+  t37_case "N1 host network namespace" "$ro/t37n1" "$work/t37n1.pid" ""
+  t37_end "$work/t37n1.pid"
+  out=$("$nd" /usr/bin/true 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -S "$ro/t37n1/s" ]
+  result "T-37 N0 control: the same socket file without its listener runs the command" $? "(rc $rc)"
+  t37_listen "$ro/t37n2" "$work/t37n2.pid" sudo -n unshare --net -- setpriv --reuid "$(id -u)" --regid "$(id -g)" --clear-groups --
+  t37_case "N2 a network namespace of its own" "$ro/t37n2" "$work/t37n2.pid" fast
+  t37_end "$work/t37n2.pid"
+  chmod 700 "$ro/t37n1" "$ro/t37n2" 2>/dev/null
 
   # --- T-18 unsupported use is refused: uid 0 (a real sudo run) and a Linux
   # that is not a GitHub-hosted runner. The command is `true`.
@@ -1461,7 +1553,7 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   [ "$r" = 125 ] && grep -q "no Runner.Worker ancestor" "$work/t18.rc.err" 2>/dev/null
   result "T-18 no Runner.Worker ancestor: refused" $? "(rc ${r:-none})"
 else
-  echo "INFO  T-16, T-17, T-18 skipped: Linux (GitHub-hosted runner) only"
+  echo "INFO  T-16, T-17, T-18, T-37 skipped: Linux (GitHub-hosted runner) only"
 fi
 
 # --- T-20 code that runs inside the isolation uses no here-document or
@@ -1485,6 +1577,25 @@ grep -qE '^helper_sums="canary\.py=[0-9a-f]{64} drive\.sh=[0-9a-f]{64} payload=[
   ! grep -nE '^[^#]*helper_sums=.*\$\(' "$here/no-docker.test.sh" >/dev/null &&
   ! grep -nE '^[^#]*>"?\$helpers/' "$here/no-docker.test.sh" >/dev/null
 result "T-23 the helpers run outside any isolation are pinned to reviewed sha256 values, not hashed after writing" $?
+
+# --- T-36 the Linux rules of no-docker-probe.py as pure functions, on both
+# platforms: fixtures only (every call that would read /proc, open a file
+# or socket, run a program or fork raises), the probe's functions called by
+# what runs (W) and mutated copies of the probe rejected (M1 to M11). The
+# numbers of assertions are fixed here: a case that loses one fails.
+# On 85cfb37: the NSpid rule accepted only a /proc of an ancestor namespace
+# (M1), an empty socket list passed, and no fast listing existed.
+t36=$(python3 -I -B "$here/no-docker-probe-unit.py" "$root/scripts/ci/no-docker-probe.py" 2>&1)
+t36_rc=$?
+printf '%s\n' "$t36" | grep -vE '^ok   ' | sed 's/^/INFO    /'
+for want in C01=2 C02=13 C03=12 C04=14 C05=9 C06=13 C07=5 C08=42 C09=4 C10=8 W=10 M=11; do
+  tag=${want%=*}
+  n=$(printf '%s\n' "$t36" | grep -cE "^ok   ${tag}[0-9]* ")
+  bad=$(printf '%s\n' "$t36" | grep -cE "^FAIL ${tag}[0-9]* ")
+  [ "$t36_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
+    printf '%s\n' "$t36" | grep -qx 'SUMMARY 143 ok, 0 failed'
+  result "T-36 $tag: $n of ${want#*=} assertions pass" $? "(rc $t36_rc, $bad failed)"
+done
 
 # --- T-19 CI order (static): no step that is not isolated follows an
 # isolated one in a job; the required jobs exist; no if: conditions.
