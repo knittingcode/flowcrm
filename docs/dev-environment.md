@@ -550,10 +550,16 @@ at a time (the kernel copies it under one lock, so it has every process of
 that instant, zombies included) and checks each process in it, by its
 unique id before and after the check: one of the run's is sent SIGKILL at
 once. A copy shows the run has ended when every process in it is shown not
-to be one of the run's, or was already dead before that copy was taken.
-Every process started later descends from one in the copy (the kernel lists
-a child before it can run, and its parent until it is reaped), so none of
-them can be one of the run's either. A process that ends before it can be
+to be one of the run's, or was already dead (a zombie) before that copy was
+taken. Every process started later descends from one in the copy (the
+kernel lists a child before it can run, and its parent until it is
+reaped), so none of them can be one of the run's either. The one process
+that becomes one of the run's after it could be checked is the run's own
+`sandbox-exec` before it applies the profile: the supervisor waits for it
+first, and when a run is checked whose owner is gone, a process that owner
+started keeps every copy open. The argument relies on a pid not being
+reused while one copy is checked (milliseconds; the kernel's counter wraps
+at 99999). A process that ends before it can be
 checked leaves that copy open, as it may have started one of the run's
 first; the supervisor then takes the next copy. Measured: a run without
 leftovers is shown done in about 0.07 seconds, a run whose daemon must be
@@ -724,8 +730,10 @@ them.
   by itself, the user ends it or logs out. Until then the channels the
   sandbox leaves open (loopback ports, the pasteboard, reading the user's
   files and process information) stay available to it, without a time
-  limit. Processes left by versions without the owner record are not
-  recognised; end them by pid after updating.
+  limit. A marker directory of an earlier version (without the owner
+  record) is checked like one whose owner is gone once it is a minute old;
+  processes of such a version whose directory was already removed are not
+  recognised: end them by pid after updating.
 - **Process identity (macOS).** A process is signalled only after its
   unique id and membership were read again, microseconds before. A pid
   reused within that window by a process outside could still be ended:
