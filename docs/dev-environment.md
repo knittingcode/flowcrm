@@ -530,42 +530,57 @@ directory. The code that runs inside (`bin/devenv`, `tests/devenv/unit.sh`,
 the guard suites and the scripts they run) therefore uses none; T-20
 checks this statically.
 
-When the command ends, every process it left in the sandbox is ended: a
+When the command ends, the processes it left in the sandbox are ended: a
 plain background job, a daemon after `setsid` and a double fork, a
 `posix_spawn` child in a session of its own, a process group of its own.
 `no-docker.sh` hands its process to a supervisor in
 `scripts/ci/no-docker-probe.py`, which starts `sandbox-exec`, waits for it
 and then ends what is left. It finds those processes by a marker: the
-profile denies reading file `a` of a marker directory of the run (and of
-one common to every run), in `$TMPDIR` outside the run's directory, and
-leaves file `b` next to it alone. From outside, `sandbox_check()` asks how a
-process's sandbox would decide; a process is in the run's sandbox exactly
-when it is denied `a` and allowed `b`. Measured: an unsandboxed process is
-allowed both, other sandboxes decide both the same way, and the files must
-exist, or every process is "denied". A process cannot leave its sandbox,
-and every process it starts inherits it, however it detaches. The
-supervisor sends SIGKILL to each member as soon as it finds one, after
-reading its start time and membership again, and lists the processes again
-until there is none. A killed process cannot start another one, and
-nothing a member does can undo SIGKILL. The supervisor needs no new process
-to do this, so a command that uses up the processes it may start cannot
-stop it. It prints how many processes it ended. If members are still
-there after 10 seconds (one of another user, or members that start new
-processes faster than they are ended), the run fails with status 125. The
-run's marker directory is then kept, the message names the command that
-ends them (`no-docker-probe.py --end <marker directory>`), and until then no
-new run starts. SIGINT, SIGTERM, SIGHUP or SIGQUIT delivered to `no-docker.sh`
-end the command and everything it left at once, and the status is 128 plus
-the signal number; a signal the caller ignores stays ignored. The probe
-checks from inside that the sandbox carries both markers.
+profile denies reading file `a` of the run's marker directory, in `$TMPDIR`
+outside the run's directory, and leaves file `b` next to it alone. From
+outside, `sandbox_check()` asks how a process's sandbox would decide; a
+process is in the run's sandbox exactly when it is sandboxed, denied `a` and
+allowed `b`. Measured: an unsandboxed process is allowed both, and the
+files must exist, or every process is "denied". A process cannot leave its
+sandbox, and every process it starts inherits it, however it detaches.
+
+The run is reported done only when it is shown that none of its processes
+runs any more. The supervisor takes one copy of the kernel's process list
+at a time (the kernel copies it under one lock, so it has every process of
+that instant, zombies included) and checks each process in it, by its
+unique id before and after the check: one of the run's is sent SIGKILL at
+once. A copy shows the run has ended when every process in it is shown not
+to be one of the run's, or was already dead before that copy was taken.
+Every process started later descends from one in the copy (the kernel lists
+a child before it can run, and its parent until it is reaped), so none of
+them can be one of the run's either. A process that ends before it can be
+checked leaves that copy open, as it may have started one of the run's
+first; the supervisor then takes the next copy. Measured: a run without
+leftovers is shown done in about 0.07 seconds, a run whose daemon must be
+ended in about 0.4 seconds.
+
+If that cannot be shown within 10 seconds, the run fails with status 125;
+it is never reported done. Measured: a process that forks a new one and
+ends, over and over (thousands of times per second), makes every copy
+open: the run fails, although that process is not found and keeps running,
+still in the sandbox with every limit above. The run's marker directory is
+then kept, and no new run starts until it is shown that none of its
+processes runs any more (then that directory is removed). The supervisor
+needs no new process for any of this, so a command that uses up the
+processes it may start cannot stop it. SIGINT, SIGTERM, SIGHUP or SIGQUIT
+delivered to `no-docker.sh` end the command and everything it left in the
+same way, and the status is 128 plus the signal number; a signal the
+caller ignores stays ignored. The probe checks from inside that the
+sandbox carries the run's marker.
 
 SIGKILL of `no-docker.sh` (or a crash of the supervisor) cannot be handled:
 what the command left keeps running, still inside the sandbox with every
-limit above. Before each run, `no-docker.sh` therefore looks for processes
-of the common marker that run on their own (their supervisor is gone) and
-refuses to start while there is one, naming them. A concurrent run's own
-processes are under its supervisor and do not count, but a daemon it left
-does until it ends.
+limit above. The marker directory records the run's owner (the process
+that becomes its supervisor). Before each run, `no-docker.sh` looks at the
+marker directories whose owner is gone; it removes one once it is shown
+that none of its processes runs, and otherwise refuses to start, naming
+them. It never ends anything there. Runs in progress elsewhere (their
+owner lives) are left alone.
 
 Setuid programs cannot run in the sandbox, so `ps` is an ad-hoc signed copy
 and `sudo` is unavailable. The U-16 check that another local user cannot
@@ -701,19 +716,21 @@ them.
 
 #### Accepted residual risks
 
-- **SIGKILL of `no-docker.sh` (macOS), or a failed ending.** Its
-  supervisor cannot end the command or what it left. They keep running in
-  the sandbox, with every limit above, until someone ends them
-  (`no-docker-probe.py --end <marker directory>`, or by pid); meanwhile no
-  new isolated run starts. Until then the channels the sandbox leaves open
-  (their own terminal, loopback ports, the pasteboard, reading the user's
-  files and process information) stay available to them, without a time
-  limit. Processes left by runs of a version without the markers (before
-  the supervisor) are not recognised; end them by pid after updating.
+- **SIGKILL of `no-docker.sh` (macOS), or an ending that cannot be shown.**
+  The command and what it left keep running in the sandbox, with every
+  limit above, until someone ends them (`no-docker-probe.py --end <marker
+  directory>`, or by pid); meanwhile no new isolated run starts. A process
+  that keeps forking and ending is not found at all; it runs until it stops
+  by itself, the user ends it or logs out. Until then the channels the
+  sandbox leaves open (loopback ports, the pasteboard, reading the user's
+  files and process information) stay available to it, without a time
+  limit. Processes left by versions without the owner record are not
+  recognised; end them by pid after updating.
 - **Process identity (macOS).** A process is signalled only after its
-  start time and membership were read again, microseconds before. A pid
+  unique id and membership were read again, microseconds before. A pid
   reused within that window by a process outside could still be ended:
-  an availability risk, not a way out.
+  an availability risk, not a way out. Reusing a pid needs the kernel's
+  counter to wrap (pids up to 99999).
 - **Late listeners.** A loopback port that starts listening after the run
   started (on macOS) is reachable, as are the ports the command opens
   itself. This includes a VM's port forward that starts later. The probe
@@ -827,7 +844,7 @@ in the test's directories or send signal 0 or TERM to the test's own
 - **T-01 and T-02:** `--check`, and a claimed but unproven isolation.
 - **T-07:** loopback ports that were already listening are unreachable,
   while ports opened inside are reachable.
-- **T-06, T-08 to T-15, T-21, T-22 and T-24 to T-29, macOS only:**
+- **T-06, T-08 to T-15, T-21, T-22 and T-24 to T-34, macOS only:**
   - **T-06 and T-11:** the write limits, including that a bash 3.2
     here-document fails;
   - **T-08:** the complete port list;
@@ -838,8 +855,10 @@ in the test's directories or send signal 0 or TERM to the test's own
   - **T-14:** integrity of the helpers;
   - **T-15:** `--work`, accepted and refused cases;
   - **T-21:** canary files named like bash 3.2 here-document files in
-    `/tmp` and `/private/var/tmp` cannot be opened for writing, truncated,
-    removed, renamed, replaced or chmodded, and none can be created;
+    `/tmp` and `/private/var/tmp` (random names, created exclusively, read
+    and removed only while they are the files created) cannot be opened for
+    writing, truncated, removed, renamed, replaced or chmodded, and none can
+    be created;
   - **T-22:** a file outside the run's directory cannot be changed through
     a hard link, a symbolic link, a rename over it or an exchange;
   - **T-24:** four processes the command leaves (a background child, a
@@ -849,11 +868,22 @@ in the test's directories or send signal 0 or TERM to the test's own
   - **T-25:** SIGINT, SIGTERM and SIGHUP to `no-docker.sh` end the command
     and those four processes at once (status 128 plus the signal);
   - **T-26:** after SIGKILL of `no-docker.sh`, its leftovers keep a new run
-    from starting (125) until they are ended through the run's marker;
+    from starting (125) until they are ended through the run's marker
+    directory, whose owner is gone;
   - **T-27:** when the probe cannot make the markers, look for leftovers or
     supervise, the command is not run;
   - **T-28:** a debugger attach from inside to a test canary outside that
     allows debuggers fails, while it works from outside;
+  - **T-30:** a process that keeps forking and ending is never reported as
+    ended; new runs refuse while it runs and start after it ended;
+  - **T-31:** two runs at the same time each end their own processes and
+    do not refuse each other;
+  - **T-32:** processes that start and end outside meanwhile do not make
+    the ending fail;
+  - **T-33:** an ending that cannot be shown fails the run (125), ends the
+    supervisor's own child and keeps the marker directory;
+  - **T-34:** SIGTERM at several moments while the command starts processes:
+    every run ends in time and none of its processes survives;
   - **T-29:** another terminal's device cannot be read from inside, while
     it can from outside.
 - **T-16 to T-18, Linux only:**
