@@ -364,9 +364,9 @@ class ProcTable:
                 return [buf[i] for i in range(got) if buf[i] > 0 and buf[i] != os.getpid()]
         raise OSError("the process list did not fit")
 
-    def _info(self, pid, flavor, struct):
+    def _info(self, pid, flavor, struct, arg=0):
         ctypes.set_errno(0)
-        n = self.proc.proc_pidinfo(pid, flavor, 0, ctypes.byref(struct), ctypes.sizeof(struct))
+        n = self.proc.proc_pidinfo(pid, flavor, arg, ctypes.byref(struct), ctypes.sizeof(struct))
         if n == ctypes.sizeof(struct):
             return True
         if ctypes.get_errno() in (errno.ESRCH, 0):
@@ -374,9 +374,20 @@ class ProcTable:
         raise OSError(f"cannot read process {pid} ({os.strerror(ctypes.get_errno())})")
 
     def identity(self, pid):
-        """The kernel's unique id of the process, or None if it is gone."""
+        """The kernel's unique id of the process, or None if it is gone (or
+        a zombie)."""
         u = ProcUniqIdentifierInfo()
         return u.uniqueid if self._info(pid, self.PROC_PIDUNIQIDENTIFIERINFO, u) else None
+
+    def parent_identity(self, pid):
+        """The unique id of the process's parent, or None if it is gone."""
+        u = ProcUniqIdentifierInfo()
+        return u.puniqueid if self._info(pid, self.PROC_PIDUNIQIDENTIFIERINFO, u) else None
+
+    def zombie(self, pid):
+        """True if pid is a zombie (only an argument of 1 finds those)."""
+        s = ProcShortInfo()
+        return self._info(pid, self.PROC_PIDT_SHORTBSDINFO, s, arg=1) and s.status == SZOMB
 
 
 class Sandboxes(ProcTable):
@@ -425,6 +436,8 @@ class Sandboxes(ProcTable):
         between two identity reads, so the answer belongs to one process."""
         first = self.identity(pid)
         if first is None:
+            if self.zombie(pid):
+                return "zombie", None
             raise Gone()
         s = ProcShortInfo()
         if not self._info(pid, self.PROC_PIDT_SHORTBSDINFO, s):
@@ -441,7 +454,7 @@ class Sandboxes(ProcTable):
         return ("member" if sandboxed == 1 and a == 1 and b == 0 else "other"), first
 
 
-def sweep(sbx, seconds, kill):
+def sweep(sbx, seconds, kill, owner=None):
     """Show that no process of the sandbox runs any more, killing each one
     found if kill (SIGKILL, after its identity and the markers were read
     again). Returns (ended, members) once a round proves it: in one
@@ -453,7 +466,13 @@ def sweep(sbx, seconds, kill):
     before it could be told apart, or became a zombie only now, leaves the
     round open: it may have started a member before it died. Raises
     OSError when no round proves it within seconds (for example a process
-    that keeps starting new ones and ending); the caller fails closed."""
+    that keeps starting new ones and ending); the caller fails closed.
+    owner (the unique id of a run's owner that is gone): a process the
+    owner started that is not a member (yet) keeps every round open, as it
+    may be the run's sandbox-exec before it applied the profile, the one
+    process that becomes a member after it was checked. Relies on pids not
+    being reused within one round (the kernel's counter would have to wrap
+    at 99999)."""
     deadline = time.monotonic() + seconds
     others = {}  # pid: unique id of a process that is not a member
     dead = set()  # pids seen dead before the current snapshot
@@ -477,6 +496,9 @@ def sweep(sbx, seconds, kill):
                     proven = False
                 continue
             if kind == "other":
+                if owner is not None and sbx.parent_identity(pid) == owner:
+                    proven = False
+                    continue
                 others[pid] = uid
             elif kind == "zombie":
                 dead_now.add(pid)
@@ -506,18 +528,25 @@ def sweep(sbx, seconds, kill):
         time.sleep(0.005)
 
 
-def owner_alive(table, directory):
-    """True if the owner the marker directory records still runs (same pid
-    and unique id), False if it is gone; raises OSError if the record is
-    unreadable."""
+def owner_record(directory):
+    """(pid, unique id) the marker directory records as its owner; raises
+    OSError if the record is unreadable."""
     rec = os.path.join(directory, "owner")
     if not regular_file(rec) or os.lstat(rec).st_size > 64:
         raise OSError(f"{rec} is not a regular file of ours")
     with open(rec) as f:
         fields = f.read().split()
-    if len(fields) != 2 or not fields[0].isdigit():
+    if len(fields) != 2 or not fields[0].isdigit() or not fields[1].isdigit():
         raise OSError(f"{rec} is not an owner record")
-    return str(table.identity(int(fields[0]))) == fields[1]
+    return int(fields[0]), int(fields[1])
+
+
+def owner_alive(table, directory):
+    """True if the owner the marker directory records still runs (same pid
+    and unique id), False if it is gone; raises OSError if the record is
+    unreadable."""
+    pid, uid = owner_record(directory)
+    return table.identity(pid) == uid
 
 
 def darwin_markers(tmp, owner):
@@ -578,7 +607,11 @@ def darwin_orphans(tmp, seconds=5.0):
         if not os.path.lexists(d):
             continue  # removed meanwhile by its own run
         try:
-            _, members = sweep(Sandboxes(d), seconds, kill=False)
+            try:
+                gone_owner = owner_record(d)[1]
+            except FileNotFoundError:
+                gone_owner = None
+            _, members = sweep(Sandboxes(d), seconds, kill=False, owner=gone_owner)
         except OSError as e:
             # Among others: a marker file is missing, so its processes
             # cannot be found any more; the directory stays until someone
@@ -674,14 +707,17 @@ def darwin_supervise(markdir, started_file, remove, argv):
                 # still its own (also when sandbox-exec has not applied the
                 # profile yet).
                 child.kill()
-            status = child.wait()
+            status = child.wait(timeout=10)
         ended = darwin_end(sbx)
     except BaseException as e:  # noqa: BLE001 - every failure fails closed
         failure = str(e) or type(e).__name__
     finally:
         if child is not None and child.poll() is None:
             child.kill()
-            child.wait()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                failure = failure or f"the isolation tool (pid {child.pid}) does not end"
         started = os.path.exists(started_file)
         if not failure:
             shutil.rmtree(markdir, ignore_errors=True)
@@ -1109,7 +1145,11 @@ def main():
                 alive = False
             if alive:
                 raise OSError(f"the run of {sys.argv[2]} is still in progress (its owner runs); not ending it")
-            n = darwin_end(sbx)
+            try:
+                gone_owner = owner_record(sys.argv[2])[1]
+            except FileNotFoundError:
+                gone_owner = None
+            n = sweep(sbx, 10.0, kill=True, owner=gone_owner)[0]
             shutil.rmtree(sys.argv[2], ignore_errors=True)
             print(f"no-docker: ended {n} processes; none is left", file=sys.stderr)
             return 0
