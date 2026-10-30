@@ -48,17 +48,19 @@ Modes used by no-docker.sh outside the isolation:
   --seal WORK   as root in the new mount namespace: make every mount
                 reachable by path read-only, except the private file systems
                 and WORK, and verify it (Linux);
-  --markers TMP make sure the marker directory common to every run exists
-                in the per-user temporary directory TMP, make one for a new
-                run and print its path (macOS);
-  --orphans TMP fail if a process of an earlier run is still alive on its
-                own (macOS);
+  --markers TMP OWNER
+                make a marker directory for a new run in the per-user
+                temporary directory TMP, recording the process OWNER that
+                supervises it, and print its path (macOS);
+  --orphans TMP fail if a run that ended without its supervisor may still
+                have processes (macOS);
   --supervise MARKDIR STARTED REMOVE -- COMMAND...
                 run COMMAND (sandbox-exec), then end every process left in
                 the sandbox of MARKDIR; signals end it at once; 125 unless
                 the file STARTED exists; removes MARKDIR and the directory
                 REMOVE ("-": none) (macOS, no-docker.sh's last step);
-  --end MARKDIR end every process of the sandbox of MARKDIR (macOS).
+  --end MARKDIR end every process of the sandbox of MARKDIR, and remove it
+                once that is shown (macOS).
 """
 
 import concurrent.futures
@@ -249,7 +251,7 @@ def check_mechanism_darwin():
            + ("" if e is not None else ": written"))
     # The markers by which no-docker.sh finds this sandbox's processes from
     # outside: reading A is denied, reading B is not.
-    for d in (os.environ.get("NO_DOCKER_MARK", ""), os.path.join(user_tmp, COMMON_MARK) if user_tmp else ""):
+    for d in (os.environ.get("NO_DOCKER_MARK", ""),):
         result = "unknown"
         if d:
             try:
@@ -266,29 +268,37 @@ def check_mechanism_darwin():
 
 # The processes of one sandbox, seen from outside it. no-docker.sh (and the
 # suite's own guard) add to the profile `(deny file-read-data (literal A))`
-# for the file A of the run's marker directory and of the directory common
-# to every run, and leave the file B next to it alone; no other profile
-# names these files. sandbox_check() asks the kernel how a process's
-# sandbox would decide, so a process is in the run's sandbox exactly when
-# it is denied A and allowed B (measured: an unsandboxed process is
-# allowed both, other sandboxes deny or allow both; the files must exist,
-# or every process is "denied"). A process cannot leave its sandbox, and
-# every process it starts inherits it. The marker directories are in the
-# per-user temporary directory, outside every directory the sandbox may
-# write, so the command cannot remove or replace them.
-COMMON_MARK = "no-docker-mark"
+# for file A of the run's marker directory and leave file B next to it
+# alone; no other profile names these files. sandbox_check() asks the
+# kernel how a process's sandbox would decide, so a process is in the
+# run's sandbox exactly when it is sandboxed at all, denied A and allowed
+# B (measured: an unsandboxed process is allowed both; the files must
+# exist, or every process is "denied"). A process cannot leave its
+# sandbox, and every process it starts inherits it. The marker directory
+# is in the per-user temporary directory, outside every directory the
+# sandbox may write, so the command cannot remove or replace it; it also
+# records the run's owner (the supervisor), so a run that ended without
+# its supervisor can be recognised later.
+MARK_PREFIX = "no-docker-mark."
 SZOMB = 5
 
 
-class ProcBsdInfo(ctypes.Structure):
-    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32), ("xstatus", ctypes.c_uint32),
-                ("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
-                ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32), ("rgid", ctypes.c_uint32),
-                ("svuid", ctypes.c_uint32), ("svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
-                ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32), ("nfiles", ctypes.c_uint32),
-                ("pgid", ctypes.c_uint32), ("pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
-                ("e_tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32), ("start_tvsec", ctypes.c_uint64),
-                ("start_tvusec", ctypes.c_uint64)]
+class ProcShortInfo(ctypes.Structure):
+    # struct proc_bsdshortinfo (PROC_PIDT_SHORTBSDINFO): answers for
+    # processes of other users too.
+    _fields_ = [("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32), ("pgid", ctypes.c_uint32),
+                ("status", ctypes.c_uint32), ("comm", ctypes.c_char * 16), ("flags", ctypes.c_uint32),
+                ("uid", ctypes.c_uint32), ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32),
+                ("rgid", ctypes.c_uint32), ("svuid", ctypes.c_uint32), ("svgid", ctypes.c_uint32),
+                ("rfu", ctypes.c_uint32)]
+
+
+class ProcUniqIdentifierInfo(ctypes.Structure):
+    # struct proc_uniqidentifierinfo (PROC_PIDUNIQIDENTIFIERINFO): an id
+    # the kernel never reuses while it runs.
+    _fields_ = [("uuid", ctypes.c_uint8 * 16), ("uniqueid", ctypes.c_uint64), ("puniqueid", ctypes.c_uint64),
+                ("idversion", ctypes.c_int32), ("orig_ppidversion", ctypes.c_uint32),
+                ("reserve3", ctypes.c_uint64), ("reserve4", ctypes.c_uint64)]
 
 
 def private_dir(path):
@@ -297,45 +307,91 @@ def private_dir(path):
     return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700
 
 
-def marker_files(directory, create):
+def regular_file(path):
+    st = os.lstat(path)
+    return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+
+
+def marker_files(directory):
     """The marker files A and B of directory, which must be a private
-    directory with two empty regular files of ours; created if asked."""
-    if create:
-        try:
-            os.mkdir(directory, 0o700)
-        except FileExistsError:
-            pass
+    directory with two empty regular files of ours."""
     if not private_dir(directory):
         raise OSError(f"{directory} is not a directory of ours with mode 0700")
     files = []
     for name in ("a", "b"):
         path = os.path.join(directory, name)
-        if create:
-            try:
-                os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
-            except FileExistsError:
-                pass
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        if not regular_file(path):
             raise OSError(f"{path} is not a regular file of ours")
         files.append(os.fsencode(path))
     return files
 
 
-class Sandboxes:
-    """sandbox_check() and the process table (libproc). Raises OSError if
-    either is unavailable or gives an answer it cannot interpret, so every
-    caller fails closed."""
+class Gone(Exception):
+    """The process ended (or its pid now names another process)."""
 
-    PROC_PIDTBSDINFO = 3
+
+class ProcTable:
+    """The process table (libproc). Raises OSError if it is unavailable or
+    gives an answer that cannot be interpreted, so every caller fails
+    closed."""
+
+    PROC_PIDT_SHORTBSDINFO = 13
+    PROC_PIDUNIQIDENTIFIERINFO = 17
+
+    def __init__(self):
+        try:
+            self.proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError as e:
+            raise OSError(f"libproc is not available: {e}") from None
+        self.proc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.proc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+
+    def snapshot(self):
+        """Every pid, from one copy of the kernel's process lists (taken
+        under one lock, so it holds every process that existed at that
+        instant, zombies included). A full buffer may mean a cut list, so
+        it is taken again with a larger one."""
+        for _ in range(8):
+            n = self.proc.proc_listallpids(None, 0)
+            if n <= 0:
+                raise OSError("cannot list the processes")
+            room = n + 4096
+            buf = (ctypes.c_int * room)()
+            got = self.proc.proc_listallpids(buf, ctypes.sizeof(buf))
+            if got <= 0:
+                raise OSError("cannot list the processes")
+            if got < room:
+                return [buf[i] for i in range(got) if buf[i] > 0 and buf[i] != os.getpid()]
+        raise OSError("the process list did not fit")
+
+    def _info(self, pid, flavor, struct):
+        ctypes.set_errno(0)
+        n = self.proc.proc_pidinfo(pid, flavor, 0, ctypes.byref(struct), ctypes.sizeof(struct))
+        if n == ctypes.sizeof(struct):
+            return True
+        if ctypes.get_errno() in (errno.ESRCH, 0):
+            return False
+        raise OSError(f"cannot read process {pid} ({os.strerror(ctypes.get_errno())})")
+
+    def identity(self, pid):
+        """The kernel's unique id of the process, or None if it is gone."""
+        u = ProcUniqIdentifierInfo()
+        return u.uniqueid if self._info(pid, self.PROC_PIDUNIQIDENTIFIERINFO, u) else None
+
+
+class Sandboxes(ProcTable):
+    """The process table and sandbox_check() for the marker of one run.
+    Raises OSError if either is unavailable or gives an answer it cannot
+    interpret, so every caller fails closed."""
+
     FILTER_PATH = 1
 
     def __init__(self, directory):
+        super().__init__()
         self.directory = directory
-        self.deny, self.allow = marker_files(directory, create=False)
+        self.deny, self.allow = marker_files(directory)
         try:
             sb = ctypes.CDLL("/usr/lib/system/libsystem_sandbox.dylib", use_errno=True)
-            self.proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
             self.check_fn = sb.sandbox_check
             no_report = ctypes.c_int.in_dll(sb, "SANDBOX_CHECK_NO_REPORT").value
         except (OSError, AttributeError, ValueError) as e:
@@ -346,16 +402,16 @@ class Sandboxes:
         self.check_fn.restype = ctypes.c_int
         self.check_fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
         self.kind = self.FILTER_PATH | no_report
-        self.proc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        self.proc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
         self.verify()
+        if self.identity(os.getpid()) is None:
+            raise OSError("process identities cannot be read")
 
     def verify(self):
         """The marker files still exist and this (unsandboxed) process is
         allowed both and is not sandboxed. A missing file reads as denied
-        for every process, so this runs before every scan and every signal;
-        anything else means the calls do not work as measured."""
-        marker_files(self.directory, create=False)
+        for every process, so this runs before every scan, after every
+        membership answer and before every signal."""
+        marker_files(self.directory)
         me = os.getpid()
         if (self._check(me, self.deny), self._check(me, self.allow), self.check_fn(me, None, 0)) != (0, 0, 0):
             raise OSError("sandbox_check() does not answer as expected for this process")
@@ -363,112 +419,187 @@ class Sandboxes:
     def _check(self, pid, path):
         return self.check_fn(pid, b"file-read-data", self.kind, ctypes.c_char_p(path))
 
-    def member(self, pid):
-        """True or False; raises OSError if it cannot be told. A member must
-        be sandboxed at all, be denied A and be allowed B."""
+    def classify(self, pid):
+        """("member" | "other" | "zombie", unique id) of pid; raises Gone if
+        it ended meanwhile, OSError if it cannot be told. Membership is read
+        between two identity reads, so the answer belongs to one process."""
+        first = self.identity(pid)
+        if first is None:
+            raise Gone()
+        s = ProcShortInfo()
+        if not self._info(pid, self.PROC_PIDT_SHORTBSDINFO, s):
+            raise Gone()
+        if s.status == SZOMB:
+            return "zombie", first
         sandboxed = self.check_fn(pid, None, 0)
         a, b = self._check(pid, self.deny), self._check(pid, self.allow)
+        self.verify()
+        if self.identity(pid) != first:
+            raise Gone()
         if sandboxed not in (0, 1) or a not in (0, 1) or b not in (0, 1):
             raise OSError(f"sandbox_check() failed for pid {pid} ({sandboxed}, {a}, {b})")
-        return sandboxed == 1 and a == 1 and b == 0
+        return ("member" if sandboxed == 1 and a == 1 and b == 0 else "other"), first
 
-    def pids(self):
-        n = self.proc.proc_listallpids(None, 0)
-        if n <= 0:
-            raise OSError("cannot list the processes")
-        buf = (ctypes.c_int * (n + 1024))()
-        n = self.proc.proc_listallpids(buf, ctypes.sizeof(buf))
-        if n <= 0:
-            raise OSError("cannot list the processes")
-        return [buf[i] for i in range(n) if buf[i] > 0 and buf[i] != os.getpid()]
 
-    def info(self, pid):
-        """(ppid, uid, status, start time) of pid, or None if it is gone."""
-        i = ProcBsdInfo()
-        if self.proc.proc_pidinfo(pid, self.PROC_PIDTBSDINFO, 0, ctypes.byref(i), ctypes.sizeof(i)) != ctypes.sizeof(i):
-            return None
-        return i.ppid, i.uid, i.status, (i.start_tvsec, i.start_tvusec)
-
-    def members(self):
-        """{pid: info} of the members that still run (a zombie has ended)."""
-        self.verify()
-        found = {}
-        for pid in self.pids():
-            inf = self.info(pid)
-            if inf is None or inf[2] == SZOMB:
+def sweep(sbx, seconds, kill):
+    """Show that no process of the sandbox runs any more, killing each one
+    found if kill (SIGKILL, after its identity and the markers were read
+    again). Returns (ended, members) once a round proves it: in one
+    snapshot every pid is a process that is not a member (membership never
+    changes), or one already dead (a zombie or gone) before that snapshot
+    was taken. Every process started later descends from a process in the
+    snapshot (a child is listed before it can run, its parent until it is
+    reaped), so none of them can be a member either. A pid that ended
+    before it could be told apart, or became a zombie only now, leaves the
+    round open: it may have started a member before it died. Raises
+    OSError when no round proves it within seconds (for example a process
+    that keeps starting new ones and ending); the caller fails closed."""
+    deadline = time.monotonic() + seconds
+    others = {}  # pid: unique id of a process that is not a member
+    dead = set()  # pids seen dead before the current snapshot
+    ended = 0
+    members = set()
+    rounds = 0
+    while True:
+        rounds += 1
+        sbx.verify()
+        snap = sbx.snapshot()
+        present = set(snap)
+        proven = True
+        dead_now = set()
+        for pid in snap:
+            if pid in dead:
                 continue
             try:
-                if self.member(pid):
-                    found[pid] = inf
-            except OSError:
-                if self.info(pid) is not None:
-                    raise
-        return found
+                kind, uid = sbx.classify(pid)
+            except Gone:
+                if pid not in others:
+                    proven = False
+                continue
+            if kind == "other":
+                others[pid] = uid
+            elif kind == "zombie":
+                dead_now.add(pid)
+                if pid not in others:
+                    proven = False
+            else:
+                proven = False
+                members.add(pid)
+                if kill and sbx.identity(pid) == uid:
+                    sbx.verify()
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        ended += 1
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        pass  # another user's (a setuid program): still found next round
+        if proven:
+            return ended, members
+        # A pid absent from a snapshot may name a new process later.
+        dead = (dead | dead_now) & present
+        others = {p: u for p, u in others.items() if p in present}
+        if time.monotonic() > deadline:
+            live = sorted(p for p in members if sbx.identity(p) is not None)
+            raise OSError(f"cannot show within {seconds:.0f}s that every process of the isolation ended "
+                          f"({rounds} rounds; still running: {' '.join(map(str, live)) or 'none seen'})")
+        time.sleep(0.005)
 
 
-def darwin_markers(tmp):
-    """For no-docker.sh and the suite: make sure the common marker directory
-    exists in the per-user temporary directory tmp, make a new one for the
-    run, and print the run's."""
-    marker_files(os.path.join(tmp, COMMON_MARK), create=True)
-    run = tempfile.mkdtemp(prefix=COMMON_MARK + ".", dir=tmp)
-    marker_files(run, create=True)
+def owner_alive(table, directory):
+    """True if the owner the marker directory records still runs (same pid
+    and unique id), False if it is gone; raises OSError if the record is
+    unreadable."""
+    rec = os.path.join(directory, "owner")
+    if not regular_file(rec) or os.lstat(rec).st_size > 64:
+        raise OSError(f"{rec} is not a regular file of ours")
+    with open(rec) as f:
+        fields = f.read().split()
+    if len(fields) != 2 or not fields[0].isdigit():
+        raise OSError(f"{rec} is not an owner record")
+    return str(table.identity(int(fields[0]))) == fields[1]
+
+
+def darwin_markers(tmp, owner):
+    """For no-docker.sh and the suite: make a marker directory for a new run
+    in the per-user temporary directory tmp, recording its owner (pid and
+    unique id; the supervisor that owner becomes, or the suite), and print
+    its path."""
+    run = tempfile.mkdtemp(prefix=MARK_PREFIX, dir=tmp)
+    for name in ("a", "b"):
+        os.close(os.open(os.path.join(run, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    table = ProcTable()
+    uid = table.identity(int(owner)) if owner.isdigit() else None
+    if uid is None:
+        shutil.rmtree(run, ignore_errors=True)
+        raise OSError(f"the owner {owner} of the run does not exist")
+    # Complete or absent for a reader: written aside, then renamed.
+    part = os.path.join(run, "owner.part")
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"{owner} {uid}\n")
+    os.rename(part, os.path.join(run, "owner"))
     print(run)
     return 0
 
 
-def darwin_orphans(tmp):
-    """Before a sandbox starts: fail if a process of an earlier run is still
-    alive on its own, that is a member of the common marker whose topmost
-    member ancestor was handed to launchd (no live supervisor above it). A
-    run in progress elsewhere keeps its members under its supervisor; its
-    daemons count as orphans, so a concurrent run that leaves one blocks
-    new ones until it ends."""
-    sbx = Sandboxes(os.path.join(tmp, COMMON_MARK))
-    found = sbx.members()
-    orphans = []
-    for pid, inf in found.items():
-        top, seen = inf, 0
-        while top[0] in found and seen < 4096:
-            top = found[top[0]]
-            seen += 1
-        if top[0] <= 1:
-            orphans.append(pid)
-    if orphans:
-        print("no-docker: processes of an earlier isolated run are still running (pids "
-              + " ".join(str(p) for p in sorted(orphans)) + "); end them first", file=sys.stderr)
+def darwin_orphans(tmp, seconds=5.0):
+    """Before a sandbox starts: refuse if an earlier run ended without its
+    supervisor (no-docker.sh killed, or its ending failed) and processes of
+    it may still run. Each run's marker directory records its owner; one
+    whose owner is gone is checked with sweep(), without killing: proven
+    empty, it is removed; otherwise (members found, or not provable in
+    time) the run is refused and they are named. Directories of runs whose
+    owner lives (other runs in progress) are left alone."""
+    table = ProcTable()
+    stale = []
+    for name in sorted(os.listdir(tmp)):
+        if not name.startswith(MARK_PREFIX):
+            continue
+        d = os.path.join(tmp, name)
+        try:
+            if not private_dir(d):
+                continue
+            if not os.path.lexists(os.path.join(d, "owner")):
+                # Renamed into place right after the directory is made; an
+                # old one without it is a run of an earlier version.
+                if time.time() - os.lstat(d).st_mtime < 60:
+                    continue
+                stale.append(d)
+                continue
+            if not owner_alive(table, d):
+                stale.append(d)
+        except FileNotFoundError:
+            continue  # removed meanwhile by its own run
+        except OSError:
+            stale.append(d)
+    left = []
+    for d in stale:
+        if not os.path.lexists(d):
+            continue  # removed meanwhile by its own run
+        try:
+            _, members = sweep(Sandboxes(d), seconds, kill=False)
+        except OSError as e:
+            # Among others: a marker file is missing, so its processes
+            # cannot be found any more; the directory stays until someone
+            # who knows that none runs removes it.
+            left.append(f"{d}: {e}")
+            continue
+        if members:
+            left.append(f"{d}: processes {' '.join(map(str, sorted(members)))}")
+        else:
+            shutil.rmtree(d, ignore_errors=True)
+    if left:
+        print("no-docker: an earlier isolated run ended without its supervisor and may have processes left; "
+              "end them with: python3 -I " + os.path.abspath(__file__) + " --end <marker directory>: "
+              + "; ".join(left), file=sys.stderr)
         return 1
     return 0
 
 
 def darwin_end(sbx, seconds=10.0):
-    """End every process of the run's sandbox: SIGKILL each member as soon as
-    it is found (its start time and membership read again right before the
-    signal, so a reused pid is not hit), and list the table again until it
-    has none. A killed process cannot start another, and nothing a member
-    does can undo SIGKILL. Needs no new process. Returns the number of
-    processes ended; raises OSError if members are left after the time
-    limit (another user's, such as a sudo inside, cannot be signalled)."""
-    deadline = time.monotonic() + seconds
-    ended = 0
-    while True:
-        found = sbx.members()
-        if not found:
-            return ended
-        if time.monotonic() > deadline:
-            raise OSError("processes of the isolation survive (pids "
-                          + " ".join(f"{p}:uid{inf[1]}" for p, inf in sorted(found.items())) + ")")
-        for pid, inf in found.items():
-            now = sbx.info(pid)
-            sbx.verify()
-            if now is None or now[3] != inf[3] or not sbx.member(pid):
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-                ended += 1
-            except (ProcessLookupError, PermissionError):
-                pass
-        time.sleep(0.01)
+    """End every process of the run's sandbox (sweep with kill)."""
+    return sweep(sbx, seconds, kill=True)[0]
 
 
 class Interrupted(Exception):
@@ -481,11 +612,15 @@ def darwin_supervise(markdir, started_file, remove, argv):
     its sandbox; SIGINT, SIGTERM, SIGHUP or SIGQUIT end it at once the same
     way. Everything that needs a library is loaded before the command
     starts, and ending it needs no new process, so a command that uses up
-    the processes it may start cannot prevent it. Removes the run's marker
-    directory and the directory remove (if not "-"). The status is the
-    command's, or 125 if the isolation could not be applied (started_file,
-    which the command's start creates, is missing) or its processes could
-    not all be ended; after a signal, 128 plus its number."""
+    the processes it may start cannot prevent it. The run succeeds only
+    when a round of sweep() proved that none of its processes runs any
+    more. Removes the run's marker directory (kept when that could not be
+    shown, so that the next run refuses and the processes can still be
+    ended through it) and the directory remove (if not "-"). The status is
+    the command's, or 125 if the isolation could not be applied
+    (started_file, which the command's start creates, is missing) or its
+    processes could not be shown to have ended; after a signal, 128 plus
+    its number."""
     def refused(why):
         print(f"no-docker: refused: {why}", file=sys.stderr)
         return 125
@@ -533,21 +668,21 @@ def darwin_supervise(markdir, started_file, remove, argv):
             # Also when it arrives in the finally clause above (the handler
             # clears waiting before it raises, so it raises only once).
             pass
-        try:
-            ended = darwin_end(sbx)
-            if child is not None:
-                if child.poll() is None:
-                    # Interrupted before sandbox-exec applied the profile:
-                    # our own child, not yet reaped, so its pid is its own.
-                    child.kill()
-                status = child.wait(timeout=10)
-                ended += darwin_end(sbx)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            failure = str(e)
+        if child is not None:
+            if child.poll() is None:
+                # Interrupted: our own child, not yet reaped, so its pid is
+                # still its own (also when sandbox-exec has not applied the
+                # profile yet).
+                child.kill()
+            status = child.wait()
+        ended = darwin_end(sbx)
+    except BaseException as e:  # noqa: BLE001 - every failure fails closed
+        failure = str(e) or type(e).__name__
     finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
         started = os.path.exists(started_file)
-        # Kept when processes are left, so they can still be ended through
-        # it (--end MARKDIR).
         if not failure:
             shutil.rmtree(markdir, ignore_errors=True)
         if remove != "-":
@@ -555,7 +690,7 @@ def darwin_supervise(markdir, started_file, remove, argv):
     if ended:
         print(f"no-docker: ended {ended} processes the command left running", file=sys.stderr)
     if failure:
-        return refused(f"processes of the isolated command could not all be ended: {failure}; "
+        return refused(f"the processes of the isolated command could not be shown to have ended: {failure}; "
                        f"end them with: python3 -I {os.path.abspath(__file__)} --end {markdir}")
     if not started:
         return refused(f"the isolation tool returned {status} without starting the command; the command was not run")
@@ -960,14 +1095,23 @@ def main():
         sys.stdout.buffer.write(b"".join(p + b"\0" for p in paths))
         print(f"no-docker: {len(paths)} Unix sockets listed on {points} mounts in {took:.1f}s", file=sys.stderr)
         return 0
-    if sys.platform == "darwin" and sys.argv[1:2] in (["--markers"], ["--orphans"], ["--end"]) and len(sys.argv) == 3:
+    if sys.platform == "darwin" and (sys.argv[1:2] == ["--markers"] and len(sys.argv) == 4
+                                     or sys.argv[1:2] in (["--orphans"], ["--end"]) and len(sys.argv) == 3):
         try:
             if sys.argv[1] == "--markers":
-                return darwin_markers(sys.argv[2])
+                return darwin_markers(sys.argv[2], sys.argv[3])
             if sys.argv[1] == "--orphans":
                 return darwin_orphans(sys.argv[2])
-            n = darwin_end(Sandboxes(sys.argv[2]))
-            print(f"no-docker: ended {n} processes", file=sys.stderr)
+            sbx = Sandboxes(sys.argv[2])
+            try:
+                alive = owner_alive(sbx, sys.argv[2])
+            except FileNotFoundError:
+                alive = False
+            if alive:
+                raise OSError(f"the run of {sys.argv[2]} is still in progress (its owner runs); not ending it")
+            n = darwin_end(sbx)
+            shutil.rmtree(sys.argv[2], ignore_errors=True)
+            print(f"no-docker: ended {n} processes; none is left", file=sys.stderr)
             return 0
         except OSError as e:
             print(f"no-docker: cannot check the processes of the isolation: {e}", file=sys.stderr)

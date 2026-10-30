@@ -33,11 +33,13 @@
 #          osascript, launchctl, ssh, launchd job, Launch Services, Apple
 #          Events, login item or background task registration and no lookup
 #          of Docker's own services. When the command ends, or no-docker.sh
-#          gets SIGINT, SIGTERM, SIGHUP or SIGQUIT, every process left in the
-#          sandbox is killed (found by a marker of the run), or the run
-#          fails (125); a process left by a run that could not do that
-#          (SIGKILL, failure) keeps new runs from starting. $TMPDIR must be
-#          the per-user directory under /private/var/folders.
+#          gets SIGINT, SIGTERM, SIGHUP or SIGQUIT, the processes left in
+#          the sandbox (found by a marker of the run) are killed; the run
+#          is reported done only when it is shown that none of them runs
+#          any more, otherwise it fails (125). A run that ended so, or
+#          without its supervisor (SIGKILL), keeps new runs from starting
+#          until that is shown. $TMPDIR must be the per-user directory
+#          under /private/var/folders.
 #   Linux  sudo unshare: new network (loopback only), mount, pid, and IPC
 #          namespaces; empty tmpfs over /run, /var/run, /tmp, /var/tmp,
 #          /dev/shm and /sys/fs/cgroup, a fresh /dev/mqueue, every other mount
@@ -200,14 +202,15 @@ case $os in
       work=$(cd -P "$work" && pwd -P) || refuse "cannot resolve the temporary directory"
       trap 'rm -rf "$work"' EXIT
     fi
-    # The sandbox carries a marker of this run and one common to every run
-    # (a denied read of a file in each marker directory, which are in
-    # $tmp, outside everything the sandbox may write), by which
-    # no-docker-probe.py finds its processes from outside: a process cannot
-    # leave its sandbox, and every process it starts inherits it. A
-    # process left by an earlier run is ruled out before anything is
-    # written into the run's directory.
-    markdir=$(python3 -I "$probe" --markers "$tmp") || refuse "cannot make the marker of the run"
+    # The sandbox carries a marker of this run (a denied read of a file in
+    # its marker directory, which is in $tmp, outside everything the
+    # sandbox may write), by which no-docker-probe.py finds its processes
+    # from outside: a process cannot leave its sandbox, and every process it
+    # starts inherits it. The directory records this process as the run's
+    # owner (the supervisor it becomes). An earlier run that ended without
+    # its supervisor and may have processes left is ruled out before
+    # anything is written into the run's directory.
+    markdir=$(python3 -I "$probe" --markers "$tmp" "$$") || refuse "cannot make the marker of the run"
     case $markdir in "$tmp"/no-docker-mark.?*) ;; *) refuse "unexpected marker directory $markdir" ;; esac
     plain "$markdir" || refuse "unexpected character in the marker directory $markdir"
     if [ -n "$given_work" ]; then
@@ -342,7 +345,7 @@ case $os in
 (deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
 (deny file-write*)
 (allow file-write* (subpath \"$work\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\"))
-(deny file-read-data (literal \"$tmp/no-docker-mark/a\") (literal \"$markdir/a\"))
+(deny file-read-data (literal \"$markdir/a\"))
 (deny file-read* (regex #\"^/dev/ttys[0-9]+\$\"))
 (deny user-preference-write)
 (deny file-ioctl (ioctl-command #x80017472))
