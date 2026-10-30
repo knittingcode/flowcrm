@@ -627,9 +627,15 @@ every network namespace:
      file), in a child process per namespace that the deadline kills.
   2. Every Unix socket that a process holds, in its descriptor table or in
      an io_uring's registered files, must be in one of those lists (one
-     retry); otherwise a network namespace was missed. An io_uring whose
-     registered files the kernel shows only in part, or names a socket in
-     them only by its protocol (kernels before 6.16), counts as missed.
+     retry); otherwise a network namespace was missed. Every socket in an
+     io_uring's registered files counts here, whatever its protocol. An
+     io_uring whose table cannot be read whole counts as missed: the kernel
+     shows fewer entries than its count (its lock was busy, or the table
+     has empty slots, which kernels from 6.13 count but do not show), or an
+     entry is neither `socket:[N]`, another `type:[N]`, a path nor an
+     anonymous inode (kernels before 6.16 name files and sockets by name or
+     protocol only, so on them any io_uring with registered files makes the
+     walk run).
   3. Every bound socket must be found again at its name in the host's
      mount tree as the same file (device and inode, checked on the opened
      file), with one link, on a local file system (ext2/3/4, xfs, btrfs,
