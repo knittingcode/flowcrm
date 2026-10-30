@@ -302,7 +302,7 @@ def c08(P, emit):
     emit("C08", raises(lambda: P["uring_sockets"]("UserFiles:\t2\n    0: socket:[12]\nUserBufs:\t0\n")),
          "rejected: an io_uring showing fewer entries than its count (its lock was busy)")
     emit("C08", raises(lambda: P["uring_sockets"]("UserFiles:\t1\n    0: UNIX-STREAM\nUserBufs:\t0\n")),
-         "rejected: an io_uring naming a socket by its protocol only (kernels before 6.16)")
+         "rejected: an io_uring naming a socket by its protocol only (kernels up to 6.13)")
     host = P["parse_mountinfo"](
         b"25 1 259:1 / / rw - ext4 /dev/root rw\n"
         b"40 25 259:1 /home/runner/x /mnt/x rw - ext4 /dev/root rw\n"

@@ -630,12 +630,13 @@ every network namespace:
      retry); otherwise a network namespace was missed. Every socket in an
      io_uring's registered files counts here, whatever its protocol. An
      io_uring whose table cannot be read whole counts as missed: the kernel
-     shows fewer entries than its count (its lock was busy, or the table
-     has empty slots, which kernels from 6.13 count but do not show), or an
-     entry is neither `socket:[N]`, another `type:[N]`, a path nor an
-     anonymous inode (kernels before 6.16 name files and sockets by name or
-     protocol only, so on them any io_uring with registered files makes the
-     walk run).
+     hides its entries (up to 6.14) or the whole table (from 6.15) while its
+     lock is busy, shows fewer entries than its count when the table has
+     empty slots (from 6.14 they are counted but not shown), or an entry is
+     neither `socket:[N]`, another `type:[N]`, a path nor an anonymous inode
+     (up to 6.13 the kernel names files and sockets by name or protocol
+     only and shows empty slots as `<none>`, so on those kernels any
+     io_uring with registered files makes the walk run).
   3. Every bound socket must be found again at its name in the host's
      mount tree as the same file (device and inode, checked on the opened
      file), with one link, on a local file system (ext2/3/4, xfs, btrfs,

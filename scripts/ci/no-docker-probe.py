@@ -1106,9 +1106,10 @@ def cross_check(held, dumped):
 def uring_sockets(fdinfo):
     """The sockets in the registered file table of an io_uring (its fdinfo).
     Incomplete when the kernel left the table or some of its entries out
-    (its lock was busy), and when an entry names a socket only by its
-    protocol (kernels before 6.16 print that instead of socket:[N]), since
-    that socket cannot be found in the dumps."""
+    (its lock was busy, or empty slots from 6.14), and when an entry is not
+    identifiable (up to 6.13 the kernel prints a socket's protocol instead
+    of socket:[N], and <none> for an empty slot), since such a socket
+    cannot be found in the dumps."""
     head, sep, rest = ("\n" + fdinfo).partition("\nUserFiles:")
     if not sep:
         raise Incomplete("an io_uring's registered files are not shown")
