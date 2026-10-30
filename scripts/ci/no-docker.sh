@@ -40,8 +40,12 @@
 #          supplementary groups, capabilities or the means to regain them
 #          (no_new_privs), in a session of its own, with an allowlisted
 #          environment, under a root pid 1 that waits for it; when it ends,
-#          when no-docker.sh gets SIGINT, SIGTERM or SIGHUP (a cancelled
-#          step) or when unshare dies, every process left inside is killed.
+#          when no-docker.sh itself gets SIGINT, SIGTERM or SIGHUP (such as
+#          Ctrl-C, or a caller forwarding the signal) or when unshare dies,
+#          every process left inside is killed. A cancelled or timed-out
+#          GitHub step does not signal no-docker.sh: its namespace keeps
+#          running, read-only and without network, until the VM is
+#          discarded (an accepted residual).
 #          Unix sockets found outside before the start must not accept a
 #          connection inside.
 # In both, the variables that select an engine are removed and DOCKER_CONFIG
@@ -372,11 +376,15 @@ case $os in
     [ "${#token}" -eq 32 ] || refuse "cannot make a random token"
     printf '::stop-commands::%s\n' "$token"
     printf '::stop-commands::%s\n' "$token" >&2
-    # Cancellation: unshare runs as root and, with --fork, blocks SIGINT and
-    # SIGTERM; pid 1 ignores signals from outside its namespace. So a signal
-    # to this script (a cancelled or timed-out step) is turned into SIGKILL
-    # of the unshare started below, found as a descendant of its sudo;
-    # --kill-child then kills pid 1, and with it every process inside.
+    # Interruption: unshare runs as root and, with --fork, blocks SIGINT and
+    # SIGTERM; pid 1 ignores signals from outside its namespace. So SIGINT,
+    # SIGTERM or SIGHUP delivered to this script itself (Ctrl-C, or a caller
+    # forwarding the signal) is turned into SIGKILL of the unshare started
+    # below, found as a descendant of its sudo; --kill-child then kills
+    # pid 1, and with it every process inside. A cancelled or timed-out
+    # GitHub step signals only the step's shell and later SIGKILLs the
+    # process tree, so it does not reach this trap: the namespace keeps
+    # running, read-only and without network, until the VM is discarded.
     exec 3<&0
     sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc --propagation private -- \
       /bin/sh -c "$init" no-docker-init "$uid" "$(id -g)" "$work" "$probe" "$cwd" \

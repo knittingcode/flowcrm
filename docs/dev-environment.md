@@ -561,15 +561,19 @@ does not exec:
    `--kill-child` kills pid 1. pid 1 makes no credential change, so that
    signal stays armed.
 
-Cancellation: `unshare` runs as root, and with `--fork` it blocks SIGINT and
-SIGTERM; pid 1 ignores signals from outside its namespace. So when
-`no-docker.sh` gets SIGINT, SIGTERM or SIGHUP (a cancelled or timed-out
-step), it sends SIGKILL, through `sudo`, to the `unshare` it started: the
-process named `unshare` whose ancestors include the `sudo` of this run.
-Through `--kill-child`, that kills pid 1 and every process inside. If
-`no-docker.sh` itself is killed with SIGKILL first, nothing can forward
-the cancellation: the namespace then runs until the runner's VM is
-discarded (see the residual risks).
+Interruption: `unshare` runs as root, and with `--fork` it blocks SIGINT
+and SIGTERM; pid 1 ignores signals from outside its namespace. So when
+SIGINT, SIGTERM or SIGHUP is delivered to `no-docker.sh` itself (Ctrl-C in
+a terminal, or a caller that forwards the signal), it sends SIGKILL,
+through `sudo`, to the `unshare` it started: the process named `unshare`
+whose ancestors include the `sudo` of this run. Through `--kill-child`,
+that kills pid 1 and every process inside.
+
+A cancelled or timed-out GitHub step does not reach this. The runner
+signals only the step's shell, and later sends SIGKILL to the process
+tree, so `no-docker.sh` gets no signal it can handle. The namespace then
+keeps running, with read-only mounts and no network, until the runner's
+VM is discarded (see the residual risks).
 
 The probe checks from inside:
 
@@ -667,10 +671,14 @@ them.
 - **Orphan cleanup after a kill (Linux).** `env -i` drops
   `RUNNER_TRACKING_ID`, so the runner's end-of-job cleanup cannot find
   processes of the namespace. They are killed with pid 1 instead, on a
-  normal end and when `no-docker.sh` gets SIGINT, SIGTERM or SIGHUP (see
-  above). If `no-docker.sh` is killed with SIGKILL before it can forward
-  a cancellation, the namespace keeps running, with every limit above,
-  until the runner's VM is discarded.
+  normal end and when SIGINT, SIGTERM or SIGHUP is delivered to
+  `no-docker.sh` itself (see above).
+- **Cancelled or timed-out CI steps (Linux).** GitHub signals only the
+  step's shell and later sends SIGKILL to the process tree. Neither
+  reaches the trap in `no-docker.sh`, so the namespace and anything left
+  in it keep running until the runner's VM is discarded. They still have
+  read-only mounts, no network, no capabilities and no view of other
+  processes. Only the checkout's post-job step follows.
 - **CI coverage when a scan fails.** Isolated steps run last in their job
   (see below). When the container scan fails, the Dev environment job stops
   before `tests/devenv/unit.sh`, so the allocator unit tests do not run in
@@ -754,7 +762,9 @@ in the test's directories or send signal 0 or TERM to the test's own
     masked cgroups, private IPC and loopback only;
   - **T-17:** a `setsid` daemon, checked to be running before the command
     returns, does not outlive the command, neither when the command ends
-    nor when `no-docker.sh` gets SIGTERM (a cancelled step);
+    nor when SIGTERM is delivered to `no-docker.sh` itself. A cancelled
+    GitHub step does not signal `no-docker.sh`, so that case is not
+    covered;
   - **T-18:** uid 0 (a real `sudo` run), missing or other runner variables,
     a workspace outside `$HOME` and a caller without a `Runner.Worker`
     ancestor are refused.

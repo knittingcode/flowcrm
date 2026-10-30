@@ -812,8 +812,9 @@ with open("/proc/net/unix", "rb") as f:
   rm -f "$t16_tmp" "$t16_shm" "$t16_in"
 
   # --- T-17 no process survives the isolated command: a `setsid -f` canary
-  # with a unique marker, after a normal end and after the isolation was
-  # cancelled (TERM to no-docker.sh, as a cancelled CI step does). The
+  # with a unique marker, after a normal end and after TERM delivered to
+  # no-docker.sh itself (as by Ctrl-C or a caller forwarding the signal; a
+  # cancelled GitHub step does not signal no-docker.sh and is not covered). The
   # canary is a shell kept alive by "sleep 60; :", so the process with the
   # marker in its command line is the one that must die; the command checks
   # that it runs before it returns. Checked from outside, after
@@ -850,7 +851,7 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   left=$?
   pkill -TERM -f -- "$t17c" 2>/dev/null
   [ "$started" = yes ] && [ "$left" -ne 0 ]
-  result "T-17 TERM to no-docker.sh (a cancelled step) kills every process inside the isolation" $? \
+  result "T-17 TERM delivered to no-docker.sh itself kills every process inside the isolation" $? \
     "(canary started $started, rc $r, survivor $([ "$left" -eq 0 ] && echo yes || echo no))"
 
   # --- T-18 unsupported use is refused: uid 0 (a real sudo run) and a Linux
