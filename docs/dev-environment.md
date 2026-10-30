@@ -604,17 +604,52 @@ refused.
 - `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`;
 - a `Runner.Worker` process (by `comm` and executable name) is an ancestor
   of the caller. An unreadable ancestor counts as a refusal;
+- the caller is in the initial pid namespace (`pid:[4026531836]`), so the
+  namespace made below it is shown to descend from the caller's;
 - `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` are directories under `$HOME`;
-- `sudo -n` works and `unshare`, `setpriv`, `setsid`, `ip`, `mount`, `find`,
-  `stat` and `python3` exist.
+- `sudo -n` works and `timeout`, `unshare`, `setpriv`, `setsid`, `ip`,
+  `mount`, `find`, `stat` and `python3` exist.
 
-Before entering, the caller's side lists every Unix socket file on the
-local file systems (`find -xdev -type s` per mount) and every bound
-pathname socket of the host's network namespace (`/proc/net/unix`, which is
-what `ss -xl` shows). The list has a 180-second budget; when it runs out,
-the run is refused instead of using a partial list. The time it took is
-printed with each run, on stderr and as a `::notice::` in the CI log.
-Inside, the list is a read-only file.
+Before entering, the caller's side lists the Unix sockets that must not
+accept a connection inside. A pathname socket accepts one only while a
+socket is bound to its file, connecting finds that socket by the file's
+inode in whatever network namespace it is, and a read-only mount does not
+stop it. So the list is every path to every live, bound pathname socket of
+every network namespace:
+
+- **Fast listing** (`no-docker-probe.py --sockets-fast`, as root through
+  `sudo -n timeout -s KILL 15`, in at most 10 seconds). It writes nothing;
+  its list reaches the run's directory through the caller's redirection.
+  1. It finds every network namespace that has a process, a bind mount or
+     an open descriptor, and has the kernel list every Unix socket of each
+     (`sock_diag`, every state, with the device and inode of each bound
+     file), in a child process per namespace that the deadline kills.
+  2. Every Unix socket that a process holds, in its descriptor table or in
+     an io_uring's registered files, must be in one of those lists (one
+     retry); otherwise a network namespace was missed.
+  3. Every bound socket must be found again at its name in the host's
+     mount tree as the same file (device and inode, checked on the opened
+     file), with one link, on a local file system (ext2/3/4, xfs, btrfs,
+     tmpfs, devtmpfs, hugetlbfs). Its paths are then every mount of that
+     file system that contains it, bind mounts and hidden ones included.
+  4. The host network namespace's `/proc/net/unix` names are added, as
+     before.
+- **The walk**, unchanged, as the caller, if the fast listing cannot show
+  its list complete: any error, any process or descriptor that cannot be
+  read, a socket bound with a relative name, removed, renamed, with more
+  than one link, of another mount namespace or on another file system, two
+  sockets at one path, a netlink reply that is not exactly a whole dump, or
+  the 10 seconds running out. It lists every Unix socket file on the local
+  file systems (`find -xdev -type s` per mount) and the host's
+  `/proc/net/unix` names, and both lists are used.
+
+The whole listing has a 180-second budget; when it runs out, the run is
+refused instead of using a partial list. The mode (`mode fast`, or
+`mode walk` with its reason), the counts and the time are printed with each
+run, on stderr and as a `::notice::` in the CI log. Inside, the list is a
+read-only file. The fast listing also finds sockets in directories that can
+be searched but not listed, which the walk misses; what it relies on is
+listed under the residual risks.
 
 The command then runs under
 `sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc`
@@ -663,15 +698,25 @@ VM is discarded (see the residual risks).
 The probe checks from inside:
 
 - no uid is 0; every capability set is empty; `NoNewPrivs` is 1; there are
-  no supplementary groups;
+  no supplementary groups; the four gids are equal and not a system group
+  (above 999, as Debian and Ubuntu number them: the Docker group, `disk`,
+  `adm` and the like are below);
 - the network, mount, pid and IPC namespaces differ from the caller's;
-- the process is in a pid namespace below the caller's (`NSpid`), and
-  `/proc` belongs to it;
+- the caller's pid namespace is the initial one (`pid:[4026531836]`, its
+  fixed inode number) and the process's is not, so it is below the
+  caller's: every pid namespace descends from the initial one;
+- `/proc` is of the process's own pid namespace: `NSpid` is its pid alone
+  (a procfs shows a task's pids from its own namespace down, so a `/proc`
+  of an ancestor namespace would show two or more), and `/proc/self` is
+  its pid. `/proc` has no `hidepid` or `subset` option;
 - pid 1 is the root shell of the isolation and every other visible process
-  has the caller's uid. None is a runner, init or engine process, so
-  `/proc/<pid>/root` and `nsenter` have no target outside;
+  has the caller's uid. A process whose status cannot be read, other than
+  one that just ended, counts as foreign, and pid 1 must be read. None is
+  a runner, init or engine process, so `/proc/<pid>/root` and `nsenter`
+  have no target outside;
 - the process is in a session of its own without a controlling terminal,
-  so `TIOCSTI` has no target;
+  so `TIOCSTI` has no target; none of its standard descriptors is a Unix
+  socket;
 - loopback is the only interface;
 - `/tmp`, `/var/tmp`, `/dev/shm` and `/run` are tmpfs, and `/dev/mqueue` an
   mqueue, on devices other than the caller's. `/sys/fs/cgroup` is a
@@ -686,13 +731,19 @@ The probe checks from inside:
   Unix sockets accepts a stream, seqpacket or datagram connection (a
   listener with a full backlog counts as accepting). Pathname sockets on a
   read-only mount would still accept one, which is why every one of them
-  is tried.
+  is tried. An empty list fails.
 
-The probe also prints the uids and gids of the command. The command keeps
-the caller's primary group; on a runner that may be the group of the
-Docker socket, which is kept away by the hidden path and the connect test
-above. This Linux path has not yet run in CI in this version: the first
-run on a GitHub-hosted runner is its first evidence.
+The checks above are evaluated together, and only if every one passed are
+the writes and connects of the last items tried: a failed check, or an
+error, means nothing is written or connected to.
+
+The probe also prints the uids and gids of the command, and `no-docker.sh`
+the caller's primary group with its name and the group of
+`/var/run/docker.sock`. The command keeps the caller's primary group,
+which must not be a system group (above). This Linux path has not yet
+passed in CI: run 41126389201 (on 85cfb37) refused every isolated step at
+the pid namespace check that this version replaces, so the first green run
+on a GitHub-hosted runner is its first evidence.
 
 The output between the start and the end of the isolated command is framed
 with `::stop-commands::<random token>`, so the command cannot issue
@@ -768,6 +819,20 @@ them.
   appears on a read-only mount after the list was made, from a process
   outside the namespace, is not tried. On a GitHub-hosted runner no such
   service runs during the isolated steps.
+- **What the fast listing relies on (Linux).** A live socket is missed only
+  if no process holds it in a descriptor or a visible io_uring table and
+  its network namespace has no process, bind mount or open descriptor: a
+  socket only in flight in an `SCM_RIGHTS` message, in an io_uring reached
+  only through a registered ring descriptor or created straight into a
+  fixed slot, or held by the kernel (9p, nbd). Only processes outside the
+  isolation, which are not the adversary, can set that up. Socket inode
+  numbers in the kernel's list have 32 bits: on a file system with 64-bit
+  inode numbers, a removed socket's name could be taken by another socket
+  file whose number has the same low 32 bits (two sockets at one path make
+  the walk run). When the fast listing cannot show its list complete, the
+  walk runs; each such run takes about 140 to 150 seconds on a runner
+  (measured), so repeated walks can make a job time out (red, never an
+  unisolated run).
 - **Shared keyring and readable files (Linux).** The per-user kernel
   keyring is shared. Files such as `~/.docker/config.json` stay readable,
   but there is no network to use them on.
@@ -894,12 +959,15 @@ in the test's directories or send signal 0 or TERM to the test's own
     every run ends in time and none of its processes survives;
   - **T-29:** another terminal's device cannot be read from inside, while
     it can from outside.
-- **T-16 to T-18, Linux only:**
-  - **T-16:** a canary inside sees only the namespace's processes, cannot
-    read `/proc/1/root` and cannot connect to any engine, session or host
-    socket. It gets EROFS in `$HOME`, the workspace, `$RUNNER_TEMP` and the
-    tool cache, and sees a private `/tmp` and `/dev/shm`, read-only mounts,
-    masked cgroups, private IPC and loopback only;
+- **T-16 to T-18 and T-37, Linux only:**
+  - **T-16:** a canary inside sees `NSpid` as its pid alone, is in a pid
+    namespace other than the caller's (the initial one), sees only the
+    namespace's processes (an unreadable one counts as foreign) through a
+    `/proc` without `hidepid`, cannot read `/proc/1/root` and cannot
+    connect to any engine, session or host socket. It gets EROFS in
+    `$HOME`, the workspace, `$RUNNER_TEMP` and the tool cache, and sees a
+    private `/tmp` and `/dev/shm`, read-only mounts, masked cgroups, private
+    IPC and loopback only. Every check must print exactly one ok line;
   - **T-17:** a `setsid` daemon, checked to be running before the command
     returns, does not outlive the command, neither when the command ends
     nor when SIGTERM is delivered to `no-docker.sh` itself. A cancelled
@@ -907,7 +975,22 @@ in the test's directories or send signal 0 or TERM to the test's own
     covered;
   - **T-18:** uid 0 (a real `sudo` run), missing or other runner variables,
     a workspace outside `$HOME` and a caller without a `Runner.Worker`
-    ancestor are refused.
+    ancestor are refused;
+  - **T-37:** a listener of the suite, outside, bound in a directory that
+    cannot be listed (mode 0311), makes the run refuse (125) naming its
+    path: N1 in the host network namespace, N2 in a network namespace of
+    its own, which only the fast listing finds (`mode fast` is required).
+    N0: the same file without its listener runs the command.
+- **T-02** also requires that the refusal comes from the probe's mechanism
+  check and that its writes and connects never ran.
+- **T-36:** pure tests of the Linux rules (both platforms): the credential,
+  pid namespace, process, mount, descriptor and socket-list rules, the
+  netlink parser, the device and alias computations, the budgets and the
+  gate, on fixtures only, with every call that would read `/proc`, open a
+  file or socket, run a program or fork made to raise. The number of
+  assertions per case is fixed in the suite; eleven mutated copies of the
+  probe (among them the old `NSpid` rule) must each be rejected, and a
+  check that the probe calls the tested functions must pass.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
@@ -920,8 +1003,8 @@ The macOS cases run only on a developer's Mac: there is no macOS CI job.
   suites, on a macOS developer machine or in CI. On Linux outside CI the
   suites refuse to run.
 - Until a CI run on the GitHub-hosted runner has shown the Linux cases
-  T-16 to T-18 passing, use only payloads that read or print, on both
-  platforms.
+  T-16 to T-18 and T-37 passing, use only payloads that read or print, on
+  both platforms.
 - Never use a destructive Docker command (prune, forced removal, `down -v`,
   `--rmi`), not even in isolation.
 - `tests/devenv/integration.sh` and the `tests/app/` suites use the real
