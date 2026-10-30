@@ -549,9 +549,12 @@ reading its start time and membership again, and lists the processes again
 until there is none. A killed process cannot start another one, and
 nothing a member does can undo SIGKILL. The supervisor needs no new process
 to do this, so a command that uses up the processes it may start cannot
-stop it. It prints how many processes it ended. If a member cannot be ended
-within 10 seconds (for example one of another user), the run fails with
-status 125. SIGINT, SIGTERM, SIGHUP or SIGQUIT delivered to `no-docker.sh`
+stop it. It prints how many processes it ended. If members are still
+there after 10 seconds (one of another user, or members that start new
+processes faster than they are ended), the run fails with status 125. The
+run's marker directory is then kept, the message names the command that
+ends them (`no-docker-probe.py --end <marker directory>`), and until then no
+new run starts. SIGINT, SIGTERM, SIGHUP or SIGQUIT delivered to `no-docker.sh`
 end the command and everything it left at once, and the status is 128 plus
 the signal number; a signal the caller ignores stays ignored. The probe
 checks from inside that the sandbox carries both markers.
@@ -657,10 +660,18 @@ The probe checks from inside:
   `/proc/self/mountinfo` and the mount ID of each path. Creating a file in
   `$HOME`, `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` must fail as well;
 - the working directory is reachable by its path;
+- no other `proc` file system and no `nsfs` mount is reachable by path;
 - there is no socket in the private directories, and none of the listed
-  Unix sockets accepts a stream, seqpacket or datagram connection.
-  Pathname sockets on a read-only mount would still accept one, which is
-  why every one of them is tried.
+  Unix sockets accepts a stream, seqpacket or datagram connection (a
+  listener with a full backlog counts as accepting). Pathname sockets on a
+  read-only mount would still accept one, which is why every one of them
+  is tried.
+
+The probe also prints the uids and gids of the command. The command keeps
+the caller's primary group; on a runner that may be the group of the
+Docker socket, which is kept away by the hidden path and the connect test
+above. This Linux path has not yet run in CI in this version: the first
+run on a GitHub-hosted runner is its first evidence.
 
 The output between the start and the end of the isolated command is framed
 with `::stop-commands::<random token>`, so the command cannot issue
@@ -690,12 +701,15 @@ them.
 
 #### Accepted residual risks
 
-- **SIGKILL of `no-docker.sh` (macOS).** Its supervisor cannot end what
-  the command left. Those processes stay in the sandbox, with every limit
-  above, until someone ends them or the user logs out; meanwhile no new
-  isolated run starts. Processes left by runs of a version without the
-  markers (before the supervisor) are not recognised: log out once after
-  updating.
+- **SIGKILL of `no-docker.sh` (macOS), or a failed ending.** Its
+  supervisor cannot end the command or what it left. They keep running in
+  the sandbox, with every limit above, until someone ends them
+  (`no-docker-probe.py --end <marker directory>`, or by pid); meanwhile no
+  new isolated run starts. Until then the channels the sandbox leaves open
+  (their own terminal, loopback ports, the pasteboard, reading the user's
+  files and process information) stay available to them, without a time
+  limit. Processes left by runs of a version without the markers (before
+  the supervisor) are not recognised; end them by pid after updating.
 - **Process identity (macOS).** A process is signalled only after its
   start time and membership were read again, microseconds before. A pid
   reused within that window by a process outside could still be ended:
