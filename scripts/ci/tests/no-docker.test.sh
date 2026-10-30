@@ -120,6 +120,15 @@ sha() { # file: its sha256
   { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } <"$1" | cut -c1-64
 }
 
+# Files that code under test could write are read only when they are
+# regular files, so a planted FIFO or link cannot hang or redirect a read.
+regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+count_in() { # pattern file: number of matching lines, 0 if not a regular file
+  local n=0
+  regular "$2" && n=$(grep -c -- "$1" <"$2" 2>/dev/null)
+  echo "${n:-0}"
+}
+
 new_work() { # a fresh, empty directory for --work
   mktemp -d "$vt/w.XXXXXX"
 }
@@ -335,19 +344,34 @@ run_case() {
   case $os-$mode in
     Darwin-bare) bare "$helpers" "$data" "$canary" "${cmd[@]}" ;;
     Darwin-guard)
+      # The write policy of no-docker.sh: only the case's directories, the
+      # /dev nodes of its profile and bash 3.2's here-documents; plus its
+      # other denies and the ports listening now. Only the canary socket
+      # is reachable.
       verify_helpers "$helpers" || exit 2
+      held=""
+      for port in $(python3 -I "$root/scripts/ci/no-docker-probe.py" --listening) ; do
+        case $port in *[!0-9]* | "") echo "HARNESS ERROR: unexpected port $port" >&2; exit 2 ;; esac
+        held="$held (remote ip \"localhost:$port\")"
+      done
       sandbox-exec -p "(version 1)
 (allow default)
 (deny network-outbound (remote unix-socket))
 (allow network-outbound (remote unix-socket (path-literal \"$canary\")))
 (deny network-outbound (remote ip))
 (allow network-outbound (remote ip \"localhost:*\"))
-(deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\"))
-(deny file-write* (subpath \"$home\") (subpath \"$ro\"))
+(deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
+(deny file-write*)
+(allow file-write* (subpath \"$data\") (subpath \"$w\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\") (literal \"/private/tmp\") (regex #\"^/private/tmp/sh-thd[^/]*\$\"))
+(deny user-preference-write)
+(deny file-ioctl (ioctl-command #x80017472))
 (deny signal)
 (allow signal (target same-sandbox))
 (deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/bin/launchctl\") (literal \"/usr/bin/ssh\"))
-(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.coreservices.appleevents\") (global-name-regex #\"^com\\.apple\\.lsd\\.\"))" \
+(deny job-creation)
+(deny lsopen)
+(deny appleevent-send)
+(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.coreservices.appleevents\") (global-name-regex #\"^com\\.apple\\.lsd\\.\") (global-name \"com.apple.xpc.smd\") (global-name-regex #\"^com\\.apple\\.backgroundtaskmanagement\") (global-name-regex #\"^com\\.apple\\.coreservices\\.sharedfilelistd\") (global-name-regex #\"^com\\.docker\\.\") (global-name-regex #\"^com\\.electron\\.dockerdesktop\\.\"))" \
         "$BASH" "$helpers/drive.sh" "$helpers/canary.py" "$data" "$canary" "${cmd[@]}"
       ;;
     *)
@@ -358,8 +382,7 @@ run_case() {
   RC=$?
   STARTED=1
   [ -e "$data/drive-started" ] || STARTED=0
-  REQ=$(grep -c . "$data/canary.log" 2>/dev/null)
-  REQ=${REQ:-0}
+  REQ=$(count_in . "$data/canary.log")
 }
 
 # The harness without the containment: the lines that re-execute it under
@@ -789,43 +812,46 @@ with open("/proc/net/unix", "rb") as f:
   rm -f "$t16_tmp" "$t16_shm" "$t16_in"
 
   # --- T-17 no process survives the isolated command: a `setsid -f` canary
-  # with a unique marker, after a normal end and after the isolation itself
-  # (unshare) is killed. Checked from outside, after no-docker.sh returned.
-  # On 38b5ebd: no pid namespace and no --kill-child, the canary survives;
-  # and there is no unshare process to kill (it exec'd), which fails too.
+  # with a unique marker, after a normal end and after the isolation was
+  # cancelled (TERM to no-docker.sh, as a cancelled CI step does). The
+  # canary is a shell kept alive by "sleep 60; :", so the process with the
+  # marker in its command line is the one that must die; the command checks
+  # that it runs before it returns. Checked from outside, after
+  # no-docker.sh returned.
+  # On 38b5ebd: no pid namespace and no --kill-child, so the canary
+  # survives; and TERM to no-docker.sh left sudo, unshare and the command
+  # running.
   t17m=t17-$nonce
-  "$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60" "$1-in" </dev/null >/dev/null 2>&1; exit 0' _ "$t17m" >/dev/null 2>&1
-  r=$?
+  t17=$("$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if pgrep -f -- "$1-in" >/dev/null; then echo canary-started; exit 0; fi
+  sleep 0.1
+done
+echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f -- "$t17m-in" >/dev/null || break; sleep 0.5; done
   pgrep -f -- "$t17m-in" >/dev/null
   left=$?
   pkill -TERM -f -- "$t17m-in" 2>/dev/null
-  [ "$r" -eq 0 ] && [ "$left" -ne 0 ]
-  result "T-17 a daemonised process does not outlive the isolated command" $? "(rc $r, survivor $([ "$left" -eq 0 ] && echo yes || echo no))"
+  [ "$t17" = canary-started ] && [ "$left" -ne 0 ]
+  result "T-17 a daemonised process does not outlive the isolated command" $? \
+    "($t17, survivor $([ "$left" -eq 0 ] && echo yes || echo no))"
 
   t17c=t17c-$nonce
-  "$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60" "$1-in" </dev/null >/dev/null 2>&1; sleep 60' _ "$t17c" >/dev/null 2>&1 &
+  "$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1; sleep 60; :' _ "$t17c" >/dev/null 2>&1 &
   t17pid=$!
   for _ in $(seq 1 240); do pgrep -f -- "$t17c-in" >/dev/null && break; sleep 0.5; done
   started=no
   pgrep -f -- "$t17c-in" >/dev/null && started=yes
-  upid=""
-  for p in $(pgrep -x unshare); do
-    q=$p
-    while [ -n "$q" ] && [ "$q" -gt 1 ]; do
-      q=$(ps -o ppid= -p "$q" 2>/dev/null | tr -d ' ')
-      if [ "$q" = "$t17pid" ]; then upid=$p; break 2; fi
-    done
-  done
-  [ -z "$upid" ] || sudo -n kill -KILL "$upid"
+  kill -TERM "$t17pid" 2>/dev/null
   wait "$t17pid" 2>/dev/null
+  r=$?
   for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f -- "$t17c-in" >/dev/null || break; sleep 0.5; done
   pgrep -f -- "$t17c-in" >/dev/null
   left=$?
   pkill -TERM -f -- "$t17c" 2>/dev/null
-  [ "$started" = yes ] && [ -n "$upid" ] && [ "$left" -ne 0 ]
-  result "T-17 killing the isolation (unshare) kills every process inside it" $? \
-    "(canary started $started, unshare ${upid:-not found}, survivor $([ "$left" -eq 0 ] && echo yes || echo no))"
+  [ "$started" = yes ] && [ "$left" -ne 0 ]
+  result "T-17 TERM to no-docker.sh (a cancelled step) kills every process inside the isolation" $? \
+    "(canary started $started, rc $r, survivor $([ "$left" -eq 0 ] && echo yes || echo no))"
 
   # --- T-18 unsupported use is refused: uid 0 (a real sudo run) and a Linux
   # that is not a GitHub-hosted runner. The command is `true`.
@@ -870,10 +896,8 @@ check_safe() { # name
   # Refused (125, the mutant never ran) or run isolated (97, every case ran
   # and none reached an engine); either way the canary engine got nothing.
   local cases answered
-  cases=$(grep -c ' rc=' "$LOG" 2>/dev/null)
-  cases=${cases:-0}
-  answered=$(grep -c 'canary-engine' "$LOG" 2>/dev/null)
-  answered=${answered:-0}
+  cases=$(count_in ' rc=' "$LOG")
+  answered=$(count_in 'canary-engine' "$LOG")
   [ "$REQ" -eq 0 ] && [ "$answered" -eq 0 ]
   result "$1: no request reached an engine" $? "(canary requests $REQ, answered cases $answered, rc $RC)"
   [ "$STARTED" -eq 1 ]
@@ -888,7 +912,7 @@ check_safe() { # name
       grep -q '^no-docker: refused: inside no-docker.sh, but the isolation check fails' "$OUT"
     result "$1: the harness refused before the mutant ran (an engine is reachable)" $? "(rc $RC, $cases cases)"
   fi
-  ! grep -E '^(real-socket-cli|real-socket-curl) rc=0 ' "$LOG" >/dev/null 2>&1
+  [ "$(count_in '^real-socket-c[a-z]* rc=0 ' "$LOG")" -eq 0 ]
   result "$1: the real Docker socket paths were not reached" $?
   [ ! -e "$home_marker" ]
   result "$1: nothing written under \$HOME" $?
@@ -904,8 +928,7 @@ check_safe "T-04 mutant edited into bin/devenv"
 # --- T-05 control: the same check catches a harness without containment
 run_case t05 "$ro/unit-uncontained.sh" inplace guard
 shown+=("t05 $LOG $OUT")
-answered=$(grep -c 'canary-engine' "$LOG" 2>/dev/null)
-answered=${answered:-0}
+answered=$(count_in 'canary-engine' "$LOG")
 [ "$STARTED" -eq 1 ] && [ "$REQ" -gt 0 ] && [ "$answered" -gt 0 ] && [ "$RC" -eq 97 ]
 result "T-05 control: without the containment the mutant's commands reach the canary engine" $? "(canary requests $REQ, answered cases $answered, rc $RC)"
 
@@ -913,7 +936,7 @@ echo
 for s in "${shown[@]}"; do
   read -r f log out <<<"$s"
   printf 'INFO  %s cases:\n' "$f"
-  sed 's/^/INFO    /' "$log" 2>/dev/null
+  ! regular "$log" || sed 's/^/INFO    /' <"$log" 2>/dev/null
   printf 'INFO  %s harness output (last lines):\n' "$f"
   tail -n 8 "$out" 2>/dev/null | sed 's/^/INFO    /'
 done

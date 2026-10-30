@@ -2,9 +2,12 @@
 
 Usage: ci-isolation-order.py REPO_ROOT [WORKFLOW]   (default .github/workflows/ci.yml)
 
-A step is isolated when a script it runs (named in its `run:` text, or in
-the recipe of a `make` target it runs) calls scripts/ci/no-docker.sh: it
-runs code under test, which may leave files or processes for later steps.
+A step is isolated when every command it runs (in its `run:` text, or in
+the recipe of a `make` target it runs) is scripts/ci/no-docker.sh, its
+test harness scripts/ci/tests/no-docker.test.sh, or a script with the
+recognised re-exec stanza: it runs code under test, which may leave files
+or processes for later steps. A step that mixes such commands with others
+fails.
 Code under test cannot write anything on the Linux runner's file systems
 except private temporary directories, but the order is the second line:
 after the first isolated step of a job, only isolated steps may follow.
@@ -31,6 +34,9 @@ OWN = {"scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py", "scripts/ci/t
        "scripts/ci/tests/ci-isolation-order.py", ".github/workflows/ci.yml"}
 SCRIPT = re.compile(r"(?<![\w./$-])((?:\./)?(?:[\w.-]+/)*[\w.-]+\.(?:sh|py))(?![\w.-])")
 REQUIRED = ("Repository guard", "Dev environment")
+# Runs code under test only through no-docker.sh (it has no stanza of its
+# own: it tests the isolation from outside).
+HARNESS = "scripts/ci/tests/no-docker.test.sh"
 
 ok = True
 
@@ -142,33 +148,39 @@ def commands(text):
     return words
 
 
-def scripts_of(root, text):
-    names = set()
-    words = commands(text)
-    for w in words:
-        if SCRIPT.fullmatch(w):
-            names.add(w)
+def step_commands(root, text):
+    """Every program a step runs: its own commands and those of the
+    recipes of the make targets it runs."""
+    words = []
+    for w in commands(text):
+        words.append(w)
     for targets in re.findall(r"(?:^|[\n;&|]\s*)make((?:\s+[A-Za-z][\w-]*)+)", text):
         for t in targets.split():
-            names.update(w for w in commands(make_recipe(root, t).replace("\t", " ")) if SCRIPT.fullmatch(w))
-    return sorted(n[2:] if n.startswith("./") else n for n in names)
+            words += commands(make_recipe(root, t).replace("\t", " "))
+    return [w[2:] if w.startswith("./") else w for w in words if w != "make"]
 
 
 def isolated(root, step):
-    """(isolated, scripts, missing scripts) of a step."""
-    names = scripts_of(root, step["text"])
-    missing, iso = [], False
-    for n in names:
-        try:
-            content = open(os.path.join(root, n), encoding="utf-8", errors="replace").read()
-        except OSError:
-            missing.append(n)
+    """(isolated, mixed, missing scripts) of a step. A command is isolated
+    when it is scripts/ci/no-docker.sh, the isolation's own test harness, or
+    a script with the recognised re-exec stanza; any other command (docker,
+    make help, a trusted guard) is not. A step is isolated when all of its
+    commands are; one that mixes both is reported."""
+    iso, other, missing = [], [], []
+    for w in step_commands(root, step["text"]):
+        if not SCRIPT.fullmatch(w):
+            other.append(w)
             continue
-        if "no-docker.sh" in content and n not in ("scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py"):
-            iso = True
-        if n == "scripts/ci/no-docker.sh":
-            iso = True
-    return iso, names, missing
+        if w in ("scripts/ci/no-docker.sh", HARNESS):
+            iso.append(w)
+            continue
+        try:
+            content = open(os.path.join(root, w), encoding="utf-8", errors="replace").read()
+        except OSError:
+            missing.append(w)
+            continue
+        (iso if STANZA.search(content) else other).append(w)
+    return bool(iso) and not other, bool(iso) and bool(other), missing
 
 
 def tracked(root):
@@ -196,9 +208,10 @@ def main():
         first = None
         late = []
         for i, step in enumerate(job["steps"]):
-            iso, scripts, missing = isolated(root, step)
+            iso, mixed, missing = isolated(root, step)
             report(not missing, f"{job['name'] or jid} / {step['name']}: the scripts it runs exist"
                    + (f" (missing {' '.join(missing)})" if missing else ""))
+            report(not mixed, f"{job['name'] or jid} / {step['name']}: does not mix isolated and other commands")
             if iso and first is None:
                 first = step["name"]
             elif not iso and first is not None:
