@@ -413,6 +413,524 @@ $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
 $ make test-app                                  # application: the four suites below
 ```
 
+### Isolation from Docker
+
+`tests/devenv/unit.sh` and the guard regression suites in
+`scripts/ci/tests/` run code under test, including a modified or mutated
+copy of it (`DEVENV=`, `GUARD=`, `ADAPTED=` or an edited file). That code
+runs with the caller's user ID and may be any shell, Python or program on
+the machine: it may fork, daemonise, write files, open sockets and send
+signals. Each suite therefore re-executes itself under
+`scripts/ci/no-docker.sh`. The isolation must keep the code away from:
+
+- the container engines and their objects (images, containers, volumes,
+  networks, build cache), including those of other projects;
+- the user's environment: files in `$HOME` and in the checkout, shell and
+  tool configuration, user-session IPC and the user's other processes;
+- later steps of the same CI job.
+
+The person or job that starts a suite is trusted. The checks of the
+environment described below prevent accidental use where the isolation is
+not supported; they are not a boundary against the caller. Kernel and
+sandbox vulnerabilities and CPU or memory exhaustion are out of scope.
+
+Supported platforms:
+
+| Platform | Support | Mechanism |
+|---|---|---|
+| macOS developer machine | supported | `sandbox-exec` profile |
+| Linux on a GitHub-hosted Actions runner | supported | `sudo -n unshare` namespaces |
+| Linux anywhere else (developer machines, self-hosted runners, containers) | refused (exit 125): "Linux is supported on GitHub-hosted CI runners only" | — |
+| other systems | refused (exit 125) | — |
+| any platform as uid 0 | refused (exit 125) | — |
+
+Each property below is enforced by the sandbox profile or the kernel. Before
+the command starts, `scripts/ci/no-docker-probe.py` checks from inside the
+ones each platform's section lists as checked; on macOS the others rest on
+`sandbox-exec` accepting the profile and on the regression tests. If any
+check fails, a tool is missing, a mount fails, the profile is rejected or
+the command was not started inside the isolation, the command does not run
+and the exit status is 125.
+
+On both platforms the variables that select an engine (`DOCKER_*`,
+`CONTAINER_HOST`, `PODMAN_*`, `COMPOSE_*` and similar) are removed,
+`DOCKER_CONFIG` is an empty directory and `$TMPDIR` is a directory of the
+run. The probe then asks every endpoint it can find whether a container
+engine answers there: the usual socket paths, the Docker contexts,
+`DOCKER_HOST`, sockets under `/run`, `/var/run`, `/tmp`, `$TMPDIR` and
+`~/.docker`, ports 2375 and 2376 and every listening TCP port. The walk
+of those directories stops at 20,000 entries. On Linux that refuses the
+run. On macOS, where every Unix socket connect is denied anyway, the probe
+prints an INFO line instead.
+
+#### macOS
+
+`$TMPDIR` must be the per-user temporary directory that macOS creates,
+`/private/var/folders/<xx>/<id>/T`, owned by the user with mode 0700. If
+`TMPDIR` is unset, `getconf DARWIN_USER_TEMP_DIR` is used. Any other
+directory, such as `/tmp`, `/private/var/tmp`, `/`, Homebrew's prefix or a
+directory of the user's own, is refused. Each run gets a fresh directory
+there, mode 0700. The command's `$TMPDIR` is inside it.
+
+The `sandbox-exec` profile denies:
+
+- connecting to any Unix socket. The probe checks this with a socket of its
+  own: EPERM;
+- TCP beyond loopback, and to loopback ports 22, 2375 and 2376. The probe
+  checks 2375 and a non-loopback address;
+- TCP to every port that was listening when the run started, on any address
+  (a development server, an IDE, a published container port or a socket
+  proxy). The list comes from `netstat`; if `netstat` fails, prints no
+  column header or prints a LISTEN row that cannot be parsed, the run is
+  refused. The probe connects to each held port;
+- file writes anywhere except in the run's directory, `/dev/null`,
+  `/dev/zero`, `/dev/tty`, `/dev/dtracehelper` and `/dev/fd/*`. Nothing in
+  `/tmp` or `/private/var/tmp` is writable, so no file another process
+  keeps there can be changed, replaced or created from inside. The probe
+  checks that `$HOME`, the user's temporary directory, `/tmp`,
+  `/private/var/tmp` and an `sh-thd-*` file in `/tmp` are not writable and
+  that `$TMPDIR` is. This `/dev` list was measured with bash 3.2, python3,
+  `mktemp`, `/usr/bin/git`, `tests/devenv/unit.sh` and the guard suites.
+  Writing to `/dev/random`, `/dev/urandom` and other terminals' `/dev/ttys*`
+  is denied. `/usr/bin/git` reports that it cannot write the `xcrun_db`
+  cache in the user's temporary directory and still works. That cache is
+  read by `xcrun` outside the sandbox, so it stays write-denied;
+- signals to any process outside the sandbox. Processes of the run can
+  signal each other, including process groups. The probe sends signal 0 to
+  `no-docker.sh` outside: EPERM;
+- debugging any process (`system-debug`): `ptrace(PT_ATTACHEXC)` fails with
+  EPERM, even against a process of the user that allows debuggers
+  (`get-task-allow`). Measured: without this rule the attach succeeds, and
+  a debugger could then stop, signal or end that process;
+- the task ports of processes outside the sandbox (control, inspect, read
+  and name ports), which debuggers and readers such as `vmmap` and `sample`
+  use. Measured: without the rule they read the memory map of such a
+  process from inside; with it they are refused, while they still work on
+  the command's own processes and `ps` still lists every process;
+- reading the devices of other terminals (`/dev/ttys*`), which would let
+  the command read what is typed in them. The command keeps its own
+  terminal through `/dev/tty` and the descriptors it inherits;
+- preference writes through `cfprefsd` and `TIOCSTI` on the terminal;
+- `open`, `osascript`, `launchctl` and `ssh`, job submission to launchd,
+  Launch Services and Apple Events. Measured with a re-signed copy of
+  `launchctl` inside: `submit` and `bootstrap` of a job and `setenv` in the
+  user's launchd domain all fail, and no job or variable appears;
+- lookups of the services that register login items and background tasks
+  (`com.apple.xpc.smd`, `com.apple.backgroundtaskmanagement*`,
+  `com.apple.coreservices.sharedfilelistd*`) and of Docker Desktop's own
+  services (`com.docker.*`, `com.electron.dockerdesktop.*`).
+
+bash 3.2, which is also `/bin/sh`, keeps each here-document and
+here-string in a temporary file, ignoring `$TMPDIR`: in `/private/var/tmp`,
+or in `/tmp` where `/var/tmp` is not writable, as inside a sandbox. Neither
+is writable inside, so a here-document fails there ("cannot create temp
+file for here document"). Measured: bash then falls back to the working
+directory, so one works only while the working directory is in the run's
+directory. The code that runs inside (`bin/devenv`, `tests/devenv/unit.sh`,
+the guard suites and the scripts they run) therefore uses none; T-20
+checks this statically.
+
+When the command ends, the processes it left in the sandbox are ended: a
+plain background job, a daemon after `setsid` and a double fork, a
+`posix_spawn` child in a session of its own, a process group of its own.
+`no-docker.sh` hands its process to a supervisor in
+`scripts/ci/no-docker-probe.py`, which starts `sandbox-exec`, waits for it
+and then ends what is left. It finds those processes by a marker: the
+profile denies reading file `a` of the run's marker directory, in `$TMPDIR`
+outside the run's directory, and leaves file `b` next to it alone. From
+outside, `sandbox_check()` asks how a process's sandbox would decide; a
+process is in the run's sandbox exactly when it is sandboxed, denied `a` and
+allowed `b`. Measured: an unsandboxed process is allowed both, and the
+files must exist, or every process is "denied". A process cannot leave its
+sandbox, and every process it starts inherits it, however it detaches.
+
+The run is reported done only when it is shown that none of its processes
+runs any more. The supervisor takes one copy of the kernel's process list
+at a time (the kernel copies it under one lock, so it has every process of
+that instant, zombies included) and checks each process in it, by its
+unique id before and after the check: one of the run's is sent SIGKILL at
+once. A copy shows the run has ended when every process in it is shown not
+to be one of the run's, or was already dead (a zombie) before that copy was
+taken. Every process started later descends from one in the copy (the
+kernel lists a child before it can run, and its parent until it is
+reaped), so none of them can be one of the run's either. The one process
+that becomes one of the run's after it could be checked is the run's own
+`sandbox-exec` before it applies the profile: the supervisor waits for it
+first, and when a run is checked whose owner is gone, a process that owner
+started keeps every copy open. The argument relies on a pid not being
+reused while one copy is checked (milliseconds; the kernel's counter wraps
+at 99999). A process that ends before it can be
+checked leaves that copy open, as it may have started one of the run's
+first; the supervisor then takes the next copy. Measured: a run without
+leftovers is shown done in about 0.07 seconds, a run whose daemon must be
+ended in about 0.4 seconds.
+
+If that cannot be shown within 10 seconds, the run fails with status 125;
+it is never reported done. Measured: a process that forks a new one and
+ends, over and over (thousands of times per second), makes every copy
+open: the run fails, although that process is not found and keeps running,
+still in the sandbox with every limit above. The run's marker directory is
+then kept, and no new run starts until it is shown that none of its
+processes runs any more (then that directory is removed). The supervisor
+needs no new process for any of this, so a command that uses up the
+processes it may start cannot stop it. SIGINT, SIGTERM, SIGHUP or SIGQUIT
+delivered to `no-docker.sh` end the command and everything it left in the
+same way, and the status is 128 plus the signal number; a signal the
+caller ignores stays ignored. The probe checks from inside that the
+sandbox carries the run's marker.
+
+SIGKILL of `no-docker.sh` (or a crash of the supervisor) cannot be handled:
+what the command left keeps running, still inside the sandbox with every
+limit above. The marker directory records the run's owner (the process
+that becomes its supervisor). Before each run, `no-docker.sh` looks at the
+marker directories whose owner is gone; it removes one once it is shown
+that none of its processes runs, and otherwise refuses to start, naming
+them. It never ends anything there. Runs in progress elsewhere (their
+owner lives) are left alone.
+
+Setuid programs cannot run in the sandbox, so `ps` is an ad-hoc signed copy
+and `sudo` is unavailable. The U-16 check that another local user cannot
+read a secret therefore prints INFO and is not counted; the U-16 mode checks
+still run. macOS applies a sandbox inside another only if the profiles are
+identical, so the suites cannot run inside a different sandbox: they are
+refused.
+
+#### Linux (GitHub-hosted runners)
+
+`no-docker.sh` refuses unless:
+
+- the caller is not uid 0 (real or effective). This is checked before
+  anything else;
+- `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`;
+- a `Runner.Worker` process (by `comm` and executable name) is an ancestor
+  of the caller. An unreadable ancestor counts as a refusal;
+- `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` are directories under `$HOME`;
+- `sudo -n` works and `unshare`, `setpriv`, `setsid`, `ip`, `mount`, `find`,
+  `stat` and `python3` exist.
+
+Before entering, the caller's side lists every Unix socket file on the
+local file systems (`find -xdev -type s` per mount) and every bound
+pathname socket of the host's network namespace (`/proc/net/unix`, which is
+what `ss -xl` shows). The list has a 180-second budget; when it runs out,
+the run is refused instead of using a partial list. The time it took is
+printed with each run, on stderr and as a `::notice::` in the CI log.
+Inside, the list is a read-only file.
+
+The command then runs under
+`sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc`
+with private mount propagation. The namespace's pid 1 is a root shell that
+does not exec:
+
+1. It brings up loopback in the new network namespace.
+2. It mounts an empty tmpfs over `/run` (and `/var/run` when that is not a
+   symbolic link), `/tmp`, `/var/tmp` and `/dev/shm`, a fresh mqueue on
+   `/dev/mqueue` and a read-only tmpfs over `/sys/fs/cgroup`. The run's
+   directory, which is under `/tmp` (or under `/var/tmp` with `--work`), is
+   bind-mounted aside first and moved back into the new tmpfs, so the
+   original `/tmp` is not visible.
+3. It remounts every other mount reachable by path read-only. A bind
+   remount changes only the namespace's copy and keeps the other per-mount
+   flags. This covers `$HOME` with the workspace, `$RUNNER_TEMP`,
+   `$GITHUB_ENV`, `$GITHUB_PATH` and `~/.docker`, as well as
+   `/opt/hostedtoolcache` and every other mount.
+4. It runs the command as a child: `setpriv` with the caller's uid and gid,
+   no supplementary groups, `no_new_privs`, and empty inheritable and
+   bounding capability sets; then `setsid --wait`, then `env -i` with an
+   allowlist of variables (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+   `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ`, `CI`, `DEVENV*`, `GUARD*`,
+   `ADAPTED`, `HARNESS` and `FLOWCRM_*`). No session bus, display, agent,
+   runner file-command or token variable reaches the command.
+5. It waits for the command, reaping orphans meanwhile, and exits with the
+   command's status. When pid 1 exits, the kernel kills every process left
+   in the namespace, including daemonised ones. If `unshare` itself dies,
+   `--kill-child` kills pid 1. pid 1 makes no credential change, so that
+   signal stays armed.
+
+Interruption: `unshare` runs as root, and with `--fork` it blocks SIGINT
+and SIGTERM; pid 1 ignores signals from outside its namespace. So when
+SIGINT, SIGTERM or SIGHUP is delivered to `no-docker.sh` itself (Ctrl-C in
+a terminal, or a caller that forwards the signal), it sends SIGKILL,
+through `sudo`, to the `unshare` it started: the process named `unshare`
+whose ancestors include the `sudo` of this run. Through `--kill-child`,
+that kills pid 1 and every process inside.
+
+A cancelled or timed-out GitHub step does not reach this. The runner
+signals only the step's shell, and later sends SIGKILL to the process
+tree, so `no-docker.sh` gets no signal it can handle. The namespace then
+keeps running, with read-only mounts and no network, until the runner's
+VM is discarded (see the residual risks).
+
+The probe checks from inside:
+
+- no uid is 0; every capability set is empty; `NoNewPrivs` is 1; there are
+  no supplementary groups;
+- the network, mount, pid and IPC namespaces differ from the caller's;
+- the process is in a pid namespace below the caller's (`NSpid`), and
+  `/proc` belongs to it;
+- pid 1 is the root shell of the isolation and every other visible process
+  has the caller's uid. None is a runner, init or engine process, so
+  `/proc/<pid>/root` and `nsenter` have no target outside;
+- the process is in a session of its own without a controlling terminal,
+  so `TIOCSTI` has no target;
+- loopback is the only interface;
+- `/tmp`, `/var/tmp`, `/dev/shm` and `/run` are tmpfs, and `/dev/mqueue` an
+  mqueue, on devices other than the caller's. `/sys/fs/cgroup` is a
+  read-only tmpfs, and no cgroup file is writable;
+- every mount reachable by path is read-only, except the private file
+  systems above, the run's directory, `/proc` and `/dev`. This is read from
+  `/proc/self/mountinfo` and the mount ID of each path. Creating a file in
+  `$HOME`, `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` must fail as well;
+- the working directory is reachable by its path;
+- no other `proc` file system and no `nsfs` mount is reachable by path;
+- there is no socket in the private directories, and none of the listed
+  Unix sockets accepts a stream, seqpacket or datagram connection (a
+  listener with a full backlog counts as accepting). Pathname sockets on a
+  read-only mount would still accept one, which is why every one of them
+  is tried.
+
+The probe also prints the uids and gids of the command. The command keeps
+the caller's primary group; on a runner that may be the group of the
+Docker socket, which is kept away by the hidden path and the connect test
+above. This Linux path has not yet run in CI in this version: the first
+run on a GitHub-hosted runner is its first evidence.
+
+The output between the start and the end of the isolated command is framed
+with `::stop-commands::<random token>`, so the command cannot issue
+workflow commands. The start line is printed on both stdout and stderr; the
+token is never passed inside.
+
+#### Run directory (`--work DIR`)
+
+`no-docker.sh --work DIR COMMAND` uses `DIR` as the run's directory
+instead of a temporary one, and keeps it afterwards. It is the command's
+only writable directory and holds its `$TMPDIR`.
+
+`DIR` must:
+
+- be given as an absolute, canonical path with no symbolic link in it;
+- be a directory of the caller with mode 0700;
+- be empty;
+- not be or contain `$HOME`;
+- be under `$TMPDIR` or `/private/var/tmp` on macOS, and under `/var/tmp`
+  on Linux.
+
+Otherwise the run is refused. `tests/devenv/unit.sh` passes
+`NO_DOCKER_WORK=<dir>` on as `--work`. Whatever the command leaves in
+`DIR` is untrusted data: a later reader must not follow symbolic links,
+must accept regular files only, must limit their size and must not execute
+them.
+
+#### Accepted residual risks
+
+- **SIGKILL of `no-docker.sh` (macOS), or an ending that cannot be shown.**
+  The command and what it left keep running in the sandbox, with every
+  limit above, until someone ends them (`no-docker-probe.py --end <marker
+  directory>`, or by pid); meanwhile no new isolated run starts. A process
+  that keeps forking and ending is not found at all; it runs until it stops
+  by itself, the user ends it or logs out. Until then the channels the
+  sandbox leaves open (loopback ports, the pasteboard, reading the user's
+  files and process information) stay available to it, without a time
+  limit. A marker directory of an earlier version (without the owner
+  record) is checked like one whose owner is gone once it is a minute old;
+  processes of such a version whose directory was already removed are not
+  recognised: end them by pid after updating.
+- **Process identity (macOS).** A process is signalled only after its
+  unique id and membership were read again, microseconds before. A pid
+  reused within that window by a process outside could still be ended:
+  an availability risk, not a way out. Reusing a pid needs the kernel's
+  counter to wrap (pids up to 99999).
+- **Late listeners.** A loopback port that starts listening after the run
+  started (on macOS) is reachable, as are the ports the command opens
+  itself. This includes a VM's port forward that starts later. The probe
+  asks each listening port whether it is an engine only at the start. The
+  other way round, a loopback port the command opens during the run can be
+  reached by programs outside, which may take its answers for those of a
+  local service (for example a readiness check of `bin/devenv` run at the
+  same time).
+- **Login items and launchd (macOS).** The services that register login
+  items and background tasks are denied, and launchd jobs and `setenv`
+  through a re-signed `launchctl` fail (measured). Services that launchd
+  starts on the command's behalf run outside the sandbox; they are limited
+  by the lookups and Apple Events denied above, not by the supervisor.
+- **Terminals and the pasteboard (macOS).** Reading and writing other
+  terminals' devices are denied. A process of the command can still make
+  itself the foreground process group of its own terminal while it runs.
+  The pasteboard (`pbcopy`) is not denied; using it needs a person to
+  paste.
+- **Reading other processes (macOS).** The environment and arguments of the
+  user's other processes are readable (`ps eww`), as are the user's files.
+- **Writes through other processes (macOS).** The file-write limit covers
+  the command's own writes. Writes made for it by system services are
+  limited by the launchd, Launch Services, Apple Events, preference and
+  login-item denies above, not by the file rule. Keychain items are data,
+  not code.
+- **Sockets created after the list (Linux).** A pathname socket that
+  appears on a read-only mount after the list was made, from a process
+  outside the namespace, is not tried. On a GitHub-hosted runner no such
+  service runs during the isolated steps.
+- **Shared keyring and readable files (Linux).** The per-user kernel
+  keyring is shared. Files such as `~/.docker/config.json` stay readable,
+  but there is no network to use them on.
+- **Orphan cleanup after a kill (Linux).** `env -i` drops
+  `RUNNER_TRACKING_ID`, so the runner's end-of-job cleanup cannot find
+  processes of the namespace. They are killed with pid 1 instead, on a
+  normal end and when SIGINT, SIGTERM or SIGHUP is delivered to
+  `no-docker.sh` itself (see above).
+- **Cancelled or timed-out CI steps (Linux).** GitHub signals only the
+  step's shell and later sends SIGKILL to the process tree. Neither
+  reaches the trap in `no-docker.sh`, so the namespace and anything left
+  in it keep running until the runner's VM is discarded. They still have
+  read-only mounts, no network, no capabilities and no view of other
+  processes. Only the checkout's post-job step follows.
+- **CI coverage when a scan fails.** Isolated steps run last in their job
+  (see below). When the container scan fails, the Dev environment job stops
+  before `tests/devenv/unit.sh`, so the allocator unit tests do not run in
+  that CI run.
+
+#### CI
+
+The isolated steps are the last steps of each required job:
+
+- **Repository guard:** the trusted guard scripts, ShellCheck and
+  actionlint run first; then the guard regression suites and
+  `scripts/ci/tests/no-docker.test.sh`.
+- **Dev environment:** `tests/devenv/unit.sh` runs after the container
+  scan.
+
+After them, only the checkout action's post-job step runs. During the
+isolated steps on Linux it reads nothing that the code under test could
+have written: the workspace and `$HOME` are read-only, and `/tmp` is
+private.
+
+`scripts/ci/tests/ci-isolation-order.py` checks the order statically:
+
+- after the first isolated step of a job, every following step is
+  isolated. A step is isolated when every command it runs (directly or
+  through a `make` target) is `no-docker.sh`, its test harness
+  `no-docker.test.sh`, or a script with the re-exec stanza. A step that
+  mixes such commands with others fails;
+- the required jobs exist;
+- no job or step has an `if:` condition or a `continue-on-error:` key;
+- every other file that mentions `no-docker.sh` has the recognised re-exec
+  stanza.
+
+#### Regression tests
+
+`scripts/ci/tests/no-docker.test.sh` runs a mutated `bin/devenv` whose
+commands reach Docker in more than 20 ways, both as `DEVENV` and edited
+into the file. The mutant only reads (`docker version`, `GET /version`);
+its text is pinned by sha256 and checked before each use. Its target is a
+canary engine of the test, which answers like Docker and records every
+request.
+
+- **T-03 and T-04:** on macOS, `unit.sh` runs on the host as a developer
+  would run it. The mutant must run to its end without a request reaching
+  the canary. On Linux, `unit.sh` runs inside the isolation, where the
+  canary is a reachable engine, so it must refuse.
+- **T-05 (control):** a copy of `unit.sh` without the re-execution, behind
+  an outer guard. The mutant must reach the canary. On macOS, that guard
+  (also used for every case with `HARNESS=`) has the same write policy and
+  denies as `no-docker.sh`. Only the case's own directories are writable,
+  and only the canary's socket is reachable.
+- Files that code under test could write are read only when they are
+  regular files, so a planted FIFO or link cannot hang or redirect the
+  test.
+- **T-14 and T-23:** the helpers that the test runs outside any isolation
+  (`canary.py`, `drive.sh`) and the mutant's text are tracked files in
+  `scripts/ci/tests/no-docker/`. Their sha256 values are constants in the
+  test, set when they were reviewed, and every copy is checked against
+  them immediately before each run outside, so a copy changed at any time
+  is never run. The copies are kept outside every directory that code
+  under test can write. T-14 checks that a changed copy is detected and not
+  run, and T-23 that the values are constants.
+
+The other cases run plain commands that only print, connect, write markers
+in the test's directories or send signal 0 or TERM to the test's own
+`sleep`:
+
+- **T-00:** the read-only lint of the mutant.
+- **T-01 and T-02:** `--check`, and a claimed but unproven isolation.
+- **T-07:** loopback ports that were already listening are unreachable,
+  while ports opened inside are reachable.
+- **T-06, T-08 to T-15, T-21, T-22 and T-24 to T-34, macOS only:**
+  - **T-06 and T-11:** the write limits, including that a bash 3.2
+    here-document fails;
+  - **T-08:** the complete port list;
+  - **T-09 and T-12:** the `TMPDIR` allowlist;
+  - **T-10:** preferences and `TIOCSTI`;
+  - **T-13:** a canary outside cannot be signalled (EPERM) and survives,
+    while the command's own child and process group can be signalled;
+  - **T-14:** integrity of the helpers;
+  - **T-15:** `--work`, accepted and refused cases;
+  - **T-21:** canary files named like bash 3.2 here-document files in
+    `/tmp` and `/private/var/tmp` (random names, created exclusively, read
+    and removed only while they are the files created) cannot be opened for
+    writing, truncated, removed, renamed, replaced or chmodded, and none can
+    be created;
+  - **T-22:** a file outside the run's directory cannot be changed through
+    a hard link, a symbolic link, a rename over it or an exchange;
+  - **T-24:** four processes the command leaves (a background child, a
+    `setsid` daemon after a double fork, a `posix_spawn` child in a session
+    of its own, a process group of its own) are all ended, after a normal
+    end, a failed command and a command killed by SIGKILL;
+  - **T-25:** SIGINT, SIGTERM and SIGHUP to `no-docker.sh` end the command
+    and those four processes at once (status 128 plus the signal);
+  - **T-26:** after SIGKILL of `no-docker.sh`, its leftovers keep a new run
+    from starting (125) until they are ended through the run's marker
+    directory, whose owner is gone;
+  - **T-27:** when the probe cannot make the markers, look for leftovers or
+    supervise, the command is not run;
+  - **T-28:** a debugger attach from inside to a test canary outside that
+    allows debuggers fails, while it works from outside;
+  - **T-30:** a process that keeps forking and ending is never reported as
+    ended; new runs refuse while it runs and start after it ended;
+  - **T-31:** two runs at the same time each end their own processes and
+    do not refuse each other;
+  - **T-32:** processes that start and end outside meanwhile do not make
+    the ending fail;
+  - **T-33:** an ending that cannot be shown fails the run (125), ends the
+    supervisor's own child and keeps the marker directory;
+  - **T-34:** SIGTERM at several moments while the command starts processes:
+    every run ends in time and none of its processes survives;
+  - **T-29:** another terminal's device cannot be read from inside, while
+    it can from outside.
+- **T-16 to T-18, Linux only:**
+  - **T-16:** a canary inside sees only the namespace's processes, cannot
+    read `/proc/1/root` and cannot connect to any engine, session or host
+    socket. It gets EROFS in `$HOME`, the workspace, `$RUNNER_TEMP` and the
+    tool cache, and sees a private `/tmp` and `/dev/shm`, read-only mounts,
+    masked cgroups, private IPC and loopback only;
+  - **T-17:** a `setsid` daemon, checked to be running before the command
+    returns, does not outlive the command, neither when the command ends
+    nor when SIGTERM is delivered to `no-docker.sh` itself. A cancelled
+    GitHub step does not signal `no-docker.sh`, so that case is not
+    covered;
+  - **T-18:** uid 0 (a real `sudo` run), missing or other runner variables,
+    a workspace outside `$HOME` and a caller without a `Runner.Worker`
+    ancestor are refused.
+- **T-19:** the static CI order check, on both platforms.
+- **T-20:** a static check that the code run inside the isolation has no
+  here-document or here-string, on both platforms.
+
+The macOS cases run only on a developer's Mac: there is no macOS CI job.
+
+#### Mutation testing
+
+- Run a mutated copy of `bin/devenv` or of a guard only through these
+  suites, on a macOS developer machine or in CI. On Linux outside CI the
+  suites refuse to run.
+- Until a CI run on the GitHub-hosted runner has shown the Linux cases
+  T-16 to T-18 passing, use only payloads that read or print, on both
+  platforms.
+- Never use a destructive Docker command (prune, forced removal, `down -v`,
+  `--rmi`), not even in isolation.
+- `tests/devenv/integration.sh` and the `tests/app/` suites use the real
+  Docker daemon on purpose, so never run them on a mutated copy.
+  `integration.sh` refuses a `DEVENV` that differs from `bin/devenv`, but no
+  suite can tell an edited checkout from a mutated one.
+- BE-18 mutates a copy of the backend inside the api test container, which
+  has no Docker socket.
+
 Application suites (`tests/app/`), each in its own Compose projects:
 
 - `scan.sh` (SC-xx): Trivy scans of the runtime images (production-like api

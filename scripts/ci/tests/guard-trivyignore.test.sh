@@ -10,6 +10,10 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
+# The suite runs the guard, or a modified or mutated copy of it (GUARD=),
+# so it runs only where no container engine can be reached.
+"$here/../no-docker.sh" --check >/dev/null 2>&1 ||
+  exec "$here/../no-docker.sh" "$BASH" "$here/guard-trivyignore.test.sh" "$@"
 guard=${GUARD:-"$here/../guard-trivyignore.sh"}
 real=$(git -C "$here" rev-parse --show-toplevel) || exit 2
 work=$(mktemp -d "${TMPDIR:-/tmp}/guard-trivyignore-tests.XXXXXX") || exit 2

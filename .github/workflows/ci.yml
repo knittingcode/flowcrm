@@ -28,26 +28,14 @@ jobs:
       - name: Reject tracked local-only files
         run: scripts/ci/guard-tracked-files.sh
 
-      - name: Run guard regression tests
-        run: scripts/ci/tests/guard-tracked-files.test.sh
-
       - name: Require a digest-pinned Dockerfile frontend
         run: scripts/ci/guard-dockerfile-frontend.sh
-
-      - name: Run Dockerfile frontend guard regression tests
-        run: scripts/ci/tests/guard-dockerfile-frontend.test.sh
 
       - name: Check the container scan exceptions against their policy
         run: scripts/ci/guard-trivyignore.sh
 
-      - name: Run container scan exception guard regression tests
-        run: scripts/ci/tests/guard-trivyignore.test.sh
-
       - name: Keep the edge configuration free of ACME server, PKI, issuers and mutable admin
         run: scripts/ci/guard-edge-config.sh
-
-      - name: Run edge configuration guard regression tests
-        run: scripts/ci/tests/guard-edge-config.test.sh
 
       - name: ShellCheck
         run: >-
@@ -57,12 +45,31 @@ jobs:
           scripts/ci/guard-dockerfile-frontend.sh scripts/ci/tests/guard-dockerfile-frontend.test.sh
           scripts/ci/guard-trivyignore.sh scripts/ci/tests/guard-trivyignore.test.sh
           scripts/ci/guard-edge-config.sh scripts/ci/tests/guard-edge-config.test.sh
+          scripts/ci/no-docker.sh scripts/ci/tests/no-docker.test.sh
 
       - name: actionlint
         run: >-
           docker run --rm --network none -v "$PWD:/repo:ro" -w /repo
           rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
           -color
+
+      # Code under test runs only in the steps from here to the end of the
+      # job, each isolated by scripts/ci/no-docker.sh; no step that is not
+      # isolated may follow them (checked by scripts/ci/tests/ci-isolation-order.py).
+      - name: Run guard regression tests
+        run: scripts/ci/tests/guard-tracked-files.test.sh
+
+      - name: Run Dockerfile frontend guard regression tests
+        run: scripts/ci/tests/guard-dockerfile-frontend.test.sh
+
+      - name: Run container scan exception guard regression tests
+        run: scripts/ci/tests/guard-trivyignore.test.sh
+
+      - name: Run edge configuration guard regression tests
+        run: scripts/ci/tests/guard-edge-config.test.sh
+
+      - name: Run test isolation regression tests
+        run: scripts/ci/tests/no-docker.test.sh
 
   # The application checks run in this required job on purpose: a separate
   # job that is not a required check could fail (or be skipped) without
@@ -105,9 +112,6 @@ jobs:
       - name: make help and make doctor
         run: make help && make doctor
 
-      - name: Allocator unit tests
-        run: tests/devenv/unit.sh
-
       - name: Allocator integration tests (real Docker)
         run: tests/devenv/integration.sh
 
@@ -127,3 +131,8 @@ jobs:
       # docs/security/container-vulnerabilities.md).
       - name: Container vulnerability scan (Trivy)
         run: tests/app/scan.sh
+
+      # Code under test runs only from here to the end of the job, isolated by
+      # scripts/ci/no-docker.sh (order checked by scripts/ci/tests/ci-isolation-order.py).
+      - name: Allocator unit tests
+        run: tests/devenv/unit.sh

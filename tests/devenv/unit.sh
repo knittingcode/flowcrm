@@ -19,6 +19,11 @@
 set -u
 
 here=$(cd -P "$(dirname "$0")" && pwd -P)
+# The suite sources and runs bin/devenv, or a modified or mutated copy of
+# it, so it runs only where no container engine can be reached.
+# NO_DOCKER_WORK=<dir> is the isolation's only writable directory (--work).
+"$here/../../scripts/ci/no-docker.sh" --check >/dev/null 2>&1 ||
+  exec "$here/../../scripts/ci/no-docker.sh" ${NO_DOCKER_WORK:+--work "$NO_DOCKER_WORK"} "$BASH" "$here/unit.sh" "$@"
 # DEVENV=<path> runs the suite against another copy (mutation checks).
 devenv_script=${DEVENV:-"$here/../../bin/devenv"}
 # shellcheck source=../../bin/devenv
@@ -109,6 +114,10 @@ expect_eq "U-03 all 20 range ports considered" 20 "$#"
 RUNTIME_DIR=$work/rt
 STATE_FILE=$RUNTIME_DIR/dev.env
 LOCK_DIR=$RUNTIME_DIR/lock
+# Every runtime path, so that nothing is written into the checkout's .runtime.
+SECRETS_DIR=$RUNTIME_DIR/secrets
+GATE_DIR=$RUNTIME_DIR/gate
+GATE_FILE=$GATE_DIR/security-gate
 mkdir -p "$RUNTIME_DIR"
 # Fixtures are written to $work/st first: piping into state_case would run it
 # in a subshell and lose its pass/fail counts.
@@ -271,30 +280,23 @@ result "U-09 no volume removal or global prune in bin/devenv" $r
 # bin/devenv, then runs MODE: "hold" waits for GO itself; the other modes
 # run a script from $work through run_op (recorded, own process group).
 # await.sh READY GO: create READY, then wait (at most 30 s) for GO.
-cat >"$work/await.sh" <<'AWAIT'
-: >"$1"
+printf '%s\n' ': >"$1"
 i=0
-while [ ! -e "$2" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
-AWAIT
+while [ ! -e "$2" ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' >"$work/await.sh"
 # tree.sh READY GO GCPID: like a Docker CLI with its Compose plugin, start a
 # descendant that waits for GO, then wait for it.
-cat >"$work/tree.sh" <<'TREE'
-sh "${0%/*}/await.sh" "$1.gc" "$2" &
+printf '%s\n' 'sh "${0%/*}/await.sh" "$1.gc" "$2" &
 echo $! >"$3"
 i=0
 while [ ! -e "$1.gc" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 : >"$1"
-wait
-TREE
+wait' >"$work/tree.sh"
 # termchild.sh READY MARK: record a received SIGTERM in MARK, then exit.
-cat >"$work/termchild.sh" <<'TERMCHILD'
-trap ': >"$2"; exit 0' TERM
+printf '%s\n' 'trap '\'': >"$2"; exit 0'\'' TERM
 : >"$1"
 i=0
-while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done
-TERMCHILD
-cat >"$work/lockctl.sh" <<'LOCKCTL'
-# lockctl.sh DEVENV RUNTIME_DIR LOCK_WAIT [hold|child|tree|term ARGS...]
+while [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' >"$work/termchild.sh"
+printf '%s\n' '# lockctl.sh DEVENV RUNTIME_DIR LOCK_WAIT [hold|child|tree|term ARGS...]
 . "$1"
 SELF=$1
 RUNTIME_DIR=$2
@@ -302,15 +304,14 @@ LOCK_DIR=$2/lock
 LOCK_WAIT=$3
 work=${0%/*}
 trap on_exit EXIT
-trap 'on_signal 143 TERM' TERM
+trap '\''on_signal 143 TERM'\'' TERM
 acquire_lock test
 case ${4-} in
   hold) sh "$work/await.sh" "$5" "$6" ;;
   child) run_op sh "$work/await.sh" "$5" "$6" ;;
   tree) run_op sh "$work/tree.sh" "$5" "$6" "$7" ;;
   term) run_op sh "$work/termchild.sh" "$5" "$6" ;;
-esac
-LOCKCTL
+esac' >"$work/lockctl.sh"
 # An array, not a function: env and & must start the lock owner itself.
 lockctl=("$BASH" "$work/lockctl.sh" "$devenv_script" "$RUNTIME_DIR")
 wait_file() { # file: bounded wait (10 s) for a readiness signal
@@ -480,16 +481,14 @@ result "U-11 compose_op() refuses to run without the lock" $? "(rc $r: $out)"
 # try_edge() with a fake docker whose `compose up` prints a bind conflict and
 # then exits 1 or is killed by SIGKILL; `compose ps` reports no edge.
 mkdir -p "$work/fakeedge"
-cat >"$work/fakeedge/docker" <<'FAKE'
-#!/bin/sh
+printf '%s\n' '#!/bin/sh
 case " $* " in
   *" up "*)
-    echo 'Error response from daemon: Bind for 127.0.0.1:8080 failed: port is already allocated' >&2
+    echo '\''Error response from daemon: Bind for 127.0.0.1:8080 failed: port is already allocated'\'' >&2
     [ "$FAKE_MODE" = killed ] && kill -KILL $$
     exit 1 ;;
 esac
-exit 0
-FAKE
+exit 0' >"$work/fakeedge/docker"
 chmod +x "$work/fakeedge/docker"
 # shellcheck disable=SC2030,SC2031 # PATH and globals change only inside the subshell, on purpose
 edge_rc() { # mode: try_edge result with the fake docker
@@ -691,15 +690,14 @@ result "U-15 the URL label follows the stack" $?
 # http_ok requests the stack's readiness path and requires the stack's own
 # body: one local server answers like the application (/health/ready) and
 # the fixture (/health); another answers every path with an SPA page.
-cat >"$work/ready_server.py" <<'PYSERVER'
-import http.server, sys
+printf '%s\n' 'import http.server, sys
 mode = sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if mode == "spa":
             status, body = 200, b"<!doctype html><div id=root></div>"
         elif self.path == "/health/ready":
-            status, body = 200, b'{"status":"ready"}'
+            status, body = 200, b'\''{"status":"ready"}'\''
         elif self.path == "/health":
             status, body = 200, b"ok\n"
         else:
@@ -712,8 +710,7 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 server = http.server.HTTPServer(("127.0.0.1", 0), H)
 open(sys.argv[1], "w").write(str(server.server_address[1]))
-server.serve_forever()
-PYSERVER
+server.serve_forever()' >"$work/ready_server.py"
 python3 "$work/ready_server.py" "$work/ready.port" stacks &
 bg_pids="$bg_pids $!"
 python3 "$work/ready_server.py" "$work/spa.port" spa &
@@ -1092,8 +1089,7 @@ RUNTIME_DIR=$saved_runtime GATE_FILE=$saved_gate GATE_DIR=$saved_gate_dir
 # --- U-21 gate_blocks reads the edge's real answer (FND-009E)
 # Against one-shot local listeners: only the gate's own 503 counts as
 # blocked, not any other 503 and not a 200.
-cat >"$work/u21-serve.py" <<'PY'
-import socket, sys
+printf '%s\n' 'import socket, sys
 status, body = sys.argv[2], sys.argv[3]
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 0)); s.listen(1)
@@ -1115,8 +1111,7 @@ try:
         pass
 except OSError:
     pass
-c.close(); s.close()
-PY
+c.close(); s.close()' >"$work/u21-serve.py"
 u21() { # name status body expected(0 blocked|1 not)
   local pf=$work/u21.port i=0 r
   rm -f "$pf"
@@ -1405,22 +1400,21 @@ u25 "a missing password file is not a login" row "$work/u25.missing" no-file/fal
 # stack is refused. remove_untagged_images may remove only the untagged
 # images labelled with the run's project, by ID and never forced.
 mkdir -p "$work/fakeimg"
-cat >"$work/fakeimg/docker" <<'FAKE'
-#!/bin/sh
+printf '%s\n' '#!/bin/sh
 d=$FAKE_IMG
 echo "$*" >>"$d/calls"
-named() { awk -v i="$1" '$2 == i { f = 1 } END { exit !f }' "$d/names"; }
-used() { awk -v i="$1" '$2 == i { f = 1 } END { exit !f }' "$d/containers"; }
-drop_image() { awk -v i="$1" '$1 != i' "$d/images" >"$d/images.new" && mv "$d/images.new" "$d/images"; }
+named() { awk -v i="$1" '\''$2 == i { f = 1 } END { exit !f }'\'' "$d/names"; }
+used() { awk -v i="$1" '\''$2 == i { f = 1 } END { exit !f }'\'' "$d/containers"; }
+drop_image() { awk -v i="$1" '\''$1 != i'\'' "$d/images" >"$d/images.new" && mv "$d/images.new" "$d/images"; }
 case "$1 $2" in
-  "ps -aq"*) cut -d' ' -f1 "$d/containers" ;;
+  "ps -aq"*) cut -d'\'' '\'' -f1 "$d/containers" ;;
   "inspect -f")
     shift 3
-    for c in "$@"; do awk -v c="$c" '$1 == c { print $2 }' "$d/containers"; done ;;
+    for c in "$@"; do awk -v c="$c" '\''$1 == c { print $2 }'\'' "$d/containers"; done ;;
   "image ls")
     shift 2
     case $1 in
-      --format) cut -d' ' -f1 "$d/names"; exit 0 ;;
+      --format) cut -d'\'' '\'' -f1 "$d/names"; exit 0 ;;
     esac
     # image IDs, filtered like Docker: dangling=true (no name) and
     # label=com.docker.compose.project=P. IDs in "stale" are listed as
@@ -1441,36 +1435,36 @@ case "$1 $2" in
     done <"$d/images" ;;
   "image inspect")
     ref=$5
-    id=$(awk -v r="$ref" '$1 == r { print $2 }' "$d/names")
-    [ -n "$id" ] || id=$(awk -v r="$ref" '$1 == r { print $1 }' "$d/images")
+    id=$(awk -v r="$ref" '\''$1 == r { print $2 }'\'' "$d/names")
+    [ -n "$id" ] || id=$(awk -v r="$ref" '\''$1 == r { print $1 }'\'' "$d/images")
     [ -n "$id" ] || exit 1
     case $4 in
-      *RepoTags*) awk -v i="$id" '$2 == i { print $1 }' "$d/names" ;;
+      *RepoTags*) awk -v i="$id" '\''$2 == i { print $1 }'\'' "$d/names" ;;
       *) echo "$id" ;;
     esac ;;
   "image rm")
     shift 2
     force=0
-    case " $* " in *' -f '* | *' --force '*) force=1 ;; esac
+    case " $* " in *'\'' -f '\''* | *'\'' --force '\''*) force=1 ;; esac
     for a in "$@"; do
       case $a in
         -f | --force) continue ;;
       esac
-      id=$(awk -v r="$a" '$1 == r { print $2 }' "$d/names")
+      id=$(awk -v r="$a" '\''$1 == r { print $2 }'\'' "$d/names")
       if [ -n "$id" ] && [ "$force" = 0 ]; then
         # By name: only this name goes, and the image with its last name;
         # refused for the last name of an image a container uses.
-        if [ "$(awk -v i="$id" '$2 == i' "$d/names" | wc -l)" -eq 1 ] && used "$id"; then
+        if [ "$(awk -v i="$id" '\''$2 == i'\'' "$d/names" | wc -l)" -eq 1 ] && used "$id"; then
           echo "conflict: image is being used by a container" >&2
           exit 1
         fi
-        awk -v r="$a" '$1 != r' "$d/names" >"$d/names.new" && mv "$d/names.new" "$d/names"
+        awk -v r="$a" '\''$1 != r'\'' "$d/names" >"$d/names.new" && mv "$d/names.new" "$d/names"
         named "$id" || drop_image "$id"
         continue
       fi
       # By ID or forced: every name of the image goes, and the image.
       [ -n "$id" ] || id=$a
-      if ! named "$id" && ! awk -v i="$id" '$1 == i { f = 1 } END { exit !f }' "$d/images"; then
+      if ! named "$id" && ! awk -v i="$id" '\''$1 == i { f = 1 } END { exit !f }'\'' "$d/images"; then
         echo "No such image: $a" >&2
         exit 1
       fi
@@ -1478,12 +1472,11 @@ case "$1 $2" in
         echo "conflict: unable to delete $id (must be forced)" >&2
         exit 1
       fi
-      awk -v i="$id" '$2 != i' "$d/names" >"$d/names.new" && mv "$d/names.new" "$d/names"
+      awk -v i="$id" '\''$2 != i'\'' "$d/names" >"$d/names.new" && mv "$d/names.new" "$d/names"
       drop_image "$id"
     done ;;
   *) echo "unexpected: docker $*" >&2; exit 99 ;;
-esac
-FAKE
+esac' >"$work/fakeimg/docker"
 chmod +x "$work/fakeimg/docker"
 u26_dev=$( . "$here/../app/lib.sh" && project_of "$APP_REPO")
 u26_run=flowcrm-aaaaaa-test-bbbbbb
@@ -1655,8 +1648,7 @@ u26_guard "no prune command of any kind" "$u26_pat_prune"
 # removal, one after && does not. (The command name is in a variable so that
 # this file has no match.)
 u26_dk=docker
-cat >"$work/u26-fixture.sh" <<EOF
-$u26_dk \\
+printf '%s\n' "$u26_dk \\
   rmi -f x
 $u26_dk image \\
   rm \\
@@ -1669,8 +1661,7 @@ $u26_dk image \\
   prune -f
 $u26_dk image rm y 2>&1 -f
 $u26_dk image rm y &>/dev/null --force
-$u26_dk image rm y && rm -f z
-EOF
+$u26_dk image rm y && rm -f z" >"$work/u26-fixture.sh"
 u26_hits() { # pattern: first line numbers of the fixture's matching lines
   u26_lines "$work/u26-fixture.sh" | grep -E -- "$1" | cut -d: -f2 | paste -sd ' ' -
 }

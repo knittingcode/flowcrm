@@ -10,6 +10,10 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
+# The suite runs the guard, or a modified or mutated copy of it (GUARD=),
+# so it runs only where no container engine can be reached.
+"$here/../no-docker.sh" --check >/dev/null 2>&1 ||
+  exec "$here/../no-docker.sh" "$BASH" "$here/guard-tracked-files.test.sh" "$@"
 guard=${GUARD:-"$here/../guard-tracked-files.sh"}
 work=$(mktemp -d "${TMPDIR:-/tmp}/guard-tests.XXXXXX") || exit 2
 trap 'rm -rf "$work"' EXIT
