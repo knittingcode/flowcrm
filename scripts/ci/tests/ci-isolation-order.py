@@ -16,7 +16,9 @@ Also checked:
   - the required jobs "Repository guard" and "Dev environment" exist and
     each has an isolated step;
   - no job or step has an `if:` condition (one could run a non-isolated
-    step after a failed isolated one, or skip a required check);
+    step after a failed isolated one, or skip a required check) or a
+    `continue-on-error:` key (a failed step, a security gate included,
+    would no longer fail its job);
   - every tracked file that mentions no-docker.sh is either part of the
     isolation itself, documentation, the workflow, or has the re-exec
     stanza in its recognised form, so a suite isolated another way is
@@ -71,7 +73,7 @@ def parse(path):
         if not in_jobs:
             continue
         if n == 2:
-            job = {"name": "", "steps": [], "if": False}
+            job = {"name": "", "steps": [], "if": False, "coe": False}
             jobs[line.strip().rstrip(":")] = job
             step = None
         elif n == 4 and job is not None:
@@ -81,10 +83,12 @@ def parse(path):
                 job["name"] = key[len("name:"):].strip().strip("'\"")
             if key.startswith("if:"):
                 job["if"] = True
+            if key.startswith("continue-on-error:"):
+                job["coe"] = True
         elif n >= 6 and job is not None:
             stripped = line.strip()
             if n == 6 and stripped.startswith("- "):
-                step = {"name": "", "text": "", "if": False, "run": [], "in_run": False}
+                step = {"name": "", "text": "", "if": False, "coe": False, "run": [], "in_run": False}
                 job["steps"].append(step)
                 stripped = stripped[2:]
                 n = 8
@@ -96,6 +100,8 @@ def parse(path):
                     step["name"] = stripped[len("name:"):].strip().strip("'\"")
                 elif stripped.startswith("if:"):
                     step["if"] = True
+                elif stripped.startswith("continue-on-error:"):
+                    step["coe"] = True
                 elif stripped.startswith("run:"):
                     value = stripped[len("run:"):].strip()
                     step["in_run"] = True
@@ -204,6 +210,9 @@ def main():
         report(required in names, f"required job {required!r} exists")
     report(not any(j["if"] or any(s["if"] for s in j["steps"]) for j in jobs.values()),
            "no job or step has an if: condition")
+    coe = [s["name"] or job["name"] for job in jobs.values() for s in [{"name": ""}] * job["coe"] + job["steps"]
+           if s.get("coe", job["coe"] and not s["name"])]
+    report(not coe, "no job or step has continue-on-error" + (f" ({', '.join(repr(c) for c in coe)})" if coe else ""))
     for jid, job in jobs.items():
         first = None
         late = []
