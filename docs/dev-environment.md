@@ -528,7 +528,8 @@ local file systems (`find -xdev -type s` per mount) and every bound
 pathname socket of the host's network namespace (`/proc/net/unix`, which is
 what `ss -xl` shows). The list has a 180-second budget; when it runs out,
 the run is refused instead of using a partial list. The time it took is
-printed with each run. Inside, the list is a read-only file.
+printed with each run, on stderr and as a `::notice::` in the CI log.
+Inside, the list is a read-only file.
 
 The command then runs under
 `sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc`
@@ -556,9 +557,19 @@ does not exec:
    runner file-command or token variable reaches the command.
 5. It waits for the command, reaping orphans meanwhile, and exits with the
    command's status. When pid 1 exits, the kernel kills every process left
-   in the namespace, including daemonised ones. If `unshare` itself is
-   killed (a cancelled job or a timeout), `--kill-child` kills pid 1. pid 1
-   makes no credential change, so that signal stays armed.
+   in the namespace, including daemonised ones. If `unshare` itself dies,
+   `--kill-child` kills pid 1. pid 1 makes no credential change, so that
+   signal stays armed.
+
+Cancellation: `unshare` runs as root, and with `--fork` it blocks SIGINT and
+SIGTERM; pid 1 ignores signals from outside its namespace. So when
+`no-docker.sh` gets SIGINT, SIGTERM or SIGHUP (a cancelled or timed-out
+step), it sends SIGKILL, through `sudo`, to the `unshare` it started: the
+process named `unshare` whose ancestors include the `sudo` of this run.
+Through `--kill-child`, that kills pid 1 and every process inside. If
+`no-docker.sh` itself is killed with SIGKILL first, nothing can forward
+the cancellation: the namespace then runs until the runner's VM is
+discarded (see the residual risks).
 
 The probe checks from inside:
 
@@ -588,7 +599,8 @@ The probe checks from inside:
 
 The output between the start and the end of the isolated command is framed
 with `::stop-commands::<random token>`, so the command cannot issue
-workflow commands. The token is never passed inside.
+workflow commands. The start line is printed on both stdout and stderr; the
+token is never passed inside.
 
 #### Run directory (`--work DIR`)
 
@@ -626,6 +638,17 @@ them.
   services that register login items and background tasks are denied. A
   re-signed copy of `launchctl` loses its entitlements. Whether such a copy
   can still `setenv` in the user's launchd domain was not measured.
+- **Here-document files in `/tmp` (macOS).** bash 3.2, which is also
+  `/bin/sh`, writes every here-document to `/tmp/sh-thd*` whatever
+  `$TMPDIR` is. It creates the file, closes it, opens it again by name and
+  then removes it. Measured: without the `sh-thd*` allowance, here-documents
+  in the sandbox fail ("cannot create temp file for here document"), also
+  with `$TMPDIR` in the run's directory. So the allowance stays. Code in
+  the sandbox can therefore remove and recreate an `sh-thd*` file of a
+  bash 3.2 that runs outside the sandbox, between that bash's close and
+  reopen. That injects shell input into the outside script. The window is
+  short, but a leftover process (above) can wait for it. SBPL cannot limit
+  the rule to files the sandbox created itself.
 - **Terminals and the pasteboard (macOS).** Writes to other terminals'
   devices are denied. The pasteboard (`pbcopy`) is not; using it needs a
   person to paste.
@@ -643,8 +666,11 @@ them.
   but there is no network to use them on.
 - **Orphan cleanup after a kill (Linux).** `env -i` drops
   `RUNNER_TRACKING_ID`, so the runner's end-of-job cleanup cannot find
-  processes of the namespace. They are killed with pid 1 instead (see
-  above).
+  processes of the namespace. They are killed with pid 1 instead, on a
+  normal end and when `no-docker.sh` gets SIGINT, SIGTERM or SIGHUP (see
+  above). If `no-docker.sh` is killed with SIGKILL before it can forward
+  a cancellation, the namespace keeps running, with every limit above,
+  until the runner's VM is discarded.
 - **CI coverage when a scan fails.** Isolated steps run last in their job
   (see below). When the container scan fails, the Dev environment job stops
   before `tests/devenv/unit.sh`, so the allocator unit tests do not run in
@@ -668,8 +694,10 @@ private.
 `scripts/ci/tests/ci-isolation-order.py` checks the order statically:
 
 - after the first isolated step of a job, every following step is
-  isolated. A step is isolated when a script it runs (directly or through
-  a `make` target) calls `no-docker.sh`;
+  isolated. A step is isolated when every command it runs (directly or
+  through a `make` target) is `no-docker.sh`, its test harness
+  `no-docker.test.sh`, or a script with the re-exec stanza. A step that
+  mixes such commands with others fails;
 - the required jobs exist;
 - no job or step has an `if:` condition;
 - every other file that mentions `no-docker.sh` has the recognised re-exec
@@ -689,7 +717,13 @@ request.
   the canary. On Linux, `unit.sh` runs inside the isolation, where the
   canary is a reachable engine, so it must refuse.
 - **T-05 (control):** a copy of `unit.sh` without the re-execution, behind
-  an outer guard. The mutant must reach the canary.
+  an outer guard. The mutant must reach the canary. On macOS, that guard
+  (also used for every case with `HARNESS=`) has the same write policy and
+  denies as `no-docker.sh`. Only the case's own directories are writable,
+  and only the canary's socket is reachable.
+- Files that code under test could write are read only when they are
+  regular files, so a planted FIFO or link cannot hang or redirect the
+  test.
 - **T-14:** the helpers that the test runs outside any isolation, and the
   mutant's text, are kept outside every directory that code under test can
   write. Their sha256 is checked immediately before each such run. The
@@ -718,8 +752,9 @@ in the test's directories or send signal 0 or TERM to the test's own
     socket. It gets EROFS in `$HOME`, the workspace, `$RUNNER_TEMP` and the
     tool cache, and sees a private `/tmp` and `/dev/shm`, read-only mounts,
     masked cgroups, private IPC and loopback only;
-  - **T-17:** a `setsid` daemon does not outlive the command, neither when
-    the command ends nor when `unshare` is killed;
+  - **T-17:** a `setsid` daemon, checked to be running before the command
+    returns, does not outlive the command, neither when the command ends
+    nor when `no-docker.sh` gets SIGTERM (a cancelled step);
   - **T-18:** uid 0 (a real `sudo` run), missing or other runner variables,
     a workspace outside `$HOME` and a caller without a `Runner.Worker`
     ancestor are refused.
