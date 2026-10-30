@@ -31,20 +31,26 @@
 #     tested behind the guard. Should that isolation fail, the read-only
 #     payload would reach the real daemon, which the cases detect;
 #   - the helpers this suite runs outside any isolation (drive.sh,
-#     canary.py) and the payload are kept outside every directory the code
-#     under test can write, and their sha256 is checked immediately before
-#     each such run (T-14);
+#     canary.py) and the payload are tracked files (no-docker/) pinned to
+#     reviewed sha256 values in this file; their copies are kept outside
+#     every directory the code under test can write, and checked against
+#     those values immediately before each such run (T-14, T-23);
 #   - the other cases run plain commands that only print, connect to this
 #     suite's own listeners, write marker files in directories of this
 #     suite (and in protected places, where the write must fail; a marker
 #     that was written anyway is removed), send signal 0 or TERM to this
-#     suite's own `sleep` canaries, or sleep.
+#     suite's own `sleep` canaries, start processes of their own that
+#     sleep and must be ended by no-docker.sh (any left over are killed by
+#     pid only while their arguments carry the case's marker), attach a
+#     debugger to or read the memory map of this suite's own canary copies
+#     of /bin/sleep, read a pseudo-terminal of their own, or sleep.
 # This suite itself runs no docker command.
 #
-# T-11 to T-15 are macOS only, T-16 to T-18 Linux only (each prints INFO on
-# the other platform); T-19 is static and runs on both. Each case says how
-# it fails against the no-docker.sh of 38b5ebd, which these cases were
-# written to catch.
+# T-06, T-08 to T-15, T-21, T-22 and T-24 to T-29 are macOS only, T-16 to
+# T-18 Linux only (each prints INFO on the other platform); T-19, T-20 and
+# T-23 are static and run on both. Each case says how it fails against the
+# no-docker.sh of 38b5ebd or dfb6ee4, which these cases were written to
+# catch.
 #
 # Usage: no-docker.test.sh
 # HARNESS=<path> checks another copy of tests/devenv/unit.sh instead of the
@@ -93,6 +99,9 @@ nonce=$$-$(date +%s)
 home_marker=$home/.flowcrm-no-docker-test-$nonce
 tmp=$(cd -P "${TMPDIR:-/tmp}" && pwd -P)
 [ -n "$tmp" ] && [ "$tmp" != / ] || exit 2
+# macOS: the per-user temporary directory no-docker.sh uses (its markers).
+ndtmp=$tmp
+[ "$os" != Darwin ] || [ -n "${TMPDIR-}" ] || ndtmp=$(cd -P "$(getconf DARWIN_USER_TEMP_DIR)" && pwd -P) || exit 2
 # Next to $TMPDIR: writable by the user, outside what the sandbox allows.
 outside_marker=$(dirname "$tmp")/.flowcrm-no-docker-test-$nonce
 tmp_marker=/private/tmp/.flowcrm-no-docker-test-$nonce
@@ -133,66 +142,20 @@ new_work() { # a fresh, empty directory for --work
   mktemp -d "$vt/w.XXXXXX"
 }
 
-# --- the canary engine --------------------------------------------------------
-cat >"$helpers/canary.py" <<'PY'
-import json, os, socketserver, sys
-path, log = sys.argv[1], sys.argv[2]
-class H(socketserver.StreamRequestHandler):
-    def handle(self):
-        while True:
-            line = self.rfile.readline()
-            if not line:
-                return
-            headers = {}
-            while True:
-                h = self.rfile.readline()
-                if h in (b"\r\n", b"\n", b""):
-                    break
-                k, _, v = h.decode("latin-1").partition(":")
-                headers[k.strip().lower()] = v.strip()
-            if headers.get("user-agent") != "no-docker-probe":
-                with open(log, "a") as f:
-                    f.write(line.decode("latin-1").strip() + " ua=" + headers.get("user-agent", "-") + "\n")
-            target = line.split()[1].decode("latin-1") if len(line.split()) > 1 else "/"
-            if target.endswith("/_ping"):
-                body = b"OK"
-            elif target.endswith("/version"):
-                body = json.dumps({"Version": "canary-engine", "ApiVersion": "1.45", "MinAPIVersion": "1.24",
-                                   "Os": "linux", "Arch": "amd64"}).encode()
-            else:
-                body = json.dumps({"message": "canary-engine"}).encode()
-            self.wfile.write(b"HTTP/1.1 200 OK\r\nApi-Version: 1.45\r\nOstype: linux\r\n"
-                             b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body))
-            if not line.startswith(b"HEAD"):
-                self.wfile.write(body)
-            self.wfile.flush()
-class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-S(path, H).serve_forever()
-PY
-
-# drive.sh <canary.py> <data dir> <canary socket> <harness command...>:
-# starts the canary (logging to <data dir>/canary.log), records that the
-# harness was started (<data dir>/drive-started), runs it with DOCKER_HOST
-# pointing at the canary and stops the canary again.
-cat >"$helpers/drive.sh" <<'DRIVE'
-canary_py=$1 data=$2 canary=$3
-shift 3
-mkdir -p "$data" || exit 2
-: >"$data/canary.log" || exit 2
-rm -f "$canary"
-python3 -I "$canary_py" "$canary" "$data/canary.log" &
-cpid=$!
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [ -S "$canary" ] && break; sleep 0.2; done
-[ -S "$canary" ] || { echo "HARNESS ERROR: the canary engine did not start"; kill "$cpid"; exit 2; }
-: >"$data/drive-started"
-DOCKER_HOST=unix://$canary "$@"
-rc=$?
-sleep 0.5 # let the canary finish writing
-kill "$cpid" 2>/dev/null
-wait "$cpid" 2>/dev/null
-exit "$rc"
-DRIVE
+# --- the helpers -------------------------------------------------------------
+# Tracked files of this suite (scripts/ci/tests/no-docker/), copied to
+# $helpers and checked against the sha256 below, which is part of this
+# reviewed source: a copy that differs in any way is never run. Changing
+# a helper needs a new review and a new hash here.
+#   canary.py <socket> <log>: the canary engine, a Unix socket that answers
+#     like Docker and records every request;
+#   drive.sh <canary.py> <data dir> <canary socket> <harness command...>:
+#     starts the canary (logging to <data dir>/canary.log), records that
+#     the harness was started (<data dir>/drive-started), runs it with
+#     DOCKER_HOST pointing at the canary and stops the canary again;
+#   payload: the mutant's payload (below).
+helper_sums="canary.py=35dae9af68f8ec8a8a8668a1468fb192ed14f35461d893e3ab9525db11d69ce5 drive.sh=bb13bfa8771d611cc6be3bacf709b769b0c7d0868f0d2821b040107019a7d283 payload=7fd727d79f1eb2e8e3a6f52e25da8f0fe35851b79d262384f6bbc5f5c946ed25"
+cp "$here/no-docker/canary.py" "$here/no-docker/drive.sh" "$here/no-docker/payload" "$helpers/" || exit 2
 
 # A Docker configuration whose context "canary" points at a canary socket.
 ctx=$(printf 'canary' | { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; } | cut -c1-64)
@@ -203,62 +166,16 @@ ctxcfg() { # dir canary
 }
 
 # --- the mutant ---------------------------------------------------------------
-# Inserted after the first line of bin/devenv, so it runs as soon as the file
-# is sourced or executed. Each case appends "<case> rc=<status> out=<output>"
-# to the log; the mutant then exits 97.
-cat >"$helpers/payload" <<'MUT'
-qa_log=@LOG@ qa_canary=@CANARY@ qa_cfg=@CFG@ qa_marker=@MARKER@
-qa() { # case command...
-  qa_n=$1
-  shift
-  qa_out=$("$@" 2>&1)
-  printf '%s rc=%s out=%s\n' "$qa_n" "$?" "$(printf '%s' "$qa_out" | tr '\n' ' ' | cut -c1-200)" >>"$qa_log"
-}
-qa_fmt='{{.Server.Version}}'
-qa inherited-env docker version --format "$qa_fmt"
-qa path-lookup docker -H "unix://$qa_canary" version --format "$qa_fmt"
-for qa_p in /usr/local/bin/docker /usr/bin/docker /opt/homebrew/bin/docker /Applications/Docker.app/Contents/Resources/bin/docker; do
-  [ ! -x "$qa_p" ] || qa "absolute-path:$qa_p" "$qa_p" -H "unix://$qa_canary" version --format "$qa_fmt"
-done
-qa builtin-command command docker -H "unix://$qa_canary" version --format "$qa_fmt"
-qa env-wrapper env docker -H "unix://$qa_canary" version --format "$qa_fmt"
-qa env-docker-host env DOCKER_HOST="unix://$qa_canary" docker version --format "$qa_fmt"
-qa context env DOCKER_CONFIG="$qa_cfg" docker --context canary version --format "$qa_fmt"
-qa nested-bash bash -c 'docker -H "unix://$1" version --format "$2"' _ "$qa_canary" "$qa_fmt"
-qa nested-sh sh -c 'docker -H "unix://$1" version --format "$2"' _ "$qa_canary" "$qa_fmt"
-qa_x=$(docker -H "unix://$qa_canary" version --format "$qa_fmt" 2>&1)
-printf 'command-substitution rc=%s out=%s\n' "$?" "$(printf '%s' "$qa_x" | tr '\n' ' ')" >>"$qa_log"
-qa_x=`docker -H "unix://$qa_canary" version --format "$qa_fmt" 2>&1`
-printf 'backticks rc=%s out=%s\n' "$?" "$(printf '%s' "$qa_x" | tr '\n' ' ')" >>"$qa_log"
-qa_dk=docker
-qa variable "$qa_dk" -H "unix://$qa_canary" version --format "$qa_fmt"
-qa quoted "docker" -H "unix://$qa_canary" version --format "$qa_fmt"
-qa exec-subshell sh -c 'exec docker -H "unix://$1" version --format "$2"' _ "$qa_canary" "$qa_fmt"
-qa xargs sh -c 'echo version | xargs docker -H "unix://$1"' _ "$qa_canary"
-(docker -H "unix://$qa_canary" version --format "$qa_fmt" >"$qa_log.bg" 2>&1; echo "background rc=$? out=$(tr '\n' ' ' <"$qa_log.bg")" >>"$qa_log") &
-wait
-qa sudo sudo -n docker -H "unix://$qa_canary" version --format "$qa_fmt"
-qa curl-unix-socket curl -sS --max-time 5 --unix-socket "$qa_canary" http://docker/version
-qa python-raw-socket python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"GET /version HTTP/1.0\r\n\r\n"); print(s.recv(4096).decode())' "$qa_canary"
-qa real-socket-cli docker -H unix:///var/run/docker.sock version --format "$qa_fmt"
-qa real-socket-curl curl -sS --max-time 5 --unix-socket /var/run/docker.sock http://docker/_ping
-qa home-write touch "$qa_marker"
-exit 97
-MUT
-
-# The payload is exactly the reviewed text: on macOS the cases T-03 and T-04
-# run without the outer guard, so their safety rests on it only reading.
-# Changing it needs a new safety review and a new hash here.
-payload_sha256=7fd727d79f1eb2e8e3a6f52e25da8f0fe35851b79d262384f6bbc5f5c946ed25
-helper_sums="canary.py=$(sha "$helpers/canary.py") drive.sh=$(sha "$helpers/drive.sh") payload=$(sha "$helpers/payload")"
-case " $helper_sums " in
-  *" payload=$payload_sha256 "*) ;;
-  *) echo "HARNESS ERROR: the mutant payload differs from the reviewed one; refusing to run" >&2; exit 2 ;;
-esac
+# The payload is inserted after the first line of bin/devenv, so it runs as
+# soon as the file is sourced or executed. Each case appends
+# "<case> rc=<status> out=<output>" to the log; the mutant then exits 97.
+# It is exactly the reviewed text: on macOS the cases T-03 and T-04 run
+# without the outer guard, so their safety rests on it only reading.
 
 # verify_helpers <dir>: the helpers and the payload in <dir> are regular
-# files with the sha256 recorded when this suite wrote them. Called
-# immediately before every run of drive.sh and before every mutant is made.
+# files with the reviewed sha256 of helper_sums. Called right after they
+# are copied, immediately before every run of drive.sh and before every
+# mutant is made.
 verify_helpers() {
   local f want got
   for f in canary.py drive.sh payload; do
@@ -270,11 +187,12 @@ verify_helpers() {
     fi
     got=$(sha "$1/$f")
     if [ "$got" != "$want" ]; then
-      echo "HARNESS ERROR: $1/$f changed since it was written ($got); refusing to run" >&2
+      echo "HARNESS ERROR: $1/$f is not the reviewed one ($got); refusing to run" >&2
       return 1
     fi
   done
 }
+verify_helpers "$helpers" || exit 2
 
 # bare <helpers dir> <data dir> <canary> <command...>: drive.sh outside any
 # isolation, only after its helpers verified.
@@ -344,17 +262,22 @@ run_case() {
   case $os-$mode in
     Darwin-bare) bare "$helpers" "$data" "$canary" "${cmd[@]}" ;;
     Darwin-guard)
-      # The write policy of no-docker.sh: only the case's directories, the
-      # /dev nodes of its profile and bash 3.2's here-documents; plus its
-      # other denies and the ports listening now. Only the canary socket
-      # is reachable.
+      # The write policy of no-docker.sh: only the case's directories and
+      # the /dev nodes of its profile; plus its other denies and the ports
+      # listening now. Only the canary socket is reachable. The guard's
+      # sandbox carries markers like no-docker.sh's, and no-docker-probe.py
+      # supervises it the same way: whatever the harness leaves running is
+      # ended when drive.sh returns, and the case fails if that cannot be
+      # shown (125).
       verify_helpers "$helpers" || exit 2
       held=""
       for port in $(python3 -I "$root/scripts/ci/no-docker-probe.py" --listening) ; do
         case $port in *[!0-9]* | "") echo "HARNESS ERROR: unexpected port $port" >&2; exit 2 ;; esac
         held="$held (remote ip \"localhost:$port\")"
       done
-      sandbox-exec -p "(version 1)
+      gmark=$(python3 -I "$root/scripts/ci/no-docker-probe.py" --markers "$ndtmp") || exit 2
+      case $gmark in "$ndtmp"/no-docker-mark.?*) ;; *) echo "HARNESS ERROR: unexpected marker directory $gmark" >&2; exit 2 ;; esac
+      python3 -I "$root/scripts/ci/no-docker-probe.py" --supervise "$gmark" "$data/drive-started" - -- /usr/bin/sandbox-exec -p "(version 1)
 (allow default)
 (deny network-outbound (remote unix-socket))
 (allow network-outbound (remote unix-socket (path-literal \"$canary\")))
@@ -362,9 +285,14 @@ run_case() {
 (allow network-outbound (remote ip \"localhost:*\"))
 (deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
 (deny file-write*)
-(allow file-write* (subpath \"$data\") (subpath \"$w\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\") (literal \"/private/tmp\") (regex #\"^/private/tmp/sh-thd[^/]*\$\"))
+(allow file-write* (subpath \"$data\") (subpath \"$w\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\"))
+(deny file-read-data (literal \"$ndtmp/no-docker-mark/a\") (literal \"$gmark/a\"))
+(deny file-read* (regex #\"^/dev/ttys[0-9]+\$\"))
 (deny user-preference-write)
 (deny file-ioctl (ioctl-command #x80017472))
+(deny system-debug)
+(deny mach-task-name mach-task-read mach-task-inspect mach-priv-task-port)
+(allow mach-task-name mach-task-read mach-task-inspect mach-priv-task-port (target same-sandbox))
 (deny signal)
 (allow signal (target same-sandbox))
 (deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/bin/launchctl\") (literal \"/usr/bin/ssh\"))
@@ -437,15 +365,20 @@ r=$?
 result "T-02 claimed but unproven isolation (NO_DOCKER_ACTIVE outside it): refused, command not run" $? "(rc $r)"
 
 if [ "$os" = Darwin ]; then
-  # --- T-06 plain commands (no mutant): the write limits
+  # --- T-06 plain commands (no mutant): the write limits. A bash 3.2
+  # here-document from a working directory outside the run's directory
+  # fails: bash keeps it in /tmp (it cannot use /var/tmp inside), which the
+  # sandbox does not allow, so code run inside uses none.
+  # On dfb6ee4: /private/tmp/sh-thd* was writable, so the here-document
+  # worked (rc 0 and "here-document" in t06).
   w6=$(new_work) || exit 2
-  "$nd" --work "$w6" /bin/bash -c 'touch "$1" "$2" "$3" 2>/dev/null; cat >"$4" <<EOF
+  "$nd" --work "$w6" /bin/bash -c 'touch "$1" "$2" "$3" 2>/dev/null; cd / && cat >"$4" <<EOF
 here-document
-EOF' _ "$home_marker" "$outside_marker" "$tmp_marker" "$w6/t06" >/dev/null 2>&1
+EOF' _ "$home_marker" "$outside_marker" "$tmp_marker" "$w6/t06" >"$work/t06.out" 2>&1
   r=$?
-  [ "$r" -eq 0 ] && [ "$(cat "$w6/t06" 2>/dev/null)" = here-document ] &&
+  [ "$r" -eq 1 ] && [ ! -s "$w6/t06" ] && grep -q 'cannot create temp file for here.document' "$work/t06.out" &&
     [ ! -e "$home_marker" ] && [ ! -e "$outside_marker" ] && [ ! -e "$tmp_marker" ]
-  result "T-06 writes only in the run's directory (bash 3.2 here-documents work): not under \$HOME, next to \$TMPDIR or in /tmp" $? "(rc $r)"
+  result "T-06 writes only in the run's directory: not under \$HOME, next to \$TMPDIR or in /tmp (a bash 3.2 here-document fails)" $? "(rc $r)"
   rm -f "$home_marker" "$outside_marker" "$tmp_marker"
 
   # T-08: the held-port list must be complete. A netstat without its column
@@ -626,8 +559,352 @@ print("own-group", g.wait())
   t15 "/tmp" /tmp
   t15 "/private/var/tmp itself" /private/var/tmp
   t15 "a relative path" t15
+
+  # --- T-21 here-document files of bash 3.2 cannot be changed from inside.
+  # Outside the sandbox bash 3.2 keeps them in /private/var/tmp, inside it
+  # (and in other sandboxes that allow /tmp but not /var/tmp) in
+  # /private/tmp. Two canaries named like them, made here: none can be
+  # opened for writing, truncated, appended to, removed, renamed or
+  # replaced from inside, and no new one can be created.
+  # On dfb6ee4: the profile allowed writes to /private/tmp/sh-thd*, so every
+  # operation on that canary succeeded.
+  t21a=/private/tmp/sh-thd-flowcrm-test-$nonce
+  t21b=/private/var/tmp/sh-thd-flowcrm-test-$nonce
+  w21=$(new_work) || exit 2
+  for f in "$t21a" "$t21b"; do (umask 077 && printf 'original\n' >"$f") || exit 2; done
+  t21=$("$nd" --work "$w21" python3 -I -c '
+import errno, os, sys
+w = sys.argv[1]
+for path in sys.argv[2:]:
+    open(os.path.join(w, "x"), "w").close()
+    tries = {
+        "write": lambda: os.open(path, os.O_WRONLY),
+        "read-write": lambda: os.open(path, os.O_RDWR),
+        "append": lambda: os.open(path, os.O_WRONLY | os.O_APPEND),
+        "truncate": lambda: os.truncate(path, 0),
+        "unlink": lambda: os.unlink(path),
+        "rename-away": lambda: os.rename(path, path + ".moved"),
+        "replace": lambda: os.rename(os.path.join(w, "x"), path),
+        "create": lambda: os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+        "chmod": lambda: os.chmod(path, 0o666),
+    }
+    for name, f in tries.items():
+        try:
+            r = f()
+            if isinstance(r, int):
+                os.close(r)
+            print("t21 bad ", path, name, "allowed")
+        except OSError as e:
+            print("t21 " + ("ok  " if e.errno in (errno.EPERM, errno.EACCES) else "bad ") , path, name,
+                  errno.errorcode.get(e.errno, e.errno))
+' "$w21" "$t21a" "$t21b" 2>/dev/null)
+  r=$?
+  t21_left=""
+  for f in "$t21a" "$t21b"; do
+    [ "$(cat "$f" 2>/dev/null)" = original ] || t21_left="$t21_left changed:$f"
+    for x in "$f.moved" "$f.new"; do [ ! -e "$x" ] || t21_left="$t21_left $x"; done
+  done
+  printf '%s\n' "$t21" | grep '^t21 bad' | sed 's/^/INFO    /'
+  [ "$r" -eq 0 ] && [ "$(printf '%s\n' "$t21" | grep -c '^t21 ok')" -eq 18 ] && [ -z "$t21_left" ]
+  result "T-21 bash 3.2 here-document files (/private/tmp and /private/var/tmp sh-thd-*) cannot be written, replaced or created from inside" $? \
+    "(rc $r, $(printf '%s\n' "$t21" | grep -c '^t21 ok') of 18 denied, changed or left:${t21_left:- none})"
+  rm -f "$t21a" "$t21b" "$t21a.moved" "$t21b.moved" "$t21a.new" "$t21b.new"
+
+  # --- T-22 a file outside the run's directory cannot be changed through a
+  # hard link, a symbolic link, a rename over it or an exchange (all on
+  # the same volume as the run's directory).
+  # (A-M3: measured on 38b5ebd, no regression case until now.)
+  t22f=$work/t22-target
+  printf 'original\n' >"$t22f" || exit 2
+  w22=$(new_work) || exit 2
+  t22=$("$nd" --work "$w22" python3 -I -c '
+import ctypes, errno, os, sys
+w, target = sys.argv[1], sys.argv[2]
+libc = ctypes.CDLL(None, use_errno=True)
+def say(ok, text):
+    print(("t22 ok   " if ok else "t22 bad  ") + text)
+try:
+    os.link(target, os.path.join(w, "hard"))
+    try:
+        with open(os.path.join(w, "hard"), "a") as f:
+            f.write("changed\n")
+        say(False, "hard link made and written through")
+    except OSError as e:
+        say(True, f"hard link made, but not writable ({errno.errorcode.get(e.errno)})")
+except OSError as e:
+    say(True, f"hard link refused ({errno.errorcode.get(e.errno)})")
+os.symlink(target, os.path.join(w, "soft"))
+try:
+    with open(os.path.join(w, "soft"), "a") as f:
+        f.write("changed\n")
+    say(False, "written through a symbolic link")
+except OSError as e:
+    say(True, f"symbolic link not writable ({errno.errorcode.get(e.errno)})")
+mine = os.path.join(w, "mine")
+with open(mine, "w") as f:
+    f.write("replaced\n")
+try:
+    os.rename(mine, target)
+    say(False, "renamed over the target")
+except OSError as e:
+    say(True, f"rename over the target refused ({errno.errorcode.get(e.errno)})")
+RENAME_SWAP = 0x2
+r = libc.renamex_np(os.fsencode(mine), os.fsencode(target), RENAME_SWAP)
+say(r != 0, f"exchange with the target refused ({errno.errorcode.get(ctypes.get_errno(), r)})")
+r = libc.exchangedata(os.fsencode(mine), os.fsencode(target), 0)
+say(r != 0, f"exchangedata with the target refused ({errno.errorcode.get(ctypes.get_errno(), r)})")
+' "$w22" "$t22f" 2>/dev/null)
+  r=$?
+  printf '%s\n' "$t22" | grep '^t22 ' | sed 's/^/INFO    /'
+  [ "$r" -eq 0 ] && [ "$(printf '%s\n' "$t22" | grep -c '^t22 ok')" -eq 5 ] && [ "$(cat "$t22f")" = original ]
+  result "T-22 a file outside the run's directory cannot be changed through links, a rename or an exchange" $? \
+    "(rc $r, target $(cat "$t22f" 2>/dev/null | head -n 1))"
+
+  # --- T-24 to T-27 no process of the command outlives it. The command is a
+  # Python "leaver" that starts four processes meant to survive it: a plain
+  # child, a setsid daemon after a double fork, a posix_spawn child with
+  # POSIX_SPAWN_SETSID and a child in a process group of its own. Each
+  # appends its pid to <run dir>/pids once it runs and then sleeps 60 s;
+  # every one carries the case's marker in its arguments, which is how the
+  # checks below (and their clean-up) recognise them. The leaver waits until
+  # all four are recorded, then ends as the case says. The pids are read
+  # back as data and a pid counts as a survivor only while its arguments
+  # still carry the marker.
+  # On dfb6ee4: nothing ended them, so all four survived each case.
+  t24_leaver='
+import ctypes, os, signal, sys, time
+w, tag, how = sys.argv[1], sys.argv[2], sys.argv[3]
+SLEEP = [sys.executable, "-I", "-B", "-c", "import os, sys, time; open(sys.argv[1], \"a\").write(f\"{os.getpid()}\\n\"); time.sleep(60)", w + "/pids", tag]
+if os.fork() == 0:
+    os.execv(SLEEP[0], SLEEP)
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        os.execv(SLEEP[0], SLEEP)
+    os._exit(0)
+libc = ctypes.CDLL(None, use_errno=True)
+attr = ctypes.c_void_p()
+libc.posix_spawnattr_init(ctypes.byref(attr))
+libc.posix_spawnattr_setflags(ctypes.byref(attr), ctypes.c_short(0x0400))  # POSIX_SPAWN_SETSID
+argv = (ctypes.c_char_p * (len(SLEEP) + 1))(*[a.encode() for a in SLEEP], None)
+pid = ctypes.c_int()
+libc.posix_spawn(ctypes.byref(pid), SLEEP[0].encode(), None, ctypes.byref(attr), argv, None)
+if os.fork() == 0:
+    os.setpgid(0, 0)
+    os.execv(SLEEP[0], SLEEP)
+for _ in range(100):
+    try:
+        if len(open(w + "/pids").read().split()) >= 4:
+            break
+    except OSError:
+        pass
+    time.sleep(0.05)
+open(w + "/mark", "w").write(os.environ.get("NO_DOCKER_MARK", ""))
+if how == "fail":
+    sys.exit(3)
+if how == "kill-self":
+    os.kill(os.getpid(), signal.SIGKILL)
+if how == "wait":
+    open(w + "/pids", "a").write(f"{os.getpid()}\n")
+    time.sleep(60)
+'
+  t24_left() { # run-dir tag: the recorded pids that still run as the case's processes
+    local p
+    regular "$1/pids" || return 0
+    for p in $(tr -c '0-9\n' ' ' <"$1/pids"); do
+      ps -o args= -p "$p" 2>/dev/null | grep -q -- "$2" && printf ' %s' "$p"
+    done
+  }
+  t24_clean() { # run-dir tag: end only processes that still carry the case's marker
+    local p
+    for p in $(t24_left "$1" "$2"); do kill -KILL "$p" 2>/dev/null; done
+  }
+  t24() { # name how expected-rc
+    local w tag=t24-$2-$nonce left n
+    w=$(new_work) || exit 2
+    "$nd" --work "$w" python3 -I -B -c "$t24_leaver" "$w" "$tag" "$2" >"$work/t24-$2.out" 2>&1
+    r=$?
+    sleep 0.5
+    left=$(t24_left "$w" "$tag")
+    n=$(count_in . "$w/pids")
+    t24_clean "$w" "$tag"
+    [ "$r" -eq "$3" ] && [ "$n" -eq 4 ] && [ -z "$left" ] && grep -q 'no-docker: ended [0-9]* processes' "$work/t24-$2.out"
+    result "T-24 $1: none of the 4 processes it left survives" $? "(rc $r, $n recorded, survivors:${left:- none})"
+  }
+  t24 "normal end" ok 0
+  t24 "failed command" fail 3
+  t24 "command killed by SIGKILL" kill-self 137
+
+  # T-25: SIGINT, SIGTERM or SIGHUP to no-docker.sh while the command runs
+  # ends the command and all it started at once. no-docker.sh is started
+  # with SIGINT at its default (an asynchronous command of this script
+  # would otherwise ignore it).
+  t25() { # signal expected-rc
+    local w tag=t25-$1-$nonce ndpid left n t0 took
+    w=$(new_work) || exit 2
+    python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' "$nd" --work "$w" python3 -I -B -c "$t24_leaver" "$w" "$tag" wait >"$work/t25-$1.out" 2>&1 &
+    ndpid=$!
+    for _ in $(seq 1 100); do [ "$(count_in . "$w/pids")" -ge 5 ] && break; sleep 0.1; done
+    n=$(count_in . "$w/pids")
+    t0=$(date +%s)
+    # Our own child, still running (its arguments name no-docker.sh).
+    ps -o args= -p "$ndpid" 2>/dev/null | grep -q -- no-docker && kill -"$1" "$ndpid"
+    wait "$ndpid"
+    r=$?
+    took=$(($(date +%s) - t0))
+    sleep 0.5
+    left=$(t24_left "$w" "$tag")
+    t24_clean "$w" "$tag"
+    [ "$n" -eq 5 ] && [ "$r" -eq "$2" ] && [ "$took" -le 10 ] && [ -z "$left" ]
+    result "T-25 SIG$1 to no-docker.sh ends the command and the 4 processes it left" $? \
+      "(rc $r, $n recorded, ${took}s, survivors:${left:- none})"
+  }
+  t25 INT 130
+  t25 TERM 143
+  t25 HUP 129
+
+  # T-26: SIGKILL of no-docker.sh cannot be handled: what the command left
+  # keeps running, still sandboxed, and no new isolated run starts while it
+  # does (125, command not run). The case then ends them through the run's
+  # marker (no-docker-probe.py --end) and a new run starts again.
+  w=$(new_work) || exit 2
+  tag=t26-$nonce
+  t26_before=$(cd "$ndtmp" && ls -d no-docker-mark.* 2>/dev/null)
+  python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' "$nd" --work "$w" python3 -I -B -c "$t24_leaver" "$w" "$tag" wait >"$work/t26.out" 2>&1 &
+  ndpid=$!
+  for _ in $(seq 1 100); do [ "$(count_in . "$w/pids")" -ge 5 ] && break; sleep 0.1; done
+  ps -o args= -p "$ndpid" 2>/dev/null | grep -q -- no-docker && kill -KILL "$ndpid"
+  wait "$ndpid" 2>/dev/null
+  sleep 0.5
+  t26_alive=$(t24_left "$w" "$tag")
+  w26=$(new_work) || exit 2
+  "$nd" --work "$w26" /usr/bin/touch "$w26/ran" >"$work/t26b.out" 2>&1
+  r=$?
+  t26_mark=""
+  regular "$w/mark" && t26_mark=$(cat "$w/mark")
+  # Data the sandboxed command wrote: accepted only as the name of a marker
+  # directory that did not exist before this case (one path component).
+  case ${t26_mark#"$ndtmp"/} in no-docker-mark.*[!A-Za-z0-9_]* | "$t26_mark") t26_mark="" ;; no-docker-mark.?*) ;; *) t26_mark="" ;; esac
+  case "
+$t26_before
+" in *"
+${t26_mark#"$ndtmp"/}
+"*) t26_mark="" ;; esac
+  [ -n "$t26_mark" ] && [ -d "$t26_mark" ] && [ ! -L "$t26_mark" ] || t26_mark=""
+  t26_end=1
+  if [ -n "$t26_mark" ] && python3 -I "$root/scripts/ci/no-docker-probe.py" --end "$t26_mark" >/dev/null 2>&1; then
+    t26_end=0
+    rm -rf "$t26_mark"
+  fi
+  t26_left=$(t24_left "$w" "$tag")
+  t24_clean "$w" "$tag"
+  w26c=$(new_work) || exit 2
+  "$nd" --work "$w26c" /usr/bin/touch "$w26c/ran" >/dev/null 2>&1
+  r2=$?
+  [ -n "$t26_alive" ] && [ "$r" -eq 125 ] && [ ! -e "$w26/ran" ] && grep -q 'earlier isolated run' "$work/t26b.out" &&
+    [ "$t26_end" -eq 0 ] && [ -z "$t26_left" ] && [ "$r2" -eq 0 ] && [ -e "$w26c/ran" ]
+  result "T-26 after SIGKILL of no-docker.sh its leftovers keep every new run from starting until they are ended" $? \
+    "(left after SIGKILL:${t26_alive:- none}; new run rc $r; ended through the marker $t26_end; afterwards rc $r2)"
+
+  # T-27: if the processes of the isolation cannot be found or ended (here:
+  # no-docker-probe.py fails), nothing runs.
+  mkdir -p "$work/t27"
+  t27() { # mode
+    local w
+    printf '#!/bin/sh\ncase " $* " in *" %s "*) exit 1 ;; esac\nexec %s "$@"\n' "$1" "$(command -v python3)" >"$work/t27/python3"
+    chmod +x "$work/t27/python3"
+    w=$(new_work) || exit 2
+    PATH=$work/t27:$PATH "$nd" --work "$w" /usr/bin/touch "$w/ran" >/dev/null 2>&1
+    r=$?
+    [ "$r" -ne 0 ] && [ ! -e "$w/ran" ]
+    result "T-27 no-docker-probe.py $1 fails: the command is not run" $? "(rc $r)"
+  }
+  t27 --markers
+  t27 --orphans
+  t27 --supervise
+
+  # --- T-28 no debugger access to a process outside (A-M2). The canaries
+  # are copies of /bin/sleep in this suite's directory, signed ad hoc with
+  # get-task-allow, so that a debugger of the same user may attach to them;
+  # the control attaches to one from outside and reads the other's memory
+  # map. Inside, ptrace(PT_ATTACHEXC) on the other must fail (EPERM), its
+  # task name port and its memory map (vmmap) must be refused, and it must
+  # still run.
+  # On dfb6ee4: the profile denied none of these, so the attach from inside
+  # succeeded (and ended the canary when the attacher exited).
+  t28c=$work/t28-sleep
+  cp /bin/sleep "$t28c" &&
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+      '<plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>' >"$work/t28.plist" &&
+    codesign -f -s - --entitlements "$work/t28.plist" "$t28c" >/dev/null 2>&1 || exit 2
+  t28_attach='
+import ctypes, errno, subprocess, sys
+libc = ctypes.CDLL(None, use_errno=True)
+pid = int(sys.argv[1])
+if sys.argv[2] == "inside":
+    me = ctypes.c_uint.in_dll(libc, "mach_task_self_").value
+    port = ctypes.c_uint(0)
+    kr = libc.task_name_for_pid(me, pid, ctypes.byref(port))
+    vm = subprocess.run(["/usr/bin/vmmap", "--summary", str(pid)], capture_output=True, timeout=60).returncode
+    print("task-name " + ("got" if kr == 0 else "refused") + " vmmap " + ("read" if vm == 0 else "refused"), end=" ")
+r = libc.ptrace(14, pid, None, 0)  # PT_ATTACHEXC
+print("attached" if r == 0 else "denied " + errno.errorcode.get(ctypes.get_errno(), "?"))
+'
+  "$t28c" 60 &
+  t28a=$!
+  "$t28c" 60 &
+  t28b=$!
+  sleep 0.3
+  t28_vm=$(/usr/bin/vmmap --summary "$t28b" >/dev/null 2>&1 && echo read || echo refused)
+  t28_out=$(python3 -I -c "$t28_attach" "$t28a" outside 2>&1)
+  t28_in=$("$nd" python3 -I -c "$t28_attach" "$t28b" inside 2>/dev/null)
+  r=$?
+  t28_state=$(ps -o stat= -p "$t28b" 2>/dev/null | tr -d ' ')
+  for p in "$t28a" "$t28b"; do
+    ps -o args= -p "$p" 2>/dev/null | grep -q -- "$t28c" && kill -KILL "$p" 2>/dev/null
+  done
+  wait "$t28a" "$t28b" 2>/dev/null
+  [ "$t28_out" = attached ] && [ "$t28_vm" = read ] && [ "$r" -eq 0 ] &&
+    [ "$t28_in" = "task-name refused vmmap refused denied EPERM" ] && case $t28_state in S*) true ;; *) false ;; esac
+  result "T-28 a debugger attach, task port or memory map of a process outside is refused from inside (control: they work from outside)" $? \
+    "(outside: $t28_out, vmmap $t28_vm; inside rc $r: $t28_in; canary state ${t28_state:-gone})"
+
+  # --- T-29 another terminal cannot be read from inside: a pseudo-terminal
+  # this case opens outside stands for one; its device is opened by path
+  # (control: outside it can be, and a line written to it is read).
+  # On dfb6ee4: the profile allowed reading /dev/ttys*, so the line typed
+  # into another terminal was read.
+  t29=$(python3 -I -c '
+import os, pty, select, subprocess, sys
+probe = "import os, select, sys\ntry:\n    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)\nexcept OSError as e:\n    print(\"denied\", e.errno)\n    sys.exit(0)\nr, _, _ = select.select([fd], [], [], 5)\nprint(\"read\" if r and os.read(fd, 64) else \"opened\")\n"
+out = []
+for where in ("outside", "inside"):
+    master, slave = pty.openpty()
+    argv = [sys.executable, "-I", "-c", probe, os.ttyname(slave)]
+    if where == "inside":
+        argv = [sys.argv[1]] + argv
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    select.select([], [], [], 1.5)
+    os.write(master, b"typed\n")
+    try:
+        o, _ = p.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        o, _ = p.communicate()
+    out.append(f"{where}:{o.strip()}")
+    os.close(master)
+    os.close(slave)
+print(" ".join(out))
+' "$nd" 2>&1)
+  [ "$t29" = "outside:read inside:denied 1" ]
+  result "T-29 another terminal's device cannot be read from inside (control: it can from outside)" $? "($t29)"
 else
-  echo "INFO  T-06, T-08 to T-15 skipped: macOS sandbox profile only"
+  echo "INFO  T-06, T-08 to T-15, T-21, T-22, T-24 to T-29 skipped: macOS sandbox profile only"
 fi
 
 # --- T-07 loopback ports listening before the isolation
@@ -881,6 +1158,28 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
 else
   echo "INFO  T-16, T-17, T-18 skipped: Linux (GitHub-hosted runner) only"
 fi
+
+# --- T-20 code that runs inside the isolation uses no here-document or
+# here-string (static): on macOS bash 3.2 would need /tmp for them, which
+# the sandbox does not allow, so one would fail there (and a missed failure
+# can look like a pass). The suites, the scripts they run and bin/devenv;
+# the payload is checked by its hash. The one allowed match is the edge
+# guard's test text for a Caddyfile here-document.
+t20=$(cd "$root" && grep -nE "(^|[^<])<<-?[[:space:]]*[\"'\\\\]?[A-Za-z_]|<<<" -- bin/devenv tests/devenv/unit.sh \
+  tests/devenv/tally.sh scripts/ci/no-docker.sh scripts/ci/guard-*.sh scripts/ci/tests/guard-*.test.sh 2>&1 |
+  grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | grep -vF 'heredoc (<<) is not supported')
+printf '%s\n' "$t20" | grep . | sed 's/^/INFO    /'
+[ -z "$t20" ]
+result "T-20 code run inside the isolation has no here-document or here-string" $?
+
+# --- T-23 the helpers this suite runs outside any isolation are pinned to
+# reviewed hashes in this file (static): none is hashed after it was
+# written. On dfb6ee4: canary.py and drive.sh were written with
+# here-documents and their sha256 taken afterwards.
+grep -qE '^helper_sums="canary\.py=[0-9a-f]{64} drive\.sh=[0-9a-f]{64} payload=[0-9a-f]{64}"$' "$here/no-docker.test.sh" &&
+  ! grep -nE '^[^#]*helper_sums=.*\$\(' "$here/no-docker.test.sh" >/dev/null &&
+  ! grep -nE '^[^#]*>"?\$helpers/' "$here/no-docker.test.sh" >/dev/null
+result "T-23 the helpers run outside any isolation are pinned to reviewed sha256 values, not hashed after writing" $?
 
 # --- T-19 CI order (static): no step that is not isolated follows an
 # isolated one in a job; the required jobs exist; no if: conditions.
