@@ -1487,7 +1487,7 @@ s.listen(64)
 with open(pidfile + ".tmp", "w") as f:
     f.write(str(os.getpid()))
 os.rename(pidfile + ".tmp", pidfile)
-time.sleep(120)
+time.sleep(400)
 PY
   t37_listen() { # dir pidfile [prefix command...]: start a listener on dir/s
     local d=$1 pf=$2
@@ -1581,19 +1581,19 @@ result "T-23 the helpers run outside any isolation are pinned to reviewed sha256
 # --- T-36 the Linux rules of no-docker-probe.py as pure functions, on both
 # platforms: fixtures only (every call that would read /proc, open a file
 # or socket, run a program or fork raises), the probe's functions called by
-# what runs (W) and mutated copies of the probe rejected (M1 to M11). The
+# what runs (W) and mutated copies of the probe rejected (M1 to M13). The
 # numbers of assertions are fixed here: a case that loses one fails.
 # On 85cfb37: the NSpid rule accepted only a /proc of an ancestor namespace
 # (M1), an empty socket list passed, and no fast listing existed.
 t36=$(python3 -I -B "$here/no-docker-probe-unit.py" "$root/scripts/ci/no-docker-probe.py" 2>&1)
 t36_rc=$?
 printf '%s\n' "$t36" | grep -vE '^ok   ' | sed 's/^/INFO    /'
-for want in C01=2 C02=13 C03=12 C04=14 C05=9 C06=13 C07=5 C08=42 C09=4 C10=8 W=10 M=11; do
+for want in C01=2 C02=13 C03=12 C04=14 C05=9 C06=15 C07=6 C08=45 C09=4 C10=8 W=10 M=13; do
   tag=${want%=*}
   n=$(printf '%s\n' "$t36" | grep -cE "^ok   ${tag}[0-9]* ")
   bad=$(printf '%s\n' "$t36" | grep -cE "^FAIL ${tag}[0-9]* ")
   [ "$t36_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
-    printf '%s\n' "$t36" | grep -qx 'SUMMARY 143 ok, 0 failed'
+    printf '%s\n' "$t36" | grep -qx 'SUMMARY 151 ok, 0 failed'
   result "T-36 $tag: $n of ${want#*=} assertions pass" $? "(rc $t36_rc, $bad failed)"
 done
 

@@ -7,7 +7,7 @@ open a file or socket, run a program, fork or enter a namespace is replaced
 by one that raises: the rules are tested on fixtures only, never on this
 machine. Each assertion prints "ok   <case> <text>" or "FAIL <case> <text>";
 the cases are C01 to C10 (the regression cases of FCRM-SEC-019), W (the
-probe calls the tested functions) and M1 to M11 (mutated copies of the
+probe calls the tested functions) and M1 to M13 (mutated copies of the
 probe, each of which must fail at least one assertion of its case). The
 last line is "SUMMARY <ok> ok, <failed> failed". Exit 0 only if nothing
 failed; 2 if a mutant cannot be made exactly.
@@ -196,6 +196,8 @@ def c06(P, emit):
             ("an nsfs file", lambda v: v.update({"/x": mount("/x", "nsfs")})),
             ("/proc with hidepid=2", lambda v: v["/proc"].update(super=["rw", "hidepid=2"])),
             ("/proc with hidepid=invisible", lambda v: v["/proc"].update(super=["rw", "hidepid=invisible"])),
+            ("/proc with hidepid=noaccess", lambda v: v["/proc"].update(super=["rw", "hidepid=noaccess"])),
+            ("/proc with hidepid=ptraceable", lambda v: v["/proc"].update(super=["rw", "hidepid=ptraceable"])),
             ("/proc with subset=pid", lambda v: v["/proc"].update(opts=["rw", "subset=pid"])),
             ("/proc not a procfs", lambda v: v["/proc"].update(fstype="tmpfs")),
             ("/proc missing", lambda v: v.pop("/proc")),
@@ -216,6 +218,8 @@ def c07(P, emit):
     emit("C07", not passes(ev([], [])), "rejected: an empty list proves nothing")
     emit("C07", not passes(P["eval_stdio"]([(0, "unix socket"), (1, "pipe"), (2, "pipe")])),
          "rejected: a standard descriptor is a Unix socket")
+    emit("C07", not passes(P["eval_stdio"]([(0, "pipe"), (1, "socket"), (2, "pipe")])),
+         "rejected: a standard descriptor is a TCP socket")
     emit("C07", passes(P["eval_stdio"]([(0, "character device"), (1, "pipe"), (2, "pipe")])), "pipes and /dev/null pass")
 
 
@@ -293,6 +297,12 @@ def c08(P, emit):
     emit("C08", P["uring_sockets"]("pos:\t0\nUserFiles:\t2\n    0: socket:[12]\n    1: /tmp/f\nUserBufs:\t0\n") == {12},
          "the sockets of an io_uring's registered files are read")
     emit("C08", raises(lambda: P["uring_sockets"]("pos:\t0\nSqThread:\t-1\n")), "rejected: an io_uring without its file table")
+    emit("C08", P["uring_sockets"]("UserFiles:\t3\n    0: pipe:[7]\n    1: anon_inode:[eventfd]\n    2: /x\nUserBufs:\t0\n") == set(),
+         "an io_uring with a pipe, an eventfd and a file holds no socket")
+    emit("C08", raises(lambda: P["uring_sockets"]("UserFiles:\t2\n    0: socket:[12]\nUserBufs:\t0\n")),
+         "rejected: an io_uring showing fewer entries than its count (its lock was busy)")
+    emit("C08", raises(lambda: P["uring_sockets"]("UserFiles:\t1\n    0: UNIX-STREAM\nUserBufs:\t0\n")),
+         "rejected: an io_uring naming a socket by its protocol only (kernels before 6.16)")
     host = P["parse_mountinfo"](
         b"25 1 259:1 / / rw - ext4 /dev/root rw\n"
         b"40 25 259:1 /home/runner/x /mnt/x rw - ext4 /dev/root rw\n"
@@ -463,8 +473,8 @@ MUTANTS = [
      '    if not good:\n        return False\n    after()', '    after()\n    if not good:\n        return False'),
     ("M7", "C08", "the link count not checked",
      '    if nlink != 1:\n        return f"its file has', '    if False:\n        return f"its file has'),
-    ("M8", "C08", "an io_uring without its file table tolerated",
-     '    if not sep:\n        raise Incomplete("an io_uring', '    if False:\n        raise Incomplete("an io_uring'),
+    ("M8", "C08", "an io_uring's partial file table tolerated",
+     '    if not count.strip().isdigit() or len(entries) != int(count):', '    if False:'),
     ("M9", "C08", "only the path itself, no alias",
      'return sorted({rebase(path, m["root"], m["point"]) for m in entries\n                   if m["dev"] == dev and under(path, m["root"])})',
      'return [path]'),
@@ -472,6 +482,10 @@ MUTANTS = [
      'struct.pack("<BBHIIIII", LINUX_AF_UNIX, 0, 0, 0xFFFFFFFF,', 'struct.pack("<BBHIIIII", LINUX_AF_UNIX, 0, 0, 1 << 10,'),
     ("M11", "C03", "any unreadable process skipped",
      '            if not gone(st):\n                foreign.append', '            if False:\n                foreign.append'),
+    ("M12", "C02", "the caller's pid namespace not checked",
+     '(caller == INIT_PID_NS, f"the caller is', '(True, f"the caller is'),
+    ("M13", "C02", "NSpid containing the pid accepted",
+     '(nspid.split() == [str(pid)], f"/proc shows', '(str(pid) in nspid.split(), f"/proc shows'),
 ]
 
 

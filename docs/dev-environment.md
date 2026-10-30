@@ -618,7 +618,8 @@ stop it. So the list is every path to every live, bound pathname socket of
 every network namespace:
 
 - **Fast listing** (`no-docker-probe.py --sockets-fast`, as root through
-  `sudo -n timeout -s KILL 15`, in at most 10 seconds). It writes nothing;
+  `sudo -n timeout -s KILL 15`: it gives up after 10 seconds and is killed
+  at 15). It writes nothing;
   its list reaches the run's directory through the caller's redirection.
   1. It finds every network namespace that has a process, a bind mount or
      an open descriptor, and has the kernel list every Unix socket of each
@@ -626,7 +627,9 @@ every network namespace:
      file), in a child process per namespace that the deadline kills.
   2. Every Unix socket that a process holds, in its descriptor table or in
      an io_uring's registered files, must be in one of those lists (one
-     retry); otherwise a network namespace was missed.
+     retry); otherwise a network namespace was missed. An io_uring whose
+     registered files the kernel shows only in part, or names a socket in
+     them only by its protocol (kernels before 6.16), counts as missed.
   3. Every bound socket must be found again at its name in the host's
      mount tree as the same file (device and inode, checked on the opened
      file), with one link, on a local file system (ext2/3/4, xfs, btrfs,
@@ -715,7 +718,7 @@ The probe checks from inside:
   a runner, init or engine process, so `/proc/<pid>/root` and `nsenter`
   have no target outside;
 - the process is in a session of its own without a controlling terminal,
-  so `TIOCSTI` has no target; none of its standard descriptors is a Unix
+  so `TIOCSTI` has no target; none of its standard descriptors is a
   socket;
 - loopback is the only interface;
 - `/tmp`, `/var/tmp`, `/dev/shm` and `/run` are tmpfs, and `/dev/mqueue` an
@@ -988,7 +991,7 @@ in the test's directories or send signal 0 or TERM to the test's own
   netlink parser, the device and alias computations, the budgets and the
   gate, on fixtures only, with every call that would read `/proc`, open a
   file or socket, run a program or fork made to raise. The number of
-  assertions per case is fixed in the suite; eleven mutated copies of the
+  assertions per case is fixed in the suite; thirteen mutated copies of the
   probe (among them the old `NSpid` rule) must each be rejected, and a
   check that the probe calls the tested functions must pass.
 - **T-19:** the static CI order check, on both platforms.
