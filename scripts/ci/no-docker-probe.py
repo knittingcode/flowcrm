@@ -14,18 +14,22 @@ and by `no-docker.sh --check`. Exit 0 only if
         /private/var/tmp, while $TMPDIR (inside the run's directory) is
         writable;
       Linux: not uid 0, no capability in any set, no_new_privs, no
-        supplementary group; network, mount, pid and IPC namespaces that
-        differ from the caller's (NO_DOCKER_HOST_NS); a pid namespace below
-        the caller's whose pid 1 is the root shell of no-docker.sh and whose
-        other processes are all ours; a session of our own without a
-        controlling terminal; only the loopback interface; /tmp, /var/tmp,
+        supplementary group, a primary group that is not a system group;
+        network, mount, pid and IPC namespaces that differ from the caller's
+        (NO_DOCKER_HOST_NS); a pid namespace below the caller's (the caller's
+        is the initial one, ours is not), with a /proc of its own (NSpid is
+        our pid alone, /proc/self is our pid) that hides no process, whose
+        pid 1 is the root shell of no-docker.sh and whose other processes
+        are all ours; a session of our own without a controlling terminal;
+        no standard descriptor that is a Unix socket; only the loopback
+        interface; /tmp, /var/tmp,
         /dev/shm, /run and /dev/mqueue are new file systems
         (NO_DOCKER_HOST_DEVS) and /sys/fs/cgroup is masked; every other
         mount reachable by path is read-only; writes to $HOME,
         $GITHUB_WORKSPACE and $RUNNER_TEMP (NO_DOCKER_PROTECTED) fail; no
         cgroup file is writable; no socket in the private directories; and
         no Unix socket that no-docker.sh listed outside (NO_DOCKER_SOCKETS)
-        accepts a connection;
+        accepts a connection, of a list that is not empty;
   - and no container engine answers on any endpoint we can find: the
     usual socket paths of Docker Engine, Docker Desktop, rootless Docker,
     Podman, Colima, OrbStack and Rancher Desktop; every endpoint of the
@@ -41,10 +45,16 @@ mechanism checks passed. Prints one line per check.
 
 Modes used by no-docker.sh outside the isolation:
   --listening   print the listening TCP port numbers (macOS), one per line;
-  --sockets     print, NUL-separated, every Unix socket path on the local
-                file systems and every bound pathname socket of this
-                network namespace (Linux); fails when its time budget runs
-                out;
+  --sockets-fast
+                as root: print, NUL-separated, every path to every live
+                bound pathname Unix socket of every network namespace, from
+                the kernel's socket lists (Linux); exit 3, with the paths
+                found so far, unless the list is shown complete within 10 s;
+  --sockets [BUDGET]
+                the walk: print, NUL-separated, every Unix socket path on
+                the local file systems and every bound pathname socket of
+                this network namespace (Linux); fails when its time budget
+                (180 s) runs out;
   --seal WORK   as root in the new mount namespace: make every mount
                 reachable by path read-only, except the private file systems
                 and WORK, and verify it (Linux);
@@ -67,13 +77,16 @@ import concurrent.futures
 import ctypes
 import errno
 import glob
+import grp
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -750,6 +763,13 @@ PRIVATE = (("/tmp", "tmpfs"), ("/var/tmp", "tmpfs"), ("/dev/shm", "tmpfs"), ("/r
            ("/dev/mqueue", "mqueue"))
 HOST_COMMS = {"systemd", "init", "Runner.Worker", "Runner.Listener", "dockerd", "containerd", "sshd",
               "containerd-shim", "rootlesskit", "podman", "dbus-daemon"}
+# The initial pid namespace, from which every other one descends: its inode
+# number is fixed (PROC_PID_INIT_INO); every other namespace gets a number
+# of 0xF0000000 or above.
+INIT_PID_NS = "pid:[4026531836]"
+# Debian and Ubuntu give system groups (docker, disk, adm, shadow,
+# systemd-journal, ...) gids up to 999.
+SYS_GID_MAX = 999
 
 
 def unescape(s):
@@ -763,7 +783,8 @@ def mounts():
             fields = line.split()
             sep = fields.index("-")
             entries.append({"id": int(fields[0]), "point": unescape(fields[4]),
-                            "opts": fields[5].split(","), "fstype": fields[sep + 1]})
+                            "opts": fields[5].split(","), "fstype": fields[sep + 1],
+                            "super": fields[sep + 3].split(",") if len(fields) > sep + 3 else []})
     return entries
 
 
@@ -832,32 +853,525 @@ def seal(work):
     return 0
 
 
-def enumerate_sockets(budget=180):
-    """Every socket file on the local file systems (find -xdev per mount)
-    and every bound pathname socket of this network namespace
-    (/proc/net/unix, what ss -xl shows). Raises when the budget runs out."""
-    start = time.monotonic()
+def proc_net_unix_paths():
+    """The bound pathname sockets of this network namespace (/proc/net/unix,
+    what ss -xl shows)."""
     found = set()
-    points = sorted({m["point"] for m in mounts() if m["fstype"] not in PSEUDO})
-    for p in points:
-        left = budget - (time.monotonic() - start)
-        if left <= 0:
-            raise TimeoutError(f"the {budget}s budget ran out before {p}")
-        try:
-            r = subprocess.run(["find", p, "-xdev", "-type", "s", "-print0"], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=left)
-        except subprocess.TimeoutExpired:
-            raise TimeoutError(f"the {budget}s budget ran out in {p}") from None
-        if r.returncode not in (0, 1):  # 1: some directories were unreadable
-            raise OSError(f"find {p} exited with {r.returncode}")
-        found.update(x for x in r.stdout.split(b"\0") if x)
     with open("/proc/net/unix", "rb") as f:
         next(f)
         for line in f:
             parts = line.split(None, 7)
             if len(parts) == 8 and parts[7].startswith(b"/"):
                 found.add(parts[7].rstrip(b"\n"))
-    return sorted(found), len(points), time.monotonic() - start
+    return found
+
+
+def enumerate_sockets(budget=180, clock=time.monotonic, run=subprocess.run, entries=None):
+    """The walk: every socket file on the local file systems (find -xdev per
+    mount, as the calling user) and every bound pathname socket of this
+    network namespace. Raises when the budget runs out."""
+    start = clock()
+    found = set()
+    points = sorted({m["point"] for m in (mounts() if entries is None else entries) if m["fstype"] not in PSEUDO})
+    for p in points:
+        left = budget - (clock() - start)
+        if left <= 0:
+            raise TimeoutError(f"the {budget:g}s budget ran out before {p}")
+        try:
+            r = run(["find", p, "-xdev", "-type", "s", "-print0"], stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, timeout=left)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(f"the {budget:g}s budget ran out in {p}") from None
+        if r.returncode not in (0, 1):  # 1: some directories were unreadable
+            raise OSError(f"find {p} exited with {r.returncode}")
+        found.update(x for x in r.stdout.split(b"\0") if x)
+    found |= proc_net_unix_paths()
+    return sorted(found), len(points), clock() - start
+
+
+# The fast listing (--sockets-fast, as root, outside the namespaces). A
+# pathname Unix socket accepts a connection only while a socket is bound to
+# its inode, and connecting finds that socket by inode whatever network
+# namespace it is in; a read-only mount does not stop it. So what must not
+# be reachable inside is every live, bound pathname socket of every network
+# namespace, at every path the mount tree leads to its inode by. The kernel
+# lists them (sock_diag, UNIX_DIAG_VFS: the device and inode of the bound
+# file). The listing is used only if it is shown complete: every Unix
+# socket any process holds (fd tables, io_uring tables) is in a listed
+# network namespace, and every bound socket is found again at its name as
+# the same inode with one link on a local file system, so its paths are the
+# mounts of its file system that contain it. Anything else, any error and
+# running out of time (Incomplete) make no-docker.sh run the walk.
+
+NLMSG_ERROR, NLMSG_DONE = 2, 3
+NLM_F_REQUEST, NLM_F_DUMP, NLM_F_DUMP_INTR = 0x1, 0x300, 0x10
+NETLINK_SOCK_DIAG, SOCK_DIAG_BY_FAMILY = 4, 20
+UDIAG_SHOW_NAME, UDIAG_SHOW_VFS = 0x1, 0x2
+UNIX_DIAG_NAME, UNIX_DIAG_VFS = 0, 1
+LINUX_AF_UNIX, LINUX_MSG_TRUNC, LINUX_CLONE_NEWNET = 1, 0x20, 0x40000000
+# File systems whose link counts and inode numbers are the kernel's own.
+# On FUSE, NFS, 9p, CIFS, virtiofs or overlayfs a server or the layers
+# decide them, so one link does not mean one name there: the walk runs.
+LOCAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "devtmpfs", "hugetlbfs"}
+FAST_BUDGET = 10.0
+
+
+class Incomplete(Exception):
+    """The fast listing cannot show that it saw every live socket."""
+
+
+class NoEnd(Incomplete):
+    """The socket dump has not ended yet (more replies to read)."""
+
+
+class Deadline:
+    def __init__(self, seconds, clock=time.monotonic):
+        self.seconds, self.clock = seconds, clock
+        self.end = clock() + seconds
+
+    def left(self):
+        return self.end - self.clock()
+
+    def check(self, what):
+        if self.left() <= 0:
+            raise Incomplete(f"the {self.seconds:g}s budget ran out {what}")
+
+
+def nl_align(n):
+    return (n + 3) & ~3
+
+
+def diag_request(seq):
+    """A dump request for every AF_UNIX socket in every state, with its name
+    and the device and inode of its file."""
+    req = struct.pack("<BBHIIIII", LINUX_AF_UNIX, 0, 0, 0xFFFFFFFF, 0, UDIAG_SHOW_NAME | UDIAG_SHOW_VFS,
+                      0xFFFFFFFF, 0xFFFFFFFF)
+    return struct.pack("<IHHII", 16 + len(req), SOCK_DIAG_BY_FAMILY, NLM_F_REQUEST | NLM_F_DUMP, seq, 0) + req
+
+
+def parse_diag_msg(payload):
+    """One unix_diag_msg: {"ino", "path" (bytes, None unless bound to a
+    path), "vfs" ((inode, device) of the bound file, else None)}."""
+    if len(payload) < 16:
+        raise Incomplete("a socket record is cut short")
+    family, _, _, _, ino, _, _ = struct.unpack_from("<BBBBIII", payload)
+    if family != LINUX_AF_UNIX:
+        raise Incomplete(f"a socket record of family {family}")
+    name = vfs = None
+    off = 16
+    while off < len(payload):
+        if len(payload) - off < 4:
+            raise Incomplete(f"socket {ino}: an attribute is cut short")
+        alen, atype = struct.unpack_from("<HH", payload, off)
+        if alen < 4 or off + alen > len(payload):
+            raise Incomplete(f"socket {ino}: an attribute of length {alen} overruns its record")
+        body = payload[off + 4:off + alen]
+        if atype == UNIX_DIAG_NAME:
+            name = bytes(body)
+        elif atype == UNIX_DIAG_VFS:
+            if len(body) != 8:
+                raise Incomplete(f"socket {ino}: a file attribute of {len(body)} bytes")
+            vfs = struct.unpack("<II", body)
+        off += nl_align(alen)
+    path = None
+    if name is not None and name[:1] not in (b"", b"\0"):  # a leading NUL: abstract
+        path = name.split(b"\0", 1)[0]
+    if (vfs is None) != (path is None):
+        raise Incomplete(f"socket {ino}: its name and its file disagree")
+    return {"ino": ino, "path": path, "vfs": vfs}
+
+
+def parse_diag(batches, seq):
+    """The records of a complete dump. batches: (data, flags, sender port)
+    of every reply read. Raises NoEnd while the end marker is missing and
+    Incomplete on anything else that is not exactly a whole dump."""
+    out = []
+    for n, (data, flags, sender) in enumerate(batches):
+        if flags & LINUX_MSG_TRUNC:
+            raise Incomplete("a netlink reply was truncated")
+        if sender != 0:
+            raise Incomplete(f"a netlink reply came from port {sender}, not the kernel")
+        off = 0
+        while off < len(data):
+            if len(data) - off < 16:
+                raise Incomplete("a netlink header is cut short")
+            length, mtype, mflags, mseq, _ = struct.unpack_from("<IHHII", data, off)
+            if length < 16 or off + length > len(data):
+                raise Incomplete(f"a netlink message of length {length} overruns its reply")
+            if mseq != seq:
+                raise Incomplete(f"a netlink message of sequence {mseq}, not {seq}")
+            if mflags & NLM_F_DUMP_INTR:
+                raise Incomplete("the socket dump was interrupted")
+            if mtype == NLMSG_DONE:
+                if off + nl_align(length) < len(data) or n != len(batches) - 1:
+                    raise Incomplete("data after the end of the socket dump")
+                return out
+            if mtype == NLMSG_ERROR:
+                code = struct.unpack_from("<i", data, off + 16)[0] if length >= 20 else 0
+                raise Incomplete(f"the socket dump failed ({os.strerror(-code) if code < 0 else code})")
+            if mtype != SOCK_DIAG_BY_FAMILY:
+                raise Incomplete(f"a netlink message of type {mtype}")
+            out.append(parse_diag_msg(data[off + 16:off + length]))
+            off += nl_align(length)
+    raise NoEnd("the socket dump has no end marker")
+
+
+def kernel_dev(dev):
+    """(major, minor) of a kernel dev_t (s_dev, as sock_diag reports it)."""
+    return dev >> 20, dev & 0xFFFFF
+
+
+def unescape_bytes(s):
+    return re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), s)
+
+
+def parse_mountinfo(data):
+    """mountinfo as bytes: id, (major, minor), root and mount point (bytes),
+    fstype."""
+    entries = []
+    for line in data.split(b"\n"):
+        if not line:
+            continue
+        f = line.split(b" ")
+        sep = f.index(b"-")
+        major, minor = (int(x) for x in f[2].split(b":"))
+        entries.append({"id": int(f[0]), "dev": (major, minor), "root": unescape_bytes(f[3]),
+                        "point": unescape_bytes(f[4]), "fstype": f[sep + 1].decode("ascii", "replace")})
+    return entries
+
+
+def under(path, top):
+    """True if path is top or below it, by whole path components."""
+    return top == b"/" or path == top or path.startswith(top.rstrip(b"/") + b"/")
+
+
+def rebase(path, old, new):
+    """path (under old) moved from old to new."""
+    rest = path if old == b"/" else path[len(old):]
+    if not rest:
+        return new
+    return (b"" if new == b"/" else new.rstrip(b"/")) + rest
+
+
+def fs_path(root, point, canonical):
+    """The path within its file system of the file at canonical, reached
+    through the mount of root at point; None if canonical is not below it."""
+    if not under(canonical, point):
+        return None
+    return rebase(canonical, point, root)
+
+
+def aliases(entries, dev, path):
+    """Every path through which a mount of the file system dev leads to the
+    file at path within it (bind mounts of the file or of a directory above
+    it included, hidden ones too)."""
+    return sorted({rebase(path, m["root"], m["point"]) for m in entries
+                   if m["dev"] == dev and under(path, m["root"])})
+
+
+def locate_reason(mode, ino, nlink, vfs, mount, canonical):
+    """None if the file opened at a socket's name is that socket's bound file
+    with one name, else why not."""
+    vino, vdev = vfs
+    if not stat.S_ISSOCK(mode):
+        return "its name is not a socket now"
+    if ino & 0xFFFFFFFF != vino:
+        return "its name is another inode now"
+    if nlink != 1:
+        return f"its file has {nlink} links"
+    if mount is None:
+        return "its mount is not in mountinfo"
+    if mount["dev"] != kernel_dev(vdev):
+        return f"its name is on device {mount['dev'][0]}:{mount['dev'][1]}, not {kernel_dev(vdev)[0]}:{kernel_dev(vdev)[1]}"
+    if mount["fstype"] not in LOCAL_FS:
+        return f"it is on {mount['fstype']}"
+    if canonical.endswith(b" (deleted)"):
+        return "its file was removed"
+    return None
+
+
+def claim(seen, key, vfs):
+    """Record that the socket vfs is located at key ((dev, path)); two live
+    sockets located at one path mean one of them is elsewhere."""
+    if key in seen and seen[key] != vfs:
+        raise Incomplete(f"two live sockets are located at {key[1]!r}")
+    seen[key] = vfs
+
+
+def cross_check(held, dumped):
+    """The Unix sockets held by processes that no dump listed."""
+    return sorted({i & 0xFFFFFFFF for i in held} - {i & 0xFFFFFFFF for i in dumped})
+
+
+def uring_sockets(fdinfo):
+    """The sockets in the registered file table of an io_uring (its fdinfo).
+    The kernel leaves the table out when its lock is busy: Incomplete."""
+    head, sep, rest = fdinfo.partition("\nUserFiles:")
+    if not sep:
+        raise Incomplete("an io_uring's registered files are not shown")
+    table = re.split(r"\n(?=\S)", rest, maxsplit=1)[0]
+    return {int(x) for x in re.findall(r"^\s*\d+: socket:\[(\d+)\]$", table, re.M)}
+
+
+def gone(e):
+    """True for the errors of a process or fd that ended meanwhile."""
+    return e.errno in (errno.ENOENT, errno.ESRCH)
+
+
+def proc_entries(path):
+    """The numeric entries of a /proc directory; [] if the process ended."""
+    try:
+        return [d for d in os.listdir(path) if d.isdigit()]
+    except OSError as e:
+        if gone(e):
+            return []
+        raise Incomplete(f"{path}: {e.strerror}") from None
+
+
+def proc_readlink(path):
+    try:
+        return os.readlink(path)
+    except OSError as e:
+        if gone(e):
+            return None
+        raise Incomplete(f"{path}: {e.strerror}") from None
+
+
+def scan_tasks(deadline):
+    """Every network namespace with a task, a bind mount or an open fd
+    ({inode: [(path, nofollow)]}), the Unix sockets held in fd tables and in
+    io_uring tables, and whether pid 1 was seen."""
+    nets, held, uring, mntns = {}, set(), set(), set()
+    pid1 = False
+    for pid in proc_entries("/proc"):
+        deadline.check("while scanning the processes")
+        # An exited thread group leader has no namespace links, but its
+        # other threads may still run: they are scanned below.
+        mnt = proc_readlink(f"/proc/{pid}/ns/mnt")
+        if mnt is not None and mnt not in mntns:
+            mntns.add(mnt)
+            try:
+                with open(f"/proc/{pid}/mountinfo", "rb") as f:
+                    info = parse_mountinfo(f.read())
+            except OSError as e:
+                if not gone(e):
+                    raise Incomplete(f"/proc/{pid}/mountinfo: {e.strerror}") from None
+                mntns.discard(mnt)
+                info = []
+            for m in info:
+                r = re.fullmatch(rb"net:\[(\d+)\]", m["root"])
+                if m["fstype"] == "nsfs" and r:
+                    nets.setdefault(int(r.group(1)), []).append((f"/proc/{pid}/root".encode() + m["point"], True))
+        for tid in proc_entries(f"/proc/{pid}/task"):
+            base = f"/proc/{pid}/task/{tid}"
+            net = proc_readlink(f"{base}/ns/net")
+            r = re.fullmatch(r"net:\[(\d+)\]", net or "")
+            if r:
+                nets.setdefault(int(r.group(1)), []).append((f"{base}/ns/net".encode(), False))
+            for fd in proc_entries(f"{base}/fd"):
+                link = proc_readlink(f"{base}/fd/{fd}") or ""
+                if link.startswith("socket:["):
+                    try:
+                        proto = os.getxattr(f"{base}/fd/{fd}", "system.sockprotoname")
+                    except OSError as e:
+                        if gone(e):
+                            continue
+                        raise Incomplete(f"{base}/fd/{fd}: {e.strerror}") from None
+                    if proto.startswith(b"UNIX"):
+                        held.add(int(link[8:-1]))
+                elif re.fullmatch(r"net:\[\d+\]", link):
+                    nets.setdefault(int(link[5:-1]), []).append((f"{base}/fd/{fd}".encode(), False))
+                elif link == "anon_inode:[io_uring]":
+                    try:
+                        with open(f"{base}/fdinfo/{fd}") as f:
+                            uring |= uring_sockets(f.read())
+                    except OSError as e:
+                        if not gone(e):
+                            raise Incomplete(f"{base}/fdinfo/{fd}: {e.strerror}") from None
+        pid1 = pid1 or pid == "1"
+    return nets, held, uring, pid1
+
+
+def setns(fd, nstype):
+    if hasattr(os, "setns"):
+        os.setns(fd, nstype)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.setns(fd, nstype) != 0:
+        raise OSError(ctypes.get_errno(), "setns failed")
+
+
+def open_netns(path, nofollow, ino):
+    """An fd of network namespace ino, opened through path only once the
+    object there is shown to be that namespace (O_PATH opens nothing)."""
+    fd = os.open(path, os.O_PATH | os.O_CLOEXEC | (os.O_NOFOLLOW if nofollow else 0))
+    try:
+        if os.readlink(f"/proc/self/fd/{fd}") != f"net:[{ino}]":
+            raise OSError(errno.EINVAL, f"not network namespace {ino}")
+        return os.open(f"/proc/self/fd/{fd}", os.O_RDONLY | os.O_CLOEXEC)
+    finally:
+        os.close(fd)
+
+
+def diag_dump(timeout):
+    """Every Unix socket of this network namespace (sock_diag)."""
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW | socket.SOCK_CLOEXEC, NETLINK_SOCK_DIAG)
+    try:
+        s.settimeout(timeout)
+        s.bind((0, 0))
+        s.sendto(diag_request(1), (0, 0))
+        batches = []
+        while True:
+            data, _, flags, addr = s.recvmsg(1 << 17)
+            batches.append((data, flags, addr[0]))
+            try:
+                return parse_diag(batches, 1)
+            except NoEnd:
+                continue
+    finally:
+        s.close()
+
+
+def dump_netns(ino, fd, deadline):
+    """diag_dump in network namespace ino, in a child process the deadline
+    kills: setns stays confined to it, and a blocked call cannot hold up
+    the listing."""
+    r, w = os.pipe()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.close(r)
+            setns(fd, LINUX_CLONE_NEWNET)
+            if os.readlink("/proc/thread-self/ns/net") != f"net:[{ino}]":
+                raise Incomplete("setns did not enter the namespace")
+            recs = diag_dump(max(deadline.left(), 0.1))
+            out = {"complete": True, "records": [[x["ino"], x["path"].hex() if x["path"] is not None else None,
+                                                  list(x["vfs"]) if x["vfs"] else None] for x in recs]}
+        except BaseException as e:  # reported to the parent, which falls back
+            out = {"error": f"{type(e).__name__}: {e}"[:300]}
+        data = json.dumps(out).encode()
+        try:
+            while data:
+                data = data[os.write(w, data):]
+        finally:
+            os._exit(0)
+    os.close(w)
+    chunks = []
+    try:
+        while True:
+            left = deadline.left()
+            if left <= 0 or not select.select([r], [], [], left)[0]:
+                os.kill(child, signal.SIGKILL)
+                raise Incomplete(f"the {deadline.seconds:g}s budget ran out in network namespace {ino}")
+            chunk = os.read(r, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(r)
+        os.waitpid(child, 0)
+    try:
+        out = json.loads(b"".join(chunks))
+    except ValueError:
+        raise Incomplete(f"no result from network namespace {ino}") from None
+    if out.get("complete") is not True:
+        raise Incomplete(f"network namespace {ino}: {out.get('error', 'no result')}")
+    return [{"ino": i, "path": bytes.fromhex(p) if p is not None else None, "vfs": tuple(v) if v else None}
+            for i, p, v in out["records"]]
+
+
+def mnt_id_of_fd(fd):
+    with open(f"/proc/self/fdinfo/{fd}") as f:
+        for line in f:
+            if line.startswith("mnt_id:"):
+                return int(line.split()[1])
+    raise Incomplete("no mnt_id in fdinfo")
+
+
+def locate(rec, host):
+    """(path within its file system, mount) of a bound socket's file, found
+    again at its name; Incomplete if that cannot be shown."""
+    name = rec["path"]
+    what = f"socket {name!r} (dev {kernel_dev(rec['vfs'][1])[0]}:{kernel_dev(rec['vfs'][1])[1]}, ino {rec['vfs'][0]})"
+    if not name.startswith(b"/"):
+        raise Incomplete(f"{what}: a relative name")
+    try:
+        fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Incomplete(f"{what}: {e.strerror}") from None
+    try:
+        st = os.fstat(fd)
+        mnt = mnt_id_of_fd(fd)
+        canonical = os.readlink(f"/proc/self/fd/{fd}".encode())
+    finally:
+        os.close(fd)
+    mount = next((m for m in host if m["id"] == mnt), None)
+    why = locate_reason(st.st_mode, st.st_ino, st.st_nlink, rec["vfs"], mount, canonical)
+    if why:
+        raise Incomplete(f"{what}: {why}")
+    path = fs_path(mount["root"], mount["point"], canonical)
+    if path is None:
+        raise Incomplete(f"{what}: {canonical!r} is not below its mount point")
+    return path, mount
+
+
+def fast_listing(deadline, paths):
+    """Fill paths with every path to every live bound pathname socket, and
+    return the counts for the log; Incomplete if that cannot be shown."""
+    if os.geteuid() != 0:
+        raise Incomplete("not run as root")
+    if os.readlink("/proc/self/ns/pid") != INIT_PID_NS:
+        raise Incomplete("not in the initial pid namespace")
+    if os.readlink("/proc/self") != str(os.getpid()):
+        raise Incomplete("/proc is not of this pid namespace")
+    home = os.readlink("/proc/thread-self/ns/net")
+    with open("/proc/self/mountinfo", "rb") as f:
+        host = parse_mountinfo(f.read())
+    for attempt in (1, 2):
+        nets, held, uring, pid1 = scan_tasks(deadline)
+        dumped = {}
+        for ino, handles in sorted(nets.items()):
+            deadline.check("before the socket dumps")
+            errors = []
+            for path, nofollow in handles:
+                try:
+                    fd = open_netns(path, nofollow, ino)
+                except OSError as e:
+                    errors.append(f"{path!r}: {e.strerror or e}")
+                    continue
+                try:
+                    dumped[ino] = dump_netns(ino, fd, deadline)
+                finally:
+                    os.close(fd)
+                break
+            else:
+                raise Incomplete(f"network namespace {ino} could not be entered ({'; '.join(errors[:3])})")
+        missing = cross_check(held | uring, [x["ino"] for recs in dumped.values() for x in recs])
+        if not missing:
+            break
+        if attempt == 2:
+            raise Incomplete(f"{len(missing)} Unix sockets held by processes are in no listed network namespace "
+                             f"(socket:[{missing[0]}])")
+    if not held or not pid1:
+        raise Incomplete("the process scan saw no Unix socket or not pid 1")
+    if not dumped.get(int(home[5:-1])):
+        raise Incomplete("the host network namespace listed no Unix socket")
+    seen = {}
+    live = bound = 0
+    for recs in dumped.values():
+        for rec in recs:
+            live += 1
+            if rec["path"] is None:
+                continue
+            bound += 1
+            deadline.check("while locating the bound sockets")
+            path, mount = locate(rec, host)
+            claim(seen, (mount["dev"], path), rec["vfs"])
+            paths.update(aliases(host, mount["dev"], path))
+    if os.readlink("/proc/thread-self/ns/net") != home:
+        raise Incomplete("not in the host network namespace any more")
+    paths.update(proc_net_unix_paths())
+    return {"namespaces": len(dumped), "live": live, "bound": bound, "held": len(held | uring)}
 
 
 def unix_connects(path):
@@ -895,96 +1409,219 @@ def env_pairs(name):
     return dict(x.split("=", 1) for x in os.environ.get(name, "").split() if "=" in x)
 
 
-def check_mechanism_linux():
-    me = os.getuid()
-    st = status()
+def eval_creds(st, group):
+    """Findings on this process's credentials (st: /proc/self/status)."""
     uids = st.get("Uid", "0").split()
-    report("0" not in uids, f"not root (uids {' '.join(uids)})")
     caps = {k: st.get(k, "unknown") for k in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")}
-    report(all(v != "unknown" and int(v, 16) == 0 for v in caps.values()),
-           "no capabilities (" + " ".join(f"{k}={v}" for k, v in caps.items()) + ")")
-    report(st.get("NoNewPrivs") == "1", f"no_new_privs is set ({st.get('NoNewPrivs', 'unknown')})")
-    report(st.get("Groups", "x") == "", f"no supplementary groups ({st.get('Groups') or 'none'})")
-    # The primary group is the caller's (on a runner possibly the engine
-    # socket's group): what keeps the socket away is that its path is
-    # hidden and that no listed socket accepts a connection (below).
-    print(f"no-docker: info uids {st.get('Uid', '?')}; gids {st.get('Gid', '?')}")
 
-    host_ns = env_pairs("NO_DOCKER_HOST_NS")
-    for ns in ("net", "mnt", "pid", "ipc"):
-        own = os.readlink(f"/proc/self/ns/{ns}")
-        host = host_ns.get(ns, "")
-        report(bool(host) and own != host, f"private {ns} namespace ({own}; caller {host or 'unknown'})")
-    nspid = st.get("NSpid", "").split()
-    report(len(nspid) >= 2, f"in a pid namespace below the caller's (NSpid {' '.join(nspid)})")
-    report(os.readlink("/proc/self") == str(os.getpid()), "/proc belongs to this pid namespace")
+    def zero(v):
+        return re.fullmatch(r"[0-9a-f]+", v) is not None and int(v, 16) == 0
+
+    gids = st.get("Gid", "").split()
+    plain = len(gids) == 4 and len(set(gids)) == 1 and gids[0].isdigit() and int(gids[0]) > SYS_GID_MAX
+    return [
+        ("0" not in uids, f"not root (uids {' '.join(uids)})"),
+        (all(zero(v) for v in caps.values()), "no capabilities (" + " ".join(f"{k}={v}" for k, v in caps.items()) + ")"),
+        (st.get("NoNewPrivs") == "1", f"no_new_privs is set ({st.get('NoNewPrivs', 'unknown')})"),
+        (st.get("Groups", "x") == "", f"no supplementary groups ({st.get('Groups') or 'none'})"),
+        # The primary group is the caller's: not one of the system groups,
+        # which include the one of the engine socket.
+        (plain, f"the primary group is not a system group (gids {' '.join(gids) or 'unknown'}; {group})"),
+    ]
+
+
+def eval_pidns(nspid, pid, own, host_ns, proc_self):
+    """Findings on the pid namespace. host_ns: NO_DOCKER_HOST_NS as given."""
+    callers = [x[len("pid="):] for x in host_ns.split() if x.startswith("pid=")]
+    caller = callers[0] if len(callers) == 1 else ""
+    well_formed = re.fullmatch(r"pid:\[\d+\]", own) is not None
+    return [
+        (caller == INIT_PID_NS, f"the caller is in the initial pid namespace (caller {caller or 'unknown'})"),
+        # Every pid namespace descends from the initial one: one that is
+        # not it is below the caller's.
+        (well_formed and own != INIT_PID_NS and own != caller,
+         f"in a pid namespace below the caller's ({own}; caller {caller or 'unknown'})"),
+        # A procfs shows NSpid from its own namespace down: one entry, this
+        # pid, in the namespace's own /proc; more from an ancestor's.
+        (nspid.split() == [str(pid)], f"/proc shows this process in its own pid namespace only (NSpid {nspid or 'missing'})"),
+        (proc_self == str(pid), "/proc belongs to this pid namespace"),
+    ]
+
+
+def eval_processes(entries, me):
+    """entries: (pid, its status or the OSError reading it) for every pid in
+    /proc. Only an ended process may be skipped: one that cannot be read
+    (hidepid) counts as foreign, and pid 1 must have been read."""
     foreign = []
     count = 0
-    for d in os.listdir("/proc"):
-        if not d.isdigit():
+    root = False
+    for d, st in entries:
+        if isinstance(st, OSError):
+            if not gone(st):
+                foreign.append(f"{d}:unreadable({errno.errorcode.get(st.errno, st.errno)})")
             continue
-        try:
-            pst = status(d)
-        except OSError:
-            continue  # ended meanwhile
         count += 1
-        name, puids = pst.get("Name", "?"), pst.get("Uid", "").split()
+        name, puids = st.get("Name", "?"), st.get("Uid", "").split()
         if d == "1":
-            if puids[:1] != ["0"] or name not in ("sh", "dash"):
+            root = puids[:1] == ["0"] and name in ("sh", "dash")
+            if not root:
                 foreign.append(f"1:{name}:{'/'.join(puids)}")
-        elif any(u != str(me) for u in puids) or name in HOST_COMMS:
+        elif not puids or any(u != str(me) for u in puids) or name in HOST_COMMS:
             foreign.append(f"{d}:{name}:{'/'.join(puids)}")
-    report(not foreign, f"only our processes and the root pid 1 of the isolation are visible ({count} processes"
-           + (f"; foreign: {' '.join(foreign)}" if foreign else "") + ")")
-    sid = os.getsid(0)
-    sid_ours = False
-    if sid > 1:
-        try:
-            sid_ours = all(u == str(me) for u in status(sid).get("Uid", "").split())
-        except OSError:
-            pass
-    report(sid_ours, f"a session of our own (session {sid})")
-    try:
-        os.close(os.open("/dev/tty", os.O_RDWR))
-        report(False, "no controlling terminal (TIOCSTI)")
-    except OSError as e:
-        report(True, f"no controlling terminal ({errno.errorcode.get(e.errno, e.errno)})")
+    if not root and not any(f.startswith("1:") for f in foreign):
+        foreign.append("1:missing")
+    return [(not foreign, f"only our processes and the root pid 1 of the isolation are visible ({count} processes"
+             + (f"; foreign: {' '.join(foreign)}" if foreign else "") + ")")]
 
-    names = sorted(n for _, n in socket.if_nameindex())
-    report(names == ["lo"], f"network namespace has only loopback ({' '.join(names)})")
 
-    work = os.environ.get("NO_DOCKER_RUN_DIR", "")
-    report(bool(work), f"the run's directory is known ({work or 'NO_DOCKER_RUN_DIR unset'})")
-    host_devs = env_pairs("NO_DOCKER_HOST_DEVS")
-    vis = {m["point"]: m for m in visible_mounts()}
+def eval_mounts(vis, host_devs, devs, work, left):
+    """vis: the reachable mounts by mount point; devs: st_dev of the private
+    paths; left: the mounts still writable (None without a run directory)."""
+    f = []
+    proc = vis.get("/proc")
+    hidden = [o for o in (proc or {}).get("opts", []) + (proc or {}).get("super", [])
+              if (o.startswith("hidepid=") and o not in ("hidepid=0", "hidepid=off")) or o.startswith("subset=")]
+    f.append((bool(proc) and proc["fstype"] == "proc" and not hidden,
+              f"/proc shows every process of the namespace ({','.join(hidden) or 'no hidepid or subset'})"))
     for path, fstype in PRIVATE:
         m = vis.get(path)
-        try:
-            dev = str(os.stat(path).st_dev)
-        except OSError:
-            dev = "?"
+        dev = devs.get(path, "?")
         host = host_devs.get(path, "")
-        report(bool(m) and m["fstype"] == fstype and bool(host) and dev != host,
-               f"{path} is a private {fstype} (device {dev}; caller {host or 'unknown'})")
+        f.append((bool(m) and m["fstype"] == fstype and bool(host) and dev != host,
+                  f"{path} is a private {fstype} (device {dev}; caller {host or 'unknown'})"))
     # A second procfs, or a namespace file, reachable by path would lead to
     # the host's processes (/proc/<pid>/root) or namespaces.
     extra = [f"{m['point']} ({m['fstype']})" for m in vis.values()
              if (m["fstype"] == "proc" and m["point"] != "/proc") or m["fstype"] == "nsfs"]
-    report(not extra, "no other proc or nsfs mount is reachable" + (f" ({' '.join(extra)})" if extra else ""))
+    f.append((not extra, "no other proc or nsfs mount is reachable" + (f" ({' '.join(extra)})" if extra else "")))
     m = vis.get("/sys/fs/cgroup")
-    report(bool(m) and m["fstype"] == "tmpfs" and "ro" in m["opts"], "/sys/fs/cgroup is masked by a read-only tmpfs")
+    f.append((bool(m) and m["fstype"] == "tmpfs" and "ro" in m["opts"], "/sys/fs/cgroup is masked by a read-only tmpfs"))
     if work:
-        left = writable_mounts(work)
-        report(not left, f"every other mount is read-only ({len(vis)} reachable mounts"
-               + (f"; writable: {' '.join(left)}" if left else "") + ")")
-    try:
-        report(mount_id_of(".") == mount_id_of(os.getcwd()), f"the working directory is reachable by its path ({os.getcwd()})")
-    except OSError as e:
-        report(False, f"the working directory is reachable by its path ({e})")
-    if not ok:
-        # Not isolated: write nothing and connect to nothing.
-        return
+        f.append((not left, f"every other mount is read-only ({len(vis)} reachable mounts"
+                  + (f"; writable: {' '.join(left)}" if left else "") + ")"))
+    return f
 
+
+def eval_stdio(kinds):
+    """kinds: (fd, kind) of fds 0 to 2. A Unix socket there could reach a
+    host service without a connect."""
+    return [(all(k != "unix socket" for _, k in kinds),
+             "no standard descriptor is a Unix socket (" + ", ".join(f"{fd}: {k}" for fd, k in kinds) + ")")]
+
+
+def eval_reached(paths, reached):
+    """An empty list proves nothing: it fails."""
+    return [(bool(paths) and not reached, f"none of the {len(paths)} Unix sockets listed outside accepts a connection"
+             + (": " + ", ".join(reached) if reached else ""))]
+
+
+def evaluate_linux(o):
+    """Every finding of the mechanism check, from the observations o."""
+    f = eval_creds(o["status"], o["group"])
+    for ns in ("net", "mnt", "pid", "ipc"):
+        own, host = o["ns"][ns], o["host_ns"].get(ns, "")
+        f.append((bool(host) and own != host, f"private {ns} namespace ({own}; caller {host or 'unknown'})"))
+    f += eval_pidns(o["status"].get("NSpid", ""), o["pid"], o["ns"]["pid"], o["host_ns_raw"], o["proc_self"])
+    f += eval_processes(o["processes"], o["uid"])
+    f.append((o["sid_ours"], f"a session of our own (session {o['sid']})"))
+    f.append((o["tty"] != "opened", f"no controlling terminal ({o['tty']})"))
+    f += eval_stdio(o["stdio"])
+    f.append((o["interfaces"] == ["lo"], f"network namespace has only loopback ({' '.join(o['interfaces'])})"))
+    f.append((bool(o["work"]), f"the run's directory is known ({o['work'] or 'NO_DOCKER_RUN_DIR unset'})"))
+    f += eval_mounts(o["mounts"], o["host_devs"], o["devs"], o["work"], o["writable"])
+    f.append((o["cwd_reachable"] is True, f"the working directory is reachable by its path ({o['cwd']}"
+              + ("" if o["cwd_reachable"] in (True, False) else f": {o['cwd_reachable']}") + ")"))
+    return f
+
+
+def observe_linux():
+    """What the mechanism check looks at, read once (no write, no connect)."""
+    st = status()
+    try:
+        group = grp.getgrgid(os.getgid()).gr_name
+    except KeyError:
+        group = "no group name"
+    processes = []
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                processes.append((d, status(d)))
+            except OSError as e:
+                processes.append((d, e))
+    sid = os.getsid(0)
+    sid_ours = False
+    if sid > 1:
+        try:
+            sid_ours = all(u == str(os.getuid()) for u in status(sid).get("Uid", "").split())
+        except OSError:
+            pass
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR))
+        tty = "opened"
+    except OSError as e:
+        tty = errno.errorcode.get(e.errno, str(e.errno))
+    stdio = []
+    for fd in (0, 1, 2):
+        try:
+            mode = os.fstat(fd).st_mode
+        except OSError:
+            stdio.append((fd, "closed"))
+            continue
+        kind = "socket" if stat.S_ISSOCK(mode) else "pipe" if stat.S_ISFIFO(mode) else "character device" \
+            if stat.S_ISCHR(mode) else "file" if stat.S_ISREG(mode) else "other"
+        if kind == "socket":
+            s = socket.socket(fileno=os.dup(fd))
+            kind = "unix socket" if s.family == socket.AF_UNIX else "socket"
+            s.close()
+        stdio.append((fd, kind))
+    work = os.environ.get("NO_DOCKER_RUN_DIR", "")
+    vis = {m["point"]: m for m in visible_mounts()}
+    devs = {}
+    for path, _ in PRIVATE:
+        try:
+            devs[path] = str(os.stat(path).st_dev)
+        except OSError:
+            devs[path] = "?"
+    try:
+        cwd_reachable = mount_id_of(".") == mount_id_of(os.getcwd())
+    except OSError as e:
+        cwd_reachable = str(e)
+    return {
+        "status": st, "group": group, "uid": os.getuid(), "pid": os.getpid(), "proc_self": os.readlink("/proc/self"),
+        "ns": {ns: os.readlink(f"/proc/self/ns/{ns}") for ns in ("net", "mnt", "pid", "ipc")},
+        "host_ns": env_pairs("NO_DOCKER_HOST_NS"), "host_ns_raw": os.environ.get("NO_DOCKER_HOST_NS", ""),
+        "processes": processes, "sid": sid, "sid_ours": sid_ours, "tty": tty, "stdio": stdio,
+        "interfaces": sorted(n for _, n in socket.if_nameindex()), "work": work, "mounts": vis,
+        "host_devs": env_pairs("NO_DOCKER_HOST_DEVS"), "devs": devs,
+        "writable": writable_mounts(work) if work else None, "cwd": os.getcwd(), "cwd_reachable": cwd_reachable,
+    }
+
+
+def gated(observe, evaluate, after, say):
+    """Report every finding, and only if there are findings and all passed
+    run after (the part that writes and connects). Any error before that is
+    a failure."""
+    try:
+        findings = evaluate(observe())
+    except Exception as e:
+        say(False, f"the isolation check failed: {type(e).__name__}: {e}")
+        return False
+    if not findings:
+        say(False, "the isolation check found nothing to check")
+        return False
+    good = True
+    for passed, text in findings:
+        say(passed, text)
+        good = good and passed
+    if not good:
+        return False
+    after()
+    return True
+
+
+def after_gate_linux():
+    """Isolated: writes must fail, no cgroup file is writable, no socket in
+    the private directories, and no socket listed outside connects."""
     protected = [p for p in os.environ.get("NO_DOCKER_PROTECTED", "").split(":") if p]
     report(bool(protected), "the protected directories are known (NO_DOCKER_PROTECTED)")
     for p in protected:
@@ -1014,8 +1651,13 @@ def check_mechanism_linux():
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         reached = [f"{p} ({k})" for p, k in zip(paths, pool.map(unix_connects, paths)) if k]
-    report(not reached, f"none of the {len(paths)} Unix sockets listed outside accepts a connection"
-           + (": " + ", ".join(reached) if reached else ""))
+    for passed, text in eval_reached(paths, reached):
+        report(passed, text)
+
+
+def check_mechanism_linux():
+    print(f"no-docker: info uids {status().get('Uid', '?')}; gids {status().get('Gid', '?')}")
+    gated(observe_linux, evaluate_linux, after_gate_linux, report)
 
 
 def listening_ports(strict=False):
@@ -1122,14 +1764,30 @@ def main():
             return 1
         print("\n".join(sorted({str(port) for _, port in ports}, key=int)))
         return 0
-    if sys.argv[1:] == ["--sockets"]:
+    if sys.argv[1:2] == ["--sockets"] and len(sys.argv) <= 3:
         try:
-            paths, points, took = enumerate_sockets()
-        except (OSError, TimeoutError, StopIteration) as e:
+            paths, points, took = enumerate_sockets(float(sys.argv[2]) if len(sys.argv) == 3 else 180)
+        except (OSError, TimeoutError, StopIteration, ValueError) as e:
             print(f"no-docker: cannot list the Unix sockets: {e}", file=sys.stderr)
             return 1
         sys.stdout.buffer.write(b"".join(p + b"\0" for p in paths))
-        print(f"no-docker: {len(paths)} Unix sockets listed on {points} mounts in {took:.1f}s", file=sys.stderr)
+        print(f"no-docker: {len(paths)} Unix sockets listed on {points} mounts in {took:.1f}s (mode walk)", file=sys.stderr)
+        return 0
+    if sys.argv[1:] == ["--sockets-fast"] and sys.platform.startswith("linux"):
+        # Exit 0: the complete list. Exit 3: not shown complete; the paths
+        # located so far are printed and no-docker.sh runs the walk.
+        start = time.monotonic()
+        paths = set()
+        try:
+            counts = fast_listing(Deadline(FAST_BUDGET), paths)
+        except Exception as e:  # any doubt: the walk runs
+            sys.stdout.buffer.write(b"".join(p + b"\0" for p in sorted(paths)))
+            print(f"no-docker: listing mode walk: {type(e).__name__}: {e}", file=sys.stderr)
+            return 3
+        sys.stdout.buffer.write(b"".join(p + b"\0" for p in sorted(paths)))
+        print(f"no-docker: {len(paths)} Unix sockets listed (mode fast; {counts['namespaces']} network namespaces, "
+              f"{counts['live']} live, {counts['bound']} bound to a path, {counts['held']} held by processes) "
+              f"in {time.monotonic() - start:.1f}s", file=sys.stderr)
         return 0
     if sys.platform == "darwin" and (sys.argv[1:2] == ["--markers"] and len(sys.argv) == 4
                                      or sys.argv[1:2] in (["--orphans"], ["--end"]) and len(sys.argv) == 3):

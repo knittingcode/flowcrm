@@ -96,7 +96,7 @@ fi
 [ $# -gt 0 ] || refuse "no command given"
 if [ -n "${NO_DOCKER_ACTIVE-}" ]; then
   # Already isolated (a suite re-executing itself): never nest.
-  python3 -I "$probe" >/dev/null || refuse "inside no-docker.sh, but the isolation check fails"
+  python3 -I "$probe" >&2 || refuse "inside no-docker.sh, but the isolation check fails"
   [ -z "$given_work" ] || refuse "--work cannot be used inside the isolation"
   exec "$@"
 fi
@@ -247,6 +247,10 @@ case $os in
       n=$((n + 1))
     done
     [ "$found" = yes ] || refuse "Linux is supported on GitHub-hosted CI runners only (no Runner.Worker ancestor)"
+    # The new pid namespace is shown to be below the caller's by the
+    # caller's being the initial one (no-docker-probe.py).
+    [ "$(readlink /proc/self/ns/pid)" = "pid:[4026531836]" ] ||
+      refuse "Linux is supported on GitHub-hosted CI runners only (not in the initial pid namespace)"
     protected=$home
     for v in GITHUB_WORKSPACE RUNNER_TEMP; do
       d=$(cd -P "${!v:-/nonexistent}" 2>/dev/null && pwd -P) || refuse "Linux is supported on GitHub-hosted CI runners only ($v is not a directory)"
@@ -254,7 +258,7 @@ case $os in
       case $d in "$home"/?*) ;; *) refuse "Linux is supported on GitHub-hosted CI runners only ($v is not under \$HOME)" ;; esac
       protected="$protected:$d"
     done
-    for tool in sudo unshare setpriv setsid ip mount find stat python3; do
+    for tool in sudo timeout unshare setpriv setsid ip mount find stat python3; do
       command -v "$tool" >/dev/null || refuse "$tool not found"
     done
     sudo -n true 2>/dev/null || refuse "creating the namespaces needs passwordless sudo"
@@ -278,6 +282,10 @@ case $os in
       v=$(stat -c %d "$d") || refuse "cannot stat $d"
       host_devs="$host_devs $d=$v"
     done
+    # The command keeps the caller's primary group (the probe refuses a
+    # system group); for the log, next to the group of the engine socket.
+    printf 'no-docker: info primary group %s (%s); /var/run/docker.sock group %s\n' "$(id -g)" \
+      "$(id -gn 2>/dev/null || echo '?')" "$(stat -Lc '%g (%G)' /var/run/docker.sock 2>/dev/null || echo none)" >&2
     ;;
   *)
     refuse "no isolation mechanism for $os"
@@ -372,11 +380,32 @@ case $os in
     refuse "cannot start the supervisor (python3)"
     ;;
   Linux)
-    # Every Unix socket on the local file systems and every bound one of
-    # the host's network namespace; inside, none may accept a connection.
-    # A time budget that runs out refuses rather than truncating the list.
-    timing=$(python3 -I "$probe" --sockets 2>&1 >"$work/sockets.list") || refuse "cannot list the Unix sockets: $timing"
-    # Its duration, in the log of every run (the budget is 180 s).
+    # The Unix sockets that must not accept a connection inside: every live
+    # pathname socket of every network namespace at every path to it, from
+    # the kernel (as root, killed after 15 s; it writes nothing, its list
+    # comes through this shell's redirection). Unless that is shown
+    # complete (exit 0), the walk of every local file system runs as before,
+    # as the caller, and both lists are used. 180 s in all; a budget that
+    # runs out refuses rather than truncating the list.
+    start=$SECONDS
+    # shellcheck disable=SC2024 # on purpose: this shell, not root, writes the list
+    timing=$(sudo -n timeout -s KILL 15 python3 -I "$probe" --sockets-fast 2>&1 >"$work/sockets.fast")
+    frc=$?
+    if [ "$frc" -ne 0 ]; then
+      [ "$frc" -eq 3 ] || {
+        timing="no-docker: listing mode walk: the fast listing ended with status $frc"
+        : >"$work/sockets.fast" || refuse "cannot reset the socket list"
+      }
+      printf '%s\n' "$timing" >&2
+      left=$((180 - (SECONDS - start)))
+      [ "$left" -gt 0 ] || refuse "cannot list the Unix sockets: the 180s budget ran out"
+      timing=$(python3 -I "$probe" --sockets "$left" 2>&1 >"$work/sockets.walk") || refuse "cannot list the Unix sockets: $timing"
+      if ! cat "$work/sockets.walk" >>"$work/sockets.fast" || ! rm -f "$work/sockets.walk"; then
+        refuse "cannot keep the socket list"
+      fi
+    fi
+    mv "$work/sockets.fast" "$work/sockets.list" || refuse "cannot keep the socket list"
+    # Its mode and duration, in the log of every run.
     printf '%s\n' "$timing" >&2
     printf '::notice title=no-docker::%s\n' "${timing#no-docker: }"
     envargs+=("NO_DOCKER_SOCKETS=/run/no-docker/sockets.list" "NO_DOCKER_HOST_NS=${host_ns# }"
