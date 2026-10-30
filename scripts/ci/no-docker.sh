@@ -39,8 +39,9 @@
 #          read-only; the command runs as the calling user without
 #          supplementary groups, capabilities or the means to regain them
 #          (no_new_privs), in a session of its own, with an allowlisted
-#          environment, under a root pid 1 that waits for it; when it ends
-#          or the isolation is killed, every process left inside is killed.
+#          environment, under a root pid 1 that waits for it; when it ends,
+#          when no-docker.sh gets SIGINT, SIGTERM or SIGHUP (a cancelled
+#          step) or when unshare dies, every process left inside is killed.
 #          Unix sockets found outside before the start must not accept a
 #          connection inside.
 # In both, the variables that select an engine are removed and DOCKER_CONFIG
@@ -106,6 +107,31 @@ plain() {
 # owner_mode PATH: "<uid> <octal mode>" of PATH.
 owner_mode() {
   if [ "$os" = Darwin ]; then stat -f '%u %Lp' "$1"; else stat -c '%u %a' "$1"; fi
+}
+
+# kill_isolation (Linux): SIGKILL the unshare that this script started:
+# a process named unshare whose ancestors include $spid, the sudo of this
+# script. Called from the INT/TERM/HUP trap.
+# shellcheck disable=SC2329
+kill_isolation() {
+  local d p q st n
+  for d in /proc/[0-9]*; do
+    p=${d#/proc/}
+    [ "$(cat "$d/comm" 2>/dev/null)" = unshare ] || continue
+    q=$p
+    n=0
+    while [ "$n" -lt 16 ]; do
+      st=$(cat "/proc/$q/stat" 2>/dev/null) || break
+      read -r _ q _ <<<"${st##*) }"
+      case $q in "" | *[!0-9]*) break ;; esac
+      [ "$q" -gt 1 ] || break
+      if [ "$q" = "$spid" ]; then
+        sudo -n kill -KILL "$p" 2>/dev/null
+        break
+      fi
+      n=$((n + 1))
+    done
+  done
 }
 
 # use_work DIR PARENT...: check the caller's --work DIR and use it as $work.
@@ -294,7 +320,10 @@ case $os in
     # Every Unix socket on the local file systems and every bound one of
     # the host's network namespace; inside, none may accept a connection.
     # A time budget that runs out refuses rather than truncating the list.
-    python3 -I "$probe" --sockets >"$work/sockets.list" || refuse "cannot list the Unix sockets"
+    timing=$(python3 -I "$probe" --sockets 2>&1 >"$work/sockets.list") || refuse "cannot list the Unix sockets: $timing"
+    # Its duration, in the log of every run (the budget is 180 s).
+    printf '%s\n' "$timing" >&2
+    printf '::notice title=no-docker::%s\n' "${timing#no-docker: }"
     envargs+=("NO_DOCKER_SOCKETS=/run/no-docker/sockets.list" "NO_DOCKER_HOST_NS=${host_ns# }"
       "NO_DOCKER_HOST_DEVS=${host_devs# }" "NO_DOCKER_PROTECTED=$protected")
     # pid 1 of the new pid namespace is this root shell. It does not exec:
@@ -327,9 +356,13 @@ case $os in
       mkdir -p "$work" && mount --move /run/no-docker/work "$work" || die "cannot move $work into the private temporary directory"
       python3 -I "$probe" --seal "$work" || die "cannot make the other mounts read-only"
       cd "$cwd" || die "the working directory $cwd is not visible in the isolation"
+      # An asynchronous command gets /dev/null as stdin unless it is
+      # given one explicitly: that of the caller, through fd 3.
+      exec 3<&0
       setpriv --reuid "$uid" --regid "$gid" --clear-groups --no-new-privs --inh-caps=-all --bounding-set=-all -- \
-        setsid --wait /usr/bin/env -i "$@" &
+        setsid --wait /usr/bin/env -i "$@" <&3 3<&- &
       child=$!
+      exec 3<&-
       wait "$child"
       exit $?
     '
@@ -338,10 +371,27 @@ case $os in
     token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     [ "${#token}" -eq 32 ] || refuse "cannot make a random token"
     printf '::stop-commands::%s\n' "$token"
+    printf '::stop-commands::%s\n' "$token" >&2
+    # Cancellation: unshare runs as root and, with --fork, blocks SIGINT and
+    # SIGTERM; pid 1 ignores signals from outside its namespace. So a signal
+    # to this script (a cancelled or timed-out step) is turned into SIGKILL
+    # of the unshare started below, found as a descendant of its sudo;
+    # --kill-child then kills pid 1, and with it every process inside.
+    exec 3<&0
     sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc --propagation private -- \
       /bin/sh -c "$init" no-docker-init "$uid" "$(id -g)" "$work" "$probe" "$cwd" \
-      "${envargs[@]}" "$BASH" "$here/no-docker.sh" --inner "$@"
-    rc=$?
+      "${envargs[@]}" "$BASH" "$here/no-docker.sh" --inner "$@" <&3 3<&- &
+    spid=$!
+    exec 3<&-
+    interrupted=""
+    trap 'interrupted=yes; kill_isolation' INT TERM HUP
+    while :; do
+      wait "$spid"
+      rc=$?
+      [ -n "$interrupted" ] || break
+      interrupted=""
+    done
+    trap - INT TERM HUP
     printf '::%s::\n' "$token"
     ;;
 esac
