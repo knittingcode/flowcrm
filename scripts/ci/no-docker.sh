@@ -382,7 +382,7 @@ case $os in
   Linux)
     # The Unix sockets that must not accept a connection inside: every live
     # pathname socket of every network namespace at every path to it, from
-    # the kernel (as root, killed after 15 s; it writes nothing, its list
+    # the kernel (as root, within 10 s, killed at 15 s; it writes nothing, its list
     # comes through this shell's redirection). Unless that is shown
     # complete (exit 0), the walk of every local file system runs as before,
     # as the caller, and both lists are used. 180 s in all; a budget that
@@ -393,7 +393,7 @@ case $os in
     frc=$?
     if [ "$frc" -ne 0 ]; then
       [ "$frc" -eq 3 ] || {
-        timing="no-docker: listing mode walk: the fast listing ended with status $frc"
+        timing="no-docker: listing mode walk: the fast listing ended with status $frc${timing:+: $timing}"
         : >"$work/sockets.fast" || refuse "cannot reset the socket list"
       }
       printf '%s\n' "$timing" >&2

@@ -780,7 +780,7 @@ def mounts():
     entries = []
     with open("/proc/self/mountinfo") as f:
         for line in f:
-            fields = line.split()
+            fields = line.rstrip("\n").split(" ")
             sep = fields.index("-")
             entries.append({"id": int(fields[0]), "point": unescape(fields[4]),
                             "opts": fields[5].split(","), "fstype": fields[sep + 1],
@@ -1105,12 +1105,26 @@ def cross_check(held, dumped):
 
 def uring_sockets(fdinfo):
     """The sockets in the registered file table of an io_uring (its fdinfo).
-    The kernel leaves the table out when its lock is busy: Incomplete."""
-    head, sep, rest = fdinfo.partition("\nUserFiles:")
+    Incomplete when the kernel left the table or some of its entries out
+    (its lock was busy), and when an entry names a socket only by its
+    protocol (kernels before 6.16 print that instead of socket:[N]), since
+    that socket cannot be found in the dumps."""
+    head, sep, rest = ("\n" + fdinfo).partition("\nUserFiles:")
     if not sep:
         raise Incomplete("an io_uring's registered files are not shown")
-    table = re.split(r"\n(?=\S)", rest, maxsplit=1)[0]
-    return {int(x) for x in re.findall(r"^\s*\d+: socket:\[(\d+)\]$", table, re.M)}
+    count, _, table = rest.partition("\n")
+    table = re.split(r"\n(?=\S)", table, maxsplit=1)[0]
+    entries = re.findall(r"^\s*\d+: (.*)$", table, re.M)
+    if not count.strip().isdigit() or len(entries) != int(count):
+        raise Incomplete(f"an io_uring shows {len(entries)} of its {count.strip()} registered files")
+    sockets = set()
+    for e in entries:
+        r = re.fullmatch(r"socket:\[(\d+)\]", e)
+        if r:
+            sockets.add(int(r.group(1)))
+        elif not e.startswith(("/", "anon_inode:")) and not re.fullmatch(r"[a-z]+:\[\d+\]", e):
+            raise Incomplete(f"an io_uring holds {e!r}, which cannot be identified")
+    return sockets
 
 
 def gone(e):
@@ -1503,10 +1517,10 @@ def eval_mounts(vis, host_devs, devs, work, left):
 
 
 def eval_stdio(kinds):
-    """kinds: (fd, kind) of fds 0 to 2. A Unix socket there could reach a
-    host service without a connect."""
-    return [(all(k != "unix socket" for _, k in kinds),
-             "no standard descriptor is a Unix socket (" + ", ".join(f"{fd}: {k}" for fd, k in kinds) + ")")]
+    """kinds: (fd, kind) of fds 0 to 2. A socket there could reach a host
+    service without a connect."""
+    return [(all("socket" not in k for _, k in kinds),
+             "no standard descriptor is a socket (" + ", ".join(f"{fd}: {k}" for fd, k in kinds) + ")")]
 
 
 def eval_reached(paths, reached):
