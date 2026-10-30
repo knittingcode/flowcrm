@@ -26,13 +26,18 @@
 #   macOS  sandbox-exec: no connect to a Unix socket, no TCP beyond
 #          loopback, to loopback ports 22, 2375 and 2376 or to a loopback
 #          port that was listening before the command started; file writes
-#          only in the run's own directory (the command's $TMPDIR is in it),
-#          the /dev nodes a shell needs and bash 3.2's here-document files in
-#          /tmp; no signal to a process outside the sandbox; no preference
-#          write, TIOCSTI, open, osascript, launchctl, ssh, launchd job, Launch
-#          Services, Apple Events, login item or background task registration
-#          and no lookup of Docker's own services. $TMPDIR must be the
-#          per-user directory under /private/var/folders.
+#          only in the run's own directory (the command's $TMPDIR is in it)
+#          and the /dev nodes a shell needs, nothing in /tmp (so no bash 3.2
+#          here-document inside); no signal to and no debugging of a
+#          process outside the sandbox; no preference write, TIOCSTI, open,
+#          osascript, launchctl, ssh, launchd job, Launch Services, Apple
+#          Events, login item or background task registration and no lookup
+#          of Docker's own services. When the command ends, or no-docker.sh
+#          gets SIGINT, SIGTERM, SIGHUP or SIGQUIT, every process left in the
+#          sandbox is killed (found by a marker of the run); a process left
+#          by a run that could not do that (SIGKILL) keeps new runs from
+#          starting. $TMPDIR must be the per-user directory under
+#          /private/var/folders.
 #   Linux  sudo unshare: new network (loopback only), mount, pid, and IPC
 #          namespaces; empty tmpfs over /run, /var/run, /tmp, /var/tmp,
 #          /dev/shm and /sys/fs/cgroup, a fresh /dev/mqueue, every other mount
@@ -53,7 +58,8 @@
 # inside that each mechanism is in effect and that no engine answers on any
 # endpoint it can find. If isolation cannot be applied or proven, COMMAND
 # does not run and the exit status is 125; so is the status if the
-# isolation tool returns without the command having started inside it.
+# isolation tool returns without the command having started inside it, and
+# on macOS if the processes the command left could not all be ended.
 
 set -u
 
@@ -118,7 +124,7 @@ owner_mode() {
 # script. Called from the INT/TERM/HUP trap.
 # shellcheck disable=SC2329
 kill_isolation() {
-  local d p q st n
+  local d p q st n rest
   for d in /proc/[0-9]*; do
     p=${d#/proc/}
     [ "$(cat "$d/comm" 2>/dev/null)" = unshare ] || continue
@@ -126,7 +132,10 @@ kill_isolation() {
     n=0
     while [ "$n" -lt 16 ]; do
       st=$(cat "/proc/$q/stat" 2>/dev/null) || break
-      read -r _ q _ <<<"${st##*) }"
+      # Field 4, the parent: after the name, "STATE PPID ...".
+      rest=${st##*) }
+      rest=${rest#* }
+      q=${rest%% *}
       case $q in "" | *[!0-9]*) break ;; esac
       [ "$q" -gt 1 ] || break
       if [ "$q" = "$spid" ]; then
@@ -210,7 +219,9 @@ case $os in
         break
       fi
       st=$(cat "/proc/$pid/stat" 2>/dev/null) || break
-      read -r _ pid _ <<<"${st##*) }"
+      rest=${st##*) }
+      rest=${rest#* }
+      pid=${rest%% *}
       case $pid in "" | *[!0-9]*) break ;; esac
       n=$((n + 1))
     done
@@ -295,11 +306,32 @@ case $os in
     done
     envargs+=("NO_DOCKER_HELD_PORTS=$(printf '%s' "$listening" | tr '\n' ' ')" "NO_DOCKER_OUTER_PID=$$"
       "NO_DOCKER_USER_TMP=$tmp")
+    # The sandbox carries a marker of this run and one common to every run
+    # (a denied read of a file in each marker directory, which are in
+    # $tmp, outside everything the sandbox may write), by which
+    # no-docker-probe.py finds its processes from outside: a process cannot
+    # leave its sandbox, and every process it starts inherits it.
+    markdir=$(python3 -I "$probe" --markers "$tmp") || refuse "cannot make the marker of the run"
+    case $markdir in "$tmp"/no-docker-mark.?*) ;; *) refuse "unexpected marker directory $markdir" ;; esac
+    plain "$markdir" || refuse "unexpected character in the marker directory $markdir"
+    if [ -n "$given_work" ]; then
+      remove=-
+      trap 'rm -rf "$markdir"' EXIT
+    else
+      remove=$work
+      trap 'rm -rf "$work" "$markdir"' EXIT
+    fi
+    python3 -I "$probe" --orphans "$tmp" || refuse "cannot rule out a process left by an earlier isolated run"
+    envargs+=("NO_DOCKER_MARK=$markdir")
     # File writes: the run's directory; of /dev only what shells and
-    # interpreters open for writing (measured, docs/dev-environment.md);
-    # bash 3.2's here-document files, which it creates in /tmp whatever
-    # $TMPDIR is. Signals only within this sandbox. An SBPL error makes
-    # sandbox-exec fail, so the command never starts (125).
+    # interpreters open for writing (measured, docs/dev-environment.md).
+    # Nothing in /tmp: bash 3.2 keeps here-documents there when it cannot
+    # use /var/tmp, whatever $TMPDIR is, so code run inside must not use
+    # here-documents or here-strings, and no bash in another sandbox can
+    # have its here-documents changed from inside. Signals, task ports
+    # (debuggers, vmmap, sample) and process names only within this
+    # sandbox; no ptrace of any process; no reading other terminals. An
+    # SBPL error makes sandbox-exec fail, so the command never starts (125).
     profile="(version 1)
 (allow default)
 (deny network-outbound (remote unix-socket))
@@ -307,7 +339,9 @@ case $os in
 (allow network-outbound (remote ip \"localhost:*\"))
 (deny network-outbound (remote ip \"localhost:22\") (remote ip \"localhost:2375\") (remote ip \"localhost:2376\")$held)
 (deny file-write*)
-(allow file-write* (subpath \"$work\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\") (literal \"/private/tmp\") (regex #\"^/private/tmp/sh-thd[^/]*\$\"))
+(allow file-write* (subpath \"$work\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+\$\"))
+(deny file-read-data (literal \"$tmp/no-docker-mark/a\") (literal \"$markdir/a\"))
+(deny file-read* (regex #\"^/dev/ttys[0-9]+\$\"))
 (deny user-preference-write)
 (deny file-ioctl (ioctl-command #x80017472))
 (deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/bin/launchctl\") (literal \"/usr/bin/ssh\"))
@@ -315,10 +349,22 @@ case $os in
 (deny lsopen)
 (deny appleevent-send)
 (deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.coreservices.appleevents\") (global-name-regex #\"^com\\.apple\\.lsd\\.\") (global-name \"com.apple.xpc.smd\") (global-name-regex #\"^com\\.apple\\.backgroundtaskmanagement\") (global-name-regex #\"^com\\.apple\\.coreservices\\.sharedfilelistd\") (global-name-regex #\"^com\\.docker\\.\") (global-name-regex #\"^com\\.electron\\.dockerdesktop\\.\"))
+(deny system-debug)
+(deny mach-task-name mach-task-read mach-task-inspect mach-priv-task-port)
+(allow mach-task-name mach-task-read mach-task-inspect mach-priv-task-port (target same-sandbox))
 (deny signal)
 (allow signal (target same-sandbox))"
-    sandbox-exec -p "$profile" /usr/bin/env -i "${envargs[@]}" "$BASH" "$here/no-docker.sh" --inner "$@"
-    rc=$?
+    # The supervisor takes over this process: a signal sent to it ends the
+    # command and everything it left at once, and so does the command's
+    # end. It removes the run's directory (unless given with --work) and
+    # the marker directory.
+    trap - EXIT
+    shopt -s execfail
+    exec python3 -I "$probe" --supervise "$markdir" "$work/started" "$remove" -- /usr/bin/sandbox-exec -p "$profile" \
+      /usr/bin/env -i "${envargs[@]}" "$BASH" "$here/no-docker.sh" --inner "$@"
+    rm -rf "$markdir"
+    [ "$remove" = - ] || rm -rf "$work"
+    refuse "cannot start the supervisor (python3)"
     ;;
   Linux)
     # Every Unix socket on the local file systems and every bound one of

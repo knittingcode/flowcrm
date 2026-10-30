@@ -47,7 +47,18 @@ Modes used by no-docker.sh outside the isolation:
                 out;
   --seal WORK   as root in the new mount namespace: make every mount
                 reachable by path read-only, except the private file systems
-                and WORK, and verify it (Linux).
+                and WORK, and verify it (Linux);
+  --markers TMP make sure the marker directory common to every run exists
+                in the per-user temporary directory TMP, make one for a new
+                run and print its path (macOS);
+  --orphans TMP fail if a process of an earlier run is still alive on its
+                own (macOS);
+  --supervise MARKDIR STARTED REMOVE -- COMMAND...
+                run COMMAND (sandbox-exec), then end every process left in
+                the sandbox of MARKDIR; signals end it at once; 125 unless
+                the file STARTED exists; removes MARKDIR and the directory
+                REMOVE ("-": none) (macOS, no-docker.sh's last step);
+  --end MARKDIR end every process of the sandbox of MARKDIR (macOS).
 """
 
 import concurrent.futures
@@ -57,6 +68,8 @@ import glob
 import json
 import os
 import re
+import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -131,7 +144,12 @@ def connects(address):
 def create_error(directory):
     """None if a new file can be created in directory (it is removed again),
     else the errno of the failure."""
-    path = os.path.join(directory, f".no-docker-probe-{os.getpid()}")
+    return create_error_named(directory, f".no-docker-probe-{os.getpid()}")
+
+
+def create_error_named(directory, name):
+    """As create_error, for a file of the given name."""
+    path = os.path.join(directory, name)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
@@ -224,6 +242,320 @@ def check_mechanism_darwin():
             report(not_writable(d), f"macOS sandbox denies writes {where} ({d})")
     tmpdir = os.environ.get("TMPDIR", "")
     report(bool(tmpdir) and create_error(tmpdir) is None, f"$TMPDIR of the run is writable ({tmpdir})")
+    # bash 3.2 keeps here-documents in /private/tmp/sh-thd-*: none of another
+    # bash outside may be created, replaced or rewritten from here.
+    e = create_error_named("/private/tmp", f"sh-thd-no-docker-probe-{os.getpid()}")
+    report(e is not None, "macOS sandbox denies writes to here-document files of bash 3.2 (/private/tmp/sh-thd-*)"
+           + ("" if e is not None else ": written"))
+    # The markers by which no-docker.sh finds this sandbox's processes from
+    # outside: reading A is denied, reading B is not.
+    for d in (os.environ.get("NO_DOCKER_MARK", ""), os.path.join(user_tmp, COMMON_MARK) if user_tmp else ""):
+        result = "unknown"
+        if d:
+            try:
+                open(os.path.join(d, "b"), "rb").close()
+                try:
+                    open(os.path.join(d, "a"), "rb").close()
+                    result = "not denied"
+                except PermissionError:
+                    result = "ok"
+            except OSError as err:
+                result = errno.errorcode.get(err.errno, str(err))
+        report(result == "ok", f"the sandbox carries the marker of {d or '?'} ({result})")
+
+
+# The processes of one sandbox, seen from outside it. no-docker.sh (and the
+# suite's own guard) add to the profile `(deny file-read-data (literal A))`
+# for the file A of the run's marker directory and of the directory common
+# to every run, and leave the file B next to it alone; no other profile
+# names these files. sandbox_check() asks the kernel how a process's
+# sandbox would decide, so a process is in the run's sandbox exactly when
+# it is denied A and allowed B (measured: an unsandboxed process is
+# allowed both, other sandboxes deny or allow both; the files must exist,
+# or every process is "denied"). A process cannot leave its sandbox, and
+# every process it starts inherits it. The marker directories are in the
+# per-user temporary directory, outside every directory the sandbox may
+# write, so the command cannot remove or replace them.
+COMMON_MARK = "no-docker-mark"
+SZOMB = 5
+
+
+class ProcBsdInfo(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32), ("xstatus", ctypes.c_uint32),
+                ("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
+                ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32), ("rgid", ctypes.c_uint32),
+                ("svuid", ctypes.c_uint32), ("svgid", ctypes.c_uint32), ("rfu_1", ctypes.c_uint32),
+                ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32), ("nfiles", ctypes.c_uint32),
+                ("pgid", ctypes.c_uint32), ("pjobc", ctypes.c_uint32), ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32), ("start_tvsec", ctypes.c_uint64),
+                ("start_tvusec", ctypes.c_uint64)]
+
+
+def private_dir(path):
+    """True if path is a directory of ours, mode 0700, not a symbolic link."""
+    st = os.lstat(path)
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700
+
+
+def marker_files(directory, create):
+    """The marker files A and B of directory, which must be a private
+    directory with two empty regular files of ours; created if asked."""
+    if create:
+        try:
+            os.mkdir(directory, 0o700)
+        except FileExistsError:
+            pass
+    if not private_dir(directory):
+        raise OSError(f"{directory} is not a directory of ours with mode 0700")
+    files = []
+    for name in ("a", "b"):
+        path = os.path.join(directory, name)
+        if create:
+            try:
+                os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+            except FileExistsError:
+                pass
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError(f"{path} is not a regular file of ours")
+        files.append(os.fsencode(path))
+    return files
+
+
+class Sandboxes:
+    """sandbox_check() and the process table (libproc). Raises OSError if
+    either is unavailable or gives an answer it cannot interpret, so every
+    caller fails closed."""
+
+    PROC_PIDTBSDINFO = 3
+    FILTER_PATH = 1
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.deny, self.allow = marker_files(directory, create=False)
+        try:
+            sb = ctypes.CDLL("/usr/lib/system/libsystem_sandbox.dylib", use_errno=True)
+            self.proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            self.check_fn = sb.sandbox_check
+            no_report = ctypes.c_int.in_dll(sb, "SANDBOX_CHECK_NO_REPORT").value
+        except (OSError, AttributeError, ValueError) as e:
+            raise OSError(f"sandbox_check() is not available: {e}") from None
+        # Variadic after the third parameter: with exactly three argtypes,
+        # ctypes passes the path as a variadic argument (on the stack on
+        # arm64), as the function expects.
+        self.check_fn.restype = ctypes.c_int
+        self.check_fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        self.kind = self.FILTER_PATH | no_report
+        self.proc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.proc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        self.verify()
+
+    def verify(self):
+        """The marker files still exist and this (unsandboxed) process is
+        allowed both and is not sandboxed. A missing file reads as denied
+        for every process, so this runs before every scan and every signal;
+        anything else means the calls do not work as measured."""
+        marker_files(self.directory, create=False)
+        me = os.getpid()
+        if (self._check(me, self.deny), self._check(me, self.allow), self.check_fn(me, None, 0)) != (0, 0, 0):
+            raise OSError("sandbox_check() does not answer as expected for this process")
+
+    def _check(self, pid, path):
+        return self.check_fn(pid, b"file-read-data", self.kind, ctypes.c_char_p(path))
+
+    def member(self, pid):
+        """True or False; raises OSError if it cannot be told. A member must
+        be sandboxed at all, be denied A and be allowed B."""
+        sandboxed = self.check_fn(pid, None, 0)
+        a, b = self._check(pid, self.deny), self._check(pid, self.allow)
+        if sandboxed not in (0, 1) or a not in (0, 1) or b not in (0, 1):
+            raise OSError(f"sandbox_check() failed for pid {pid} ({sandboxed}, {a}, {b})")
+        return sandboxed == 1 and a == 1 and b == 0
+
+    def pids(self):
+        n = self.proc.proc_listallpids(None, 0)
+        if n <= 0:
+            raise OSError("cannot list the processes")
+        buf = (ctypes.c_int * (n + 1024))()
+        n = self.proc.proc_listallpids(buf, ctypes.sizeof(buf))
+        if n <= 0:
+            raise OSError("cannot list the processes")
+        return [buf[i] for i in range(n) if buf[i] > 0 and buf[i] != os.getpid()]
+
+    def info(self, pid):
+        """(ppid, uid, status, start time) of pid, or None if it is gone."""
+        i = ProcBsdInfo()
+        if self.proc.proc_pidinfo(pid, self.PROC_PIDTBSDINFO, 0, ctypes.byref(i), ctypes.sizeof(i)) != ctypes.sizeof(i):
+            return None
+        return i.ppid, i.uid, i.status, (i.start_tvsec, i.start_tvusec)
+
+    def members(self):
+        """{pid: info} of the members that still run (a zombie has ended)."""
+        self.verify()
+        found = {}
+        for pid in self.pids():
+            inf = self.info(pid)
+            if inf is None or inf[2] == SZOMB:
+                continue
+            try:
+                if self.member(pid):
+                    found[pid] = inf
+            except OSError:
+                if self.info(pid) is not None:
+                    raise
+        return found
+
+
+def darwin_markers(tmp):
+    """For no-docker.sh and the suite: make sure the common marker directory
+    exists in the per-user temporary directory tmp, make a new one for the
+    run, and print the run's."""
+    marker_files(os.path.join(tmp, COMMON_MARK), create=True)
+    run = tempfile.mkdtemp(prefix=COMMON_MARK + ".", dir=tmp)
+    marker_files(run, create=True)
+    print(run)
+    return 0
+
+
+def darwin_orphans(tmp):
+    """Before a sandbox starts: fail if a process of an earlier run is still
+    alive on its own, that is a member of the common marker whose topmost
+    member ancestor was handed to launchd (no live supervisor above it). A
+    run in progress elsewhere keeps its members under its supervisor; its
+    daemons count as orphans, so a concurrent run that leaves one blocks
+    new ones until it ends."""
+    sbx = Sandboxes(os.path.join(tmp, COMMON_MARK))
+    found = sbx.members()
+    orphans = []
+    for pid, inf in found.items():
+        top, seen = inf, 0
+        while top[0] in found and seen < 4096:
+            top = found[top[0]]
+            seen += 1
+        if top[0] <= 1:
+            orphans.append(pid)
+    if orphans:
+        print("no-docker: processes of an earlier isolated run are still running (pids "
+              + " ".join(str(p) for p in sorted(orphans)) + "); end them first", file=sys.stderr)
+        return 1
+    return 0
+
+
+def darwin_end(sbx, seconds=10.0):
+    """End every process of the run's sandbox: SIGKILL each member as soon as
+    it is found (its start time and membership read again right before the
+    signal, so a reused pid is not hit), and list the table again until it
+    has none. A killed process cannot start another, and nothing a member
+    does can undo SIGKILL. Needs no new process. Returns the number of
+    processes ended; raises OSError if members are left after the time
+    limit (another user's, such as a sudo inside, cannot be signalled)."""
+    deadline = time.monotonic() + seconds
+    ended = 0
+    while True:
+        found = sbx.members()
+        if not found:
+            return ended
+        if time.monotonic() > deadline:
+            raise OSError("processes of the isolation survive (pids "
+                          + " ".join(f"{p}:uid{inf[1]}" for p, inf in sorted(found.items())) + ")")
+        for pid, inf in found.items():
+            now = sbx.info(pid)
+            sbx.verify()
+            if now is None or now[3] != inf[3] or not sbx.member(pid):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                ended += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(0.01)
+
+
+class Interrupted(Exception):
+    pass
+
+
+def darwin_supervise(markdir, started_file, remove, argv):
+    """no-docker.sh's last step on macOS, in its process: run argv (the
+    sandbox-exec command line), wait for it, then end whatever is left in
+    its sandbox; SIGINT, SIGTERM, SIGHUP or SIGQUIT end it at once the same
+    way. Everything that needs a library is loaded before the command
+    starts, and ending it needs no new process, so a command that uses up
+    the processes it may start cannot prevent it. Removes the run's marker
+    directory and the directory remove (if not "-"). The status is the
+    command's, or 125 if the isolation could not be applied (started_file,
+    which the command's start creates, is missing) or its processes could
+    not all be ended; after a signal, 128 plus its number."""
+    def refused(why):
+        print(f"no-docker: refused: {why}", file=sys.stderr)
+        return 125
+
+    try:
+        sbx = Sandboxes(markdir)
+    except OSError as e:
+        shutil.rmtree(markdir, ignore_errors=True)
+        if remove != "-":
+            shutil.rmtree(remove, ignore_errors=True)
+        return refused(f"cannot identify the processes of the isolation: {e}; the command was not run")
+    caught = []
+    waiting = [False]
+
+    def on_signal(signum, frame):
+        # Only the wait for the command is cut short; ending the processes
+        # always runs to its end.
+        caught.append(signum)
+        if waiting[0]:
+            waiting[0] = False
+            raise Interrupted()
+
+    # A signal the caller ignores stays ignored, for the command too.
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        if signal.getsignal(s) != signal.SIG_IGN:
+            signal.signal(s, on_signal)
+    child = None
+    status = 125
+    ended, failure = 0, None
+    try:
+        try:
+            child = subprocess.Popen(argv, close_fds=False)
+        except OSError as e:
+            print(f"no-docker: cannot start the isolation: {e}", file=sys.stderr)
+        try:
+            # A signal that came while it was being started is not lost: the
+            # wait is skipped.
+            waiting[0] = True
+            if child is not None and not caught:
+                status = child.wait()
+        except Interrupted:
+            pass
+        finally:
+            waiting[0] = False
+        try:
+            ended = darwin_end(sbx)
+            if child is not None:
+                if child.poll() is None:
+                    # Interrupted before sandbox-exec applied the profile:
+                    # our own child, not yet reaped, so its pid is its own.
+                    child.kill()
+                status = child.wait(timeout=10)
+                ended += darwin_end(sbx)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            failure = str(e)
+    finally:
+        started = os.path.exists(started_file)
+        shutil.rmtree(markdir, ignore_errors=True)
+        if remove != "-":
+            shutil.rmtree(remove, ignore_errors=True)
+    if ended:
+        print(f"no-docker: ended {ended} processes the command left running", file=sys.stderr)
+    if failure:
+        return refused(f"processes of the isolated command could not all be ended: {failure}")
+    if not started:
+        return refused(f"the isolation tool returned {status} without starting the command; the command was not run")
+    if caught:
+        print(f"no-docker: interrupted by signal {caught[0]}; every process of the command was ended", file=sys.stderr)
+        return 128 + caught[0]
+    return 128 - status if status < 0 else status
 
 
 # --- Linux -------------------------------------------------------------------
@@ -360,10 +692,12 @@ def unix_connects(path):
             s.connect(path)
             return name
         except socket.timeout:
-            return name + " (timeout)"  # a listener with a full backlog
+            return name + " (timeout)"
         except OSError as e:
             if e.errno == errno.EPROTOTYPE:
                 continue
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return name + " (backlog full)"  # a listener, busy
             return None
         finally:
             s.close()
@@ -393,6 +727,10 @@ def check_mechanism_linux():
            "no capabilities (" + " ".join(f"{k}={v}" for k, v in caps.items()) + ")")
     report(st.get("NoNewPrivs") == "1", f"no_new_privs is set ({st.get('NoNewPrivs', 'unknown')})")
     report(st.get("Groups", "x") == "", f"no supplementary groups ({st.get('Groups') or 'none'})")
+    # The primary group is the caller's (on a runner possibly the engine
+    # socket's group): what keeps the socket away is that its path is
+    # hidden and that no listed socket accepts a connection (below).
+    print(f"no-docker: info uids {st.get('Uid', '?')}; gids {st.get('Gid', '?')}")
 
     host_ns = env_pairs("NO_DOCKER_HOST_NS")
     for ns in ("net", "mnt", "pid", "ipc"):
@@ -450,6 +788,11 @@ def check_mechanism_linux():
         host = host_devs.get(path, "")
         report(bool(m) and m["fstype"] == fstype and bool(host) and dev != host,
                f"{path} is a private {fstype} (device {dev}; caller {host or 'unknown'})")
+    # A second procfs, or a namespace file, reachable by path would lead to
+    # the host's processes (/proc/<pid>/root) or namespaces.
+    extra = [f"{m['point']} ({m['fstype']})" for m in vis.values()
+             if (m["fstype"] == "proc" and m["point"] != "/proc") or m["fstype"] == "nsfs"]
+    report(not extra, "no other proc or nsfs mount is reachable" + (f" ({' '.join(extra)})" if extra else ""))
     m = vis.get("/sys/fs/cgroup")
     report(bool(m) and m["fstype"] == "tmpfs" and "ro" in m["opts"], "/sys/fs/cgroup is masked by a read-only tmpfs")
     if work:
@@ -610,6 +953,20 @@ def main():
         sys.stdout.buffer.write(b"".join(p + b"\0" for p in paths))
         print(f"no-docker: {len(paths)} Unix sockets listed on {points} mounts in {took:.1f}s", file=sys.stderr)
         return 0
+    if sys.platform == "darwin" and sys.argv[1:2] in (["--markers"], ["--orphans"], ["--end"]) and len(sys.argv) == 3:
+        try:
+            if sys.argv[1] == "--markers":
+                return darwin_markers(sys.argv[2])
+            if sys.argv[1] == "--orphans":
+                return darwin_orphans(sys.argv[2])
+            n = darwin_end(Sandboxes(sys.argv[2]))
+            print(f"no-docker: ended {n} processes", file=sys.stderr)
+            return 0
+        except OSError as e:
+            print(f"no-docker: cannot check the processes of the isolation: {e}", file=sys.stderr)
+            return 1
+    if sys.platform == "darwin" and sys.argv[1:2] == ["--supervise"] and len(sys.argv) > 6 and sys.argv[5] == "--":
+        return darwin_supervise(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[6:])
     if sys.argv[1:2] == ["--seal"] and len(sys.argv) == 3:
         try:
             return seal(sys.argv[2])
