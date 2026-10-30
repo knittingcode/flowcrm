@@ -417,116 +417,326 @@ $ make test-app                                  # application: the four suites 
 
 `tests/devenv/unit.sh` and the guard regression suites in
 `scripts/ci/tests/` run code under test, including a modified or mutated
-copy of it (`DEVENV=`, `GUARD=`, `ADAPTED=` or an edited file). They run it
-only where no container engine can be reached: each re-executes itself under
-`scripts/ci/no-docker.sh`, so a command in that code cannot touch the
-images, containers, volumes, networks or build cache of the machine, however
-it reaches Docker (the CLI on `PATH` or by absolute path, a nested shell or
-command substitution, `-H`, `--context` or an inherited `DOCKER_HOST`,
-`curl --unix-socket` or a raw socket).
+copy of it (`DEVENV=`, `GUARD=`, `ADAPTED=` or an edited file). That code
+runs with the caller's user ID and may be any shell, Python or program on
+the machine: it may fork, daemonise, write files, open sockets and send
+signals. Each suite therefore re-executes itself under
+`scripts/ci/no-docker.sh`. The isolation must keep the code away from:
 
-- macOS: `sandbox-exec` denies:
-  - every connect to a Unix socket;
-  - TCP beyond loopback, and to loopback ports 22, 2375 and 2376;
-  - TCP to every loopback port that was already listening when the suite
-    started, such as a local development server, an IDE, a published
-    container port or a socket proxy. The list comes from `netstat`. If
-    `netstat` fails, prints no column header or prints a LISTEN row that
-    cannot be parsed, the suite is refused (exit 125). An empty list is accepted only when
-    `netstat` printed its header and no LISTEN row;
-  - writes anywhere except under `$TMPDIR` and `/dev`, and in `/tmp` the
-    `sh-thd*` here-document files of bash 3.2, which it creates there
-    whatever `$TMPDIR` is. This covers `$HOME`, where Docker Desktop keeps
-    its disk image, and places whose files are run or read outside the
-    sandbox later: Homebrew's prefix, `/Applications` and other programs'
-    temporary files in `/tmp`. `$TMPDIR` must
-    therefore be a directory of its own. If it is `/`, `/tmp`, under `/tmp`
-    or under `$HOME`, the suite is refused (exit 125). The macOS default
-    under `/var/folders` is fine;
-  - hard links do not get around this. Measured: a link from `$TMPDIR` to
-    a file in a write-denied place is refused;
-  - preference writes through `cfprefsd` (`defaults write`), which would
-    otherwise reach `~/Library/Preferences` although `$HOME` is
-    write-denied;
-  - `TIOCSTI` on the terminal, which would otherwise let a command inject
-    keystrokes into the shell that started the suite;
-  - `open`, `osascript`, `launchctl` and `ssh`, job submission to launchd,
-    and access to Launch Services and Apple Events, so that no program is
-    started outside the sandbox. A re-signed copy of one of these programs
-    can run, but launchd, Launch Services and Apple Events still refuse it,
-    and the network routes of `ssh` are denied above.
+- the container engines and their objects (images, containers, volumes,
+  networks, build cache), including those of other projects;
+- the user's environment: files in `$HOME` and in the checkout, shell and
+  tool configuration, user-session IPC and the user's other processes;
+- later steps of the same CI job.
 
-  The profile filters these routes; it is not a complete jail. Known
-  residual routes:
-  - loopback ports that the suite opens itself stay reachable. So does a
-    service that starts listening after the suite started; the probe asks
-    each listening port whether it is an engine only at the start;
-  - a command can still create `sh-thd*` files or directories in `/tmp`.
-    bash creates its own here-document files exclusively, so at worst a
-    later here-document of another shell fails;
-  - signals to the user's processes outside the sandbox are allowed. A
-    command could stop Docker Desktop, but not change its objects;
-  - login items and background tasks are registered through Launch
-    Services, Apple Events or launchd, which are denied. Their other
-    interfaces were not measured;
-  - the write check next to `$TMPDIR` proves nothing when the directory
-    holding `$TMPDIR` is not writable by the user anyway.
-- Linux: `sudo unshare` gives a network namespace with only loopback and an
-  empty tmpfs over `/run`; the suite then runs as the calling user without
-  supplementary groups (no `docker` group) and with `no_new_privs`. This
-  needs passwordless sudo.
-- `DOCKER_*` and similar variables are removed and `DOCKER_CONFIG` is an
-  empty directory.
-- Before the suite runs, `scripts/ci/no-docker-probe.py` checks from inside
-  that the mechanism is in effect and that no engine answers on any endpoint
-  it finds: the usual socket paths, the Docker contexts, `DOCKER_HOST`, the
-  sockets under `/run`, `/var/run`, `/tmp`, `$TMPDIR` and `~/.docker`,
-  ports 2375 and 2376 and every listening loopback port. If the isolation cannot be applied or proven, the
-  suite does not run (exit 125).
-- Setuid programs cannot run inside, so `sudo` is unavailable. The U-16
-  check that another local user cannot read a secret therefore prints INFO
-  and is not counted, in CI as well as locally; the U-16 mode checks still
-  run.
-- On Linux the probe finds an engine socket owned by the calling user only
-  in the places listed above. Writes are not restricted on Linux, so a
-  mutant could change files that run later outside the isolation. CI
-  runners are discarded after each job; on a developer machine, run
-  mutants only with read-only payloads (see below).
+The person or job that starts a suite is trusted. The checks of the
+environment described below prevent accidental use where the isolation is
+not supported; they are not a boundary against the caller. Kernel and
+sandbox vulnerabilities and CPU or memory exhaustion are out of scope.
 
-- macOS applies a sandbox inside another only if the profiles are
-  identical, so the suites cannot run inside a different sandbox: they are
-  refused (exit 125).
+Supported platforms:
 
-`scripts/ci/tests/no-docker.test.sh` checks this with a mutated `bin/devenv`
-whose commands reach Docker in more than 20 ways, both as `DEVENV` and edited
-into the file.
+| Platform | Support | Mechanism |
+|---|---|---|
+| macOS developer machine | supported | `sandbox-exec` profile |
+| Linux on a GitHub-hosted Actions runner | supported | `sudo -n unshare` namespaces |
+| Linux anywhere else (developer machines, self-hosted runners, containers) | refused (exit 125): "Linux is supported on GitHub-hosted CI runners only" | — |
+| other systems | refused (exit 125) | — |
+| any platform as uid 0 | refused (exit 125) | — |
 
-- The mutant only reads (`docker version`, `GET /version`); a pre-flight
-  check refuses to run if it contains anything else.
-- Its target is a canary engine of the test, which answers like Docker and
-  records every request. Two cases name the real socket paths.
-- On macOS, `unit.sh` runs on the host as a developer would run it. The
-  mutant must run to its end with no request reaching the canary and no
-  answer from the real socket paths.
-- On Linux, `unit.sh` runs behind `no-docker.sh`, where the canary is a
-  reachable engine, so `unit.sh` must refuse.
-- The control runs the same mutant under a copy of `unit.sh` without the
-  re-execution, behind an outer guard that leaves only the canary
-  reachable. The mutant must reach the canary.
-- Without a mutant, plain commands inside `no-docker.sh` must not reach a
-  loopback port that was listening before it started, while a port they
-  open themselves stays reachable. On macOS they must also be unable to
-  write under `$HOME`, next to `$TMPDIR` or in `/tmp`, while bash 3.2
-  here-documents still work. They must not be able to write a preference
-  or use `TIOCSTI` either. An incomplete port list and `TMPDIR=/tmp` must
-  be refused.
+Each property below is enforced by the sandbox or the kernel and checked
+from inside by `scripts/ci/no-docker-probe.py` before the command starts. If
+any check fails, a tool is missing, a mount fails, the profile is rejected or
+the command was not started inside the isolation, the command does not run
+and the exit status is 125.
 
-Mutation testing:
+On both platforms the variables that select an engine (`DOCKER_*`,
+`CONTAINER_HOST`, `PODMAN_*`, `COMPOSE_*` and similar) are removed,
+`DOCKER_CONFIG` is an empty directory and `$TMPDIR` is a directory of the
+run. The probe then asks every endpoint it can find whether a container
+engine answers there: the usual socket paths, the Docker contexts,
+`DOCKER_HOST`, sockets under `/run`, `/var/run`, `/tmp`, `$TMPDIR` and
+`~/.docker`, ports 2375 and 2376 and every listening TCP port. The walk
+of those directories stops at 20,000 entries. On Linux that refuses the
+run. On macOS, where every Unix socket connect is denied anyway, the probe
+prints an INFO line instead.
+
+#### macOS
+
+`$TMPDIR` must be the per-user temporary directory that macOS creates,
+`/private/var/folders/<xx>/<id>/T`, owned by the user with mode 0700. If
+`TMPDIR` is unset, `getconf DARWIN_USER_TEMP_DIR` is used. Any other
+directory, such as `/tmp`, `/private/var/tmp`, `/`, Homebrew's prefix or a
+directory of the user's own, is refused. Each run gets a fresh directory
+there, mode 0700. The command's `$TMPDIR` is inside it.
+
+The `sandbox-exec` profile denies:
+
+- connecting to any Unix socket. The probe checks this with a socket of its
+  own: EPERM;
+- TCP beyond loopback, and to loopback ports 22, 2375 and 2376. The probe
+  checks 2375 and a non-loopback address;
+- TCP to every port that was listening when the run started, on any address
+  (a development server, an IDE, a published container port or a socket
+  proxy). The list comes from `netstat`; if `netstat` fails, prints no
+  column header or prints a LISTEN row that cannot be parsed, the run is
+  refused. The probe connects to each held port;
+- file writes anywhere except in the run's directory, `/dev/null`,
+  `/dev/zero`, `/dev/tty`, `/dev/dtracehelper`, `/dev/fd/*` and the
+  `sh-thd*` here-document files of bash 3.2, which bash creates in `/tmp`
+  whatever `$TMPDIR` is. The probe checks that `$HOME`, the user's
+  temporary directory, `/tmp` and `/private/var/tmp` are not writable and
+  that `$TMPDIR` is. This `/dev` list was measured with bash 3.2, python3,
+  `mktemp`, `/usr/bin/git`, `tests/devenv/unit.sh` and the guard suites.
+  Writing to `/dev/random`, `/dev/urandom` and other terminals' `/dev/ttys*`
+  is denied. `/usr/bin/git` reports that it cannot write the `xcrun_db`
+  cache in the user's temporary directory and still works. That cache is
+  read by `xcrun` outside the sandbox, so it stays write-denied;
+- signals to any process outside the sandbox. Processes of the run can
+  signal each other, including process groups. The probe sends signal 0 to
+  `no-docker.sh` outside: EPERM;
+- preference writes through `cfprefsd` and `TIOCSTI` on the terminal;
+- `open`, `osascript`, `launchctl` and `ssh`, job submission to launchd,
+  Launch Services and Apple Events;
+- lookups of the services that register login items and background tasks
+  (`com.apple.xpc.smd`, `com.apple.backgroundtaskmanagement*`,
+  `com.apple.coreservices.sharedfilelistd*`) and of Docker Desktop's own
+  services (`com.docker.*`, `com.electron.dockerdesktop.*`).
+
+Setuid programs cannot run in the sandbox, so `ps` is an ad-hoc signed copy
+and `sudo` is unavailable. The U-16 check that another local user cannot
+read a secret therefore prints INFO and is not counted; the U-16 mode checks
+still run. macOS applies a sandbox inside another only if the profiles are
+identical, so the suites cannot run inside a different sandbox: they are
+refused.
+
+#### Linux (GitHub-hosted runners)
+
+`no-docker.sh` refuses unless:
+
+- the caller is not uid 0 (real or effective). This is checked before
+  anything else;
+- `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`;
+- a `Runner.Worker` process (by `comm` and executable name) is an ancestor
+  of the caller. An unreadable ancestor counts as a refusal;
+- `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` are directories under `$HOME`;
+- `sudo -n` works and `unshare`, `setpriv`, `setsid`, `ip`, `mount`, `find`,
+  `stat` and `python3` exist.
+
+Before entering, the caller's side lists every Unix socket file on the
+local file systems (`find -xdev -type s` per mount) and every bound
+pathname socket of the host's network namespace (`/proc/net/unix`, which is
+what `ss -xl` shows). The list has a 180-second budget; when it runs out,
+the run is refused instead of using a partial list. The time it took is
+printed with each run. Inside, the list is a read-only file.
+
+The command then runs under
+`sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc`
+with private mount propagation. The namespace's pid 1 is a root shell that
+does not exec:
+
+1. It brings up loopback in the new network namespace.
+2. It mounts an empty tmpfs over `/run` (and `/var/run` when that is not a
+   symbolic link), `/tmp`, `/var/tmp` and `/dev/shm`, a fresh mqueue on
+   `/dev/mqueue` and a read-only tmpfs over `/sys/fs/cgroup`. The run's
+   directory, which is under `/tmp` (or under `/var/tmp` with `--work`), is
+   bind-mounted aside first and moved back into the new tmpfs, so the
+   original `/tmp` is not visible.
+3. It remounts every other mount reachable by path read-only. A bind
+   remount changes only the namespace's copy and keeps the other per-mount
+   flags. This covers `$HOME` with the workspace, `$RUNNER_TEMP`,
+   `$GITHUB_ENV`, `$GITHUB_PATH` and `~/.docker`, as well as
+   `/opt/hostedtoolcache` and every other mount.
+4. It runs the command as a child: `setpriv` with the caller's uid and gid,
+   no supplementary groups, `no_new_privs`, and empty inheritable and
+   bounding capability sets; then `setsid --wait`, then `env -i` with an
+   allowlist of variables (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+   `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ`, `CI`, `DEVENV*`, `GUARD*`,
+   `ADAPTED`, `HARNESS` and `FLOWCRM_*`). No session bus, display, agent,
+   runner file-command or token variable reaches the command.
+5. It waits for the command, reaping orphans meanwhile, and exits with the
+   command's status. When pid 1 exits, the kernel kills every process left
+   in the namespace, including daemonised ones. If `unshare` itself is
+   killed (a cancelled job or a timeout), `--kill-child` kills pid 1. pid 1
+   makes no credential change, so that signal stays armed.
+
+The probe checks from inside:
+
+- no uid is 0; every capability set is empty; `NoNewPrivs` is 1; there are
+  no supplementary groups;
+- the network, mount, pid and IPC namespaces differ from the caller's;
+- the process is in a pid namespace below the caller's (`NSpid`), and
+  `/proc` belongs to it;
+- pid 1 is the root shell of the isolation and every other visible process
+  has the caller's uid. None is a runner, init or engine process, so
+  `/proc/<pid>/root` and `nsenter` have no target outside;
+- the process is in a session of its own without a controlling terminal,
+  so `TIOCSTI` has no target;
+- loopback is the only interface;
+- `/tmp`, `/var/tmp`, `/dev/shm` and `/run` are tmpfs, and `/dev/mqueue` an
+  mqueue, on devices other than the caller's. `/sys/fs/cgroup` is a
+  read-only tmpfs, and no cgroup file is writable;
+- every mount reachable by path is read-only, except the private file
+  systems above, the run's directory, `/proc` and `/dev`. This is read from
+  `/proc/self/mountinfo` and the mount ID of each path. Creating a file in
+  `$HOME`, `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` must fail as well;
+- the working directory is reachable by its path;
+- there is no socket in the private directories, and none of the listed
+  Unix sockets accepts a stream, seqpacket or datagram connection.
+  Pathname sockets on a read-only mount would still accept one, which is
+  why every one of them is tried.
+
+The output between the start and the end of the isolated command is framed
+with `::stop-commands::<random token>`, so the command cannot issue
+workflow commands. The token is never passed inside.
+
+#### Run directory (`--work DIR`)
+
+`no-docker.sh --work DIR COMMAND` uses `DIR` as the run's directory
+instead of a temporary one, and keeps it afterwards. It is the command's
+only writable directory and holds its `$TMPDIR`.
+
+`DIR` must:
+
+- be given as an absolute, canonical path with no symbolic link in it;
+- be a directory of the caller with mode 0700;
+- be empty;
+- not be or contain `$HOME`;
+- be under `$TMPDIR` or `/private/var/tmp` on macOS, and under `/var/tmp`
+  on Linux.
+
+Otherwise the run is refused. `tests/devenv/unit.sh` passes
+`NO_DOCKER_WORK=<dir>` on as `--work`. Whatever the command leaves in
+`DIR` is untrusted data: a later reader must not follow symbolic links,
+must accept regular files only, must limit their size and must not execute
+them.
+
+#### Accepted residual risks
+
+- **macOS leftover processes.** Background processes of the command can
+  outlive it. They stay inside the sandbox, with every limit above, but
+  have an unbounded time for the routes below. Killing the run's process
+  group or session afterwards is a follow-up.
+- **Late listeners.** A loopback port that starts listening after the run
+  started (on macOS) is reachable, as are the ports the command opens
+  itself. This includes a VM's port forward that starts later, or one
+  started while a leftover process still runs. The probe asks each
+  listening port whether it is an engine only at the start.
+- **Login items and launchd environment through copies (macOS).** The
+  services that register login items and background tasks are denied. A
+  re-signed copy of `launchctl` loses its entitlements. Whether such a copy
+  can still `setenv` in the user's launchd domain was not measured.
+- **Terminals and the pasteboard (macOS).** Writes to other terminals'
+  devices are denied. The pasteboard (`pbcopy`) is not; using it needs a
+  person to paste.
+- **Writes through other processes (macOS).** The file-write limit covers
+  the command's own writes. Writes made for it by system services are
+  limited by the launchd, Launch Services, Apple Events, preference and
+  login-item denies above, not by the file rule. Keychain items are data,
+  not code.
+- **Sockets created after the list (Linux).** A pathname socket that
+  appears on a read-only mount after the list was made, from a process
+  outside the namespace, is not tried. On a GitHub-hosted runner no such
+  service runs during the isolated steps.
+- **Shared keyring and readable files (Linux).** The per-user kernel
+  keyring is shared. Files such as `~/.docker/config.json` stay readable,
+  but there is no network to use them on.
+- **Orphan cleanup after a kill (Linux).** `env -i` drops
+  `RUNNER_TRACKING_ID`, so the runner's end-of-job cleanup cannot find
+  processes of the namespace. They are killed with pid 1 instead (see
+  above).
+- **CI coverage when a scan fails.** Isolated steps run last in their job
+  (see below). When the container scan fails, the Dev environment job stops
+  before `tests/devenv/unit.sh`, so the allocator unit tests do not run in
+  that CI run.
+
+#### CI
+
+The isolated steps are the last steps of each required job:
+
+- **Repository guard:** the trusted guard scripts, ShellCheck and
+  actionlint run first; then the guard regression suites and
+  `scripts/ci/tests/no-docker.test.sh`.
+- **Dev environment:** `tests/devenv/unit.sh` runs after the container
+  scan.
+
+After them, only the checkout action's post-job step runs. During the
+isolated steps on Linux it reads nothing that the code under test could
+have written: the workspace and `$HOME` are read-only, and `/tmp` is
+private.
+
+`scripts/ci/tests/ci-isolation-order.py` checks the order statically:
+
+- after the first isolated step of a job, every following step is
+  isolated. A step is isolated when a script it runs (directly or through
+  a `make` target) calls `no-docker.sh`;
+- the required jobs exist;
+- no job or step has an `if:` condition;
+- every other file that mentions `no-docker.sh` has the recognised re-exec
+  stanza.
+
+#### Regression tests
+
+`scripts/ci/tests/no-docker.test.sh` runs a mutated `bin/devenv` whose
+commands reach Docker in more than 20 ways, both as `DEVENV` and edited
+into the file. The mutant only reads (`docker version`, `GET /version`);
+its text is pinned by sha256 and checked before each use. Its target is a
+canary engine of the test, which answers like Docker and records every
+request.
+
+- **T-03 and T-04:** on macOS, `unit.sh` runs on the host as a developer
+  would run it. The mutant must run to its end without a request reaching
+  the canary. On Linux, `unit.sh` runs inside the isolation, where the
+  canary is a reachable engine, so it must refuse.
+- **T-05 (control):** a copy of `unit.sh` without the re-execution, behind
+  an outer guard. The mutant must reach the canary.
+- **T-14:** the helpers that the test runs outside any isolation, and the
+  mutant's text, are kept outside every directory that code under test can
+  write. Their sha256 is checked immediately before each such run. The
+  case also checks that a changed copy is detected and not run.
+
+The other cases run plain commands that only print, connect, write markers
+in the test's directories or send signal 0 or TERM to the test's own
+`sleep`:
+
+- **T-00:** the read-only lint of the mutant.
+- **T-01 and T-02:** `--check`, and a claimed but unproven isolation.
+- **T-07:** loopback ports that were already listening are unreachable,
+  while ports opened inside are reachable.
+- **T-06 and T-08 to T-15, macOS only:**
+  - **T-06 and T-11:** the write limits;
+  - **T-08:** the complete port list;
+  - **T-09 and T-12:** the `TMPDIR` allowlist;
+  - **T-10:** preferences and `TIOCSTI`;
+  - **T-13:** a canary outside cannot be signalled (EPERM) and survives,
+    while the command's own child and process group can be signalled;
+  - **T-14:** integrity of the helpers;
+  - **T-15:** `--work`, accepted and refused cases.
+- **T-16 to T-18, Linux only:**
+  - **T-16:** a canary inside sees only the namespace's processes, cannot
+    read `/proc/1/root` and cannot connect to any engine, session or host
+    socket. It gets EROFS in `$HOME`, the workspace, `$RUNNER_TEMP` and the
+    tool cache, and sees a private `/tmp` and `/dev/shm`, read-only mounts,
+    masked cgroups, private IPC and loopback only;
+  - **T-17:** a `setsid` daemon does not outlive the command, neither when
+    the command ends nor when `unshare` is killed;
+  - **T-18:** uid 0 (a real `sudo` run), missing or other runner variables,
+    a workspace outside `$HOME` and a caller without a `Runner.Worker`
+    ancestor are refused.
+- **T-19:** the static CI order check, on both platforms.
+
+The macOS cases run only on a developer's Mac: there is no macOS CI job.
+
+#### Mutation testing
 
 - Run a mutated copy of `bin/devenv` or of a guard only through these
-  suites.
-- Use payloads that only read or only print. Never use a destructive Docker
-  command (prune, forced removal, `down -v`, `--rmi`), not even in isolation.
+  suites, on a macOS developer machine or in CI. On Linux outside CI the
+  suites refuse to run.
+- Until a CI run on the GitHub-hosted runner has shown the Linux cases
+  T-16 to T-18 passing, use only payloads that read or print, on both
+  platforms.
+- Never use a destructive Docker command (prune, forced removal, `down -v`,
+  `--rmi`), not even in isolation.
 - `tests/devenv/integration.sh` and the `tests/app/` suites use the real
   Docker daemon on purpose, so never run them on a mutated copy.
   `integration.sh` refuses a `DEVENV` that differs from `bin/devenv`, but no
