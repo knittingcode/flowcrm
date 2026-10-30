@@ -48,7 +48,7 @@
 #     marker file of a run of their own (T-33), or sleep.
 # This suite itself runs no docker command.
 #
-# T-06, T-08 to T-15, T-21, T-22 and T-24 to T-34 are macOS only, T-16 to
+# T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 Linux only (each prints INFO on the other platform); T-19, T-20 and
 # T-23 are static and run on both. Each case says how it fails against the
 # no-docker.sh of 38b5ebd, dfb6ee4 or e8ed7ed, which these cases were
@@ -934,6 +934,9 @@ while g < 50000 and time.time() < deadline:
   [ "$t30_ok1" -eq 0 ] && [ "$n0" -gt 0 ] &&
     { [ "$t30_still" = no ] || { [ "$r2" -eq 125 ] && [ ! -e "$w30b/ran" ]; }; } &&
     [ "$r3" -eq 0 ] && [ -e "$w30c/ran" ]
+  t30_ok=$?
+  echo "INFO  T-30 run rc $r after ${took}s, hopping afterwards $t30_hopping; next run rc $r2, hopping after it $t30_still; after its end rc $r3"
+  [ "$t30_ok" -eq 0 ]
   result "T-30 a process that keeps forking and ending is never reported as ended; new runs refuse while it runs, and start after it ended" $? \
     "(run rc $r after ${took}s, hopping afterwards $t30_hopping; next run rc $r2, hopping after it $t30_still; after its end rc $r3)"
 
@@ -1029,10 +1032,40 @@ ${t33_mark#"$ndtmp"/}
   result "T-33 an ending that cannot be shown fails the run (125), ends the supervisor's own child and keeps the marker" $? \
     "(rc $r, command $t33_child, marker kept $t33_kept, next run rc $r2)"
 
-  # T-34: TERM to no-docker.sh at several moments of the start, while the
-  # command starts processes: each run ends within 15 s, as interrupted
-  # (143) or as not shown (125); none of the processes it recorded
-  # survives once the run ended or was ended through its marker.
+  # T-35: a zombie outside (a child of this suite that has ended and is
+  # not reaped for 15 s) does not make the ending unprovable: it is found
+  # as a zombie and counts as dead from the next copy of the table on.
+  # On 980d6a5 before the fix: zombies were not found (they read as
+  # vanished), so every copy stayed open and the run failed with 125.
+  python3 -I -c 'import subprocess, sys, time
+p = subprocess.Popen(["/usr/bin/true"])
+open(sys.argv[1], "w").write(str(p.pid))
+time.sleep(15)
+p.wait()' "$work/t35.zombie" &
+  t35holder=$!
+  for _ in $(seq 1 50); do regular "$work/t35.zombie" && break; sleep 0.1; done
+  sleep 0.5
+  t35z=$(tr -cd '0-9' <"$work/t35.zombie" 2>/dev/null)
+  t35_state=$(ps -o stat= -p "${t35z:-0}" 2>/dev/null | tr -d ' ')
+  w35=$(new_work) || exit 2
+  "$nd" --work "$w35" python3 -I -B -c "$t24_leaver" "$w35" "t35-$nonce" ok >"$work/t35.out" 2>&1
+  r=$?
+  sleep 0.5
+  left=$(t24_left "$w35" "t35-$nonce")
+  t24_clean "$w35" "t35-$nonce"
+  wait "$t35holder"
+  echo "INFO  T-35 zombie ${t35z:-?} state ${t35_state:-gone} during the run; rc $r; survivors:${left:- none}"
+  case $t35_state in Z*) t35_zombie=yes ;; *) t35_zombie=no ;; esac
+  [ "$t35_zombie" = yes ] && [ "$r" -eq 0 ] && [ -z "$left" ]
+  result "T-35 a zombie outside does not make the ending of a run unprovable" $? "(zombie $t35_zombie, rc $r)"
+
+  # T-34: TERM to no-docker.sh while the command is starting processes
+  # (at 0, 0.15 and 0.4 s after it recorded its first one; it starts one
+  # every 50 ms for 1 s): processes must have been recorded when TERM is
+  # sent; each run ends within 15 s, interrupted (143) or, if the ending
+  # could not be shown, 125 with that message; none of the processes it
+  # recorded survives once the run ended or was ended through its own
+  # marker directory.
   t34_spawn='
 import os, sys, time
 w, tag = sys.argv[1], sys.argv[2]
@@ -1046,19 +1079,22 @@ for _ in range(20):
 time.sleep(30)
 '
   t34_bad=""
-  for t34_delay in 0 0.1 0.3 0.8; do
+  for t34_delay in 0 0.15 0.4; do
     w34=$(new_work) || exit 2
     t34_before=$(cd "$ndtmp" && ls -d no-docker-mark.* 2>/dev/null)
     python3 -I -c 'import os, signal, sys
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 os.execv(sys.argv[1], sys.argv[1:])' "$nd" --work "$w34" python3 -I -B -c "$t34_spawn" "$w34" "t34-$nonce" >"$work/t34.out" 2>&1 &
     ndpid=$!
+    for _ in $(seq 1 200); do [ "$(count_in . "$w34/pids")" -ge 1 ] && break; sleep 0.05; done
     sleep "$t34_delay"
+    t34_n=$(count_in . "$w34/pids")
     t0=$(date +%s)
     ps -o args= -p "$ndpid" 2>/dev/null | grep -q -- no-docker && kill -TERM "$ndpid"
     wait "$ndpid"
     r=$?
     took=$(($(date +%s) - t0))
+    t34_all=$(count_in . "$w34/pids")
     sleep 0.5
     left=$(t24_left "$w34" "t34-$nonce")
     if [ "$r" -eq 125 ]; then
@@ -1083,7 +1119,13 @@ ${t34_mark#"$ndtmp"/}
       left=$(t24_left "$w34" "t34-$nonce")
     fi
     t24_clean "$w34" "t34-$nonce"
-    case $r in 143 | 125) ;; *) t34_bad="$t34_bad delay$t34_delay:rc$r" ;; esac
+    echo "INFO  T-34 after ${t34_delay}s: $t34_n recorded at TERM, $t34_all in all, rc $r, ${took}s, survivors:${left:- none}"
+    [ "$t34_n" -ge 1 ] || t34_bad="$t34_bad delay$t34_delay:nothing-recorded-at-TERM"
+    case $r in
+      143) ;;
+      125) grep -q 'could not be shown to have ended' "$work/t34.out" || t34_bad="$t34_bad delay$t34_delay:125-without-message" ;;
+      *) t34_bad="$t34_bad delay$t34_delay:rc$r" ;;
+    esac
     [ "$took" -le 15 ] || t34_bad="$t34_bad delay$t34_delay:${took}s"
     [ -z "$left" ] || t34_bad="$t34_bad delay$t34_delay:survivors$left"
   done
@@ -1167,7 +1209,7 @@ print(" ".join(out))
   [ "$t29" = "outside:read inside:denied 1" ]
   result "T-29 another terminal's device cannot be read from inside (control: it can from outside)" $? "($t29)"
 else
-  echo "INFO  T-06, T-08 to T-15, T-21, T-22, T-24 to T-34 skipped: macOS sandbox profile only"
+  echo "INFO  T-06, T-08 to T-15, T-21, T-22, T-24 to T-35 skipped: macOS sandbox profile only"
 fi
 
 # --- T-07 loopback ports listening before the isolation
@@ -1466,7 +1508,7 @@ check_safe() { # name
   [ "$STARTED" -eq 1 ]
   result "$1: the harness was started" $?
   if [ "$os" = Darwin ] && [ "$t0304" = bare ]; then
-    # The harness nests its own sandbox inside the guard and runs the mutant.
+    # The harness runs on the host and runs the mutant in its own sandbox.
     [ "$RC" -eq 97 ] && [ "$cases" -ge 20 ]
     result "$1: the mutant ran to its end inside the harness's isolation" $? "(rc $RC, $cases cases)"
   else
