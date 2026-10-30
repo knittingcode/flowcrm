@@ -1,0 +1,226 @@
+"""Check that isolated steps come last in every CI job (static).
+
+Usage: ci-isolation-order.py REPO_ROOT [WORKFLOW]   (default .github/workflows/ci.yml)
+
+A step is isolated when a script it runs (named in its `run:` text, or in
+the recipe of a `make` target it runs) calls scripts/ci/no-docker.sh: it
+runs code under test, which may leave files or processes for later steps.
+Code under test cannot write anything on the Linux runner's file systems
+except private temporary directories, but the order is the second line:
+after the first isolated step of a job, only isolated steps may follow.
+
+Also checked:
+  - the required jobs "Repository guard" and "Dev environment" exist and
+    each has an isolated step;
+  - no job or step has an `if:` condition (one could run a non-isolated
+    step after a failed isolated one, or skip a required check);
+  - every tracked file that mentions no-docker.sh is either part of the
+    isolation itself, documentation, the workflow, or has the re-exec
+    stanza in its recognised form, so a suite isolated another way is
+    noticed instead of being classified as not isolated.
+Exit 0 if all hold; prints one line per check.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+STANZA = re.compile(r'no-docker\.sh" --check >/dev/null 2>&1 \|\|\n\s+exec "[^"\n]*/no-docker\.sh" ')
+OWN = {"scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py", "scripts/ci/tests/no-docker.test.sh",
+       "scripts/ci/tests/ci-isolation-order.py", ".github/workflows/ci.yml"}
+SCRIPT = re.compile(r"(?<![\w./$-])((?:\./)?(?:[\w.-]+/)*[\w.-]+\.(?:sh|py))(?![\w.-])")
+REQUIRED = ("Repository guard", "Dev environment")
+
+ok = True
+
+
+def report(passed, text):
+    global ok
+    if not passed:
+        ok = False
+    print(f"ci-isolation-order: {'ok  ' if passed else 'FAIL'} {text}")
+
+
+def indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def parse(path):
+    """{job id: {"name": str, "steps": [{"name": str, "text": str}]}} of a
+    workflow written in the block style of this repository."""
+    jobs = {}
+    lines = open(path).read().splitlines()
+    in_jobs = False
+    job = None
+    step = None
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        n = indent(line)
+        if n == 0:
+            in_jobs = line.rstrip() == "jobs:"
+            job = step = None
+            continue
+        if not in_jobs:
+            continue
+        if n == 2:
+            job = {"name": "", "steps": [], "if": False}
+            jobs[line.strip().rstrip(":")] = job
+            step = None
+        elif n == 4 and job is not None:
+            step = None
+            key = line.strip()
+            if key.startswith("name:"):
+                job["name"] = key[len("name:"):].strip().strip("'\"")
+            if key.startswith("if:"):
+                job["if"] = True
+        elif n >= 6 and job is not None:
+            stripped = line.strip()
+            if n == 6 and stripped.startswith("- "):
+                step = {"name": "", "text": "", "if": False, "run": [], "in_run": False}
+                job["steps"].append(step)
+                stripped = stripped[2:]
+                n = 8
+            if step is None:
+                continue
+            if n == 8:
+                step["in_run"] = False
+                if stripped.startswith("name:"):
+                    step["name"] = stripped[len("name:"):].strip().strip("'\"")
+                elif stripped.startswith("if:"):
+                    step["if"] = True
+                elif stripped.startswith("run:"):
+                    value = stripped[len("run:"):].strip()
+                    step["in_run"] = True
+                    if value in ("|", "|-", ">", ">-"):
+                        step["style"] = value[0]
+                    else:
+                        step["style"] = "|"
+                        step["run"].append(value)
+            elif step.get("in_run"):
+                step["run"].append(stripped)
+    for job in jobs.values():
+        for step in job["steps"]:
+            sep = " " if step.get("style") == ">" else "\n"
+            step["text"] = sep.join(step["run"])
+    return jobs
+
+
+def make_recipe(root, target):
+    try:
+        lines = open(os.path.join(root, "Makefile")).read().splitlines()
+    except OSError:
+        return ""
+    out, inside = [], False
+    for line in lines:
+        if re.match(rf"^{re.escape(target)}\s*:", line):
+            inside = True
+            continue
+        if inside:
+            if line.startswith("\t"):
+                out.append(line)
+            else:
+                break
+    return "\n".join(out)
+
+
+def commands(text):
+    """The program each simple command of a shell text runs: the first word
+    after variable assignments and an interpreter (bash, sh, python3, exec,
+    env) of every command separated by a newline, ;, &&, || or |."""
+    words = []
+    for part in re.split(r"\n|;|&&|\|\||\|", text):
+        toks = part.split()
+        while toks and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]) or toks[0] in ("exec", "env", "then", "do", "!")
+                        or toks[0].lstrip("@") in ("bash", "sh", "python3", "/bin/bash", "/bin/sh")):
+            toks = toks[1:]
+            while toks and toks[0].startswith("-") and toks[0] != "-":
+                toks = toks[1:]  # interpreter options such as -I or -e
+        if toks:
+            words.append(toks[0])
+    return words
+
+
+def scripts_of(root, text):
+    names = set()
+    words = commands(text)
+    for w in words:
+        if SCRIPT.fullmatch(w):
+            names.add(w)
+    for targets in re.findall(r"(?:^|[\n;&|]\s*)make((?:\s+[A-Za-z][\w-]*)+)", text):
+        for t in targets.split():
+            names.update(w for w in commands(make_recipe(root, t).replace("\t", " ")) if SCRIPT.fullmatch(w))
+    return sorted(n[2:] if n.startswith("./") else n for n in names)
+
+
+def isolated(root, step):
+    """(isolated, scripts, missing scripts) of a step."""
+    names = scripts_of(root, step["text"])
+    missing, iso = [], False
+    for n in names:
+        try:
+            content = open(os.path.join(root, n), encoding="utf-8", errors="replace").read()
+        except OSError:
+            missing.append(n)
+            continue
+        if "no-docker.sh" in content and n not in ("scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py"):
+            iso = True
+        if n == "scripts/ci/no-docker.sh":
+            iso = True
+    return iso, names, missing
+
+
+def tracked(root):
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True).stdout
+        return [p for p in out.decode().split("\0") if p]
+    except (OSError, subprocess.CalledProcessError):
+        found = []
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if x != ".git"]
+            found += [os.path.relpath(os.path.join(d, f), root) for f in files]
+        return found
+
+
+def main():
+    root = os.path.abspath(sys.argv[1])
+    workflow = sys.argv[2] if len(sys.argv) > 2 else os.path.join(root, ".github/workflows/ci.yml")
+    jobs = parse(workflow)
+    names = {j["name"]: jid for jid, j in jobs.items()}
+    for required in REQUIRED:
+        report(required in names, f"required job {required!r} exists")
+    report(not any(j["if"] or any(s["if"] for s in j["steps"]) for j in jobs.values()),
+           "no job or step has an if: condition")
+    for jid, job in jobs.items():
+        first = None
+        late = []
+        for i, step in enumerate(job["steps"]):
+            iso, scripts, missing = isolated(root, step)
+            report(not missing, f"{job['name'] or jid} / {step['name']}: the scripts it runs exist"
+                   + (f" (missing {' '.join(missing)})" if missing else ""))
+            if iso and first is None:
+                first = step["name"]
+            elif not iso and first is not None:
+                late.append(step["name"])
+        report(not late, f"{job['name'] or jid}: no step that is not isolated after the first isolated one"
+               + (f" ({first!r}, then {', '.join(repr(s) for s in late)})" if late else ""))
+        if job["name"] in REQUIRED:
+            report(first is not None, f"{job['name']}: has isolated steps (first: {first})")
+    unknown = []
+    for p in tracked(root):
+        if p in OWN or p.endswith(".md"):
+            continue
+        try:
+            content = open(os.path.join(root, p), encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if "no-docker.sh" in content and not STANZA.search(content):
+            unknown.append(p)
+    report(not unknown, "every other file that mentions no-docker.sh has the recognised re-exec stanza"
+           + (f" (not recognised: {' '.join(unknown)})" if unknown else ""))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
