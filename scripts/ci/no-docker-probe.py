@@ -1419,7 +1419,7 @@ def gate_exec(cmd):
         return EX_REFUSED
     for v in ("NO_DOCKER_CTL", "NO_DOCKER_FENCE"):
         os.environ.pop(v, None)
-    print(f"no-docker: info the gate passed in {time.monotonic() - began:.2f}s")
+    print(f"no-docker: info the gate passed in {time.monotonic() - began:.2f}s (pid {os.getpid()})")
     sys.stderr.flush()
     try:
         os.execvp(cmd[0], cmd)

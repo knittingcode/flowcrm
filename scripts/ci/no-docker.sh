@@ -344,7 +344,7 @@ case $os in
     # descriptors of a relay's pipe and fd_bad to every other unexpected one.
     own_fds() {
       local line fd target ot et
-      ls -l "/proc/$$/fd/" >"$ctldir/fds" 2>&1 || return 1
+      ls -lv "/proc/$$/fd/" >"$ctldir/fds" 2>&1 || return 1
       ot=$(readlink "/proc/$$/fd/$o") && et=$(readlink "/proc/$$/fd/$e") || return 1
       fd_dup="" fd_bad=""
       while IFS= read -r line; do
@@ -407,6 +407,9 @@ case $os in
       # C2: the relays end once every writer is gone; only then may workflow
       # commands resume.
       if wait_all 30 "$opid:$ostart" "$epid:$estart"; then
+        if [ -n "$opid" ]; then
+          printf 'no-docker: info the relays ended %ss after the command\n' "$(secs $((${EPOCHREALTIME/./} - t)))" >&2
+        fi
         if [ "$stopped" = yes ]; then printf '::%s::\n' "$token"; fi
       else
         fail="$fail; a relay of the command's output did not end (workflow commands stay stopped)"
@@ -467,7 +470,7 @@ case $os in
       if [ -n "$lpid" ]; then
         printf '::notice title=no-docker::launch %ss: preflight %ss, fence %ss, profile load %ss, relays %ss, namespace, gate and command %ss, release %ss, cleanup %ss\n' \
           "$(secs $((${EPOCHREALTIME/./} - t_launch)))" "$(secs "$t_preflight")" "$(secs "$t_fence")" "$(secs "$t_load")" \
-          "$(secs "$t_relays")" "$(secs "$t_run")" "$(secs "$t_release")" "$(secs $((${EPOCHREALTIME/./} - t)))"
+          "$(secs "$t_relays")" "$(secs "$t_run")" "$(secs "$t_release")" "$(secs $((${EPOCHREALTIME/./} - t)))" >&2
       fi
       exit "$status"
     }
@@ -775,6 +778,12 @@ s.close()
       own_fds || refuse "cannot list the descriptors of no-docker.sh"
     fi
     [ -z "$fd_dup$fd_bad" ] || refuse "an unexpected descriptor is open in no-docker.sh:$fd_dup$fd_bad"
+    fdlist=""
+    while IFS= read -r line; do
+      case $line in *" -> "*) x=${line% -> *} && fdlist="$fdlist ${x##* }" ;; esac
+    done <"$ctldir/fds"
+    printf 'no-docker: info descriptors of no-docker.sh before the start:%s; relays: stdout pid %s on fd %s, stderr pid %s on fd %s, both children of %s\n' \
+      "$fdlist" "$opid" "$o" "$epid" "$e" "$$" >&2
     t_relays=$((${EPOCHREALTIME/./} - t))
 
     envargs+=("NO_DOCKER_HOST_NS=${host_ns# }" "NO_DOCKER_HOST_DEVS=${host_devs# }" "NO_DOCKER_PROTECTED=$protected"
