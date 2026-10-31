@@ -257,9 +257,9 @@ case $os in
         proc_stat "$pid" || return 0
         start=$ps_start
       fi
-      end=$((${EPOCHREALTIME/./} + $3 * 1000000))
+      end=$((${EPOCHREALTIME//[!0-9]/} + $3 * 1000000))
       while alive "$pid" "$start"; do
-        [ "${EPOCHREALTIME/./}" -lt "$end" ] || return 1
+        [ "${EPOCHREALTIME//[!0-9]/}" -lt "$end" ] || return 1
         sleep 0.05
       done
       return 0
@@ -269,7 +269,7 @@ case $os in
     # false if one still does after SECONDS (all share the one deadline).
     wait_all() {
       local end x p s busy
-      end=$((${EPOCHREALTIME/./} + $1 * 1000000))
+      end=$((${EPOCHREALTIME//[!0-9]/} + $1 * 1000000))
       shift
       while :; do
         busy=""
@@ -282,7 +282,7 @@ case $os in
           if alive "$p" "$s"; then busy=yes; fi
         done
         [ -n "$busy" ] || return 0
-        [ "${EPOCHREALTIME/./}" -lt "$end" ] || return 1
+        [ "${EPOCHREALTIME//[!0-9]/}" -lt "$end" ] || return 1
         sleep 0.05
       done
     }
@@ -310,7 +310,11 @@ case $os in
 
     # resolve_pending: a start interrupted between its "&" and the recording of
     # its pid is resolved from $!: changed since the marker was set, the fork
-    # happened and $! is the new process; unchanged, it did not.
+    # happened and $! is the new process; unchanged, it did not. The pids are
+    # compared by number: the kept pid is that of a process this shell
+    # started last, and the same number could come back between two adjacent
+    # commands only if the kernel's pid space wrapped meanwhile (4194304
+    # pids), which is taken as impossible.
     resolve_pending() {
       if [ -n "$pending" ] && [ "$!" != "$kept" ]; then
         case $pending in
@@ -372,6 +376,25 @@ case $os in
       alive "$spid" "$sstart"
     }
 
+    # close_relay_ends: close every descriptor of this shell on a relay's
+    # pipe ($o, $e and any copy bash keeps of a process substitution), so
+    # the relays see the end of their input once the command's copies are
+    # gone.
+    close_relay_ends() {
+      local f fd t ot="" et=""
+      [ -z "$o" ] || ot=$(readlink "/proc/$$/fd/$o" 2>/dev/null)
+      [ -z "$e" ] || et=$(readlink "/proc/$$/fd/$e" 2>/dev/null)
+      for f in "/proc/$$/fd"/*; do
+        fd=${f##*/}
+        case $fd in "" | *[!0-9]* | 0 | 1 | 2 | 255) continue ;; esac
+        t=$(readlink "$f" 2>/dev/null) || continue
+        if { [ -n "$ot" ] && [ "$t" = "$ot" ]; } || { [ -n "$et" ] && [ "$t" = "$et" ]; }; then
+          exec {fd}>&-
+        fi
+      done
+      o="" e=""
+    }
+
     # secs MICROSECONDS: as seconds with two decimals.
     secs() {
       printf '%d.%02d' $(($1 / 1000000)) $(($1 % 1000000 / 10000))
@@ -383,14 +406,12 @@ case $os in
     # and exit with the launch's status.
     # shellcheck disable=SC2317,SC2329 # run as the EXIT trap
     cleanup() {
+      trap '' INT TERM HUP
       local left="" fail="" started=no status t
       [ -z "$cleaning" ] || return
       cleaning=yes
-      trap '' INT TERM HUP
-      t=${EPOCHREALTIME/./}
-      if [ -n "$o" ]; then exec {o}>&-; fi
-      if [ -n "$e" ]; then exec {e}>&-; fi
-      o="" e=""
+      t=${EPOCHREALTIME//[!0-9]/}
+      close_relay_ends
       resolve_pending
       # C1: pid 1 of the namespace, killed by no-docker-aa.py, only while sudo
       # may still run; a fork that did not happen is recorded as such.
@@ -408,9 +429,10 @@ case $os in
       # commands resume.
       if wait_all 30 "$opid:$ostart" "$epid:$estart"; then
         if [ -n "$opid" ]; then
-          printf 'no-docker: info the relays ended %ss after the command\n' "$(secs $((${EPOCHREALTIME/./} - t)))" >&2
+          printf 'no-docker: info the relays ended %ss after the command\n' "$(secs $((${EPOCHREALTIME//[!0-9]/} - t)))" >&2
         fi
-        if [ "$stopped" = yes ]; then printf '::%s::\n' "$token"; fi
+        # On a line of its own even if the command's last line had no newline.
+        if [ "$stopped" = yes ]; then printf '\n::%s::\n' "$token"; fi
       else
         fail="$fail; a relay of the command's output did not end (workflow commands stay stopped)"
       fi
@@ -430,10 +452,10 @@ case $os in
       fi
       # C5: the release, only of a profile whose load was started.
       if [ -n "$lpid" ] && [ -z "$left" ]; then
-        local tr=${EPOCHREALTIME/./}
+        local tr=${EPOCHREALTIME//[!0-9]/}
         sudo -n timeout 30 /usr/bin/python3 -I "$aa" release "$profile" "$ctldir" ||
           left="no-docker-aa.py release refused or failed"
-        t_release=$((${EPOCHREALTIME/./} - tr))
+        t_release=$((${EPOCHREALTIME//[!0-9]/} - tr))
       fi
       [ -z "$work" ] || [ ! -e "$work/started" ] || started=yes
       # C6
@@ -449,7 +471,10 @@ case $os in
       else
         [ -z "$ctldir" ] || rm -rf "$ctldir"
       fi
-      [ "$work_made" != yes ] || rm -rf "$work"
+      if [ "$work_made" = yes ]; then
+        chmod -R u+rwx "$work" 2>/dev/null
+        rm -rf "$work" || printf 'no-docker: the run directory %s could not be removed\n' "$work" >&2
+      fi
       # C7: the status. A cleanup failure is 125 even after the command
       # succeeded; the negative control is always 125; then a signal; then a
       # refusal; then a command that did not start; then the command's own.
@@ -469,8 +494,8 @@ case $os in
       fi
       if [ -n "$lpid" ]; then
         printf '::notice title=no-docker::launch %ss: preflight %ss, fence %ss, profile load %ss, relays %ss, namespace, gate and command %ss, release %ss, cleanup %ss\n' \
-          "$(secs $((${EPOCHREALTIME/./} - t_launch)))" "$(secs "$t_preflight")" "$(secs "$t_fence")" "$(secs "$t_load")" \
-          "$(secs "$t_relays")" "$(secs "$t_run")" "$(secs "$t_release")" "$(secs $((${EPOCHREALTIME/./} - t)))" >&2
+          "$(secs $((${EPOCHREALTIME//[!0-9]/} - t_launch)))" "$(secs "$t_preflight")" "$(secs "$t_fence")" "$(secs "$t_load")" \
+          "$(secs "$t_relays")" "$(secs "$t_run")" "$(secs "$t_release")" "$(secs $((${EPOCHREALTIME//[!0-9]/} - t)))" >&2
       fi
       exit "$status"
     }
@@ -483,14 +508,14 @@ case $os in
     ctldir="" fencedir="" profile="" load_op="" state="" lpid="" lstart="" load_done="" spid="" sstart="" sudo_reaped=""
     o="" e="" opid="" ostart="" epid="" estart="" fspid="" fsstart="" fdpid="" fdstart=""
     pending="" kept="" token="" stopped="" signalled="" normal="" cleaning="" work="" work_made="" rc=""
-    t_launch=${EPOCHREALTIME/./} t_preflight=0 t_load=0 t_fence=0 t_relays=0 t_run=0 t_release=0
+    t_launch=${EPOCHREALTIME//[!0-9]/} t_preflight=0 t_load=0 t_fence=0 t_relays=0 t_run=0 t_release=0
     trap '' PIPE
     : &
     kept=$!
     trap cleanup EXIT
-    trap 'signalled=130; exit 130' INT
-    trap 'signalled=143; exit 143' TERM
-    trap 'signalled=129; exit 129' HUP
+    trap '[ -n "$cleaning" ] || { signalled=130; exit 130; }' INT
+    trap '[ -n "$cleaning" ] || { signalled=143; exit 143; }' TERM
+    trap '[ -n "$cleaning" ] || { signalled=129; exit 129; }' HUP
     # Only GitHub-hosted runners: the VM is discarded after the job, sudo
     # needs no password and no rootless engine or user session exists. The
     # checks below guard against using this elsewhere by accident; they are
@@ -543,9 +568,9 @@ case $os in
       [ -x "$tool" ] || refuse "$tool not found"
     done
     sudo -n true 2>/dev/null || refuse "creating the namespaces needs passwordless sudo"
-    t=${EPOCHREALTIME/./}
+    t=${EPOCHREALTIME//[!0-9]/}
     sudo -n timeout 10 /usr/bin/python3 -I "$aa" preflight || refuse "AppArmor cannot confine the launch (no-docker-aa.py preflight)"
-    t_preflight=$((${EPOCHREALTIME/./} - t))
+    t_preflight=$((${EPOCHREALTIME//[!0-9]/} - t))
     if [ -n "$given_work" ]; then
       use_work "$given_work" /var/tmp
     else
@@ -691,7 +716,7 @@ case $os in
     # (stream and datagram), which the command's gate must find refused with
     # EACCES. The listeners are this shell's own children; each dies with it
     # (PR_SET_PDEATHSIG) and exits unless its parent is this shell.
-    t=${EPOCHREALTIME/./}
+    t=${EPOCHREALTIME//[!0-9]/}
     # shellcheck disable=SC2016 # Python, not shell
     fence_py='
 import ctypes, os, socket, sys
@@ -733,12 +758,12 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
 s.sendto(b"no-docker fence", sys.argv[1] + "/dgram")
 s.close()
 ' "$fencedir" </dev/null || refuse "the fence cannot be reached outside the isolation"
-    t_fence=$((${EPOCHREALTIME/./} - t))
+    t_fence=$((${EPOCHREALTIME//[!0-9]/} - t))
 
     # L4: the profile of this launch, from the pinned template (root, 20 s).
     # sudo runs as root: whether it still runs is read from /proc (pid and
     # start time), never with kill -0, which this user may not send it.
-    t=${EPOCHREALTIME/./}
+    t=${EPOCHREALTIME//[!0-9]/}
     pending=load kept=$!
     sudo -n timeout 20 /usr/bin/python3 -I "$aa" "$load_op" "$profile" "$ctldir" &
     lpid=$! pending=
@@ -747,7 +772,7 @@ s.close()
     wait "$lpid"
     lrc=$? load_done=yes
     [ "$lrc" -eq 0 ] || refuse "the AppArmor profile could not be loaded (status $lrc)"
-    t_load=$((${EPOCHREALTIME/./} - t))
+    t_load=$((${EPOCHREALTIME//[!0-9]/} - t))
 
     # L5: workflow commands in the command's output are ignored: the token
     # is random and never passed inside. It is printed again only once the
@@ -759,7 +784,7 @@ s.close()
     printf '::stop-commands::%s\n' "$token" >&2 || refuse "cannot print the token that stops workflow commands"
     # The relays: the command's stdout and stderr are pipes to these two
     # children of this shell, which copy to the caller's.
-    t=${EPOCHREALTIME/./}
+    t=${EPOCHREALTIME//[!0-9]/}
     pending=relay-o kept=$!
     exec {o}> >(exec cat) || refuse "cannot start the stdout relay"
     opid=$! pending=
@@ -784,7 +809,7 @@ s.close()
     done <"$ctldir/fds"
     printf 'no-docker: info descriptors of no-docker.sh before the start:%s; relays: stdout pid %s on fd %s, stderr pid %s on fd %s, both children of %s\n' \
       "$fdlist" "$opid" "$o" "$epid" "$e" "$$" >&2
-    t_relays=$((${EPOCHREALTIME/./} - t))
+    t_relays=$((${EPOCHREALTIME//[!0-9]/} - t))
 
     envargs+=("NO_DOCKER_HOST_NS=${host_ns# }" "NO_DOCKER_HOST_DEVS=${host_devs# }" "NO_DOCKER_PROTECTED=$protected"
       "NO_DOCKER_PROFILE=$profile" "NO_DOCKER_CTL=$ctldir" "NO_DOCKER_FENCE=$fencedir")
@@ -807,7 +832,8 @@ s.close()
       case $p in "" | *[!0-9]*) die "unexpected pid namespace link" ;; esac
       case $m in "" | *[!0-9]*) die "unexpected mount namespace link" ;; esac
       umask 0222
-      printf "pid:%s mnt:%s\n" "$p" "$m" >"$ctl/.ns.init" && sync "$ctl/.ns.init" &&
+      rm -f "$ctl/.ns.init" && set -C &&
+        printf "pid:%s mnt:%s\n" "$p" "$m" >"$ctl/.ns.init" && set +C && sync "$ctl/.ns.init" &&
         mv -f "$ctl/.ns.init" "$ctl/ns" || die "cannot record the namespace"
       umask 0022
       cd / || die "cannot leave the working directory"
@@ -836,7 +862,7 @@ s.close()
     # one command, so cleanup can tell whether the fork happened ($! is set
     # in this shell right after fork(), and traps run between commands).
     put_state entering || refuse "cannot record the state of the launch"
-    t=${EPOCHREALTIME/./}
+    t=${EPOCHREALTIME//[!0-9]/}
     pending=init kept=$!
     sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc --propagation private -- \
       /bin/sh -c "$init" no-docker-init "$uid" "$gid" "$work" "$probe" "$cwd" "$ctldir" "$profile" \
@@ -849,7 +875,7 @@ s.close()
     # L9: the command's end (sudo's), then cleanup.
     wait "$spid"
     rc=$? sudo_reaped=yes
-    t_run=$((${EPOCHREALTIME/./} - t))
+    t_run=$((${EPOCHREALTIME//[!0-9]/} - t))
     normal=yes
     exit "$rc"
     ;;

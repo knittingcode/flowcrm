@@ -250,6 +250,9 @@ def p03(P, emit):
     emit("P-03", passes(dict(good, restrict_unconfined="1", restrict_userns="1")),
          "the sysctl values are recorded, not gating")
     emit("P-03", not passes({}), "rejected: an empty observation")
+    af = P["af_unix_feature"]
+    emit("P-03", af("file", "yes\n") and af("dir", "") and not af("file", "no\n") and not af("other", "")
+         and not af("missing", ""), "af_unix: a file reading yes or a directory counts; anything else does not")
 
 
 def p04(P, emit):
@@ -449,6 +452,22 @@ def p10(P, emit):
         r2 = "refused"
     emit("P-10", r1 == "killed" and r2 == "refused" and f"signal {int(signal.SIGKILL)}" not in fs2.calls,
          f"pid 1 recorded its namespace first: the same one is accepted, another one stops the kill ({r1}, {r2})")
+    fs = FakeSys()
+    fs.procs = procs_tree()
+    fs.procs[1005] = dict(fs.procs[1001])  # a second sudo of the launcher: ambiguous
+    now = [0.0]
+    fs.clock = lambda: now[0]
+
+    def tick(s_):
+        now[0] += 1.0
+    fs.sleep = tick
+    try:
+        P["kill_init"](1000, FakeCtl(), fs)
+        r = "returned"
+    except P["Refused"]:
+        r = "refused"
+    emit("P-10", r == "refused" and f"signal {int(signal.SIGKILL)}" not in fs.calls and now[0] >= 8,
+         f"an ambiguous lookup is retried until the deadline, then refused without a signal ({r}, {now[0]:.0f}s)")
 
 
 def p11(P, emit):
@@ -489,9 +508,13 @@ def p11(P, emit):
                 lf(999, {**t, 999: {"ppid": 1, "comm": "bash", "ruid": 1001}}, me, 1001)]
     emit("P-11", all(variants), "LAUNCHERPID refused: another uid, not the sudo's parent, absent, too far up, a grandparent")
     fi = P["find_init"]
+    fake = procs_tree()
+    fake[1006] = dict(fake[1002], ppid=1003, pidns=NSINO)  # a process inside named unshare, with its argv
     emit("P-11", fi(procs_tree(), 1000, HOST, None) == ("found", 1003)
-         and fi(procs_tree(monitor=1010), 1000, HOST, NSINO) == ("found", 1003),
-         "pid 1 is found below the launcher's sudo and unshare (with and without sudo's monitor)")
+         and fi(procs_tree(monitor=1010), 1000, HOST, NSINO) == ("found", 1003)
+         and fi(fake, 1000, HOST, None) == ("found", 1003),
+         "pid 1 is found below the launcher's sudo and unshare (with and without sudo's monitor; a process "
+         "inside disguised as unshare is not taken)")
     two = procs_tree()
     two[1004] = dict(two[1003])
     sudo2 = procs_tree()

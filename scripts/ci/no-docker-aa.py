@@ -185,6 +185,15 @@ def preflight_findings(o):
     ]
 
 
+def af_unix_feature(kind, text):
+    """True if the kernel's features/network/af_unix entry says AppArmor
+    mediates Unix sockets: a directory, or a file reading "yes" (as on the
+    Ubuntu runner kernels); False if missing or anything else."""
+    if kind == "dir":
+        return True
+    return kind == "file" and text.strip() == "yes"
+
+
 def parse_state(text):
     """The launch state CTLDIR/state names; "unknown" for anything else."""
     if text is None or STATE_RE.fullmatch(text) is None:
@@ -363,7 +372,9 @@ def find_init(procs, launcher, host_ino, recorded):
     level, unshares = [sudos[0]], []
     for _ in range(3):
         level = [c for p in level for c in children.get(p, [])]
-        unshares += [c for c in level if procs[c]["comm"] == "unshare"
+        # Only an unshare in the host's pid namespace: its forked child is
+        # in the new one (and so is anything the command could rename).
+        unshares += [c for c in level if procs[c]["comm"] == "unshare" and procs[c]["pidns"] == host_ino
                      and procs[c]["argv"][:len(UNSHARE_ARGV)] == UNSHARE_ARGV]
     if not unshares:
         return "none", "the sudo has not started unshare"
@@ -462,7 +473,7 @@ def pidns_tasks():
         try:
             st = proc_status(pid)
         except OSError as e:
-            st = e
+            st = still_there(e, f"/proc/{pid}")
         tasks.append((pid, ino, st))
     return tasks
 
@@ -477,7 +488,7 @@ def label_sweep():
         try:
             tids = [d for d in os.listdir(f"/proc/{pid}/task") if d.isdigit()]
         except OSError as e:
-            entries.append((f"/proc/{pid}/task", e))
+            entries.append((f"/proc/{pid}/task", still_there(e, f"/proc/{pid}")))
             continue
         for tid in tids:
             path = f"/proc/{pid}/task/{tid}/attr/apparmor/current"
@@ -530,8 +541,10 @@ class CtlDir:
             return None
 
     def read(self, name, limit=4096):
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
         try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EINVAL, f"{name} is not a regular file")
             return os.read(fd, limit).decode("utf-8", "replace")
         finally:
             os.close(fd)
@@ -625,8 +638,13 @@ class System:
             except OSError:
                 return None
 
+        path = f"{FEATURES}/network/af_unix"
         try:
-            af_unix = os.path.isdir(f"{FEATURES}/network/af_unix")
+            st = os.stat(path)
+            kind = "dir" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else "other"
+            af_unix = af_unix_feature(kind, read_text(path, 4096) if kind == "file" else "")
+        except FileNotFoundError:
+            af_unix = False
         except OSError:
             af_unix = None
         return {"enabled": param("enabled"), "mode": param("mode"), "af_unix": af_unix,
@@ -760,7 +778,7 @@ def load(op, name, ctl, sys_):
 
 
 def kill_init_once(launcher, ctl, sys_):
-    """One attempt: "killed", "not found" or Refused. The order is the
+    """One attempt: "killed", "none" (not found), "ambiguous" or Refused. The order is the
     safety argument: the pid is held by a pidfd and its start time is the
     one seen in the lookup, before and after its namespace is read, so the
     namespace recorded and the process signalled are those of pid 1."""
@@ -773,18 +791,16 @@ def kill_init_once(launcher, ctl, sys_):
         recorded = parse_ns(rec["text"])[0]
     procs = sys_.process_table()
     found, what = find_init(procs, launcher, host, recorded)
-    if found == "ambiguous":
-        raise Refused(what)
-    if found == "none":
-        return "not found"
+    if found != "found":
+        return found  # "none" or "ambiguous": looked up again until the deadline
     pid, start = what, procs[what]["start"]
     pidfd = sys_.pidfd_open(pid)
     try:
         if sys_.start_time(pid) != start:
-            return "not found"
+            return "none"
         pid_ino, mnt_ino = sys_.ns_inodes(pid)
         if sys_.start_time(pid) != start:
-            return "not found"
+            return "none"
         sys_.pidfd_signal(pidfd, 0)
         if pid_ino == host:
             raise Refused("pid 1 of the launch is in the host's pid namespace")
@@ -807,11 +823,13 @@ def kill_init(launcher, ctl, sys_):
     while True:
         try:
             result = kill_init_once(launcher, ctl, sys_)
-        except ProcessLookupError:
-            result = "not found"
+        except (ProcessLookupError, FileNotFoundError):
+            result = "none"  # pid 1 ended while it was being looked at
         if result == "killed":
             return
         if sys_.clock() >= end:
+            if result == "ambiguous":
+                raise Refused("pid 1 of the launch could not be told apart from other processes")
             say("pid 1 of the launch not found; P1 decides")
             return
         sys_.sleep(0.1)
