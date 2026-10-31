@@ -19,12 +19,15 @@ check prints "ok   <rule> <text>" or "FAIL <rule> <text>"; the last line is
          runs only the reviewed test commands;
   S-05   the AppArmor templates are exactly the reviewed rule set (RULES
          below), the negative-control one differing only by
-         attach_disconnected.
+         attach_disconnected;
+  S-08   the sha256 values no-docker-aa.py pins for the two templates are
+         those of the template files.
 
 Code means every tracked file except Markdown; lines that are comments
 (#, //, /* or *) are not code either.
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -171,6 +174,27 @@ def s05(files):
            [f"{NEGATIVE}: {x}" for x in grammar(files.get(NEGATIVE, ""), "negative")]
 
 
+# --- S-08 ---------------------------------------------------------------------
+
+def pinned(aa_text):
+    """{kind: sha256} as no-docker-aa.py pins them."""
+    found = {}
+    for kind in ("production", "negative"):
+        m = re.search(r'"' + kind + r'": \(os\.path\.join\([^)]*\),\s*"([0-9a-f]{64})"\)', aa_text)
+        found[kind] = m.group(1) if m else None
+    return found
+
+
+def s08(files):
+    pins = pinned(files.get(AA, ""))
+    found = []
+    for kind, path in (("production", TEMPLATE), ("negative", NEGATIVE)):
+        actual = hashlib.sha256(files.get(path, "").encode()).hexdigest()
+        if pins[kind] != actual:
+            found.append(f"{AA} pins {pins[kind]} for {path}, which is {actual}")
+    return found
+
+
 # --- the rules and their mutant fixtures --------------------------------------
 
 def add(path, text):
@@ -194,6 +218,8 @@ RULE_LIST = [
      add(TEST, "\nsudo -n -E true\n")),
     ("S-05", "the templates are exactly the reviewed rule set", s05,
      edit(TEMPLATE, "  deny network vsock,\n", "")),
+    ("S-08", "the template hashes pinned in no-docker-aa.py are those of the files", s08,
+     edit(NEGATIVE, "  deny network vsock,\n", "  deny network inet,\n")),
 ]
 
 

@@ -58,7 +58,7 @@
 #
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and T-37 Linux only (each prints INFO on the other platform); T-19,
-# T-20, T-23, T-36 and T-39 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38 and T-39 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -1606,13 +1606,31 @@ done
 t39=$(python3 -I -B "$here/no-docker-static.py" "$root" 2>&1)
 t39_rc=$?
 printf '%s\n' "$t39" | grep -vE '^ok   ' | sed 's/^/INFO    /'
-for want in S-02=2 S-02b=2 S-03b=2 S-05=4; do
+for want in S-02=2 S-02b=2 S-03b=2 S-05=4 S-08=2; do
   tag=${want%=*}
   n=$(printf '%s\n' "$t39" | grep -cE "^ok   ${tag} ")
   bad=$(printf '%s\n' "$t39" | grep -cE "^FAIL ${tag} ")
   [ "$t39_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
-    printf '%s\n' "$t39" | grep -qx 'SUMMARY 10 ok, 0 failed'
+    printf '%s\n' "$t39" | grep -qx 'SUMMARY 12 ok, 0 failed'
   result "T-39 $tag: $n of ${want#*=} checks pass" $? "(rc $t39_rc, $bad failed)"
+done
+
+# --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
+# both platforms: fixtures only (every call that would open, list or write a
+# file, read a link, run a program, open a pidfd or send a signal raises),
+# its operations against a fake system (P-01 to P-11), the helper's
+# functions called by what runs (W) and mutated copies of the helper
+# rejected (M1 to M17). The numbers of assertions are fixed here.
+t38=$(python3 -I -B "$here/no-docker-aa-unit.py" "$root/scripts/ci/no-docker-aa.py" 2>&1)
+t38_rc=$?
+printf '%s\n' "$t38" | grep -vE '^ok   ' | sed 's/^/INFO    /'
+for want in P-01=8 P-02=7 P-03=12 P-04=6 P-05=9 P-06=15 P-07=6 P-08=4 P-09=6 P-10=3 P-11=6 W=6 M=17; do
+  tag=${want%=*}
+  n=$(printf '%s\n' "$t38" | grep -cE "^ok   ${tag}[0-9]* ")
+  bad=$(printf '%s\n' "$t38" | grep -cE "^FAIL ${tag}[0-9]* ")
+  [ "$t38_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
+    printf '%s\n' "$t38" | grep -qx 'SUMMARY 105 ok, 0 failed'
+  result "T-38 $tag: $n of ${want#*=} assertions pass" $? "(rc $t38_rc, $bad failed)"
 done
 
 # --- T-19 CI order (static): no step that is not isolated follows an

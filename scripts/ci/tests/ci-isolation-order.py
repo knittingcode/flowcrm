@@ -34,7 +34,7 @@ import sys
 STANZA = re.compile(r'no-docker\.sh" --check >/dev/null 2>&1 \|\|\n\s+exec "[^"\n]*/no-docker\.sh" ')
 OWN = {"scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py", "scripts/ci/tests/no-docker.test.sh",
        "scripts/ci/tests/ci-isolation-order.py", ".github/workflows/ci.yml",
-       "scripts/ci/tests/no-docker-static.py"}
+       "scripts/ci/tests/no-docker-static.py", "scripts/ci/no-docker-aa.py"}
 SCRIPT = re.compile(r"(?<![\w./$-])((?:\./)?(?:[\w.-]+/)*[\w.-]+\.(?:sh|py))(?![\w.-])")
 REQUIRED = ("Repository guard", "Dev environment")
 # Runs code under test only through no-docker.sh (it has no stanza of its
