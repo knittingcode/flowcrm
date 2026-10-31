@@ -112,9 +112,10 @@ runners only. macOS is unchanged.
 - The kernel refuses every host-bound pathname socket, including late,
   aliased, unlistable and datagram ones; the enumeration's residuals are
   gone.
-- The guard job's estimated time drops to about 317 to 382 seconds (an
-  estimate from component bounds; the 600-second timeout is unchanged, and
-  L-16 fails above a projected 540 seconds).
+- The guard job's estimated time drops to about 315 to 382 seconds (an
+  estimate from component bounds, for the 45 launches of the guard suites
+  and `no-docker.test.sh`; the 600-second timeout is unchanged, and L-16
+  fails above a projected 540 seconds).
 
 **Accepted residual risks** (docs/dev-environment.md):
 - **RR-01:** a runner cancellation leaves confined processes running and the

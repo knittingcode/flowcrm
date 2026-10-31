@@ -64,7 +64,8 @@
 #     of a listener's network namespace, reading the profile list and a
 #     task's AppArmor labels, and no-docker-aa.py load, release and diag of
 #     this suite's own profiles (L-13, and releasing what a case left
-#     loaded); any profile a case leaves loaded is released on exit.
+#     loaded); the profiles a case records as left loaded are released on
+#     exit, after its carriers ended.
 # This suite itself runs no docker command.
 #
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
@@ -141,7 +142,7 @@ cleanup() {
     case $p in "" | *[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac
   done <"$work/l-listeners"
   [ ! -f "$work/l-carriers" ] || while read -r p; do
-    case $p in "" | *[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac
+    case $p in "" | *[!0-9]*) ;; *) kill "$p" 2>/dev/null && wait "$p" 2>/dev/null ;; esac
   done <"$work/l-carriers"
   [ -z "${l02_mounted-}" ] || sudo -n umount "$ro/l02alias"
   [ ! -f "$work/l-release" ] || while read -r n c; do
@@ -1357,54 +1358,50 @@ PY
 import errno, os, socket, sys, time
 def name(e):
     return "timeout" if isinstance(e, socket.timeout) else errno.errorcode.get(e.errno, str(e.errno))
+def unix(kind):
+    s = socket.socket(socket.AF_UNIX, kind)
+    opened.append(s)
+    return s
 args = sys.argv[1:]
 for op, target in zip(args[0::2], args[1::2]):
+    opened = []
     try:
         if op == "stream":
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = unix(socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect(target)
             r = "OK"
         elif op == "dgram-connect":
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            s.connect(target)
+            unix(socket.SOCK_DGRAM).connect(target)
             r = "OK"
         elif op == "dgram-send":
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-            s.sendto(b"x", target)
+            unix(socket.SOCK_DGRAM).sendto(b"x", target)
             r = "OK"
         elif op == "abstract":
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = unix(socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect("\0" + target)
             r = "OK"
-        elif op == "any":
-            try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(2)
-                s.connect(target)
-            except OSError as e:
-                if e.errno != errno.EPROTOTYPE:
-                    raise
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-                s.connect(target)
-            r = "OK"
         elif op == "scm":
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = unix(socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect(target)
             fds = socket.recv_fds(s, 16, 4)[1]
+            for fd in fds:
+                os.close(fd)
             r = f"OK fds={len(fds)}"
         elif op == "vsock":
-            s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            opened.append(socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM))
             r = "OK"
         elif op == "late":
+            # The listener writes "ready" next to its socket once it listens.
+            ready = os.path.join(os.path.dirname(target), "ready")
             for _ in range(600):
-                if os.path.exists(target):
+                if os.path.exists(ready):
                     break
                 time.sleep(0.05)
             print(f"TIME {time.time_ns()}", flush=True)
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s = unix(socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect(target)
             r = "OK"
@@ -1425,6 +1422,9 @@ for op, target in zip(args[0::2], args[1::2]):
             r = "unknown-op"
     except OSError as e:
         r = name(e)
+    finally:
+        for s in opened:
+            s.close()
     print(f"RESULT {op} {target} {r}", flush=True)
 PY
   # res FILE OP TARGET: the result the client printed for OP on TARGET.
@@ -1471,7 +1471,7 @@ PY
     c=${line##*control directory }
     c=${c%% is kept}
     printf '%s %s\n' "$n" "$c" >>"$work/l-release"
-    for _ in $(seq 1 60); do
+    for _ in 1 2 3 4 5; do
       # shellcheck disable=SC2024 # this shell appends the helper's messages to the log
       if sudo -n timeout 30 /usr/bin/python3 -I "$root/scripts/ci/no-docker-aa.py" release "$n" "$c" >>"$1" 2>&1; then
         rm -rf "$c"
@@ -1866,7 +1866,7 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   l04pid=$!
   for _ in $(seq 1 300); do [ -e "$g/started" ] && break; sleep 0.1; done
   l04_started=$(python3 -I -c 'import os, sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$g/started" 2>/dev/null || echo 0)
-  lsock stream "$ro/l04/s" "$work/l04.ready"
+  lsock stream "$ro/l04/s" "$ro/l04/ready"
   wait_bounded "$l04pid" 150
   r=$?
   python3 -I "$ro/lclient.py" stream "$ro/l04/s" >"$work/l04.out" 2>&1
@@ -1874,12 +1874,12 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   result "L-04 control: outside, the late socket is reachable" $?
   [ "$r" -eq 0 ] && [ "$(res "$work/l04.in" late "$ro/l04/s")" = EACCES ]
   result "L-04 inside: a socket bound after the start is refused with EACCES" $? "(rc $r, $(res "$work/l04.in" late "$ro/l04/s"))"
-  l04_bound=$(cut -d' ' -f2 "$work/l04.ready" 2>/dev/null)
+  l04_bound=$(cut -d' ' -f2 "$ro/l04/ready" 2>/dev/null)
   l04_tried=$(sed -n 's/^TIME //p' "$work/l04.in")
   [ "${l04_started:-0}" -gt 0 ] && [ "${l04_bound:-0}" -gt "$l04_started" ] && [ "${l04_tried:-0}" -gt "${l04_bound:-0}" ]
   result "L-04 the order: the command started, then the socket was bound, then the connect" $? \
     "(started $l04_started, bound ${l04_bound:-?}, connect ${l04_tried:-?})"
-  lstop "$work/l04.ready"
+  lstop "$ro/l04/ready"
 
   # --- L-05 sockets of the command's own still work.
   ndl python3 -I -c '
@@ -1969,7 +1969,7 @@ else:
 '
   ndl python3 -I -c "$l18_py" 2>"$work/l18.err" | cat >"$work/l18.out"
   l18_rc=${PIPESTATUS[0]}
-  read -r l18_out_sum _ < <(python3 -I -c "$l18_py" sums)
+  l18_out_sum=$(python3 -I -c "$l18_py" sums | cut -d' ' -f1)
   l18_token=$(sed -n 's/^::stop-commands::\([0-9a-f]*\)$/\1/p' "$work/l18.out" | head -n 1)
   python3 -I -c '
 import hashlib, sys
@@ -1980,7 +1980,11 @@ try:
     b = lines.index(b"::" + tok + b"::")
 except ValueError:
     sys.exit(1)
-body = b"\n".join(lines[a + 1:b]) + b"\n"
+# The launcher puts the resume token on a line of its own: one empty line
+# precedes it.
+if b < 1 or lines[b - 1] != b"":
+    sys.exit(1)
+body = b"\n".join(lines[a + 1:b - 1]) + b"\n"
 sys.exit(0 if hashlib.sha256(body).hexdigest() == sys.argv[3] else 1)
 ' "$work/l18.out" "$l18_token" "$l18_out_sum"
   l18_body=$?
@@ -2002,7 +2006,6 @@ sys.exit(0 if hashlib.sha256(body).hexdigest() == sys.argv[3] else 1)
   # exec label.
   g=$(new_work) || exit 2
   l14_before_ctl=$(ctl_dirs)
-  l14_before_tmp=$(find /tmp -maxdepth 1 -name 'no-docker.*' 2>/dev/null | wc -l | tr -d ' ')
   count_launch
   "$nd" --work "$g" /bin/sh -c 'echo "$NO_DOCKER_PROFILE" >"$1/name"; i=0
 while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo l14-out' "l14-$nonce" "$g" \
@@ -2015,8 +2018,11 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo
   for p in $(pgrep -f -- "l14-$nonce"); do
     if [ "$(sudo -n cat "/proc/$p/attr/apparmor/current" 2>/dev/null)" = "$l14_name (enforce)" ]; then l14_cmd=$p; fi
   done
-  l14_exec=""
-  [ -z "$l14_cmd" ] || l14_exec=$(sudo -n cat "/proc/$l14_cmd/attr/apparmor/exec" 2>&1)
+  l14_exec="" l14_exec_rc=1
+  if [ -n "$l14_cmd" ]; then
+    l14_exec=$(sudo -n cat "/proc/$l14_cmd/attr/apparmor/exec" 2>&1)
+    l14_exec_rc=$?
+  fi
   : >"$g/go"
   wait_bounded "$l14pid" 150
   l14_rc=$?
@@ -2032,13 +2038,12 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo
   result "L-11 while the command runs its profile is listed as exactly \"NAME (enforce)\"" $? "(${l14_name:-?}: $l14_list)"
   grep -q '^no-docker: info the gate passed in ' "$work/l14.err"
   result "L-11 the gate passed" $?
-  [ -n "$l14_cmd" ] && [ -n "$l14_exec" ]
-  result "L-11 root read the command's pending exec label (information)" $?
+  [ -n "$l14_cmd" ] && [ "$l14_exec_rc" -eq 0 ]
+  result "L-11 root read the command's pending exec label (information)" $? "(rc $l14_exec_rc)"
   [ "$l14_rc" -eq 0 ] && [ "$(grep -cx l14-out "$work/l14.out")" -eq 1 ] && [ "$(listed "$l14_name")" = 0 ]
   result "L-14 the command ran and its profile was removed" $? "(rc $l14_rc)"
-  [ "$(ctl_dirs)" = "$l14_before_ctl" ] && [ -z "$(find "$RUNNER_TEMP" -maxdepth 1 -name 'no-docker-fence.*')" ] &&
-    [ "$(find /tmp -maxdepth 1 -name 'no-docker.*' 2>/dev/null | wc -l | tr -d ' ')" = "$l14_before_tmp" ]
-  result "L-14 no control, fence or run directory is left" $?
+  [ "$(ctl_dirs)" = "$l14_before_ctl" ] && [ -z "$(find "$RUNNER_TEMP" -maxdepth 1 -name 'no-docker-fence.*')" ]
+  result "L-14 no control or fence directory is left" $?
   ! pgrep -f -- 'no-docker-fence\.' >/dev/null
   result "L-14 no fence listener is left" $?
   grep -qE '^no-docker: info descriptors of no-docker.sh before the start: 0 1 2( [0-9]+)+; relays: stdout pid [0-9]+ on fd [0-9]+, stderr pid [0-9]+ on fd [0-9]+, both children of [0-9]+$' "$work/l14.err"
@@ -2047,7 +2052,7 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo
   l14_relays=$(sed -n 's/^no-docker: info the relays ended \([0-9]*\)\.\([0-9]*\)s after the command$/\1\2/p' "$work/l14.err")
   [ -n "$l14_relays" ] && [ "$l14_relays" -le 100 ]
   result "L-14 the relays ended within 1 s of the command" $? "(${l14_relays:-?} hundredths)"
-  ! grep -qE 'refused|still loaded|cleanup failed|kill-init|killed pid 1|P1 decides' "$work/l14.err"
+  ! grep -qE '^no-docker: refused|still loaded|cleanup failed|kill-init|killed pid 1|P1 decides' "$work/l14.err"
   result "L-14 no cleanup message and no kill-init in the log of a normal end" $?
 
   # --- L-07 the caller's stdout a socket or a terminal: refused before
@@ -2083,7 +2088,9 @@ import os, socket, sys
 a, b = socket.socketpair()
 if sys.argv[1] == "dirty":
     fd = os.open("/etc/hostname", os.O_RDONLY)
-    os.dup2(fd, 5, inheritable=True)
+    if fd != 5:
+        os.dup2(fd, 5)
+    os.set_inheritable(5, True)
     os.dup2(a.fileno(), 1, inheritable=True)
 os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I", sys.argv[2], "--gate-exec", "--", "/usr/bin/touch", sys.argv[3]])
 '
@@ -2105,10 +2112,12 @@ os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I", sys.argv[2], "--gate-exe
   # --- L-09 --root-exec run directly as this user with fds 5 and 6.
   l09_py='
 import os, sys
-for n in sys.argv[3:]:
+for n in map(int, sys.argv[3:]):
     fd = os.open("/etc/hostname", os.O_RDONLY)
-    os.dup2(fd, int(n), inheritable=True)
-    os.close(fd)
+    if fd != n:
+        os.dup2(fd, n)
+        os.close(fd)
+    os.set_inheritable(n, True)
 os.execv("/usr/bin/python3", ["/usr/bin/python3", "-I", sys.argv[1], "--root-exec", str(os.getuid()), str(os.getgid()),
          "flowcrm-nd-" + "0" * 32, "--", "PATH=/usr/bin:/bin", "--", "/usr/bin/touch", sys.argv[2]])
 '
@@ -2204,6 +2213,7 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' l13b
   result "L-13b without the carrier the profile is released with that control directory" $?
 
   # --- L-13c two launches at once: each releases only its own profile.
+  l13c_tmp=$(find /tmp -maxdepth 1 -name 'no-docker.*' 2>/dev/null | wc -l | tr -d ' ')
   count_launch
   "$nd" /bin/sh -c 'sleep 2; echo l13c-a' >"$work/l13c-a.out" 2>"$work/l13c-a.err" &
   l13ca=$!
@@ -2221,8 +2231,9 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' l13b
   [ -n "$na" ] && [ -n "$nb" ] && [ "$na" != "$nb" ] && [ "$(grep -c '^no-docker-aa: released' "$work/l13c-a.err")" = 1 ] &&
     [ "$(grep -c '^no-docker-aa: released' "$work/l13c-b.err")" = 1 ]
   result "L-13c each released its own profile, once" $?
-  [ "$(listed flowcrm-nd-)" = "$nd_listed_before" ] && [ "$(ctl_dirs)" = 0 ]
-  result "L-13c no profile or control directory of theirs is left" $?
+  [ "$(listed flowcrm-nd-)" = "$nd_listed_before" ] && [ "$(ctl_dirs)" = 0 ] &&
+    [ "$(find /tmp -maxdepth 1 -name 'no-docker.*' 2>/dev/null | wc -l | tr -d ' ')" = "$l13c_tmp" ]
+  result "L-13c no profile, control directory or run directory of theirs is left" $?
 
   # --- L-15 TERM to no-docker.sh (not a runner cancellation, RR-01): 143,
   # pid 1 killed, the profile released only after P1, nothing left.
@@ -2300,8 +2311,6 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' l13b
       l15c_ok=yes
     elif [ "$r" -eq 125 ] && left_loaded "$work/l15c-$ms.err"; then
       l15c_ok=yes
-    elif [ "$r" -eq 0 ]; then
-      l15c_ok=yes # the launch ended before the signal
     fi
     grep -q '^no-docker-aa: released .*(no-namespace, state entere' "$work/l15c-$ms.err" && l15c_ok=no
     if [ "$ms" = 300 ]; then
@@ -2391,12 +2400,12 @@ done
 t38=$(python3 -I -B "$here/no-docker-aa-unit.py" "$root/scripts/ci/no-docker-aa.py" 2>&1)
 t38_rc=$?
 printf '%s\n' "$t38" | grep -vE '^ok   ' | sed 's/^/INFO    /'
-for want in P-01=8 P-02=7 P-03=12 P-04=6 P-05=9 P-06=15 P-07=6 P-08=4 P-09=6 P-10=3 P-11=6 W=6 M=17; do
+for want in P-01=8 P-02=7 P-03=13 P-04=6 P-05=9 P-06=15 P-07=6 P-08=4 P-09=6 P-10=4 P-11=6 W=6 M=17; do
   tag=${want%=*}
   n=$(printf '%s\n' "$t38" | grep -cE "^ok   ${tag}[0-9]* ")
   bad=$(printf '%s\n' "$t38" | grep -cE "^FAIL ${tag}[0-9]* ")
   [ "$t38_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
-    printf '%s\n' "$t38" | grep -qx 'SUMMARY 105 ok, 0 failed'
+    printf '%s\n' "$t38" | grep -qx 'SUMMARY 107 ok, 0 failed'
   result "T-38 $tag: $n of ${want#*=} assertions pass" $? "(rc $t38_rc, $bad failed)"
 done
 

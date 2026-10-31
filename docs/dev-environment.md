@@ -1131,8 +1131,8 @@ in the test's directories or send signal 0 or TERM to the test's own
   - **L-10:** a host process that would pass a descriptor
     (`SCM_RIGHTS`) cannot be reached;
   - **L-11 and L-14:** the preflight's records, the profile listed while
-    the command runs, the gate's pass; afterwards no profile, control,
-    fence or run directory and no listener is left, the descriptors and
+    the command runs, the gate's pass; afterwards no profile, control or
+    fence directory and no listener is left, the descriptors and
     relays are logged, the relays end within a second and a normal end
     calls no `kill-init`;
   - **L-12:** the negative control is refused (fence reachable), only
@@ -1140,7 +1140,8 @@ in the test's directories or send signal 0 or TERM to the test's own
   - **L-13, L-13b, L-13c:** the release is refused while a process of the
     suite outside carries the profile; the launcher then exits 125 and keeps
     its control directory, from which the profile is released once the
-    carrier ended; two launches at once release only their own profiles;
+    carrier ended; two launches at once release only their own profiles
+    and leave no control or run directory;
   - **L-15, L-15b, L-15c:** SIGTERM to `no-docker.sh` (143, pid 1 killed,
     released after P1, nothing left); SIGKILL of the launch's `unshare`
     while the command forks and tries a host socket (released after P1, or
