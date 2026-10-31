@@ -17,9 +17,19 @@ check prints "ok   <rule> <text>" or "FAIL <rule> <text>"; the last line is
          and the files that check it;
   S-03b  no sudo -E or --preserve-env anywhere; in no-docker.test.sh sudo
          runs only the reviewed test commands;
+  S-03   in scripts/ci/no-docker.sh, sudo runs only the seven reviewed
+         commands (the helper's operations with their time limits, the
+         namespaces, sudo -n true), and kill-init only where sudo may still
+         run (never after the normal end, which would cost its 8 s retry
+         on every launch);
+  S-04   in no-docker.sh, the AppArmor helper and aa-exec are used only
+         inside a Linux arm of its case statements, and no-docker-aa.py's
+         main() refuses any other platform;
   S-05   the AppArmor templates are exactly the reviewed rule set (RULES
          below), the negative-control one differing only by
          attach_disconnected;
+  S-06   the host socket listing is gone: no --sockets, --sockets-fast,
+         NO_DOCKER_SOCKETS, fast_listing or enumerate_sockets;
   S-08   the sha256 values no-docker-aa.py pins for the two templates are
          those of the template files.
 
@@ -36,6 +46,8 @@ import sys
 sys.dont_write_bytecode = True
 
 SELF = "scripts/ci/tests/no-docker-static.py"
+LAUNCHER = "scripts/ci/no-docker.sh"
+PROBE_UNIT = "scripts/ci/tests/no-docker-probe-unit.py"
 TEST = "scripts/ci/tests/no-docker.test.sh"
 AA = "scripts/ci/no-docker-aa.py"
 AA_UNIT = "scripts/ci/tests/no-docker-aa-unit.py"
@@ -132,6 +144,63 @@ def s03b(files):
     return found
 
 
+# --- S-03 ---------------------------------------------------------------------
+
+# Each shape is the whole command: what may follow is a redirection of its
+# errors, the end of the line, a list operator or "&".
+END = r"(\s+2>/dev/null)?\s*(\|\||&&|;|&\s*$|$)"
+LAUNCHER_SUDO = [re.compile(r + END) for r in (
+    r"sudo -n true",
+    r'sudo -n timeout 10 /usr/bin/python3 -I "\$aa" preflight',
+    r'sudo -n timeout 20 /usr/bin/python3 -I "\$aa" load "\$profile" "\$ctldir"',
+    r'sudo -n timeout 10 /usr/bin/python3 -I "\$aa" kill-init "\$\$" "\$ctldir"',
+    r'sudo -n timeout 30 /usr/bin/python3 -I "\$aa" release "\$profile" "\$ctldir"',
+    r'sudo -n timeout 10 /usr/bin/python3 -I "\$aa" diag "\$profile"',
+)] + [re.compile(r"sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc --propagation private -- \\$")]
+
+
+def s03(files):
+    found = []
+    for p, n, line in code_lines({LAUNCHER: files.get(LAUNCHER, "")}):
+        if re.match(r"\s*for \w+ in [^;]*; do$", line):
+            continue  # a word list (the tools looked for), not a command
+        for m in SUDO_USE.finditer(line):
+            rest = line[m.end() - len("sudo") - 1:].lstrip()
+            if not any(r.match(rest) for r in LAUNCHER_SUDO):
+                found.append(f"{p}:{n}")
+    lines = files.get(LAUNCHER, "").splitlines()
+    for n, line in enumerate(lines):
+        if "kill-init" in line and not comment(line) and (n == 0 or lines[n - 1].strip() != "elif sudo_may_run; then"):
+            found.append(f"{LAUNCHER}:{n + 1} (kill-init not guarded by sudo_may_run)")
+    return found
+
+
+# --- S-04 ---------------------------------------------------------------------
+
+AA_USE = re.compile(r'"\$aa"|no-docker-aa\.py|aa-exec|apparmor_parser')
+
+
+def s04(files):
+    found = []
+    inside = None  # the indentation of the Linux label whose arm this is
+    for n, line in enumerate(files.get(LAUNCHER, "").splitlines(), 1):
+        label = re.fullmatch(r"( *)(Linux|Darwin|\*)\)", line)
+        if label and label.group(2) == "Linux":
+            inside = label.group(1)
+        elif inside is not None and (line == inside + "  ;;" or (label and label.group(1) == inside)):
+            inside = None
+        if comment(line) or not AA_USE.search(line) or line.startswith('aa="$here/no-docker-aa.py"'):
+            continue
+        if inside is None:
+            found.append(f"{LAUNCHER}:{n}")
+    tree = files.get(AA, "")
+    m = re.search(r"\ndef main\(argv, sys_=None\):\n    if not sys\.platform\.startswith\(\"linux\"\):\n"
+                  r"        say\(\"Linux only\"\)\n        return 2\n", tree)
+    if not m:
+        found.append(f"{AA}: main() does not refuse other platforms first")
+    return found
+
+
 # --- S-05 ---------------------------------------------------------------------
 
 RULES = ["file,", "unix,", "network,", "signal,", "ptrace (read, readby, trace, tracedby) peer=@NAME@,",
@@ -172,6 +241,15 @@ def grammar(text, kind):
 def s05(files):
     return [f"{TEMPLATE}: {x}" for x in grammar(files.get(TEMPLATE, ""), "production")] + \
            [f"{NEGATIVE}: {x}" for x in grammar(files.get(NEGATIVE, ""), "negative")]
+
+
+# --- S-06 ---------------------------------------------------------------------
+
+LISTING = re.compile(r"--sockets(-fast)?\b|\bNO_DOCKER_SOCKETS\b|\bfast_listing\b|\benumerate_sockets\b")
+
+
+def s06(files):
+    return [f"{p}:{n}" for p, n, line in code_lines(files, exempt=(SELF, AA_UNIT, PROBE_UNIT)) if LISTING.search(line)]
 
 
 # --- S-08 ---------------------------------------------------------------------
@@ -216,8 +294,15 @@ RULE_LIST = [
      add(TEMPLATE, "  # flags=(attach_disconnected)\n  attach_disconnected,\n")),
     ("S-03b", "no sudo -E or --preserve-env; sudo in no-docker.test.sh only as reviewed", s03b,
      add(TEST, "\nsudo -n -E true\n")),
+    ("S-03", "sudo in no-docker.sh runs only the seven reviewed commands", s03,
+     add(LAUNCHER, "\n    sudo -n timeout 20 /usr/bin/python3 -I \"$aa\" load \"$profile\" \"$ctldir\" --replace\n")),
+    ("S-04", "the AppArmor helper only in the Linux arms of no-docker.sh; the helper refuses other platforms", s04,
+     edit(LAUNCHER, "  Darwin)\n    command -v sandbox-exec", "  Darwin)\n    sudo -n timeout 10 /usr/bin/python3 -I \"$aa\" preflight\n"
+          "    command -v sandbox-exec")),
     ("S-05", "the templates are exactly the reviewed rule set", s05,
      edit(TEMPLATE, "  deny network vsock,\n", "")),
+    ("S-06", "no host socket listing is left", s06,
+     add("scripts/ci/no-docker-probe.py", "\ndef fast_listing(deadline, paths):\n    return 0\n")),
     ("S-08", "the template hashes pinned in no-docker-aa.py are those of the files", s08,
      edit(NEGATIVE, "  deny network vsock,\n", "  deny network inet,\n")),
 ]

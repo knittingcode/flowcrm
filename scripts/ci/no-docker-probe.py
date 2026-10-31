@@ -1386,6 +1386,7 @@ def gate_exec(cmd):
     reset the signal dispositions, record the start and exec CMD in this
     same process, so what was checked is what runs."""
     sys.stdout = sys.stderr  # fd 1 is the command's
+    began = time.monotonic()
     name = os.environ.get("NO_DOCKER_PROFILE", "")
     ctldir, fencedir = os.environ.get("NO_DOCKER_CTL", ""), os.environ.get("NO_DOCKER_FENCE", "")
     print(f"no-docker: info uids {status().get('Uid', '?')}; gids {status().get('Gid', '?')}")
@@ -1418,6 +1419,7 @@ def gate_exec(cmd):
         return EX_REFUSED
     for v in ("NO_DOCKER_CTL", "NO_DOCKER_FENCE"):
         os.environ.pop(v, None)
+    print(f"no-docker: info the gate passed in {time.monotonic() - began:.2f}s")
     sys.stderr.flush()
     try:
         os.execvp(cmd[0], cmd)
