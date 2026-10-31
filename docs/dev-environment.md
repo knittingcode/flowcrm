@@ -439,7 +439,7 @@ Supported platforms:
 | Platform | Support | Mechanism |
 |---|---|---|
 | macOS developer machine | supported | `sandbox-exec` profile |
-| Linux on a GitHub-hosted Actions runner | supported | `sudo -n unshare` namespaces |
+| Linux on a GitHub-hosted Actions runner | supported | `sudo -n unshare` namespaces and an AppArmor profile per launch |
 | Linux anywhere else (developer machines, self-hosted runners, containers) | refused (exit 125): "Linux is supported on GitHub-hosted CI runners only" | — |
 | other systems | refused (exit 125) | — |
 | any platform as uid 0 | refused (exit 125) | — |
@@ -450,7 +450,9 @@ ones each platform's section lists as checked; on macOS the others rest on
 `sandbox-exec` accepting the profile and on the regression tests. If any
 check fails, a tool is missing, a mount fails, the profile is rejected or
 the command was not started inside the isolation, the command does not run
-and the exit status is 125.
+and the exit status is 125. On Linux the status is 125 as well when the
+launch's AppArmor profile cannot be shown safe to remove afterwards (it
+then stays loaded; see "Linux").
 
 On both platforms the variables that select an engine (`DOCKER_*`,
 `CONTAINER_HOST`, `PODMAN_*`, `COMPOSE_*` and similar) are removed,
@@ -607,105 +609,135 @@ refused.
 - the caller is in the initial pid namespace (`pid:[4026531836]`), so the
   namespace made below it is shown to descend from the caller's;
 - `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` are directories under `$HOME`;
-- `sudo -n` works and `timeout`, `unshare`, `setpriv`, `setsid`, `ip`,
-  `mount`, `find`, `stat` and `python3` exist.
+- the caller's stdout and stderr are open and neither a socket nor a
+  terminal. The command's output reaches them through pipes of
+  `no-docker.sh` (below); a socket or terminal there would be a channel out
+  of the isolation. stdin is not used;
+- `sudo -n` works, and `timeout`, `unshare`, `setpriv`, `setsid`, `ip`,
+  `mount`, `find`, `stat`, `python3`, `od`, `sync`, `/usr/bin/aa-exec` and
+  `/usr/bin/python3` exist;
+- `scripts/ci/no-docker-aa.py preflight` (as root) shows that AppArmor can
+  confine the launch: it is enabled, its global mode is `enforce`, the
+  kernel mediates `af_unix` (`features/network/af_unix`) and
+  `apparmor_parser` and `aa-exec` are present. It also records, without
+  gating, the parser version, the network feature directories,
+  `kernel.apparmor_restrict_unprivileged_unconfined` and
+  `..._userns`, `core_pattern` and sudo's `env_reset` and `closefrom`.
 
-Before entering, the caller's side lists the Unix sockets that must not
-accept a connection inside. A pathname socket accepts one only while a
-socket is bound to its file, connecting finds that socket by the file's
-inode in whatever network namespace it is, and a read-only mount does not
-stop it. So the list is every path to every live, bound pathname socket of
-every network namespace:
+**The boundary** (decision:
+[ADR-023](architecture/adr/ADR-023-linux-test-isolation-apparmor.md),
+proposed). Host Unix sockets are not listed any more: the kernel refuses
+them. Each launch loads an AppArmor profile of its own,
+`flowcrm-nd-<32 random hex digits>`, from the pinned template
+`scripts/ci/no-docker/apparmor.profile`:
 
-- **Fast listing** (`no-docker-probe.py --sockets-fast`, as root through
-  `sudo -n timeout -s KILL 15`: it gives up after 10 seconds and is killed
-  at 15). It writes nothing;
-  its list reaches the run's directory through the caller's redirection.
-  1. It finds every network namespace that has a process, a bind mount or
-     an open descriptor, and has the kernel list every Unix socket of each
-     (`sock_diag`, every state, with the device and inode of each bound
-     file), in a child process per namespace that the deadline kills.
-  2. Every Unix socket that a process holds, in its descriptor table or in
-     an io_uring's registered files, must be in one of those lists (one
-     retry); otherwise a network namespace was missed. Every socket in an
-     io_uring's registered files counts here, whatever its protocol. An
-     io_uring whose table cannot be read whole counts as missed: the kernel
-     hides its entries (up to 6.14) or the whole table (from 6.15) while its
-     lock is busy, shows fewer entries than its count when the table has
-     empty slots (from 6.14 they are counted but not shown), or an entry is
-     neither `socket:[N]`, another `type:[N]`, a path nor an anonymous inode
-     (up to 6.13 the kernel names files and sockets by name or protocol
-     only and shows empty slots as `<none>`, so on those kernels any
-     io_uring with registered files makes the walk run).
-  3. Every bound socket must be found again at its name in the host's
-     mount tree as the same file (device and inode, checked on the opened
-     file), with one link, on a local file system (ext2/3/4, xfs, btrfs,
-     tmpfs, devtmpfs, hugetlbfs). Its paths are then every mount of that
-     file system that contains it, bind mounts and hidden ones included.
-  4. The host network namespace's `/proc/net/unix` names are added, as
-     before.
-- **The walk**, unchanged, as the caller, if the fast listing cannot show
-  its list complete: any error, any process or descriptor that cannot be
-  read, a socket bound with a relative name, removed, renamed, with more
-  than one link, of another mount namespace or on another file system, two
-  sockets at one path, a netlink reply that is not exactly a whole dump, or
-  the 10 seconds running out. It lists every Unix socket file on the local
-  file systems (`find -xdev -type s` per mount) and the host's
-  `/proc/net/unix` names, and both lists are used.
+```
+abi <abi/4.0>,
+profile @NAME@ flags=(enforce) {
+  file,
+  unix,
+  network,
+  signal,
+  ptrace (read, readby, trace, tracedby) peer=@NAME@,
+  deny capability,
+  deny mount,
+  deny umount,
+  deny pivot_root,
+  deny network vsock,
+}
+```
 
-The whole listing has a 180-second budget; when it runs out, the run is
-refused instead of using a partial list. The mode (`mode fast`, or
-`mode walk` with its reason), the counts and the time are printed with each
-run, on stderr and as a `::notice::` in the CI log. Inside, the list is a
-read-only file. The fast listing also finds sockets in directories that can
-be searched but not listed, which the walk misses; what it relies on is
-listed under the residual risks.
+The profile has no `attach_disconnected`. A process confined by it, in a
+private mount namespace, that connects or sends to a pathname socket bound
+outside that namespace is refused with `EACCES`: the socket's bound path
+lies on a mount the process's namespace does not contain, so AppArmor sees
+it as disconnected. That holds whatever path, alias, bind mount or
+unlistable directory leads to the socket and whenever it was bound, for
+stream and datagram sockets alike. Sockets bound inside the namespace stay
+usable. The denial is Ubuntu's AppArmor code (`RULE_MEDIATES_UNIX`), shown
+on `7.0.0-1017-azure` with parser 4.0.1 (spike run 41209833578); on a
+kernel where it does not hold, the fence below refuses every launch.
 
-The command then runs under
-`sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc`
-with private mount propagation. The namespace's pid 1 is a root shell that
-does not exec:
+`no-docker-aa.py` (as root through `sudo -n timeout N`) loads the profile
+only from the template whose sha256 it pins, adds it without replacing,
+refuses a name already loaded, and checks that it is listed exactly once as
+`NAME (enforce)`; it records the kernel's hash of the profile when the
+kernel exports one. Its only effects are that load, the removal of the
+launch's own profile, SIGKILL of the launch's pid 1 (below) and files in
+the launch's control directory.
 
-1. It brings up loopback in the new network namespace.
-2. It mounts an empty tmpfs over `/run` (and `/var/run` when that is not a
-   symbolic link), `/tmp`, `/var/tmp` and `/dev/shm`, a fresh mqueue on
-   `/dev/mqueue` and a read-only tmpfs over `/sys/fs/cgroup`. The run's
-   directory, which is under `/tmp` (or under `/var/tmp` with `--work`), is
-   bind-mounted aside first and moved back into the new tmpfs, so the
-   original `/tmp` is not visible.
-3. It remounts every other mount reachable by path read-only. A bind
-   remount changes only the namespace's copy and keeps the other per-mount
-   flags. This covers `$HOME` with the workspace, `$RUNNER_TEMP`,
-   `$GITHUB_ENV`, `$GITHUB_PATH` and `~/.docker`, as well as
-   `/opt/hostedtoolcache` and every other mount.
-4. It runs the command as a child: `setpriv` with the caller's uid and gid,
-   no supplementary groups, `no_new_privs`, and empty inheritable and
-   bounding capability sets; then `setsid --wait`, then `env -i` with an
-   allowlist of variables (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
-   `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ`, `CI`, `DEVENV*`, `GUARD*`,
-   `ADAPTED`, `HARNESS` and `FLOWCRM_*`). No session bus, display, agent,
-   runner file-command or token variable reaches the command.
-5. It waits for the command, reaping orphans meanwhile, and exits with the
-   command's status. When pid 1 exits, the kernel kills every process left
-   in the namespace, including daemonised ones. If `unshare` itself dies,
-   `--kill-child` kills pid 1. pid 1 makes no credential change, so that
-   signal stays armed.
+**The launch**, in order:
 
-Interruption: `unshare` runs as root, and with `--fork` it blocks SIGINT
-and SIGTERM; pid 1 ignores signals from outside its namespace. So when
-SIGINT, SIGTERM or SIGHUP is delivered to `no-docker.sh` itself (Ctrl-C in
-a terminal, or a caller that forwards the signal), it sends SIGKILL,
-through `sudo`, to the `unshare` it started: the process named `unshare`
-whose ancestors include the `sudo` of this run. Through `--kill-child`,
-that kills pid 1 and every process inside.
+1. A control directory and a fence directory in `$RUNNER_TEMP`
+   (`no-docker-ctl.XXXXXX`, `no-docker-fence.XXXXXX`, mode 0700) and the
+   profile name. The launch's state is written to the control directory
+   (`loading`), atomically (write, `sync`, rename) and read back.
+2. The fence: two sockets bound outside by listeners of `no-docker.sh` (a
+   stream and a datagram socket, children of its shell with
+   `PR_SET_PDEATHSIG`), shown reachable from outside.
+3. The profile is loaded (20 s limit). Whether `sudo` still runs is read
+   from `/proc` (pid and start time), never with `kill -0`.
+4. `::stop-commands::<random token>` is printed on stdout and stderr; the
+   token is never passed inside. Two relays, `cat` processes of
+   `no-docker.sh`, will copy the command's stdout and stderr to the
+   caller's. The shell's own descriptors are then listed (by a child, into
+   the control directory): besides 0 to 2, the relays' write ends and the
+   script, other copies of a relay pipe are closed, and anything else
+   refuses the launch.
+5. The state `entering` is written and read back; if it cannot be,
+   nothing is started. Then
+   `sudo -n unshare --net --mount --pid --fork --kill-child --mount-proc --ipc --propagation private`
+   starts the namespace, with stdin `/dev/null` and the relays as stdout
+   and stderr; the state becomes `entered spid=<pid>`.
+6. The namespace's pid 1 is a root shell that does not exec. Its first
+   action, before anything untrusted exists, records its pid and mount
+   namespaces in `CTLDIR/ns` (`pid:<inode> mnt:<inode>`, root-owned, mode
+   0444, written, synced and renamed). Then, as before: loopback up; empty
+   tmpfs over `/run` (and `/var/run` when that is not a symbolic link),
+   `/tmp`, `/var/tmp` and `/dev/shm`; a fresh mqueue on `/dev/mqueue`; a
+   read-only tmpfs over `/sys/fs/cgroup`; the run's directory moved back
+   into the new tmpfs; every other mount reachable by path remounted
+   read-only. This covers `$HOME` with the workspace, `$RUNNER_TEMP` with
+   the control and fence directories, `$GITHUB_ENV`, `$GITHUB_PATH`,
+   `~/.docker` and `/opt/hostedtoolcache`.
+7. A child of pid 1 runs `no-docker-probe.py --root-exec` as root. It
+   closes every descriptor above 2 up to the hard `RLIMIT_NOFILE`, shows
+   that none is left, opens `/dev/null` there as fd 0 and logs
+   `closed: ...; remaining: 0 1 2; stdin char 1:3`. It then execs `setpriv`
+   (the caller's uid and gid, no supplementary groups, `no_new_privs`,
+   empty inheritable and bounding capability sets), `aa-exec -p NAME`,
+   which attaches the profile at the next exec, `setsid --wait`, `env -i`
+   with the allowlist of variables (`PATH`, `HOME`, `USER`, `LOGNAME`,
+   `SHELL`, `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ`, `CI`, `DEVENV*`,
+   `GUARD*`, `ADAPTED`, `HARNESS`, `FLOWCRM_*` and the isolation's own
+   `NO_DOCKER_*`) and the gate.
+8. The gate, `no-docker-probe.py --gate-exec`, confined, as the caller,
+   checks in this order:
+   - **G1:** the rules below.
+   - **G2:** the namespace record names its own pid namespace, and the
+     control and fence directories are read-only.
+   - **G3:** it, and every other process but the root pid 1, carry exactly
+     `NAME (enforce)`. A stacked or complain-mode label, or an unconfined
+     one, refuses.
+   - **G4:** the two fence sockets, which it owns and which file
+     permissions let it reach (shown with `faccessat(AT_EACCESS)`, which
+     AppArmor does not consult), refuse `connect` and `sendto` with
+     `EACCES` exactly. Any other result refuses: the refusal must come
+     from the profile.
+   - **G5:** a socket it binds in its private `/tmp` connects.
+   - **G6:** both are closed.
+   - **G7:** only if everything so far passed: the writes and the
+     engine check of the rules below.
+   - **G8, last:** its descriptors are exactly fd 0 `/dev/null` and pipes
+     on fds 1 and 2.
 
-A cancelled or timed-out GitHub step does not reach this. The runner
-signals only the step's shell, and later sends SIGKILL to the process
-tree, so `no-docker.sh` gets no signal it can handle. The namespace then
-keeps running, with read-only mounts and no network, until the runner's
-VM is discarded (see the residual risks).
+   It reports every finding on stderr. Only if all passed does it reset
+   every signal to its default disposition, clear the signal mask, record
+   the start and exec the command in its own process, so the process
+   checked is the process that runs.
+9. `no-docker.sh` waits for `sudo`, then cleans up (below).
 
-The probe checks from inside:
+The rules (G1, and G7's writes), checked from inside:
 
 - no uid is 0; every capability set is empty; `NoNewPrivs` is 1; there are
   no supplementary groups; the four gids are equal and not a system group
@@ -725,8 +757,8 @@ The probe checks from inside:
   a runner, init or engine process, so `/proc/<pid>/root` and `nsenter`
   have no target outside;
 - the process is in a session of its own without a controlling terminal,
-  so `TIOCSTI` has no target; none of its standard descriptors is a
-  socket;
+  so `TIOCSTI` has no target; its standard descriptors are pipes or
+  `/dev/null`;
 - loopback is the only interface;
 - `/tmp`, `/var/tmp`, `/dev/shm` and `/run` are tmpfs, and `/dev/mqueue` an
   mqueue, on devices other than the caller's. `/sys/fs/cgroup` is a
@@ -737,28 +769,84 @@ The probe checks from inside:
   `$HOME`, `$GITHUB_WORKSPACE` and `$RUNNER_TEMP` must fail as well;
 - the working directory is reachable by its path;
 - no other `proc` file system and no `nsfs` mount is reachable by path;
-- there is no socket in the private directories, and none of the listed
-  Unix sockets accepts a stream, seqpacket or datagram connection (a
-  listener with a full backlog counts as accepting). Pathname sockets on a
-  read-only mount would still accept one, which is why every one of them
-  is tried. An empty list fails.
+- there is no socket in the private directories.
 
-The checks above are evaluated together, and only if every one passed are
-the writes and connects of the last items tried: a failed check, or an
-error, means nothing is written or connected to.
+A suite that re-executes itself inside (`no-docker.sh --check`, or a nested
+`no-docker.sh`) is checked against G1, its own confinement (G3) and, if
+those pass, G7 and the engine check; its descriptors are only reported.
+This is not a boundary: the gate of the launch is.
+
+**Cleanup.** One function, run once on every way out (the normal end, a
+refusal, SIGINT, SIGTERM, SIGHUP), touches only what this launch recorded
+as started, with every wait bounded (112 s in all):
+
+1. If the namespace may still run, `no-docker-aa.py kill-init` finds its
+   pid 1 from the launcher's process tree, holds it by a pidfd, checks its
+   start time around reading its namespace, records `CTLDIR/ns` if pid 1
+   had not, and sends it SIGKILL. When pid 1 exits, the kernel kills
+   every other process of the namespace. Nothing else is ever signalled.
+   After a normal end `sudo` has been waited for, so this step is skipped.
+   If the fork of `sudo` had not happened, the state is set to
+   `not-forked`.
+2. The relays end once every writer is gone; only then is the token that
+   resumes workflow commands printed, so the command's output can not
+   reopen them early.
+3. The fence listeners are ended by pid and start time.
+4. A load still in flight is waited for.
+5. `no-docker-aa.py release` removes the profile only when:
+   - **P0:** `CTLDIR/ns` is a root-owned file of mode 0444 in the exact
+     format, naming a pid namespace that is not the host's;
+   - **P1:** no task is in that pid namespace, except its init as a
+     single-threaded zombie;
+   - **P2:** the profile is listed once, in enforce mode, with its
+     load-time hash;
+   - two complete sweeps of every task's `attr/apparmor/current` find no
+     label containing its name.
+
+   States `loading` and `not-forked` without `CTLDIR/ns` mean no namespace
+   was made: the profile is then removed after P2 and the sweeps, or
+   nothing is done when it was never loaded. Any error other than a task
+   that ended counts as unknown, and unknown keeps the profile loaded:
+   removing a profile unconfines any process that still carries it.
+6. If the profile cannot be shown safe to remove, it stays loaded, the
+   control directory is kept and its path printed with `no-docker: refused:
+   profile NAME still loaded (...)`, `diag` reports what is known, and the
+   run exits 125 even if the command succeeded.
+7. The status, in this order:
+   - a cleanup failure gives 125;
+   - the negative control gives 125;
+   - a signal gives 128 plus the signal (130, 143, 129);
+   - a refusal gives 125;
+   - a command that did not start gives 125;
+   - otherwise, the command's own status.
+
+A `::notice` on stderr gives the time of each phase of the launch; the gate
+prints its own.
+
+**Negative control.** `no-docker.sh --negative-control COMMAND` (GitHub-hosted
+Linux, first level only; refused nested and elsewhere) loads the
+negative template `scripts/ci/tests/no-docker/apparmor-negative.profile`
+(the same rules with `attach_disconnected`) as `flowcrm-nd-neg-<hex>`. The
+gate must then find the fence reachable and refuse. COMMAND is replaced by
+`/usr/bin/true` before anything starts and the status is always 125.
+
+**Interruption.** SIGINT, SIGTERM or SIGHUP delivered to `no-docker.sh`
+itself (Ctrl-C in a terminal, or a caller that forwards the signal) run the
+cleanup above. A cancelled or timed-out GitHub step does not reach it: the
+runner signals only the step's shell, and later sends SIGKILL to the
+process tree. The namespace then keeps running, confined, with read-only
+mounts and no network, and the profile stays loaded, until the runner's VM
+is discarded (see the residual risks).
 
 The probe also prints the uids and gids of the command, and `no-docker.sh`
 the caller's primary group with its name and the group of
 `/var/run/docker.sock`. The command keeps the caller's primary group,
-which must not be a system group (above). This Linux path has not yet
-passed in CI: run 41126389201 (on 85cfb37) refused every isolated step at
-the pid namespace check that this version replaces, so the first green run
-on a GitHub-hosted runner is its first evidence.
+which must not be a system group (above).
 
-The output between the start and the end of the isolated command is framed
-with `::stop-commands::<random token>`, so the command cannot issue
-workflow commands. The start line is printed on both stdout and stderr; the
-token is never passed inside.
+**Status of the evidence.** This Linux path has not yet run in CI. The
+spike runs 41200868832 (inconclusive) and 41209833578 (GO) showed the
+kernel mechanism only, not this launcher. The first green run of the L-tests
+on a GitHub-hosted runner will be its first evidence.
 
 #### Run directory (`--work DIR`)
 
@@ -825,24 +913,46 @@ them.
   limited by the launchd, Launch Services, Apple Events, preference and
   login-item denies above, not by the file rule. Keychain items are data,
   not code.
-- **Sockets created after the list (Linux).** A pathname socket that
-  appears on a read-only mount after the list was made, from a process
-  outside the namespace, is not tried. On a GitHub-hosted runner no such
-  service runs during the isolated steps.
-- **What the fast listing relies on (Linux).** A live socket is missed only
-  if no process holds it in a descriptor or a visible io_uring table and
-  its network namespace has no process, bind mount or open descriptor: a
-  socket only in flight in an `SCM_RIGHTS` message, in an io_uring reached
-  only through a registered ring descriptor or created straight into a
-  fixed slot, or held by the kernel (9p, nbd). Only processes outside the
-  isolation, which are not the adversary, can set that up. Socket inode
-  numbers in the kernel's list have 32 bits: on a file system with 64-bit
-  inode numbers, a removed socket's name could be taken by another socket
-  file whose number has the same low 32 bits (two sockets at one path make
-  the walk run). When the fast listing cannot show its list complete, the
-  walk runs; each such run takes about 140 to 150 seconds on a runner
-  (measured), so repeated walks can make a job time out (red, never an
-  unisolated run).
+- **The kernel and the image (Linux, RR-02, RR-03).** The denial is
+  Ubuntu's AppArmor code. A kernel, parser or runner image change can
+  disable it; the fence then refuses every launch (a red run, never an
+  unisolated one). Attaching the profile after `setpriv` needs
+  `kernel.apparmor_restrict_unprivileged_unconfined=0` (measured); with 1
+  the label is stacked and every launch refuses.
+- **io_uring, rename and hard links (Linux, RR-04).** A connect through
+  io_uring, or a host socket renamed or hard-linked into the namespace,
+  passes the same AppArmor hooks; that rests on reading the kernel source,
+  not on a test.
+- **Paths made by root (Linux, RR-05).** A root process outside that binds
+  a socket through `/proc/<pid of the namespace>/root/...` would make a
+  path inside the namespace. No trusted component does this.
+- **A late start (Linux, RR-06).** A signal while the namespace starts can
+  leave a chain that reaches pid 1 only after cleanup ended. Its gate then
+  finds no fence and refuses, so its command never starts; the profile
+  stays loaded (125) and can be released once the chain has ended.
+- **Attaching from outside (Linux, RR-07).** Only an unconfined trusted
+  process can attach the launch's profile (the command cannot:
+  `change_profile` is denied). One that does so after the last sweep and
+  before the removal is returned to unconfined by the removal: no boundary
+  is crossed. One present at sweep time keeps the profile loaded.
+- **Audit records (Linux, RR-08)** may be lost; nothing relies on them.
+- **The launch chain (Linux, RR-09).** Descriptor hygiene relies on the
+  chain staying as designed; the gate checks the process that becomes the
+  command on every launch.
+- **Annotation order (Linux, RR-10).** Output the command wrote earlier on
+  stderr may reach the runner after the resume token on stdout (as before);
+  it can only add annotations.
+- **Untrapped signals (Linux, RR-11).** A signal `no-docker.sh` does not
+  trap (such as SIGQUIT) ends it without cleanup, as a cancellation does
+  (below).
+- **A reused namespace inode (Linux, RR-12).** If the recorded pid
+  namespace inode is reused by another namespace during the release, P1
+  only refuses more: a false 125, never a removal with a carrier left.
+- **No namespace record (Linux, RR-13).** If pid 1 fails (for instance its
+  write of `CTLDIR/ns`) or `sudo`/`unshare` fails before forking it, and
+  `kill-init` never found it, the profile can never be shown safe to
+  remove: it stays loaded with no process carrying it (125) until the VM is
+  discarded.
 - **Shared keyring and readable files (Linux).** The per-user kernel
   keyring is shared. Files such as `~/.docker/config.json` stay readable,
   but there is no network to use them on.
@@ -851,12 +961,14 @@ them.
   processes of the namespace. They are killed with pid 1 instead, on a
   normal end and when SIGINT, SIGTERM or SIGHUP is delivered to
   `no-docker.sh` itself (see above).
-- **Cancelled or timed-out CI steps (Linux).** GitHub signals only the
-  step's shell and later sends SIGKILL to the process tree. Neither
-  reaches the trap in `no-docker.sh`, so the namespace and anything left
-  in it keep running until the runner's VM is discarded. They still have
+- **Cancelled or timed-out CI steps (Linux, RR-01).** GitHub signals only
+  the step's shell and later sends SIGKILL to the process tree. Neither
+  reaches the trap in `no-docker.sh`, so the namespace and anything left in
+  it keep running until the runner's VM is discarded, and the launch's
+  profile stays loaded. Nothing removes it, so they stay confined, with
   read-only mounts, no network, no capabilities and no view of other
-  processes. Only the checkout's post-job step follows.
+  processes. This is reported as a residual, never as a cleanup. Only the
+  checkout's post-job step follows.
 - **CI coverage when a scan fails.** Isolated steps run last in their job
   (see below). When the container scan fails, the Dev environment job stops
   before `tests/devenv/unit.sh`, so the allocator unit tests do not run in
@@ -969,38 +1081,104 @@ in the test's directories or send signal 0 or TERM to the test's own
     every run ends in time and none of its processes survives;
   - **T-29:** another terminal's device cannot be read from inside, while
     it can from outside.
-- **T-16 to T-18 and T-37, Linux only:**
+- **T-16 to T-18, Linux only:**
   - **T-16:** a canary inside sees `NSpid` as its pid alone, is in a pid
     namespace other than the caller's (the initial one), sees only the
     namespace's processes (an unreadable one counts as foreign) through a
-    `/proc` without `hidepid`, cannot read `/proc/1/root` and cannot
-    connect to any engine, session or host socket. It gets EROFS in
-    `$HOME`, the workspace, `$RUNNER_TEMP` and the tool cache, and sees a
-    private `/tmp` and `/dev/shm`, read-only mounts, masked cgroups, private
-    IPC and loopback only. Every check must print exactly one ok line;
+    `/proc` without `hidepid`, cannot read `/proc/1/root`, is confined by
+    exactly the launch's profile, has only descriptors 0 to 2 and finds
+    the launch's fence refused. Every host socket the suite gathers outside
+    (the kernel's list and `$HOME`, plus one of its own in `$RUNNER_TEMP`)
+    is classified: reachable outside and visible inside, it must be refused
+    with `EACCES`; under a directory the isolation hides, it is not found;
+    not reachable outside, it is only reported; none is ever reached
+    inside. It gets EROFS in `$HOME`, the workspace, `$RUNNER_TEMP` and the
+    tool cache, and sees a private `/tmp` and `/dev/shm`, read-only mounts,
+    masked cgroups, private IPC and loopback only. Every check must print
+    exactly one ok line;
   - **T-17:** a `setsid` daemon, checked to be running before the command
     returns, does not outlive the command, neither when the command ends
-    nor when SIGTERM is delivered to `no-docker.sh` itself. A cancelled
-    GitHub step does not signal `no-docker.sh`, so that case is not
-    covered;
+    nor when SIGTERM is delivered to `no-docker.sh` itself (status 143,
+    within 150 s). A cancelled GitHub step does not signal `no-docker.sh`,
+    so that case is not covered;
   - **T-18:** uid 0 (a real `sudo` run), missing or other runner variables,
-    a workspace outside `$HOME` and a caller without a `Runner.Worker`
-    ancestor are refused;
-  - **T-37:** a listener of the suite, outside, bound in a directory that
-    cannot be listed (mode 0311), makes the run refuse (125) naming its
-    path: N1 in the host network namespace, N2 in a network namespace of
-    its own, which only the fast listing finds (`mode fast` is required).
-    N0: the same file without its listener runs the command.
+    a workspace outside `$HOME`, a caller without a `Runner.Worker`
+    ancestor, and `--negative-control` off a GitHub-hosted runner or in a
+    nested run, are refused (on macOS, `--negative-control` too).
+- **L-01 to L-18, Linux only** (97 result lines; any other number fails
+  the suite). Each denial counts only next to its control, the same target
+  reached outside:
+  - **L-01:** host stream sockets, datagram `connect` and `sendto` refused
+    with `EACCES`, and an abstract socket unreachable (`ECONNREFUSED`, the
+    network namespace); the command carries exactly its profile; all four
+    targets reachable outside before and after;
+  - **L-02:** a host socket through a bind-mounted alias; **L-03:** in a
+    directory that cannot be listed (0311), of the host's and of another
+    network namespace, and a socket file without a listener
+    (`ECONNREFUSED`); **L-04:** a socket bound after the command started
+    (by timestamps);
+  - **L-05:** the gate's twin and the command's own stream and datagram
+    pairs work;
+  - **L-06:** a grandchild carries the profile, the command runs in the
+    gate's process, `change_profile`, `aa-exec -p unconfined` and `unshare
+    -U` are denied, no signal is ignored or blocked (read by `/bin/sh`
+    itself), `AF_VSOCK` is refused with `EACCES`; outside controls;
+  - **L-07:** a socket or a terminal as the caller's stdout is refused
+    before anything is made (controls: L-14's file, L-18's pipe);
+  - **L-08:** the gate run directly with a stray fd 5 and a socket on fd 1
+    reports both and its missing confinement and refuses; **L-09:**
+    `--root-exec` closes inherited fds 5 and 6 and opens `/dev/null`;
+  - **L-10:** a host process that would pass a descriptor
+    (`SCM_RIGHTS`) cannot be reached;
+  - **L-11 and L-14:** the preflight's records, the profile listed while
+    the command runs, the gate's pass; afterwards no profile, control,
+    fence or run directory and no listener is left, the descriptors and
+    relays are logged, the relays end within a second and a normal end
+    calls no `kill-init`;
+  - **L-12:** the negative control is refused (fence reachable), only
+    `/usr/bin/true` could run, its profile is released;
+  - **L-13, L-13b, L-13c:** the release is refused while a process of the
+    suite outside carries the profile; the launcher then exits 125 and keeps
+    its control directory, from which the profile is released once the
+    carrier ended; two launches at once release only their own profiles;
+  - **L-15, L-15b, L-15c:** SIGTERM to `no-docker.sh` (143, pid 1 killed,
+    released after P1, nothing left); SIGKILL of the launch's `unshare`
+    while the command forks and tries a host socket (released after P1, or
+    left loaded and released afterwards; the socket never accepted); and
+    SIGTERM at 0 to 300 ms into the launch, each run ending in an allowed
+    outcome and no profile left;
+  - **L-17 and L-18:** 1 MiB of stdout and 64 KiB of stderr arrive
+    complete through a pipe; the command's last `::error::` line comes
+    before the resume token, which is the last stdout line;
+  - **L-16, last of all the cases that launch:** 10 launches are timed and
+    the guard job projected (184 s plus the suite's launches times the mean
+    launch time): above 540 s fails, above 360 s is a warning.
 - **T-02** also requires that the refusal comes from the probe's mechanism
   check and that its writes and connects never ran.
 - **T-36:** pure tests of the Linux rules (both platforms): the credential,
-  pid namespace, process, mount, descriptor and socket-list rules, the
-  netlink parser, the device and alias computations, the budgets and the
-  gate, on fixtures only, with every call that would read `/proc`, open a
-  file or socket, run a program or fork made to raise. The number of
-  assertions per case is fixed in the suite; thirteen mutated copies of the
-  probe (among them the old `NSpid` rule) must each be rejected, and a
-  check that the probe calls the tested functions must pass.
+  pid namespace, process, mount and descriptor rules, the gate's label,
+  descriptor and fence checks, `--root-exec`'s sanitation and the gating,
+  on fixtures only, with every call that would read `/proc`, open, close or
+  duplicate a descriptor, open a socket, run or exec a program, fork or set
+  a signal made to raise. The number of assertions per case is fixed in
+  the suite (135); fourteen mutated copies of the probe (among them the old
+  `NSpid` rule and a stacked label accepted) must each be rejected, and
+  checks that the probe calls the tested functions, in order, must pass.
+- **T-38:** pure tests of `no-docker-aa.py` (both platforms): names,
+  labels, the preflight, the profile list, the sweeps, P0, P1 and the
+  state rules (with the namespace record's exact format), the template,
+  the negative template's reach, P2, `kill-init`'s order and the argument
+  validation, run against a fake system (105 assertions). Seventeen
+  mutated copies (a single sweep, P1 or P2 skipped, `kill-init` signalling
+  before recording, and so on) must each be rejected.
+- **T-39:** static rules (both platforms), each passing on the tracked
+  files and failing on a mutant fixture held in memory: no AppArmor reload,
+  replacement, removal or configuration write; `attach_disconnected` only
+  in the negative template; `sudo` in `no-docker.sh` only in its seven
+  reviewed commands, and `kill-init` only where `sudo` may still run; no
+  `sudo -E`; AppArmor only in the Linux arms; the templates exactly the
+  reviewed rules; no socket listing left; the negative control only where
+  it belongs; the pinned template hashes.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
@@ -1013,8 +1191,8 @@ The macOS cases run only on a developer's Mac: there is no macOS CI job.
   suites, on a macOS developer machine or in CI. On Linux outside CI the
   suites refuse to run.
 - Until a CI run on the GitHub-hosted runner has shown the Linux cases
-  T-16 to T-18 and T-37 passing, use only payloads that read or print, on
-  both platforms.
+  L-01, L-02, L-03, L-04, L-12, L-15 and T-16 passing, use only payloads
+  that read or print, on both platforms.
 - Never use a destructive Docker command (prune, forced removal, `down -v`,
   `--rmi`), not even in isolation.
 - `tests/devenv/integration.sh` and the `tests/app/` suites use the real
