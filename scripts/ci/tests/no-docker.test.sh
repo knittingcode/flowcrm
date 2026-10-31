@@ -49,9 +49,10 @@
 #     of their own that accepts and reads nothing, outside the isolation,
 #     in the host network namespace or in a new one made for it with sudo
 #     unshare --net and running as the user (T-37), or sleep;
-#   - T-36 runs pure tests of the probe's rules: fixtures only, with every
-#     call that would read /proc, open a file or socket, run a program or
-#     fork made to raise.
+#   - T-36 and T-38 run pure tests of the probe's rules and of the AppArmor
+#     helper: fixtures only, with every call that would read /proc, open a
+#     file or socket, run a program, fork, send a signal or change a
+#     descriptor made to raise.
 #   - T-39 reads the tracked files and checks static rules on them and on
 #     mutant fixtures held in memory.
 # This suite itself runs no docker command.
@@ -1581,21 +1582,23 @@ grep -qE '^helper_sums="canary\.py=[0-9a-f]{64} drive\.sh=[0-9a-f]{64} payload=[
 result "T-23 the helpers run outside any isolation are pinned to reviewed sha256 values, not hashed after writing" $?
 
 # --- T-36 the Linux rules of no-docker-probe.py as pure functions, on both
-# platforms: fixtures only (every call that would read /proc, open a file
-# or socket, run a program or fork raises), the probe's functions called by
-# what runs (W) and mutated copies of the probe rejected (M1 to M13). The
+# platforms: fixtures only (every call that would read /proc, open, close or
+# duplicate a descriptor, open a socket, run or exec a program, fork or set
+# a signal raises), the gate's label, descriptor and fence rules and
+# --root-exec's sanitation (C11 to C14), the probe's functions called by
+# what runs (W) and mutated copies of the probe rejected (M1 to M21). The
 # numbers of assertions are fixed here: a case that loses one fails.
 # On 85cfb37: the NSpid rule accepted only a /proc of an ancestor namespace
-# (M1), an empty socket list passed, and no fast listing existed.
+# (M1).
 t36=$(python3 -I -B "$here/no-docker-probe-unit.py" "$root/scripts/ci/no-docker-probe.py" 2>&1)
 t36_rc=$?
 printf '%s\n' "$t36" | grep -vE '^ok   ' | sed 's/^/INFO    /'
-for want in C01=2 C02=13 C03=12 C04=14 C05=9 C06=15 C07=6 C08=45 C09=4 C10=8 W=10 M=13; do
+for want in C01=2 C02=13 C03=12 C04=14 C05=9 C06=15 C07=7 C10=8 C11=7 C12=9 C13=9 C14=4 W=12 M=14; do
   tag=${want%=*}
   n=$(printf '%s\n' "$t36" | grep -cE "^ok   ${tag}[0-9]* ")
   bad=$(printf '%s\n' "$t36" | grep -cE "^FAIL ${tag}[0-9]* ")
   [ "$t36_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
-    printf '%s\n' "$t36" | grep -qx 'SUMMARY 151 ok, 0 failed'
+    printf '%s\n' "$t36" | grep -qx 'SUMMARY 135 ok, 0 failed'
   result "T-36 $tag: $n of ${want#*=} assertions pass" $? "(rc $t36_rc, $bad failed)"
 done
 

@@ -6,9 +6,10 @@ The probe's source is read once, then every call that would read /proc,
 open a file or socket, run a program, fork or enter a namespace is replaced
 by one that raises: the rules are tested on fixtures only, never on this
 machine. Each assertion prints "ok   <case> <text>" or "FAIL <case> <text>";
-the cases are C01 to C10 (the regression cases of FCRM-SEC-019), W (the
-probe calls the tested functions) and M1 to M13 (mutated copies of the
-probe, each of which must fail at least one assertion of its case). The
+the cases are C01 to C07 and C10 to C14 (the rules, the gate's label,
+descriptor and fence checks and --root-exec's sanitation), W (the probe
+calls the tested functions) and M1 to M21 (mutated copies of the probe,
+each of which must fail at least one assertion of its case). The
 last line is "SUMMARY <ok> ok, <failed> failed". Exit 0 only if nothing
 failed; 2 if a mutant cannot be made exactly.
 """
@@ -17,9 +18,9 @@ import ast
 import builtins
 import errno
 import os
+import resource
+import signal
 import socket
-import stat
-import struct
 import subprocess
 import sys
 
@@ -46,7 +47,10 @@ def tripwire(name):
 
 
 for mod, names in ((os, ("open", "listdir", "readlink", "getxattr", "setns", "fork", "stat", "lstat", "fstat",
-                         "scandir", "walk", "pipe", "kill", "waitpid")),
+                         "scandir", "walk", "pipe", "kill", "waitpid", "closerange", "close", "dup2",
+                         "set_inheritable", "execv", "execvp", "access", "statvfs", "isatty")),
+                   (signal, ("signal", "pthread_sigmask")),
+                   (resource, ("getrlimit",)),
                    (socket, ("socket", "socketpair", "if_nameindex")),
                    (subprocess, ("run", "Popen", "check_output", "call"))):
     for name in names:
@@ -105,7 +109,7 @@ def valid_obs(**over):
                 "ipc": "ipc:[4026532268]"},
          "host_ns": {"net": "net:[4026531833]", "mnt": "mnt:[4026531832]", "pid": INIT, "ipc": "ipc:[4026531839]"},
          "host_ns_raw": HOST_NS, "processes": list(PROCS), "sid": 17, "sid_ours": True, "tty": "ENXIO",
-         "stdio": [(0, "pipe"), (1, "pipe"), (2, "pipe")], "interfaces": ["lo"], "work": "/tmp/no-docker.x",
+         "stdio": [(0, "/dev/null"), (1, "pipe"), (2, "pipe")], "interfaces": ["lo"], "work": "/tmp/no-docker.x",
          "mounts": valid_mounts(), "host_devs": dict(HOST_DEVS), "devs": dict(DEVS), "writable": [],
          "cwd": "/home/runner/work", "cwd_reachable": True}
     o.update(over)
@@ -212,177 +216,16 @@ def c06(P, emit):
 
 
 def c07(P, emit):
-    ev = P["eval_reached"]
-    emit("C07", passes(ev(["/a", "/b"], [])), "listed sockets that do not connect pass")
-    emit("C07", not passes(ev(["/a", "/b"], ["/b (stream)"])), "rejected: a listed socket accepts a connection")
-    emit("C07", not passes(ev([], [])), "rejected: an empty list proves nothing")
-    emit("C07", not passes(P["eval_stdio"]([(0, "unix socket"), (1, "pipe"), (2, "pipe")])),
-         "rejected: a standard descriptor is a Unix socket")
-    emit("C07", not passes(P["eval_stdio"]([(0, "pipe"), (1, "socket"), (2, "pipe")])),
-         "rejected: a standard descriptor is a TCP socket")
-    emit("C07", passes(P["eval_stdio"]([(0, "character device"), (1, "pipe"), (2, "pipe")])), "pipes and /dev/null pass")
-
-
-# netlink fixtures: the layout of include/uapi/linux/{netlink,sock_diag,unix_diag}.h
-def nlmsg(mtype, payload, seq=1, flags=0x2):
-    return struct.pack("<IHHII", 16 + len(payload), mtype, flags, seq, 4242) + payload + b"\0" * (-len(payload) % 4)
-
-
-def rta(atype, body):
-    return struct.pack("<HH", 4 + len(body), atype) + body + b"\0" * (-len(body) % 4)
-
-
-def diag_msg(ino, name=None, vfs=None):
-    body = struct.pack("<BBBBIII", 1, 1, 10, 0, ino, 0, 0)
-    if name is not None:
-        body += rta(0, name)
-    if vfs is not None:
-        body += rta(1, struct.pack("<II", *vfs))
-    return body
-
-
-DONE = nlmsg(3, struct.pack("<i", 0))
-REC_PATH = diag_msg(100, b"/run/docker.sock\0", (5, (259 << 20) | 0))
-REC_ABSTRACT = diag_msg(101, b"\0@abstract")
-REC_UNBOUND = diag_msg(102)
-
-
-def c08(P, emit):
-    Inc, NoEnd = P["Incomplete"], P["NoEnd"]
-
-    def raises(fn, kind=None):
-        try:
-            fn()
-        except IOAttempt:
-            raise
-        except Exception as e:
-            return isinstance(e, kind or Inc)
-        return False
-
-    req = P["diag_request"](1)
-    length, mtype, flags, seq, _ = struct.unpack_from("<IHHII", req)
-    fam, _, _, states, ino, show, c1, c2 = struct.unpack_from("<BBHIIIII", req, 16)
-    emit("C08", (length, mtype, flags, fam, states, show) == (40, 20, 0x301, 1, 0xFFFFFFFF, 3) and len(req) == 40,
-         "the dump request asks for every AF_UNIX socket in every state, with name and file")
-    good = [(nlmsg(20, REC_PATH) + nlmsg(20, REC_ABSTRACT) + nlmsg(20, REC_UNBOUND), 0, 0), (DONE, 0, 0)]
-    recs = P["parse_diag"](good, 1)
-    emit("C08", [(r["ino"], r["path"], r["vfs"]) for r in recs]
-         == [(100, b"/run/docker.sock", (5, (259 << 20))), (101, None, None), (102, None, None)],
-         "a whole dump in two replies is read: the bound name without its NUL, abstract and unbound without a path")
-    for text, batches, kind in (
-            ("a reply truncated (MSG_TRUNC)", [(nlmsg(20, REC_PATH) + DONE, 0x20, 0)], None),
-            ("an interrupted dump (NLM_F_DUMP_INTR)", [(nlmsg(20, REC_PATH, flags=0x12) + DONE, 0, 0)], None),
-            ("an error answer first (no unix_diag)", [(nlmsg(2, struct.pack("<i", -2) + b"\0" * 16), 0, 0)], None),
-            ("an error in the middle", [(nlmsg(20, REC_PATH) + nlmsg(2, struct.pack("<i", -12)), 0, 0)], None),
-            ("a wrong sequence number", [(nlmsg(20, REC_PATH, seq=7) + DONE, 0, 0)], None),
-            ("a reply not from the kernel", [(nlmsg(20, REC_PATH) + DONE, 0, 777)], None),
-            ("a header cut short", [(nlmsg(20, REC_PATH)[:10], 0, 0)], None),
-            ("a length beyond the reply", [(struct.pack("<IHHII", 999, 20, 2, 1, 0) + REC_PATH, 0, 0)], None),
-            ("a length below the header", [(struct.pack("<IHHII", 8, 20, 2, 1, 0) + REC_PATH, 0, 0)], None),
-            ("an attribute overrunning its record",
-             [(nlmsg(20, struct.pack("<BBBBIII", 1, 1, 10, 0, 9, 0, 0) + struct.pack("<HH", 64, 0) + b"/x"), 0, 0)], None),
-            ("no end marker", [(nlmsg(20, REC_PATH), 0, 0)], NoEnd),
-            ("no end marker over several replies", [(nlmsg(20, REC_PATH), 0, 0), (nlmsg(20, REC_UNBOUND), 0, 0)], NoEnd),
-            ("data after the end marker", [(nlmsg(20, REC_PATH) + DONE + nlmsg(20, REC_UNBOUND), 0, 0)], None),
-            ("a reply after the end marker", [(DONE, 0, 0), (nlmsg(20, REC_PATH), 0, 0)], None),
-            ("a bound name without its file", [(nlmsg(20, diag_msg(103, b"/x\0")) + DONE, 0, 0)], None),
-            ("a file without a bound name", [(nlmsg(20, diag_msg(104, b"\0abs", (1, 2))) + DONE, 0, 0)], None),
-            ("a file attribute of the wrong size", [(nlmsg(20, diag_msg(105, b"/x\0") + rta(1, b"\0" * 4)) + DONE, 0, 0)], None),
-            ("a message of another type", [(nlmsg(16, REC_PATH) + DONE, 0, 0)], None)):
-        emit("C08", raises(lambda: P["parse_diag"](batches, 1), kind), f"rejected: {text}")
-    emit("C08", P["kernel_dev"]((259 << 20) | 0) == (259, 0) and P["kernel_dev"](1000) == (0, 1000)
-         and P["kernel_dev"]((8 << 20) | 300) == (8, 300), "kernel device numbers (259:0, 0:1000, 8:300) are read")
-    emit("C08", P["cross_check"]({5, (1 << 32) | 7}, [5, 7]) == [], "held sockets in a dump are complete (low 32 bits)")
-    emit("C08", P["cross_check"]({5, 9}, [5]) == [9], "a held socket in no dump is found missing")
-    emit("C08", P["uring_sockets"]("pos:\t0\nUserFiles:\t2\n    0: socket:[12]\n    1: /tmp/f\nUserBufs:\t0\n") == {12},
-         "the sockets of an io_uring's registered files are read")
-    emit("C08", raises(lambda: P["uring_sockets"]("pos:\t0\nSqThread:\t-1\n")), "rejected: an io_uring without its file table")
-    emit("C08", P["uring_sockets"]("UserFiles:\t3\n    0: pipe:[7]\n    1: anon_inode:[eventfd]\n    2: /x\nUserBufs:\t0\n") == set(),
-         "an io_uring with a pipe, an eventfd and a file holds no socket")
-    emit("C08", raises(lambda: P["uring_sockets"]("UserFiles:\t2\n    0: socket:[12]\nUserBufs:\t0\n")),
-         "rejected: an io_uring showing fewer entries than its count (its lock was busy)")
-    emit("C08", raises(lambda: P["uring_sockets"]("UserFiles:\t1\n    0: UNIX-STREAM\nUserBufs:\t0\n")),
-         "rejected: an io_uring naming a socket by its protocol only (kernels up to 6.13)")
-    host = P["parse_mountinfo"](
-        b"25 1 259:1 / / rw - ext4 /dev/root rw\n"
-        b"40 25 259:1 /home/runner/x /mnt/x rw - ext4 /dev/root rw\n"
-        b"41 25 259:1 /home/runner/x/s /srv/s rw - ext4 /dev/root rw\n"
-        b"42 25 259:1 /home/runner/xy /q rw - ext4 /dev/root rw\n"
-        b"43 25 0:50 / /home/runner/x rw - tmpfs t rw\n"
-        b"44 25 259:1 /home/runner/x /m\\040n rw - ext4 /dev/root rw\n")
-    emit("C08", host[5]["point"] == b"/m n" and host[0]["dev"] == (259, 1), "mountinfo is read as bytes, escapes undone")
-    got = P["aliases"](host, (259, 1), b"/home/runner/x/s")
-    emit("C08", got == [b"/home/runner/x/s", b"/m n/s", b"/mnt/x/s", b"/srv/s"],
-         f"every path to the file through a mount of its file system, hidden ones too, not /qs ({got})")
-    emit("C08", P["fs_path"](b"/home/runner/x", b"/mnt/x", b"/mnt/x/s") == b"/home/runner/x/s"
-         and P["fs_path"](b"/", b"/", b"/a/s") == b"/a/s" and P["fs_path"](b"/a/b", b"/a/b", b"/a/bc/s") is None,
-         "a path within its file system is found by whole path components")
-    lr = P["locate_reason"]
-    sock = stat.S_IFSOCK | 0o666
-    m = {"dev": (259, 1), "fstype": "ext4"}
-    vfs = (5, (259 << 20) | 1)
-    emit("C08", lr(sock, 5, 1, vfs, m, b"/run/docker.sock") is None, "the bound file with one link is located")
-    emit("C08", lr(sock, (1 << 32) | 5, 1, vfs, m, b"/s") is None, "an inode is compared by its low 32 bits")
-    for text, args in (("not a socket", (stat.S_IFREG | 0o644, 5, 1, vfs, m, b"/s")),
-                       ("another inode", (sock, 6, 1, vfs, m, b"/s")),
-                       ("two links", (sock, 5, 2, vfs, m, b"/s")),
-                       ("no link", (sock, 5, 0, vfs, m, b"/s")),
-                       ("its mount unknown", (sock, 5, 1, vfs, None, b"/s")),
-                       ("another device", (sock, 5, 1, vfs, {"dev": (259, 2), "fstype": "ext4"}, b"/s")),
-                       ("on FUSE", (sock, 5, 1, vfs, {"dev": (259, 1), "fstype": "fuse.sshfs"}, b"/s")),
-                       ("on NFS", (sock, 5, 1, vfs, {"dev": (259, 1), "fstype": "nfs4"}, b"/s")),
-                       ("on overlayfs", (sock, 5, 1, vfs, {"dev": (259, 1), "fstype": "overlay"}, b"/s")),
-                       ("removed", (sock, 5, 1, vfs, m, b"/s (deleted)"))):
-        emit("C08", lr(*args) is not None, f"not located: {text}")
-    emit("C08", raises(lambda: P["locate"]({"path": b"run/x", "vfs": vfs}, [])), "not located: a relative name")
-    seen = {}
-    P["claim"](seen, ((259, 1), b"/s"), vfs)
-    P["claim"](seen, ((259, 1), b"/s"), vfs)
-    emit("C08", raises(lambda: P["claim"](seen, ((259, 1), b"/s"), (6, vfs[1]))), "rejected: two live sockets located at one path")
-
-
-def c09(P, emit):
-    now = [0.0]
-    d = P["Deadline"](10, clock=lambda: now[0])
-    d.check("at the start")
-    now[0] = 9.9
-    d.check("just before the end")
-    now[0] = 10.0
-    try:
-        d.check("at the end")
-        emit("C09", False, "rejected: the fast listing at its 10 s budget")
-    except P["Incomplete"]:
-        emit("C09", True, "rejected: the fast listing at its 10 s budget (the walk runs)")
-    clock = [0.0]
-
-    def slow(cmd, **kw):
-        clock[0] += 100
-        return subprocess.CompletedProcess(cmd, 0, b"", b"")
-
-    entries = [{"point": "/", "fstype": "ext4"}, {"point": "/home", "fstype": "ext4"}]
-    try:
-        P["enumerate_sockets"](90, clock=lambda: clock[0], run=slow, entries=entries)
-        emit("C09", False, "rejected: a walk past its budget")
-    except TimeoutError:
-        emit("C09", True, "rejected: a walk past its budget (no-docker refuses)")
-
-    def hangs(cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-
-    try:
-        P["enumerate_sockets"](150, clock=lambda: 0.0, run=hangs, entries=entries)
-        emit("C09", False, "rejected: a find killed at the budget")
-    except TimeoutError:
-        emit("C09", True, "rejected: a find killed at the budget")
-
-    def broken(cmd, **kw):
-        return subprocess.CompletedProcess(cmd, 2, b"", b"")
-
-    try:
-        P["enumerate_sockets"](150, clock=lambda: 0.0, run=broken, entries=entries)
-        emit("C09", False, "rejected: a find that failed")
-    except OSError:
-        emit("C09", True, "rejected: a find that failed (status 2)")
+    ev = P["eval_stdio"]
+    for text, kinds in (("a standard descriptor is a Unix socket", [(0, "/dev/null"), (1, "unix socket"), (2, "pipe")]),
+                        ("a standard descriptor is a TCP socket", [(0, "/dev/null"), (1, "pipe"), (2, "socket")])):
+        emit("C07", not passes(ev(kinds)), f"rejected: {text}")
+    emit("C07", passes(ev([(0, "/dev/null"), (1, "pipe"), (2, "pipe")])), "/dev/null and pipes pass")
+    for text, kinds in (("a terminal", [(0, "terminal"), (1, "pipe"), (2, "pipe")]),
+                        ("a regular file", [(0, "/dev/null"), (1, "file"), (2, "pipe")]),
+                        ("a descriptor that cannot be examined (EACCES)", [(0, "/dev/null"), (1, "pipe"), (2, "unreadable (EACCES)")]),
+                        ("fd 0 closed", [(0, "closed"), (1, "pipe"), (2, "pipe")])):
+        emit("C07", not passes(ev(kinds)), f"rejected: {text}")
 
 
 def c10(P, emit):
@@ -412,8 +255,84 @@ def c10(P, emit):
         emit("C10", not ok and calls == [] and False in said, f"not entered when {text}")
 
 
+NAME = "flowcrm-nd-" + "0123456789abcdef" * 2
+LABEL = f"{NAME} (enforce)\n"
+ROOT_SH = {"Name": "sh", "Uid": "0\t0\t0\t0"}
+OURS = {"Name": "bash", "Uid": "1001\t1001\t1001\t1001"}
+
+
+def c11(P, emit):
+    ev = P["eval_label"]
+    emit("C11", passes(ev(LABEL, [], NAME)), "this process confined by exactly NAME in enforce mode passes")
+    emit("C11", passes(ev(LABEL, [("1", ROOT_SH, "unconfined\n"), ("21", OURS, LABEL)], NAME)),
+         "every other process confined by exactly NAME, pid 1 the root shell, passes")
+    for text, own, others in (
+            ("a stacked label", f"other//&{NAME} (enforce)\n", []),
+            ("complain mode", f"{NAME} (complain)\n", []),
+            ("another process unconfined", LABEL, [("1", ROOT_SH, "unconfined\n"), ("21", OURS, "unconfined\n")]),
+            ("pid 1 unconfined but not the root shell", LABEL, [("1", OURS, "unconfined\n")]),
+            ("the label missing", OSError(errno.ENOENT, "missing"), [])):
+        emit("C11", not passes(ev(own, others, NAME)), f"rejected: {text}")
+
+
+def fds(**over):
+    o = {"pid": 20, "listed_pid": 20, "fds": [(0, "/dev/null"), (1, "pipe"), (2, "pipe")]}
+    o.update(over)
+    return o
+
+
+STD = [(0, "/dev/null"), (1, "pipe"), (2, "pipe")]
+
+
+def c12(P, emit):
+    ev = P["eval_fds"]
+    emit("C12", passes(ev(fds())), "fd 0 /dev/null, fds 1 and 2 pipes, nothing else passes")
+    emit("C12", not passes(ev(fds(fds=STD + [(3, "unix socket")]))), "rejected: an extra fd 3 (a Unix socket)")
+    emit("C12", not passes(ev(fds(fds=STD + [(7, "file")]))), "rejected: an extra fd 7 (a file)")
+    emit("C12", passes(ev(fds(fds=STD + [(3, "closed")]))), "the listing's own descriptor (closed by now) is ignored")
+    emit("C12", not passes(ev(fds(fds=[(0, "/dev/null"), (1, "unix socket"), (2, "pipe")]))), "rejected: fd 1 a socket")
+    emit("C12", not passes(ev(fds(fds=[(0, "/dev/null"), (1, "pipe"), (2, "file")]))), "rejected: fd 2 a regular file")
+    emit("C12", not passes(ev(fds(fds=STD + [(5, "unreadable (EIO)")]))), "rejected: an fd that cannot be examined")
+    emit("C12", not passes(ev(fds(fds=[(0, "character device"), (1, "pipe"), (2, "pipe")]))), "rejected: fd 0 not /dev/null (1:3)")
+    emit("C12", not passes(ev(fds(listed_pid=4711))), "rejected: the listing of another process")
+
+
+def fence(**over):
+    o = {"stream": {"sock": True, "uid": 1001, "dac": True, "result": "EACCES"},
+         "dgram": {"sock": True, "uid": 1001, "dac": True, "result": "EACCES"}, "twin": "ok"}
+    for k, v in over.items():
+        o[k] = dict(o[k], **v) if isinstance(v, dict) else v
+    return o
+
+
+def c13(P, emit):
+    ev = P["eval_fence"]
+    emit("C13", passes(ev(fence(), 1001)), "both fence sockets refused with EACCES, the twin connects: passes")
+    for text, f in (("both fence sockets reached", fence(stream={"result": "ok"}, dgram={"result": "ok"})),
+                    ("the stream connect refused (ECONNREFUSED)", fence(stream={"result": "ECONNREFUSED"})),
+                    ("the stream fence missing (ENOENT)", fence(stream={"result": "ENOENT"})),
+                    ("the stream connect denied with EPERM", fence(stream={"result": "EPERM"})),
+                    ("the datagram timing out", fence(dgram={"result": "timeout"})),
+                    ("file permissions not shown to allow the fence", fence(dgram={"dac": False})),
+                    ("the datagram refused but the stream reached", fence(stream={"result": "ok"})),
+                    ("the twin not connecting", fence(twin="ECONNREFUSED"))):
+        emit("C13", not passes(ev(f, 1001)), f"rejected: {text}")
+
+
+def c14(P, emit):
+    ev = P["eval_root_fds"]
+    before = [(0, "pipe"), (1, "pipe"), (2, "pipe"), (3, "closed"), (5, "unix socket"), (6, "file")]
+    good, closed, _ = ev(before, [(0, "pipe"), (1, "pipe"), (2, "pipe")], "/dev/null")
+    emit("C14", good and closed == [5, 6], f"descriptors above 2 closed and none left: proceeds (closed {closed})")
+    emit("C14", ev(before, [(0, "pipe"), (1, "pipe"), (2, "pipe"), (5, "unix socket")], "/dev/null")[0] is False,
+         "rejected: a descriptor above 2 survives the close")
+    emit("C14", ev(before, [(0, "pipe"), (1, "pipe"), (2, "pipe"), (4, "closed")], "/dev/null")[0] is True,
+         "the listing's own descriptor (closed by now) is ignored")
+    emit("C14", ev(before, [(0, "pipe"), (1, "pipe"), (2, "pipe")], "terminal")[0] is False, "rejected: stdin not /dev/null")
+
+
 CASES = [("C01", c01), ("C02", c02), ("C03", c03), ("C04", c04), ("C05", c05), ("C06", c06), ("C07", c07),
-         ("C08", c08), ("C09", c09), ("C10", c10)]
+         ("C10", c10), ("C11", c11), ("C12", c12), ("C13", c13), ("C14", c14)]
 
 
 def run_case(fn, ns, emit_fn):
@@ -437,23 +356,57 @@ def calls_in(tree, fname):
     return set()
 
 
+def lines_of(tree, fname, names):
+    """{name: first line} of the calls of names in function fname."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == fname:
+            found = {}
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute)):
+                    call = n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+                    if call in names:
+                        found[call] = min(found.get(call, n.lineno), n.lineno)
+            return found
+    return {}
+
+
+def main_mode(tree, flag, fname):
+    """True if main calls fname inside an if whose test names flag."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "main":
+            for n in ast.walk(node):
+                if isinstance(n, ast.If) and flag in {c.value for c in ast.walk(n.test) if isinstance(c, ast.Constant)}:
+                    called = {c.func.id if isinstance(c.func, ast.Name) else c.func.attr
+                              for b in n.body for c in ast.walk(b)
+                              if isinstance(c, ast.Call) and isinstance(c.func, (ast.Name, ast.Attribute))}
+                    if fname in called:
+                        return True
+    return False
+
+
 def wiring():
     tree = ast.parse(SOURCE)
-    need = {
-        "check_mechanism_linux": {"gated", "observe_linux", "evaluate_linux", "after_gate_linux"},
-        "evaluate_linux": {"eval_creds", "eval_pidns", "eval_processes", "eval_stdio", "eval_mounts"},
-        "after_gate_linux": {"eval_reached", "unix_connects"},
-        "fast_listing": {"scan_tasks", "dump_netns", "cross_check", "locate", "claim", "aliases", "proc_net_unix_paths"},
-        "scan_tasks": {"uring_sockets", "parse_mountinfo", "proc_entries", "proc_readlink"},
-        "locate": {"locate_reason", "fs_path"},
-        "dump_netns": {"diag_dump", "setns"},
-        "diag_dump": {"parse_diag", "diag_request"},
-        "parse_diag": {"parse_diag_msg"},
-        "main": {"fast_listing", "enumerate_sockets", "Deadline", "check_mechanism_linux"},
-    }
-    for fname, names in need.items():
+    need = [
+        ("the gate evaluates the label (G3) and the descriptor table (G8)", "gate_exec", {"evaluate_gate", "eval_fds", "observe_fds"}),
+        ("the gate's evaluation goes through gated", "gate_exec", {"gated"}),
+        ("the gate checks the fence (G4, G6)", "gate_exec", {"fence_check", "eval_fence"}),
+        ("the gate checks the twin (G5)", "gate_exec", {"twin_check"}),
+        ("--root-exec closes and verifies the descriptors", "root_exec", {"closerange", "list_fds", "eval_root_fds", "dup2", "execv"}),
+        ("the gate runs the kept after-gate checks and the engine check (endpoints)", "gate_exec", {"after_gate_linux", "engine_check"}),
+    ]
+    for text, fname, names in need:
         missing = names - calls_in(tree, fname)
-        emit("W", not missing, f"{fname} uses {', '.join(sorted(names))}" + (f" (missing: {', '.join(sorted(missing))})" if missing else ""))
+        emit("W", not missing, f"{text}: {fname} uses {', '.join(sorted(names))}" + (f" (missing: {', '.join(sorted(missing))})" if missing else ""))
+    for flag, fname in (("--gate-exec", "gate_exec"), ("--root-exec", "root_exec"), ("--seal", "seal")):
+        emit("W", main_mode(tree, flag, fname), f"main runs {fname} for {flag}")
+    ok_check = {"check_mechanism_linux", "engine_check"} <= calls_in(tree, "main")
+    emit("W", ok_check, "main runs check_mechanism_linux and then engine_check without arguments (--check)")
+    nested = calls_in(tree, "check_mechanism_linux")
+    emit("W", {"gated", "evaluate_linux", "eval_label", "after_gate_linux"} <= nested and "endpoints" in calls_in(tree, "engine_check"),
+         "a nested run gates on G1 (evaluate_linux), G3 (eval_label) and G7 (after_gate_linux, then engine_check with endpoints)")
+    at = lines_of(tree, "gate_exec", {"signal", "pthread_sigmask", "execvp", "eval_fds"})
+    emit("W", len(at) == 4 and at["eval_fds"] < at["signal"] < at["pthread_sigmask"] < at["execvp"],
+         f"the gate checks the descriptors, then resets every signal and clears the mask, then execs ({at})")
 
 
 # --- M: mutants of the probe, each must fail its case ----------------------
@@ -461,31 +414,33 @@ def wiring():
 MUTANTS = [
     ("M1", "C01", "the old NSpid rule (two entries or more)",
      '(nspid.split() == [str(pid)], f"/proc shows', '(len(nspid.split()) >= 2, f"/proc shows'),
-    ("M2", "C08", "the cross-check finds nothing missing",
-     'return sorted({i & 0xFFFFFFFF for i in held} - {i & 0xFFFFFFFF for i in dumped})', 'return []'),
-    ("M3", "C07", "an empty socket list accepted",
-     '(bool(paths) and not reached, f"none of', '(not reached, f"none of'),
     ("M4", "C05", "the primary group rule removed",
      '(plain, f"the primary group is not a system group', '(True, f"the primary group is not a system group'),
-    ("M5", "C09", "the fast listing's budget ignored",
-     '        if self.left() <= 0:\n            raise Incomplete', '        if False:\n            raise Incomplete'),
     ("M6", "C10", "the gate removed",
      '    if not good:\n        return False\n    after()', '    after()\n    if not good:\n        return False'),
-    ("M7", "C08", "the link count not checked",
-     '    if nlink != 1:\n        return f"its file has', '    if False:\n        return f"its file has'),
-    ("M8", "C08", "an io_uring's partial file table tolerated",
-     '    if not count.strip().isdigit() or len(entries) != int(count):', '    if False:'),
-    ("M9", "C08", "only the path itself, no alias",
-     'return sorted({rebase(path, m["root"], m["point"]) for m in entries\n                   if m["dev"] == dev and under(path, m["root"])})',
-     'return [path]'),
-    ("M10", "C08", "only listening sockets dumped",
-     'struct.pack("<BBHIIIII", LINUX_AF_UNIX, 0, 0, 0xFFFFFFFF,', 'struct.pack("<BBHIIIII", LINUX_AF_UNIX, 0, 0, 1 << 10,'),
     ("M11", "C03", "any unreadable process skipped",
      '            if not gone(st):\n                foreign.append', '            if False:\n                foreign.append'),
     ("M12", "C02", "the caller's pid namespace not checked",
      '(caller == INIT_PID_NS, f"the caller is', '(True, f"the caller is'),
     ("M13", "C02", "NSpid containing the pid accepted",
      '(nspid.split() == [str(pid)], f"/proc shows', '(str(pid) in nspid.split(), f"/proc shows'),
+    ("M14", "C13", "any fence error accepted",
+     '(e.get("result") == "EACCES", f"{verb}', '(e.get("result") != "ok", f"{verb}'),
+    ("M15", "C11", "a stacked label accepted",
+     '(mine == want, f"this process is confined', '(mine.endswith(want), f"this process is confined'),
+    ("M16", "C12", "descriptors above 2 ignored",
+     'for fd, k in sorted(kinds.items()) if fd >= 3 and k != "closed"]', 'for fd, k in sorted(kinds.items()) if False]'),
+    ("M17", "C13", "the file permission proof skipped",
+     '(e.get("dac") is True, f"file permissions allow', '(True, f"file permissions allow'),
+    ("M18", "C12", "a socket on fd 1 accepted",
+     '(all(kinds.get(fd) == want for fd, want in std),', '(all(kinds.get(fd) in (want, "unix socket") for fd, want in std),'),
+    ("M19", "C13", "the twin ignored",
+     '(o.get("twin") == "ok", f"a socket bound inside', '(True, f"a socket bound inside'),
+    ("M20", "C12", "a descriptor that cannot be examined taken as closed",
+     'for fd, k in sorted(kinds.items()) if fd >= 3 and k != "closed"]',
+     'for fd, k in sorted(kinds.items()) if fd >= 3 and k != "closed" and not k.startswith("unreadable")]'),
+    ("M21", "C12", "the listing of another process accepted",
+     '(o["listed_pid"] == o["pid"], f"the descriptors listed', '(True, f"the descriptors listed'),
 ]
 
 
