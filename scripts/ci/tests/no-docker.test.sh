@@ -1609,12 +1609,12 @@ done
 t39=$(python3 -I -B "$here/no-docker-static.py" "$root" 2>&1)
 t39_rc=$?
 printf '%s\n' "$t39" | grep -vE '^ok   ' | sed 's/^/INFO    /'
-for want in S-02=2 S-02b=2 S-03=2 S-03b=2 S-04=2 S-05=4 S-06=2 S-08=2; do
+for want in S-02=2 S-02b=2 S-03=2 S-03b=2 S-04=2 S-05=4 S-06=2 S-07=2 S-08=2; do
   tag=${want%=*}
   n=$(printf '%s\n' "$t39" | grep -cE "^ok   ${tag} ")
   bad=$(printf '%s\n' "$t39" | grep -cE "^FAIL ${tag} ")
   [ "$t39_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
-    printf '%s\n' "$t39" | grep -qx 'SUMMARY 18 ok, 0 failed'
+    printf '%s\n' "$t39" | grep -qx 'SUMMARY 20 ok, 0 failed'
   result "T-39 $tag: $n of ${want#*=} checks pass" $? "(rc $t39_rc, $bad failed)"
 done
 

@@ -11,6 +11,14 @@
 #                                  run COMMAND isolated; its status
 #        no-docker.sh --check      exit 0 only if this process is already
 #                                  isolated
+#        no-docker.sh --negative-control COMMAND [ARG...]
+#                                  Linux on GitHub-hosted runners, the test
+#                                  suite's control only: launch under a
+#                                  profile that does not deny host sockets
+#                                  (the negative template), so the gate must
+#                                  refuse; COMMAND is replaced by
+#                                  /usr/bin/true and never runs, and the
+#                                  status is always 125
 #
 # --work DIR: use DIR, a fresh, empty directory of the caller (mode 0700, not
 # a symbolic link and without one in its path), as the only writable
@@ -99,6 +107,11 @@ if [ "${1-}" = --inner ]; then
   exec "$@"
 fi
 
+negative=""
+if [ "${1-}" = --negative-control ]; then
+  negative=yes
+  shift
+fi
 given_work=""
 if [ "${1-}" = --work ]; then
   [ $# -ge 2 ] || refuse "--work needs a directory"
@@ -108,6 +121,7 @@ fi
 [ $# -gt 0 ] || refuse "no command given"
 if [ -n "${NO_DOCKER_ACTIVE-}" ]; then
   # Already isolated (a suite re-executing itself): never nest.
+  [ -z "$negative" ] || refuse "--negative-control is refused inside the isolation"
   python3 -I "$probe" >&2 || refuse "inside no-docker.sh, but the isolation check fails"
   [ -z "$given_work" ] || refuse "--work cannot be used inside the isolation"
   exec "$@"
@@ -120,6 +134,7 @@ fi
 
 os=$(uname -s)
 uid=$(id -u)
+[ -z "$negative" ] || [ "$os" = Linux ] || refuse "--negative-control is for Linux on GitHub-hosted runners only"
 
 # plain PATH: true if PATH has only characters that are safe in a sandbox
 # profile and in the shell of the namespace.
@@ -433,9 +448,11 @@ case $os in
       fi
       [ "$work_made" != yes ] || rm -rf "$work"
       # C7: the status. A cleanup failure is 125 even after the command
-      # succeeded; then a signal; then a refusal; then a command that did not
-      # start; then the command's own.
+      # succeeded; the negative control is always 125; then a signal; then a
+      # refusal; then a command that did not start; then the command's own.
       if [ -n "$left$fail" ]; then
+        status=$EX_REFUSED
+      elif [ -n "$negative" ]; then
         status=$EX_REFUSED
       elif [ -n "$signalled" ]; then
         status=$signalled
@@ -460,7 +477,7 @@ case $os in
     # HUP) goes through cleanup, once, which touches only what was recorded
     # as started. "$!" has a value from here on (": &"), so the starts below
     # can be told apart from it under set -u.
-    ctldir="" fencedir="" profile="" state="" lpid="" lstart="" load_done="" spid="" sstart="" sudo_reaped=""
+    ctldir="" fencedir="" profile="" load_op="" state="" lpid="" lstart="" load_done="" spid="" sstart="" sudo_reaped=""
     o="" e="" opid="" ostart="" epid="" estart="" fspid="" fsstart="" fdpid="" fdstart=""
     pending="" kept="" token="" stopped="" signalled="" normal="" cleaning="" work="" work_made="" rc=""
     t_launch=${EPOCHREALTIME/./} t_preflight=0 t_load=0 t_fence=0 t_relays=0 t_run=0 t_release=0
@@ -656,6 +673,15 @@ case $os in
     case $hex in *[!0-9a-f]*) refuse "cannot make a random profile name" ;; esac
     [ "${#hex}" -eq 32 ] || refuse "cannot make a random profile name"
     profile=flowcrm-nd-$hex
+    load_op=load
+    if [ -n "$negative" ]; then
+      # The negative control: an ineffective profile, which the gate must
+      # refuse. Whatever was asked for, only /usr/bin/true can run.
+      set -- /usr/bin/true
+      profile=flowcrm-nd-neg-$hex
+      load_op=load-negative-control
+      printf '::warning title=no-docker::negative control: profile %s (the negative template) does not deny host sockets; the command is /usr/bin/true and the status is 125\n' "$profile"
+    fi
     put_state loading || refuse "cannot record the state of the launch"
 
     # L3: the fence, two sockets of this launch bound outside the namespace
@@ -711,7 +737,7 @@ s.close()
     # start time), never with kill -0, which this user may not send it.
     t=${EPOCHREALTIME/./}
     pending=load kept=$!
-    sudo -n timeout 20 /usr/bin/python3 -I "$aa" load "$profile" "$ctldir" &
+    sudo -n timeout 20 /usr/bin/python3 -I "$aa" "$load_op" "$profile" "$ctldir" &
     lpid=$! pending=
     proc_stat "$lpid" && lstart=$ps_start
     wait_gone "$lpid" "$lstart" 25 || refuse "loading the AppArmor profile did not end within 25s"

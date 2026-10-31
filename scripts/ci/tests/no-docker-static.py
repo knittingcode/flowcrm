@@ -30,6 +30,9 @@ check prints "ok   <rule> <text>" or "FAIL <rule> <text>"; the last line is
          attach_disconnected;
   S-06   the host socket listing is gone: no --sockets, --sockets-fast,
          NO_DOCKER_SOCKETS, fast_listing or enumerate_sockets;
+  S-07   the negative control (--negative-control, load-negative-control)
+         appears only in no-docker.sh, no-docker-aa.py, no-docker.test.sh
+         and the unit and static tests;
   S-08   the sha256 values no-docker-aa.py pins for the two templates are
          those of the template files.
 
@@ -152,7 +155,7 @@ END = r"(\s+2>/dev/null)?\s*(\|\||&&|;|&\s*$|$)"
 LAUNCHER_SUDO = [re.compile(r + END) for r in (
     r"sudo -n true",
     r'sudo -n timeout 10 /usr/bin/python3 -I "\$aa" preflight',
-    r'sudo -n timeout 20 /usr/bin/python3 -I "\$aa" load "\$profile" "\$ctldir"',
+    r'sudo -n timeout 20 /usr/bin/python3 -I "\$aa" "\$load_op" "\$profile" "\$ctldir"',
     r'sudo -n timeout 10 /usr/bin/python3 -I "\$aa" kill-init "\$\$" "\$ctldir"',
     r'sudo -n timeout 30 /usr/bin/python3 -I "\$aa" release "\$profile" "\$ctldir"',
     r'sudo -n timeout 10 /usr/bin/python3 -I "\$aa" diag "\$profile"',
@@ -252,6 +255,16 @@ def s06(files):
     return [f"{p}:{n}" for p, n, line in code_lines(files, exempt=(SELF, AA_UNIT, PROBE_UNIT)) if LISTING.search(line)]
 
 
+# --- S-07 ---------------------------------------------------------------------
+
+NEGATIVE_USE = re.compile(r"(^|[^-\w])--negative-control\b|\bload-negative-control\b")
+NEGATIVE_FILES = (LAUNCHER, AA, TEST, AA_UNIT, PROBE_UNIT)
+
+
+def s07(files):
+    return [f"{p}:{n}" for p, n, line in code_lines(files, exempt=(SELF,) + NEGATIVE_FILES) if NEGATIVE_USE.search(line)]
+
+
 # --- S-08 ---------------------------------------------------------------------
 
 def pinned(aa_text):
@@ -303,6 +316,8 @@ RULE_LIST = [
      edit(TEMPLATE, "  deny network vsock,\n", "")),
     ("S-06", "no host socket listing is left", s06,
      add("scripts/ci/no-docker-probe.py", "\ndef fast_listing(deadline, paths):\n    return 0\n")),
+    ("S-07", "the negative control only in the files that implement and test it", s07,
+     add(".github/workflows/ci.yml", "\n      - run: scripts/ci/no-docker.sh --negative-control true\n")),
     ("S-08", "the template hashes pinned in no-docker-aa.py are those of the files", s08,
      edit(NEGATIVE, "  deny network vsock,\n", "  deny network inet,\n")),
 ]
