@@ -1,0 +1,43 @@
+# FCRM-SEC-023 controlled AppArmor spike. Frozen package; it runs only after
+# an explicit owner authorization. It lives only on the orphan branch
+# spike/fcrm-sec023-apparmor (no project history), as
+# .github/workflows/spike-apparmor.yml next to spike/apparmor-spike.sh and
+# spike/sock.py.
+#
+# No third-party action and no token permission: the public repository is
+# fetched anonymously at the pushed commit, and the two spike files must
+# match the sha256 values below before anything runs.
+name: FCRM-SEC-023 AppArmor spike
+on:
+  push:
+    branches: [spike/fcrm-sec023-apparmor]
+permissions: {}
+concurrency:
+  group: fcrm-sec023-apparmor-spike
+  cancel-in-progress: false
+jobs:
+  spike:
+    if: github.repository == 'knittingcode/flowcrm' && github.ref == 'refs/heads/spike/fcrm-sec023-apparmor'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch and verify the spike files
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/spike-src"
+          mkdir "$d"
+          cd "$d"
+          git init -q
+          git -c protocol.version=2 fetch -q --no-tags --depth 1 \
+            "https://github.com/$GITHUB_REPOSITORY" "+refs/heads/spike/fcrm-sec023-apparmor:refs/remotes/spike"
+          test "$(git rev-parse refs/remotes/spike)" = "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          printf '%s  %s\n' \
+            915382940b7877ab2b3d7fa2f66a0874b1e5aceb3ad7a0e84a2711d803f2a2ac spike/apparmor-spike.sh \
+            3c296b90fcada174f0db8eba5508f8f8ea3043d63ca7c1e787af1d0ae9b14ace spike/sock.py | sha256sum -c -
+          test "$(git ls-tree -r --name-only HEAD | sort | tr '\n' ' ')" = ".github/workflows/spike-apparmor.yml spike/apparmor-spike.sh spike/sock.py "
+      - name: AppArmor Unix socket spike
+        run: bash "$RUNNER_TEMP/spike-src/spike/apparmor-spike.sh"
