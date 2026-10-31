@@ -1,0 +1,50 @@
+# FCRM-SEC-025 controlled AppArmor spike, revision 4. Frozen package; it runs
+# only after an explicit owner authorization. It lives only on the orphan
+# branch spike/fcrm-sec025-apparmor (no project history), as
+# .github/workflows/spike-apparmor-sec025.yml next to spike/apparmor-spike.sh,
+# spike/evaluate.py and spike/sock.py.
+#
+# No third-party action and no token permission: the public repository is
+# fetched anonymously at the pushed commit, and the three spike files must
+# match the sha256 values below before anything runs.
+name: FCRM-SEC-025 AppArmor spike r4
+on:
+  push:
+    branches: [spike/fcrm-sec025-apparmor]
+permissions: {}
+concurrency:
+  group: fcrm-sec025-apparmor-spike
+  cancel-in-progress: false
+jobs:
+  spike:
+    if: github.repository == 'knittingcode/flowcrm' && github.ref == 'refs/heads/spike/fcrm-sec025-apparmor'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch and verify the spike files
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/spike-src"
+          mkdir "$d"
+          cd "$d"
+          git init -q
+          git -c protocol.version=2 fetch -q --no-tags --depth 1 \
+            "https://github.com/$GITHUB_REPOSITORY" "+refs/heads/spike/fcrm-sec025-apparmor:refs/remotes/spike"
+          test "$(git rev-parse refs/remotes/spike)" = "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          printf '%s  %s\n' \
+            8e098678a7de26a928f16100709c53fb234abcf7540af3d127f0b94f178576fa spike/apparmor-spike.sh \
+            b2374b1b1e1e89e0b495c8f95c29079046b5855453f22350258e1b37c36a365c spike/evaluate.py \
+            5c5b7b8f01e017085298b574433ab049f5b428ad798c79f86e4af97dd06f73db spike/sock.py | sha256sum -c -
+          test "$(git ls-tree -r --format='%(objectmode) %(objecttype) %(path)' HEAD)" = "$(printf '%s\n' \
+            '100644 blob .github/workflows/spike-apparmor-sec025.yml' \
+            '100644 blob spike/apparmor-spike.sh' \
+            '100644 blob spike/evaluate.py' \
+            '100644 blob spike/sock.py')"
+      - name: AppArmor Unix socket spike
+        timeout-minutes: 8
+        run: bash "$RUNNER_TEMP/spike-src/spike/apparmor-spike.sh"
