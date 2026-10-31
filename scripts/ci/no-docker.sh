@@ -471,9 +471,14 @@ case $os in
       else
         [ -z "$ctldir" ] || rm -rf "$ctldir"
       fi
-      if [ "$work_made" = yes ]; then
+      # The run directory is removed only once the namespace is shown gone:
+      # a process left inside could otherwise swap a symbolic link into it
+      # while it is changed.
+      if [ "$work_made" = yes ] && [ -z "$left" ]; then
         chmod -R u+rwx "$work" 2>/dev/null
         rm -rf "$work" || printf 'no-docker: the run directory %s could not be removed\n' "$work" >&2
+      elif [ "$work_made" = yes ]; then
+        printf 'no-docker: the run directory %s is kept\n' "$work" >&2
       fi
       # C7: the status. A cleanup failure is 125 even after the command
       # succeeded; the negative control is always 125; then a signal; then a
@@ -510,12 +515,19 @@ case $os in
     pending="" kept="" token="" stopped="" signalled="" normal="" cleaning="" work="" work_made="" rc=""
     t_launch=${EPOCHREALTIME//[!0-9]/} t_preflight=0 t_load=0 t_fence=0 t_relays=0 t_run=0 t_release=0
     trap '' PIPE
+    # On Linux a refusal stops taking signals before it exits, so that a
+    # signal cannot cut short the cleanup its exit runs.
+    refuse() {
+      trap '' INT TERM HUP
+      printf 'no-docker: refused: %s; the command was not run\n' "$1" >&2
+      exit "$EX_REFUSED"
+    }
     : &
     kept=$!
     trap cleanup EXIT
-    trap '[ -n "$cleaning" ] || { signalled=130; exit 130; }' INT
-    trap '[ -n "$cleaning" ] || { signalled=143; exit 143; }' TERM
-    trap '[ -n "$cleaning" ] || { signalled=129; exit 129; }' HUP
+    trap 'trap "" INT TERM HUP; signalled=130; exit 130' INT
+    trap 'trap "" INT TERM HUP; signalled=143; exit 143' TERM
+    trap 'trap "" INT TERM HUP; signalled=129; exit 129' HUP
     # Only GitHub-hosted runners: the VM is discarded after the job, sudo
     # needs no password and no rootless engine or user session exists. The
     # checks below guard against using this elsewhere by accident; they are
@@ -775,8 +787,10 @@ s.close()
     t_load=$((${EPOCHREALTIME//[!0-9]/} - t))
 
     # L5: workflow commands in the command's output are ignored: the token
-    # is random and never passed inside. It is printed again only once the
-    # relays have copied all of the command's output (cleanup).
+    # is random and not passed inside (no argument or variable carries it;
+    # a caller whose stdout is a file the command can read gives it away,
+    # see the residual risks). It is printed again, on a line of its own,
+    # only once the relays have copied all of the command's output.
     token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
     [ "${#token}" -eq 32 ] || refuse "cannot make a random token"
     printf '::stop-commands::%s\n' "$token" || refuse "cannot print the token that stops workflow commands"
@@ -876,6 +890,7 @@ s.close()
     wait "$spid"
     rc=$? sudo_reaped=yes
     t_run=$((${EPOCHREALTIME//[!0-9]/} - t))
+    trap '' INT TERM HUP
     normal=yes
     exit "$rc"
     ;;

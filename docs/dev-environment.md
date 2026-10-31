@@ -789,8 +789,8 @@ as started, with every wait bounded (112 s in all):
    If the fork of `sudo` had not happened, the state is set to
    `not-forked`.
 2. The relays end once every writer is gone; only then is the token that
-   resumes workflow commands printed, so the command's output can not
-   reopen them early.
+   resumes workflow commands printed, on a line of its own (after an empty
+   line), so the command's output can not reopen them early.
 3. The fence listeners are ended by pid and start time.
 4. A load still in flight is waited for.
 5. `no-docker-aa.py release` removes the profile only when:
@@ -939,9 +939,15 @@ them.
 - **The launch chain (Linux, RR-09).** Descriptor hygiene relies on the
   chain staying as designed; the gate checks the process that becomes the
   command on every launch.
-- **Annotation order (Linux, RR-10).** Output the command wrote earlier on
-  stderr may reach the runner after the resume token on stdout (as before);
-  it can only add annotations.
+- **Annotation order and the stop token (Linux, RR-10).** Output the
+  command wrote earlier on stderr may reach the runner after the resume
+  token on stdout (as before); it can only add annotations. The token is
+  not passed inside, but when the caller sends stdout to a file the command
+  can read (in `$HOME`, the workspace or `$RUNNER_TEMP`), the command can
+  read it there and resume workflow commands itself: give it a pipe, or a
+  file elsewhere. No step of this repository's workflow uses step outputs
+  or unsecure commands, and `$GITHUB_ENV` and `$GITHUB_OUTPUT` are
+  read-only inside.
 - **Untrapped signals (Linux, RR-11).** A signal `no-docker.sh` does not
   trap (such as SIGQUIT) ends it without cleanup, as a cancellation does
   (below).
@@ -1169,7 +1175,7 @@ in the test's directories or send signal 0 or TERM to the test's own
   labels, the preflight, the profile list, the sweeps, P0, P1 and the
   state rules (with the namespace record's exact format), the template,
   the negative template's reach, P2, `kill-init`'s order and the argument
-  validation, run against a fake system (105 assertions). Seventeen
+  validation, run against a fake system (107 assertions). Seventeen
   mutated copies (a single sweep, P1 or P2 skipped, `kill-init` signalling
   before recording, and so on) must each be rejected.
 - **T-39:** static rules (both platforms), each passing on the tracked

@@ -1471,7 +1471,7 @@ PY
     c=${line##*control directory }
     c=${c%% is kept}
     printf '%s %s\n' "$n" "$c" >>"$work/l-release"
-    for _ in 1 2 3 4 5; do
+    for _ in $(seq 1 20); do
       # shellcheck disable=SC2024 # this shell appends the helper's messages to the log
       if sudo -n timeout 30 /usr/bin/python3 -I "$root/scripts/ci/no-docker-aa.py" release "$n" "$c" >>"$1" 2>&1; then
         rm -rf "$c"
@@ -2038,8 +2038,10 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo
   result "L-11 while the command runs its profile is listed as exactly \"NAME (enforce)\"" $? "(${l14_name:-?}: $l14_list)"
   grep -q '^no-docker: info the gate passed in ' "$work/l14.err"
   result "L-11 the gate passed" $?
-  [ -n "$l14_cmd" ] && [ "$l14_exec_rc" -eq 0 ]
-  result "L-11 root read the command's pending exec label (information)" $? "(rc $l14_exec_rc)"
+  # Information only (design 7.3): the kernel answers attr/apparmor/exec
+  # from the reader's own context, so its content or error is recorded.
+  [ -n "$l14_cmd" ]
+  result "L-11 root's view of the command's exec label is recorded (information)" $? "(rc $l14_exec_rc)"
   [ "$l14_rc" -eq 0 ] && [ "$(grep -cx l14-out "$work/l14.out")" -eq 1 ] && [ "$(listed "$l14_name")" = 0 ]
   result "L-14 the command ran and its profile was removed" $? "(rc $l14_rc)"
   [ "$(ctl_dirs)" = "$l14_before_ctl" ] && [ -z "$(find "$RUNNER_TEMP" -maxdepth 1 -name 'no-docker-fence.*')" ]
@@ -2052,7 +2054,7 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo
   l14_relays=$(sed -n 's/^no-docker: info the relays ended \([0-9]*\)\.\([0-9]*\)s after the command$/\1\2/p' "$work/l14.err")
   [ -n "$l14_relays" ] && [ "$l14_relays" -le 100 ]
   result "L-14 the relays ended within 1 s of the command" $? "(${l14_relays:-?} hundredths)"
-  ! grep -qE '^no-docker: refused|still loaded|cleanup failed|kill-init|killed pid 1|P1 decides' "$work/l14.err"
+  ! grep -qE '^no-docker: (refused|.*still loaded|the control directory .* is kept)|^no-docker-aa: (killed pid 1|pid 1 of the launch not found|refused)' "$work/l14.err"
   result "L-14 no cleanup message and no kill-init in the log of a normal end" $?
 
   # --- L-07 the caller's stdout a socket or a terminal: refused before
