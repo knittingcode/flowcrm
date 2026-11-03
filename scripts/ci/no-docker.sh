@@ -445,7 +445,9 @@ case $os in
           if alive "${x%%:*}" "${x#*:}"; then kill -KILL "${x%%:*}" 2>/dev/null; fi
         done
       fi
-      [ -z "$fencedir" ] || rm -rf "$fencedir"
+      if [ -n "$fencedir" ] && ! rm -rf "$fencedir"; then
+        fail="$fail; the fence directory $fencedir could not be removed"
+      fi
       # C4: a load still in flight.
       if [ -n "$lpid" ] && [ -z "$load_done" ]; then
         wait_gone "$lpid" "$lstart" 20 || left="${left:-the profile load did not end within 20s}"
@@ -468,8 +470,9 @@ case $os in
         fi
         [ -z "$fail" ] || printf 'no-docker: refused: cleanup failed (%s)\n' "${fail#; }" >&2
         [ -z "$ctldir" ] || printf 'no-docker: the control directory %s is kept\n' "$ctldir" >&2
-      else
-        [ -z "$ctldir" ] || rm -rf "$ctldir"
+      elif [ -n "$ctldir" ] && ! rm -rf "$ctldir"; then
+        fail="the control directory $ctldir could not be removed"
+        printf 'no-docker: refused: cleanup failed (%s)\n' "$fail" >&2
       fi
       # The run directory is removed only once the namespace is shown gone:
       # a process left inside could otherwise swap a symbolic link into it

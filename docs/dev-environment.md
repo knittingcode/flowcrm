@@ -791,7 +791,8 @@ as started, with every wait bounded (112 s in all):
 2. The relays end once every writer is gone; only then is the token that
    resumes workflow commands printed, on a line of its own (after an empty
    line), so the command's output can not reopen them early.
-3. The fence listeners are ended by pid and start time.
+3. The fence listeners are ended by pid and start time, and the fence
+   directory is removed; a failed removal is a cleanup failure.
 4. A load still in flight is waited for.
 5. `no-docker-aa.py release` removes the profile only when:
    - **P0:** `CTLDIR/ns` is a root-owned file of mode 0444 in the exact
@@ -809,9 +810,12 @@ as started, with every wait bounded (112 s in all):
    that ended counts as unknown, and unknown keeps the profile loaded:
    removing a profile unconfines any process that still carries it.
 6. If the profile cannot be shown safe to remove, it stays loaded, the
-   control directory is kept and its path printed with `no-docker: refused:
-   profile NAME still loaded (...)`, `diag` reports what is known, and the
-   run exits 125 even if the command succeeded.
+   control directory and the run directory are kept and their paths
+   printed (`no-docker: refused: profile NAME still loaded (...)`), `diag`
+   reports what is known, and the run exits 125 even if the command
+   succeeded. After any other cleanup failure the control directory is
+   kept as well; otherwise it is removed, and a failed removal is a
+   cleanup failure.
 7. The status, in this order:
    - a cleanup failure gives 125;
    - the negative control gives 125;
@@ -1188,7 +1192,8 @@ in the test's directories or send signal 0 or TERM to the test's own
   reviewed commands, and `kill-init` only where `sudo` may still run; no
   `sudo -E`; AppArmor only in the Linux arms; the templates exactly the
   reviewed rules; no socket listing left; the negative control only where
-  it belongs; the pinned template hashes.
+  it belongs; the pinned template hashes; a failed removal of the fence or
+  control directory is a cleanup failure.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
