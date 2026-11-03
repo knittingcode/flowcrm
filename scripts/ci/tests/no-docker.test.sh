@@ -55,7 +55,8 @@
 #   - T-40 runs the Linux cleanup function of no-docker.sh, taken from the
 #     script, in a shell of its own against stubs of rm, sudo and chmod,
 #     on directories of this suite only; T-41 computes L-16's projection
-#     from fixed timings.
+#     from fixed timings; T-42 copies files of a fixture directory of this
+#     suite (the opt-in NO_DOCKER_TEST_EVIDENCE copy, below).
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -75,7 +76,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39, T-40 and T-41 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40, T-41 and T-42 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -96,6 +97,108 @@ here=$(cd -P "$(dirname "$0")" && pwd -P)
 root=$(cd -P "$here/../../.." && pwd -P)
 nd=$root/scripts/ci/no-docker.sh
 os=$(uname -s)
+# Opt-in, off by default: NO_DOCKER_TEST_EVIDENCE names an empty directory
+# of this user (absolute, canonical, mode 0700, not a symbolic link). At the
+# end, before its directories are removed, the suite copies its case
+# outputs there ($work, and the --work directories under $vt, whose content
+# the commands wrote and which is data only): regular files with safe names
+# only, never following a link, each file at most 16 MiB and 128 MiB in all,
+# with MANIFEST.sha256 and SKIPPED.txt. A copy that cannot be completed
+# makes the suite fail (2). T-42 checks the copy.
+# shellcheck disable=SC2016 # Python, not shell
+keep_py='
+import errno, hashlib, os, re, stat, sys
+SAFE = re.compile(r"[A-Za-z0-9._@+=,-]+")
+FILE_MAX, TOTAL_MAX = 16 << 20, 128 << 20
+def refuse(text):
+    print(f"HARNESS ERROR: NO_DOCKER_TEST_EVIDENCE {text}", file=sys.stderr)
+    sys.exit(2)
+def check(dest):
+    if not os.path.isabs(dest) or os.path.normpath(dest) != dest:
+        refuse(f"{dest!r} is not an absolute, canonical path")
+    try:
+        st = os.lstat(dest)
+    except OSError as e:
+        refuse(f"{dest}: {e.strerror}")
+    if not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.getuid():
+        refuse(f"{dest} is not a directory of mode 0700 owned by this user")
+    if os.listdir(dest):
+        refuse(f"{dest} is not empty")
+def write(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+def copy(dest, pairs):
+    check(dest)
+    total, sums, skipped, failed, roots = 0, [], [], [], []
+    for pair in pairs:
+        name, _, src = pair.partition("=")
+        src = os.path.realpath(src)
+        if not SAFE.fullmatch(name) or any(src == r or src.startswith(r + os.sep) for r in roots):
+            continue
+        roots.append(src)
+        for dirpath, dirnames, filenames in os.walk(src, onerror=lambda e: failed.append(f"{e.filename}: {e.strerror}")):
+            rel = os.path.relpath(dirpath, src)
+            base = name if rel == "." else os.path.join(name, rel)
+            for d in sorted(dirnames):
+                if not SAFE.fullmatch(d) or os.path.islink(os.path.join(dirpath, d)):
+                    skipped.append(f"{os.path.join(base, d)!r}: directory not followed")
+                    dirnames.remove(d)
+            for f in sorted(filenames):
+                relp = os.path.join(base, f)
+                if not SAFE.fullmatch(f):
+                    skipped.append(f"{relp!r}: unsafe name")
+                    continue
+                try:
+                    if not stat.S_ISREG(os.lstat(os.path.join(dirpath, f)).st_mode):
+                        skipped.append(f"{relp}: not a regular file")
+                        continue
+                    fd = os.open(os.path.join(dirpath, f), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except OSError as e:
+                    if e.errno in (errno.ELOOP, errno.ENXIO, errno.ENOENT, errno.EOPNOTSUPP):
+                        skipped.append(f"{relp}: {errno.errorcode[e.errno]} (replaced or removed meanwhile)")
+                    else:
+                        failed.append(f"{relp}: {e.strerror}")
+                    continue
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode):
+                        skipped.append(f"{relp}: not a regular file")
+                        continue
+                    parts = []
+                    size = 0
+                    while size <= FILE_MAX:
+                        b = os.read(fd, 1 << 20)
+                        if not b:
+                            break
+                        parts.append(b)
+                        size += len(b)
+                finally:
+                    os.close(fd)
+                if size > FILE_MAX or total + size > TOTAL_MAX:
+                    failed.append(f"{relp}: too large ({size} bytes, {total} kept)")
+                    continue
+                data = b"".join(parts)
+                total += size
+                os.makedirs(os.path.join(dest, os.path.dirname(relp)), mode=0o700, exist_ok=True)
+                write(os.path.join(dest, relp), data)
+                sums.append((relp, hashlib.sha256(data).hexdigest()))
+    write(os.path.join(dest, "MANIFEST.sha256"), "".join(f"{h}  {p}\n" for p, h in sorted(sums)).encode())
+    write(os.path.join(dest, "SKIPPED.txt"), "".join(s + "\n" for s in skipped + [f"FAILED {x}" for x in failed]).encode())
+    if failed:
+        print("HARNESS ERROR: case outputs not kept: " + "; ".join(failed[:5]), file=sys.stderr)
+        sys.exit(1)
+if sys.argv[1] == "check":
+    check(sys.argv[2])
+else:
+    copy(sys.argv[2], sys.argv[3:])
+'
+keep=${NO_DOCKER_TEST_EVIDENCE-}
+[ -z "$keep" ] || python3 -I -c "$keep_py" check "$keep" || exit 2
 work=$(mktemp -d "${TMPDIR:-/tmp}/no-docker-tests.XXXXXX") || exit 2
 work=$(cd -P "$work" && pwd -P)
 [ -n "$work" ] && [ -d "$work" ] || exit 2
@@ -155,6 +258,11 @@ cleanup() {
     fi
   done <"$work/l-release"
   chmod 700 "$ro/l03n1" "$ro/l03n2" "$ro/l03n0" 2>/dev/null
+  # Opt-in (NO_DOCKER_TEST_EVIDENCE): keep the case outputs first.
+  if [ -n "$keep" ] && ! python3 -I -c "$keep_py" copy "$keep" "work=$work" "vt=$vt"; then
+    rm -rf "$work" "$ro" "$vt"
+    exit 2
+  fi
   rm -rf "$work" "$ro" "$vt"
 }
 trap cleanup EXIT
@@ -2517,6 +2625,31 @@ t41_got="$(l16_project 40 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90)|$(l
   grep -q '^  l16=$(l16_project "$l16_launches" $l16_t)$' "$here/no-docker.test.sh"
 result "T-41 L-16's projection is compared with 540 s exactly: 540 s passes, 540.004 s and 540.04 s fail, 539.95 s passes" $? \
   "($t41_got)"
+
+# --- T-42 the opt-in copy of the case outputs (NO_DOCKER_TEST_EVIDENCE),
+# pure, both platforms, on directories of this suite: regular files are
+# copied with their paths and sha256; a symbolic link, a FIFO and a file
+# with an unsafe name are skipped and recorded; a destination that is not
+# empty or not mode 0700 is refused (2).
+t42=$work/t42
+mkdir -p "$t42/src/sub" "$t42/dest" "$t42/full" "$t42/open" && chmod 700 "$t42/dest" "$t42/full" && chmod 755 "$t42/open" &&
+  printf 'a\n' >"$t42/src/a.log" && printf 'b\n' >"$t42/src/sub/b.log" && ln -s /etc/hosts "$t42/src/link" &&
+  mkfifo "$t42/src/fifo" && printf 'x\n' >"$t42/src/bad name" && : >"$t42/full/x" || exit 2
+python3 -I -c "$keep_py" copy "$t42/dest" "work=$t42/src" >/dev/null 2>&1
+t42_rc=$?
+python3 -I -c "$keep_py" check "$t42/full" >/dev/null 2>&1
+t42_full=$?
+python3 -I -c "$keep_py" check "$t42/open" >/dev/null 2>&1
+t42_open=$?
+t42_want="$(sha "$t42/src/a.log")  work/a.log
+$(sha "$t42/src/sub/b.log")  work/sub/b.log"
+[ "$t42_rc" -eq 0 ] && [ "$(cat "$t42/dest/MANIFEST.sha256" 2>/dev/null)" = "$t42_want" ] &&
+  cmp -s "$t42/src/a.log" "$t42/dest/work/a.log" && cmp -s "$t42/src/sub/b.log" "$t42/dest/work/sub/b.log" &&
+  [ ! -e "$t42/dest/work/link" ] && [ ! -e "$t42/dest/work/fifo" ] &&
+  [ "$(grep -c -e 'work/link' -e 'work/fifo' -e "work/bad name" "$t42/dest/SKIPPED.txt" 2>/dev/null)" -eq 3 ] &&
+  [ "$t42_full" -eq 2 ] && [ "$t42_open" -eq 2 ]
+result "T-42 the opt-in copy of the case outputs keeps regular files with sha256, skips links, FIFOs and unsafe names, refuses an unsuitable destination" $? \
+  "(rc $t42_rc, full $t42_full, open $t42_open)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a

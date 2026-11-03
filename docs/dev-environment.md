@@ -1218,6 +1218,13 @@ in the test's directories or send signal 0 or TERM to the test's own
   timings, exactly 540 s passes and 540.004 s or 540.04 s (which would
   print as 540) fail, so no rounding can turn a projection above 540 s
   into a pass; L-16 must use that computation.
+- **T-42:** a pure check (both platforms) of the opt-in copy of the case
+  outputs: with `NO_DOCKER_TEST_EVIDENCE` set to an empty directory of mode
+  0700, the suite copies its own outputs and the `--work` directories of
+  its cases there before removing them (regular files with safe names
+  only, never following a link, with `MANIFEST.sha256` and `SKIPPED.txt`),
+  so a CI job can export them; a copy that cannot be completed fails the
+  suite. Without the variable nothing changes.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
