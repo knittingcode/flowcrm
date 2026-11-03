@@ -814,10 +814,13 @@ as started, with every wait bounded (112 s in all):
    control directory and the run directory are kept and their paths
    printed (`no-docker: refused: profile NAME still loaded (...)`), `diag`
    reports what is known, and the run exits 125 even if the command
-   succeeded. After any other cleanup failure the control directory is
-   kept as well; otherwise it is removed. Otherwise the run directory (one
-   `no-docker.sh` made, never a `--work` directory) is removed too. A
-   failed removal of either is a cleanup failure.
+   succeeded. After a failure of an earlier cleanup step (such as a fence
+   directory that could not be removed) the control directory is kept as
+   well. Otherwise the control directory is removed, and then the run
+   directory (one `no-docker.sh` made, never a `--work` directory). A
+   failed removal of either is a cleanup failure; what was removed before
+   it stays removed (a run directory that cannot be removed leaves no
+   control directory).
 7. The status, in this order:
    - a cleanup failure gives 125;
    - the negative control gives 125;
@@ -1203,9 +1206,12 @@ in the test's directories or send signal 0 or TERM to the test's own
   from the script, run in a shell of their own with `rm`, `sudo` and
   `chmod` replaced by stubs, on the suite's own directories. A failed
   removal of the fence, control or run directory must end 125 with a
-  refusal naming it, a launch without one keeps the command's status, and
-  three mutants of that propagation must each be caught. It tests the
-  shell logic only; L-14 and L-13c show on Linux that nothing is left.
+  refusal naming that directory by its path, and leave exactly the
+  directories the design keeps (after a fence failure the control
+  directory too); a launch without one keeps the command's status and
+  leaves none. Four mutants of that propagation must each be caught. It
+  tests the shell logic only; L-14 and L-13c show on Linux that nothing is
+  left.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.

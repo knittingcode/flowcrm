@@ -2405,10 +2405,14 @@ done
 # a launch whose command exited 0, with rm, sudo and chmod replaced by shell
 # functions (only this suite's own directories are removed; nothing runs as
 # root; no namespace or profile exists). A failed removal of the fence, the
-# control or the run directory must end 125 with a refusal naming it (design
-# section 10, C3, C6, C7); without one the command's status stays 0. Three
-# mutants of the propagation must each change an outcome. The shell logic
-# only: on Linux, L-14 and L-13c show at run time that nothing is left.
+# control or the run directory must end 125 with a refusal naming that
+# directory by its path, and leave the directories the design keeps (design
+# section 10, C3, C6, C7): after a fence failure the control directory is
+# kept too; after a control or run failure what was removed before stays
+# removed. Without a failure the command's status stays 0 and nothing is
+# left. Four mutants of the propagation must each change an outcome. The
+# shell logic only: on Linux, L-14 and L-13c show at run time that nothing
+# is left.
 t40_src=$work/t40-cleanup.sh
 awk '
   /^    (proc_stat|alive|wait_gone|wait_all|put_state|resolve_pending|sudo_may_run|close_relay_ends|secs|cleanup)\(\) \{$/ { f = 1 }
@@ -2435,38 +2439,46 @@ rm() {
 . "$1"
 cleanup
 '
-t40_case() { # SOURCE fence|ctl|run|none: "<status> <refusals naming a removal>"
-  local d r
+# t40_case SOURCE fence|ctl|run|none: "<status>:<refusals naming that
+# directory by its path>:<directories left, f c r or ->".
+t40_case() {
+  local d r x name left=""
   d=$(mktemp -d "$work/t40.XXXXXX") || return 2
   mkdir "$d/fence" "$d/ctl" "$d/run" && : >"$d/run/started" || return 2
   "$BASH" -c "$t40_harness" t40 "$1" "$d" "$d/$2" >"$d/out" 2>"$d/err"
   r=$?
-  echo "$r $(grep -c '^no-docker: refused: cleanup failed (.*could not be removed' "$d/err")"
+  case $2 in fence) name=fence ;; ctl) name=control ;; *) name=run ;; esac
+  for x in fence ctl run; do
+    if [ -e "$d/$x" ]; then left=$left$(printf %.1s "$x"); else left=$left-; fi
+  done
+  echo "$r:$(grep -cxF "no-docker: refused: cleanup failed (the $name directory $d/$2 could not be removed)" "$d/err"):$left"
 }
 t40_all() { # SOURCE: the outcomes of the four cases, space-separated
-  echo "none=$(t40_case "$1" none | tr ' ' :) fence=$(t40_case "$1" fence | tr ' ' :)" \
-    "ctl=$(t40_case "$1" ctl | tr ' ' :) run=$(t40_case "$1" run | tr ' ' :)"
+  echo "none=$(t40_case "$1" none) fence=$(t40_case "$1" fence) ctl=$(t40_case "$1" ctl) run=$(t40_case "$1" run)"
 }
-t40_want="none=0:0 fence=125:1 ctl=125:1 run=125:1"
+t40_want="none=0:0:--- fence=125:1:fc- ctl=125:1:-c- run=125:1:--r"
 t40_got=$(t40_all "$t40_src")
 [ "$(grep -c '() {$' "$t40_src")" -eq 10 ] && [ "$t40_got" = "$t40_want" ]
-result "T-40 cleanup against stubs: a failed removal of the fence, control or run directory ends 125 and says so; otherwise the command's status (0)" $? \
+result "T-40 cleanup against stubs: a failed removal of the fence, control or run directory ends 125 naming it and keeps what the design keeps; otherwise status 0, nothing left" $? \
   "($t40_got; $(grep -c '() {$' "$t40_src") of 10 functions)"
 # The mutants: the fence removal unchecked; the failure cleared before the
-# status; the status not raised by a cleanup failure.
+# status; the status not raised by a cleanup failure; the fence failure
+# naming another directory.
 awk '/^      if \[ -n "\$fencedir" \] && ! rm -rf "\$fencedir"; then$/ { print "      [ -z \"$fencedir\" ] || rm -rf \"$fencedir\""; skip = 2; next }
   skip > 0 { skip--; next } { print }' "$t40_src" >"$work/t40-m1.sh"
 awk '/^      # C7: the status\./ { print "      fail=\"\"" } { print }' "$t40_src" >"$work/t40-m2.sh"
 awk '/^      # C7: the status\./ { c7 = 1 } c7 && /^        status=\$EX_REFUSED$/ && !done { print "        status=$rc"; done = 1; next } { print }' \
   "$t40_src" >"$work/t40-m3.sh"
+awk '/the fence directory \$fencedir could not be removed/ { sub(/\$fencedir could/, "$ctldir could") } { print }' \
+  "$t40_src" >"$work/t40-m4.sh"
 t40_caught=""
-for m in 1 2 3; do
+for m in 1 2 3 4; do
   if ! cmp -s "$t40_src" "$work/t40-m$m.sh" && [ "$(t40_all "$work/t40-m$m.sh")" != "$t40_want" ]; then
     t40_caught="$t40_caught M$m"
   fi
 done
-[ "$t40_caught" = " M1 M2 M3" ]
-result "T-40 mutants of the propagation are caught (fence removal unchecked, failure cleared, status not raised)" $? \
+[ "$t40_caught" = " M1 M2 M3 M4" ]
+result "T-40 mutants of the propagation are caught (fence removal unchecked, failure cleared, status not raised, another directory named)" $? \
   "(caught:${t40_caught:- none})"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
