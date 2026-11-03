@@ -55,8 +55,9 @@
 #   - T-40 runs the Linux cleanup function of no-docker.sh, taken from the
 #     script, in a shell of its own against stubs of rm, sudo and chmod,
 #     on directories of this suite only; T-41 computes L-16's projection
-#     from fixed timings; T-42 copies files of a fixture directory of this
-#     suite (the opt-in NO_DOCKER_TEST_EVIDENCE copy, below).
+#     from fixed timings; T-42 copies files of fixture directories of this
+#     suite (the opt-in NO_DOCKER_TEST_EVIDENCE copy, below), some of them
+#     replaced by a link to another of its directories at a chosen moment.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -98,97 +99,175 @@ root=$(cd -P "$here/../../.." && pwd -P)
 nd=$root/scripts/ci/no-docker.sh
 os=$(uname -s)
 # Opt-in, off by default: NO_DOCKER_TEST_EVIDENCE names an empty directory
-# of this user (absolute, canonical, mode 0700, not a symbolic link). At the
-# end, before its directories are removed, the suite copies its case
-# outputs there ($work, and the --work directories under $vt, whose content
-# the commands wrote and which is data only): regular files with safe names
-# only, never following a link, each file at most 16 MiB and 128 MiB in all,
-# with MANIFEST.sha256 and SKIPPED.txt. A copy that cannot be completed
-# makes the suite fail (2). T-42 checks the copy.
+# of this user, mode 0700, by its canonical physical path (absolute, no
+# component of it a symbolic link: on macOS /private/var/..., not
+# /var/...). At the end, before its directories are removed, the suite
+# copies its case outputs there ($work, and the --work directories under
+# $vt, whose content the commands wrote and which is data only): regular
+# files with safe names and a single link only, each at most 16 MiB and
+# 128 MiB in all, with MANIFEST.sha256 and SKIPPED.txt. Both trees are
+# walked by directory descriptors, each directory opened from its already
+# opened parent with O_NOFOLLOW (the destination and each source from /
+# down), so no link is followed and a directory replaced meanwhile is
+# skipped, not read through; files are read and written relative to their
+# opened directory. A copy that cannot be completed makes the suite fail
+# (2). T-42 checks the copy.
 # shellcheck disable=SC2016 # Python, not shell
 keep_py='
 import errno, hashlib, os, re, stat, sys
 SAFE = re.compile(r"[A-Za-z0-9._@+=,-]+")
-FILE_MAX, TOTAL_MAX = 16 << 20, 128 << 20
+FILE_MAX, TOTAL_MAX, DEPTH_MAX = 16 << 20, 128 << 20, 32
+DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+GONE = (errno.ELOOP, errno.ENOTDIR, errno.ENOENT, errno.ENXIO, errno.EOPNOTSUPP)
 def refuse(text):
     print(f"HARNESS ERROR: NO_DOCKER_TEST_EVIDENCE {text}", file=sys.stderr)
     sys.exit(2)
-def check(dest):
-    if not os.path.isabs(dest) or os.path.normpath(dest) != dest:
-        refuse(f"{dest!r} is not an absolute, canonical path")
+def opendir(path):
+    # An absolute canonical path, opened one component at a time from /
+    # without following a link: a symbolic link anywhere in it fails.
+    if not os.path.isabs(path) or os.path.normpath(path) != path or path.startswith("//"):
+        raise OSError(errno.EINVAL, "not an absolute, canonical path")
+    fd = os.open("/", DIR)
     try:
-        st = os.lstat(dest)
+        for part in path.split("/")[1:]:
+            if part:
+                nfd = os.open(part, DIR, dir_fd=fd)
+                os.close(fd)
+                fd = nfd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+def check(dest):
+    try:
+        fd = opendir(dest)
     except OSError as e:
-        refuse(f"{dest}: {e.strerror}")
-    if not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.getuid():
+        refuse(f"{dest!r} is not the canonical physical path of a directory ({e.strerror})")
+    st = os.fstat(fd)
+    if stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.getuid():
         refuse(f"{dest} is not a directory of mode 0700 owned by this user")
-    if os.listdir(dest):
+    if os.listdir(fd):
         refuse(f"{dest} is not empty")
-def write(path, data):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    return fd
+def create(dfd, name, data):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
     try:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view):]
     finally:
         os.close(fd)
+class Out:
+    # A directory of the copy: made (0700) and opened in its opened parent
+    # when the first file is kept in it.
+    def __init__(self, parent, name, fd=None):
+        self.parent, self.name, self.fd = parent, name, fd
+    def get(self):
+        if self.fd is None:
+            pfd = self.parent.get()
+            os.mkdir(self.name, 0o700, dir_fd=pfd)
+            self.fd = os.open(self.name, DIR, dir_fd=pfd)
+        return self.fd
+    def close(self):
+        if self.parent is not None and self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 def copy(dest, pairs):
-    check(dest)
-    total, sums, skipped, failed, roots = 0, [], [], [], []
+    top = Out(None, None, check(dest))
+    sums, skipped, failed, roots, names, kept = [], [], [], [], [], [0]
+    def gone(relp, e, what):
+        if e.errno in GONE:
+            skipped.append(f"{relp}: {errno.errorcode[e.errno]} ({what} replaced or removed meanwhile, not followed)")
+        else:
+            failed.append(f"{relp}: {e.strerror}")
+    def read(sfd, n, relp):
+        try:
+            fd = os.open(n, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=sfd)
+        except OSError as e:
+            gone(relp, e, "file")
+            return None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                skipped.append(f"{relp}: not a regular file")
+                return None
+            if st.st_nlink != 1:
+                skipped.append(f"{relp}: {st.st_nlink} hard links")
+                return None
+            parts, size = [], 0
+            while size <= FILE_MAX:
+                b = os.read(fd, 1 << 20)
+                if not b:
+                    break
+                parts.append(b)
+                size += len(b)
+        finally:
+            os.close(fd)
+        if size > FILE_MAX or kept[0] + size > TOTAL_MAX:
+            failed.append(f"{relp}: too large ({size} bytes, {kept[0]} kept)")
+            return None
+        kept[0] += size
+        return b"".join(parts)
+    def walk(sfd, rel, out, depth):
+        try:
+            entries = sorted(os.listdir(sfd))
+        except OSError as e:
+            failed.append(f"{rel}: {e.strerror}")
+            return
+        for n in entries:
+            relp = f"{rel}/{n}"
+            if not SAFE.fullmatch(n):
+                skipped.append(f"{relp!r}: unsafe name")
+                continue
+            try:
+                st = os.stat(n, dir_fd=sfd, follow_symlinks=False)
+            except OSError as e:
+                gone(relp, e, "entry")
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                if depth >= DEPTH_MAX:
+                    failed.append(f"{relp}: deeper than {DEPTH_MAX} directories")
+                    continue
+                try:
+                    cfd = os.open(n, DIR, dir_fd=sfd)
+                except OSError as e:
+                    gone(relp, e, "directory")
+                    continue
+                sub = Out(out, n)
+                try:
+                    walk(cfd, relp, sub, depth + 1)
+                finally:
+                    os.close(cfd)
+                    sub.close()
+            elif stat.S_ISREG(st.st_mode):
+                data = read(sfd, n, relp)
+                if data is not None:
+                    create(out.get(), n, data)
+                    sums.append((relp, hashlib.sha256(data).hexdigest()))
+            else:
+                what = "symbolic link, not followed" if stat.S_ISLNK(st.st_mode) else "not a regular file"
+                skipped.append(f"{relp}: {what}")
     for pair in pairs:
         name, _, src = pair.partition("=")
         src = os.path.realpath(src)
-        if not SAFE.fullmatch(name) or any(src == r or src.startswith(r + os.sep) for r in roots):
+        if (not SAFE.fullmatch(name) or name in names or name in ("MANIFEST.sha256", "SKIPPED.txt")
+                or any(src == r or src.startswith(r + os.sep) for r in roots)):
             continue
+        names.append(name)
         roots.append(src)
-        for dirpath, dirnames, filenames in os.walk(src, onerror=lambda e: failed.append(f"{e.filename}: {e.strerror}")):
-            rel = os.path.relpath(dirpath, src)
-            base = name if rel == "." else os.path.join(name, rel)
-            for d in sorted(dirnames):
-                if not SAFE.fullmatch(d) or os.path.islink(os.path.join(dirpath, d)):
-                    skipped.append(f"{os.path.join(base, d)!r}: directory not followed")
-                    dirnames.remove(d)
-            for f in sorted(filenames):
-                relp = os.path.join(base, f)
-                if not SAFE.fullmatch(f):
-                    skipped.append(f"{relp!r}: unsafe name")
-                    continue
-                try:
-                    if not stat.S_ISREG(os.lstat(os.path.join(dirpath, f)).st_mode):
-                        skipped.append(f"{relp}: not a regular file")
-                        continue
-                    fd = os.open(os.path.join(dirpath, f), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                except OSError as e:
-                    if e.errno in (errno.ELOOP, errno.ENXIO, errno.ENOENT, errno.EOPNOTSUPP):
-                        skipped.append(f"{relp}: {errno.errorcode[e.errno]} (replaced or removed meanwhile)")
-                    else:
-                        failed.append(f"{relp}: {e.strerror}")
-                    continue
-                try:
-                    st = os.fstat(fd)
-                    if not stat.S_ISREG(st.st_mode):
-                        skipped.append(f"{relp}: not a regular file")
-                        continue
-                    parts = []
-                    size = 0
-                    while size <= FILE_MAX:
-                        b = os.read(fd, 1 << 20)
-                        if not b:
-                            break
-                        parts.append(b)
-                        size += len(b)
-                finally:
-                    os.close(fd)
-                if size > FILE_MAX or total + size > TOTAL_MAX:
-                    failed.append(f"{relp}: too large ({size} bytes, {total} kept)")
-                    continue
-                data = b"".join(parts)
-                total += size
-                os.makedirs(os.path.join(dest, os.path.dirname(relp)), mode=0o700, exist_ok=True)
-                write(os.path.join(dest, relp), data)
-                sums.append((relp, hashlib.sha256(data).hexdigest()))
-    write(os.path.join(dest, "MANIFEST.sha256"), "".join(f"{h}  {p}\n" for p, h in sorted(sums)).encode())
-    write(os.path.join(dest, "SKIPPED.txt"), "".join(s + "\n" for s in skipped + [f"FAILED {x}" for x in failed]).encode())
+        try:
+            sfd = opendir(src)
+        except OSError as e:
+            failed.append(f"{name} ({src}): {e.strerror}")
+            continue
+        out = Out(top, name)
+        try:
+            walk(sfd, name, out, 0)
+        finally:
+            os.close(sfd)
+            out.close()
+    create(top.fd, "MANIFEST.sha256", "".join(f"{h}  {p}\n" for p, h in sorted(sums)).encode())
+    create(top.fd, "SKIPPED.txt", "".join(s + "\n" for s in skipped + [f"FAILED {x}" for x in failed]).encode())
     if failed:
         print("HARNESS ERROR: case outputs not kept: " + "; ".join(failed[:5]), file=sys.stderr)
         sys.exit(1)
@@ -2630,7 +2709,12 @@ result "T-41 L-16's projection is compared with 540 s exactly: 540 s passes, 540
 # pure, both platforms, on directories of this suite: regular files are
 # copied with their paths and sha256; a symbolic link, a FIFO and a file
 # with an unsafe name are skipped and recorded; a destination that is not
-# empty or not mode 0700 is refused (2).
+# empty or not mode 0700 is refused (2). Then no byte from outside the
+# copied tree is kept: a directory replaced by a link to outside between
+# its listing and the descent, or after it was opened, a link to a
+# directory, a destination with a link among its ancestors (refused) and a
+# file with a second hard link. On 51013e5 the four last cases fail: the
+# copy walked by path and kept the outside files.
 t42=$work/t42
 mkdir -p "$t42/src/sub" "$t42/dest" "$t42/full" "$t42/open" && chmod 700 "$t42/dest" "$t42/full" && chmod 755 "$t42/open" &&
   printf 'a\n' >"$t42/src/a.log" && printf 'b\n' >"$t42/src/sub/b.log" && ln -s /etc/hosts "$t42/src/link" &&
@@ -2650,6 +2734,72 @@ $(sha "$t42/src/sub/b.log")  work/sub/b.log"
   [ "$t42_full" -eq 2 ] && [ "$t42_open" -eq 2 ]
 result "T-42 the opt-in copy of the case outputs keeps regular files with sha256, skips links, FIFOs and unsafe names, refuses an unsuitable destination" $? \
   "(rc $t42_rc, full $t42_full, open $t42_open)"
+# The races: the copy runs through t42_race_py, which wraps the os functions
+# CALLS and, before the first of those calls whose path ends in NAME,
+# renames the directory TARGET aside and puts a symbolic link to $t42/out
+# (files of the same names, holding OUTSIDE-42) in its place: the
+# replacement happens exactly in the window under test. It exits 3 if the
+# replacement never happened, else with the copy's status.
+t42_race_py='
+import os, sys
+calls, name, target, outside, code = sys.argv[1:6]
+done = []
+def wrap(real):
+    def call(*a, **k):
+        if not done and a and isinstance(a[0], str) and os.path.basename(a[0]) == name:
+            done.append(a[0])
+            os.rename(target, target + ".moved")
+            os.symlink(outside, target)
+        return real(*a, **k)
+    return call
+for f in calls.split(","):
+    setattr(os, f, wrap(getattr(os, f)))
+sys.argv = ["-c"] + sys.argv[6:]
+rc = 0
+try:
+    exec(compile(code, "<keep>", "exec"), {"__name__": "__main__"})
+except SystemExit as e:
+    rc = e.code if isinstance(e.code, int) else 1
+sys.exit(rc if done else 3)
+'
+mkdir -p "$t42/out" "$t42/r1/src/d42" "$t42/r1/dest" "$t42/r2/src/d42" "$t42/r2/dest" "$t42/r3/real/dest" "$t42/r4/src" "$t42/r4/dest" &&
+  chmod 700 "$t42/r1/dest" "$t42/r2/dest" "$t42/r3/real/dest" "$t42/r4/dest" &&
+  printf 'OUTSIDE-42\n' >"$t42/out/f42.log" && printf 'OUTSIDE-42 extra\n' >"$t42/out/extra.log" &&
+  printf 'inside\n' >"$t42/r1/src/d42/f42.log" && printf 'top\n' >"$t42/r1/src/a.log" && ln -s "$t42/out" "$t42/r1/src/dlink" &&
+  printf 'inside\n' >"$t42/r2/src/d42/f42.log" && ln -s real "$t42/r3/alias" &&
+  printf 'top\n' >"$t42/r4/src/a.log" && ln "$t42/out/f42.log" "$t42/r4/src/hard.log" || exit 2
+# A directory replaced after the listing, before the descent (the first
+# open or listing of it), and a link to a directory: not followed.
+python3 -I -c "$t42_race_py" open,scandir,listdir d42 "$t42/r1/src/d42" "$t42/out" "$keep_py" copy "$t42/r1/dest" "work=$t42/r1/src" >/dev/null 2>&1
+t42_r1=$?
+[ "$t42_r1" -eq 0 ] && ! grep -rq OUTSIDE-42 "$t42/r1/dest" && [ ! -e "$t42/r1/dest/work/d42" ] && [ ! -e "$t42/r1/dest/work/dlink" ] &&
+  cmp -s "$t42/r1/src/a.log" "$t42/r1/dest/work/a.log" && grep -q '^work/d42: E[A-Z]* (directory replaced' "$t42/r1/dest/SKIPPED.txt" &&
+  grep -q '^work/dlink: symbolic link, not followed$' "$t42/r1/dest/SKIPPED.txt"
+result "T-42 a directory replaced by a link to outside between its listing and the descent, and a link to a directory, are not followed: no byte from outside is kept" $? \
+  "(rc $t42_r1)"
+# A directory replaced after it was opened, before its file is read (the
+# first stat or open of the file): read through the directory opened.
+python3 -I -c "$t42_race_py" open,stat,lstat f42.log "$t42/r2/src/d42" "$t42/out" "$keep_py" copy "$t42/r2/dest" "work=$t42/r2/src" >/dev/null 2>&1
+t42_r2=$?
+[ "$t42_r2" -eq 0 ] && ! grep -rq OUTSIDE-42 "$t42/r2/dest" && [ "$(cat "$t42/r2/dest/work/d42/f42.log" 2>/dev/null)" = inside ] &&
+  [ "$(cat "$t42/r2/dest/MANIFEST.sha256" 2>/dev/null)" = "$(sha "$t42/r2/src/d42.moved/f42.log")  work/d42/f42.log" ]
+result "T-42 a directory replaced by a link to outside after it was opened: its file is read through the directory opened, no byte from outside is kept" $? \
+  "(rc $t42_r2)"
+# A destination with a symbolic link among its ancestors.
+python3 -I -c "$keep_py" check "$t42/r3/alias/dest" >/dev/null 2>&1
+t42_r3c=$?
+python3 -I -c "$keep_py" copy "$t42/r3/alias/dest" "work=$t42/r4/src" >/dev/null 2>&1
+t42_r3=$?
+[ "$t42_r3c" -eq 2 ] && [ "$t42_r3" -eq 2 ] && [ -z "$(ls -A "$t42/r3/real/dest")" ]
+result "T-42 a destination with a symbolic link among its ancestors is refused (2) and nothing is written" $? \
+  "(check $t42_r3c, copy $t42_r3)"
+# A file with a second hard link (here to a file outside).
+python3 -I -c "$keep_py" copy "$t42/r4/dest" "work=$t42/r4/src" >/dev/null 2>&1
+t42_r4=$?
+[ "$t42_r4" -eq 0 ] && ! grep -rq OUTSIDE-42 "$t42/r4/dest" && [ ! -e "$t42/r4/dest/work/hard.log" ] &&
+  cmp -s "$t42/r4/src/a.log" "$t42/r4/dest/work/a.log" && grep -q '^work/hard.log: 2 hard links$' "$t42/r4/dest/SKIPPED.txt"
+result "T-42 a file with a second hard link is not copied (skipped and recorded)" $? \
+  "(rc $t42_r4)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a

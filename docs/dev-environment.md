@@ -1220,11 +1220,19 @@ in the test's directories or send signal 0 or TERM to the test's own
   into a pass; L-16 must use that computation.
 - **T-42:** a pure check (both platforms) of the opt-in copy of the case
   outputs: with `NO_DOCKER_TEST_EVIDENCE` set to an empty directory of mode
-  0700, the suite copies its own outputs and the `--work` directories of
-  its cases there before removing them (regular files with safe names
-  only, never following a link, with `MANIFEST.sha256` and `SKIPPED.txt`),
-  so a CI job can export them; a copy that cannot be completed fails the
-  suite. Without the variable nothing changes.
+  0700, given by its canonical physical path (no component of it a
+  symbolic link; on macOS `/private/var/...`, not `/var/...`), the suite
+  copies its own outputs and the `--work` directories of its cases there
+  before removing them (regular files with safe names and a single link
+  only, with `MANIFEST.sha256` and `SKIPPED.txt`), so a CI job can export
+  them; a copy that cannot be completed fails the suite. Both trees are
+  walked by directory descriptors, each directory opened from its opened
+  parent without following a link, and files are read and written
+  relative to their opened directory, so a directory replaced by a link
+  while the copy runs is skipped, not read through. T-42 replaces fixture
+  directories by links to outside at the moments that matter and checks
+  that no byte from outside is kept; a destination with a link among its
+  ancestors is refused. Without the variable nothing changes.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
