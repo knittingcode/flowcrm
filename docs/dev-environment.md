@@ -1250,6 +1250,12 @@ in the test's directories or send signal 0 or TERM to the test's own
   keeps exactly its stream and returns the command's own status, and a copy
   that cannot be written ends the suite with 2 (a harness error) even after
   the status the case expects; no other `tee` pipeline exists in the suite.
+- **T-44:** a pure check (both platforms) of L-15c's result lines: at each
+  of the six moments a true verdict passes and a false one fails, under
+  the exact name of that moment. The earlier form, whose name held a
+  command substitution that set the status the result line took (every
+  moment but 300 ms reported failed and 300 ms passed, whatever the launch
+  did), is caught.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.

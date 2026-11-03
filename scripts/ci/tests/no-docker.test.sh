@@ -59,7 +59,8 @@
 #     suite (the opt-in NO_DOCKER_TEST_EVIDENCE copy, below), some of them
 #     replaced by a link to another of its directories at a chosen moment;
 #     T-43 runs keep_stream on /bin/sh commands, into a directory of this
-#     suite it can and one it cannot write.
+#     suite it can and one it cannot write; T-44 runs L-15c's reporting
+#     with fixed verdicts.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -79,7 +80,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42 and T-43 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43 and T-44 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -438,6 +439,21 @@ keep_stream() {
     echo "HARNESS ERROR: the raw output $file could not be written (tee status ${st[1]}, command status ${st[0]})" >&2
     exit 2
   fi
+}
+
+# l15c_result MS OK RC: the result line of L-15c's launch TERMed at MS ms,
+# from its verdict OK (yes or no) and its status RC. The verdict's status
+# is taken before the name is built: a command substitution in the name
+# sets $? itself (up to 5bcdd1b the name held one, so every moment but
+# 300 ms was reported failed and 300 ms passed, whatever the launch did).
+# T-44.
+l15c_result() {
+  local ok name
+  [ "$2" = yes ]
+  ok=$?
+  name="L-15c TERM at $1 ms: an allowed outcome"
+  [ "$1" != 300 ] || name="$name; no profile of these launches is left"
+  result "$name" "$ok" "(rc $3)"
 }
 
 # --- the helpers -------------------------------------------------------------
@@ -2574,9 +2590,7 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done' l13b
     if [ "$ms" = 300 ]; then
       [ "$(listed flowcrm-nd-)" = "$nd_listed_before" ] || l15c_ok=no
     fi
-    [ "$l15c_ok" = yes ]
-    result "L-15c TERM at ${ms} ms: an allowed outcome$([ "$ms" = 300 ] && echo '; no profile of these launches is left')" $? \
-      "(rc $r)"
+    l15c_result "$ms" "$l15c_ok" "$r"
   done
 else
   echo "INFO  T-16, T-17, T-18 skipped: Linux (GitHub-hosted runner) only"
@@ -2916,6 +2930,39 @@ t43_tees=$(grep -vE '^[[:space:]]*#' "$here/no-docker.test.sh" | grep -cE '[|][[
 [ "$t43_sites" -eq 5 ] && [ "$t43_tees" -eq 3 ]
 result "T-43 the launches of T-02, T-07, T-16, T-17 and T-18 keep their streams through keep_stream; no other tee pipeline" $? \
   "($t43_sites sites, $t43_tees tee pipelines)"
+
+# --- T-44 L-15c's result lines (pure, both platforms): l15c_result reports
+# each launch's own verdict: at all six moments a "yes" passes and a "no"
+# fails with the status, each under the exact name of its moment, written
+# out here. The form of 88b9085 to 5bcdd1b (the verdict tested, then a
+# name holding a command substitution, then $?) reports that
+# substitution's status instead and is caught. L-15c calls l15c_result
+# once. Run in subshells: the suite's counts do not change.
+t44_want=$(
+  for n in "0 ms: an allowed outcome" "20 ms: an allowed outcome" "50 ms: an allowed outcome" \
+    "100 ms: an allowed outcome" "200 ms: an allowed outcome" \
+    "300 ms: an allowed outcome; no profile of these launches is left"; do
+    printf 'PASS  L-15c TERM at %s\nFAIL  L-15c TERM at %s (rc 143)\n' "$n" "$n"
+  done
+)
+t44_old() { # MS OK RC: the earlier form
+  [ "$2" = yes ]
+  result "L-15c TERM at $1 ms: an allowed outcome$([ "$1" = 300 ] && echo '; no profile of these launches is left')" $? \
+    "(rc $3)"
+}
+t44_all() { # FUNCTION: its lines for each moment, verdict yes then no
+  (
+    for ms in 0 20 50 100 200 300; do
+      for ok in yes no; do "$1" "$ms" "$ok" 143; done
+    done
+  )
+}
+t44_got=$(t44_all l15c_result)
+t44_was=$(t44_all t44_old)
+[ "$t44_got" = "$t44_want" ] && [ "$t44_was" != "$t44_want" ] &&
+  [ "$(grep -c '^    l15c_result "\$ms" "\$l15c_ok" "\$r"$' "$here/no-docker.test.sh")" -eq 1 ]
+result "T-44 L-15c reports each launch's own verdict: at all six moments a true one passes and a false one fails, under its exact name; the form whose name set the status is caught" $? \
+  "($(printf '%s\n' "$t44_got" | grep -c '^PASS') of 12 passed, $(printf '%s\n' "$t44_was" | grep -c '^PASS') with the earlier form)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
