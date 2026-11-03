@@ -57,7 +57,9 @@
 #     on directories of this suite only; T-41 computes L-16's projection
 #     from fixed timings; T-42 copies files of fixture directories of this
 #     suite (the opt-in NO_DOCKER_TEST_EVIDENCE copy, below), some of them
-#     replaced by a link to another of its directories at a chosen moment.
+#     replaced by a link to another of its directories at a chosen moment;
+#     T-43 runs keep_stream on /bin/sh commands, into a directory of this
+#     suite it can and one it cannot write.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -77,7 +79,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39, T-40, T-41 and T-42 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42 and T-43 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -117,7 +119,8 @@ os=$(uname -s)
 # fail (2). T-42 checks the copy. The cases keep what they would otherwise
 # only filter or discard there: the checker outputs of T-19, T-36, T-38
 # and T-39 and the streams of the launches of T-01, T-02, T-07, T-16 (with
-# its socket records), T-17, T-18 and L-16.
+# its socket records), T-17, T-18 and L-16; a copy through tee that fails
+# makes the suite fail (keep_stream, T-43).
 # shellcheck disable=SC2016 # Python, not shell
 keep_py='
 import errno, hashlib, os, re, stat, sys
@@ -399,6 +402,43 @@ ndl() { # no-docker.sh, counted on Linux
   [ "$os" != Linux ] || count_launch
   "$nd" "$@"
 }
+# keep_stream MODE FILE [OTHER] COMMAND...: run COMMAND, a launch whose
+# output a case reads, with that output copied by tee into FILE as the case
+# reads it, and set ks_rc to COMMAND's own status:
+#   both  stdout and stderr through tee into FILE
+#   out   stdout through tee into FILE, stderr into the file OTHER
+#   err   stderr through tee into FILE, stdout into the file OTHER
+# COMMAND still writes to a pipe. Both statuses of the pipeline are taken at
+# once; a copy that failed (tee's status not 0) is a harness error: the
+# suite ends 2, also when COMMAND ended as the case expects. T-43.
+keep_stream() {
+  local mode=$1 file=$2 other="" st
+  shift 2
+  case $mode in out | err) other=$1 && shift ;; esac
+  case $mode in
+    both)
+      "$@" 2>&1 | tee "$file" >/dev/null
+      st=("${PIPESTATUS[@]}")
+      ;;
+    out)
+      "$@" 2>"$other" | tee "$file" >/dev/null
+      st=("${PIPESTATUS[@]}")
+      ;;
+    err)
+      "$@" 2>&1 >"$other" | tee "$file" >/dev/null
+      st=("${PIPESTATUS[@]}")
+      ;;
+    *)
+      echo "HARNESS ERROR: keep_stream $mode" >&2
+      exit 2
+      ;;
+  esac
+  ks_rc=${st[0]}
+  if [ "${st[1]}" -ne 0 ]; then
+    echo "HARNESS ERROR: the raw output $file could not be written (tee status ${st[1]}, command status ${st[0]})" >&2
+    exit 2
+  fi
+}
 
 # --- the helpers -------------------------------------------------------------
 # Tracked files of this suite (scripts/ci/tests/no-docker/), copied to
@@ -620,8 +660,9 @@ r=$?
 result "T-01 --check fails outside the isolation" $? "(rc $r)"
 # Refused for the right reason: the probe's mechanism check failed, and
 # its part that writes and connects never ran.
-t02=$(NO_DOCKER_ACTIVE=1 "$nd" touch "$work/t02" 2>&1 | tee "$work/t02.out"; exit "${PIPESTATUS[0]}")
-r=$?
+keep_stream both "$work/t02.out" env NO_DOCKER_ACTIVE=1 "$nd" touch "$work/t02"
+r=$ks_rc
+t02=$(cat "$work/t02.out")
 t02_after=$(printf '%s\n' "$t02" | grep -cE 'container engine answers|accepts a connection|writes to .* fail')
 [ "$r" -eq 125 ] && [ ! -e "$work/t02" ] &&
   printf '%s\n' "$t02" | grep -q '^no-docker: refused: inside no-docker.sh, but the isolation check fails' &&
@@ -1485,7 +1526,7 @@ python3 -I "$work/t07.py" "$work/t07.port" &
 t07pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$work/t07.port" ] && break; sleep 0.2; done
 # On Linux, no-docker.sh frames the output with ::stop-commands:: lines.
-t07=$(ndl python3 -I -c '
+keep_stream out "$work/t07.out" "$work/t07.err" ndl python3 -I -c '
 import socket, sys
 def reach(port):
     s = socket.socket()
@@ -1501,7 +1542,8 @@ own = socket.socket()
 own.bind(("127.0.0.1", 0))
 own.listen(1)
 print(reach(int(sys.argv[1])), reach(own.getsockname()[1]))
-' "$(cat "$work/t07.port" 2>/dev/null || echo 0)" 2>"$work/t07.err" | tee "$work/t07.out" | grep -v '^::')
+' "$(cat "$work/t07.port" 2>/dev/null || echo 0)"
+t07=$(grep -v '^::' "$work/t07.out")
 r=$?
 kill "$t07pid" 2>/dev/null
 wait "$t07pid" 2>/dev/null
@@ -1885,9 +1927,10 @@ for raw in open(sys.argv[1], "rb").read().split(b"\0"):
   for v in GITHUB_WORKSPACE RUNNER_TEMP; do [ -z "${!v-}" ] || t16_targets+=("${!v}"); done
   [ ! -d /opt/hostedtoolcache ] || t16_targets+=(/opt/hostedtoolcache)
   cp "$ro/t16-sockets" "$ro/t16-classes" "$work/" || exit 2
-  t16=$(ndl python3 -I "$ro/t16.py" "$(readlink /proc/self/ns/ipc)" "$(readlink /proc/self/ns/pid)" "$t16_tmp" "$t16_shm" "$t16_in" \
-    "$ro/t16-classes" "$nonce" "${t16_targets[@]}" 2>&1 | tee "$work/t16.out"; exit "${PIPESTATUS[0]}")
-  r=$?
+  keep_stream both "$work/t16.out" ndl python3 -I "$ro/t16.py" "$(readlink /proc/self/ns/ipc)" "$(readlink /proc/self/ns/pid)" "$t16_tmp" "$t16_shm" "$t16_in" \
+    "$ro/t16-classes" "$nonce" "${t16_targets[@]}"
+  r=$ks_rc
+  t16=$(cat "$work/t16.out")
   lstop "$work/t16own.ready"
   printf '%s\n' "$t16" | grep '^t16 ' | sed 's/^/INFO    /'
   t16_left=""
@@ -1922,12 +1965,13 @@ for raw in open(sys.argv[1], "rb").read().split(b"\0"):
   # survives; and TERM to no-docker.sh left sudo, unshare and the command
   # running.
   t17m=t17-$nonce
-  t17=$(ndl /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1
+  keep_stream out "$work/t17.out" "$work/t17.err" ndl /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   if pgrep -f -- "$1-in" >/dev/null; then echo canary-started; exit 0; fi
   sleep 0.1
 done
-echo canary-missing' _ "$t17m" 2>"$work/t17.err" | tee "$work/t17.out" | grep -v '^::')
+echo canary-missing' _ "$t17m"
+  t17=$(grep -v '^::' "$work/t17.out")
   for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f -- "$t17m-in" >/dev/null || break; sleep 0.5; done
   pgrep -f -- "$t17m-in" >/dev/null
   left=$?
@@ -1965,8 +2009,9 @@ echo canary-missing' _ "$t17m" 2>"$work/t17.err" | tee "$work/t17.out" | grep -v
     local name=$1 msg=$2 err
     shift 2
     t18n=$((t18n + 1))
-    err=$("$@" 2>&1 >"$work/t18-$t18n.out" | tee "$work/t18-$t18n.err"; exit "${PIPESTATUS[0]}")
-    r=$?
+    keep_stream err "$work/t18-$t18n.err" "$work/t18-$t18n.out" "$@"
+    r=$ks_rc
+    err=$(cat "$work/t18-$t18n.err")
     [ "$r" -eq 125 ] && printf '%s' "$err" | grep -q -- "$msg"
     result "T-18 $name: refused" $? "(rc $r)"
   }
@@ -2835,6 +2880,42 @@ t42_r6=$?
 [ "$t42_r6" -eq 2 ] && [ -z "$(ls -A "$t42/r5/dest2")" ]
 result "T-42 a source with a symbolic link to outside among its ancestors is refused (2) and nothing is copied" $? \
   "(rc $t42_r6)"
+
+# --- T-43 a stream a case reads is kept, or the suite fails (keep_stream),
+# pure, both platforms: each mode keeps exactly the stream it copies and
+# returns the command's own status; a copy that cannot be written ends the
+# suite with 2 even after the status a case expects (125); the launches of
+# T-02, T-07, T-16, T-17 and T-18 use it, and no other tee pipeline exists.
+t43=$work/t43
+mkdir -p "$t43/ro" && chmod 500 "$t43/ro" || exit 2
+t43_cmd='printf "out1\nout2\n"; printf "err1\n" >&2; exit 125'
+keep_stream both "$t43/both.out" /bin/sh -c "$t43_cmd"
+t43_b=$ks_rc
+keep_stream out "$t43/out.out" "$t43/out.err" /bin/sh -c "$t43_cmd"
+t43_o=$ks_rc
+keep_stream err "$t43/err.err" "$t43/err.out" /bin/sh -c "$t43_cmd"
+t43_e=$ks_rc
+[ "$t43_b" -eq 125 ] && [ "$t43_o" -eq 125 ] && [ "$t43_e" -eq 125 ] &&
+  [ "$(sort "$t43/both.out" | tr '\n' ' ')" = "err1 out1 out2 " ] &&
+  [ "$(cat "$t43/out.out")" = "$(printf 'out1\nout2')" ] && [ "$(cat "$t43/out.err")" = err1 ] &&
+  [ "$(cat "$t43/err.err")" = err1 ] && [ "$(cat "$t43/err.out")" = "$(printf 'out1\nout2')" ]
+result "T-43 keep_stream keeps exactly the stream of each mode and returns the command's own status" $? \
+  "(statuses $t43_b $t43_o $t43_e)"
+(
+  keep_stream both "$t43/ro/x.out" /bin/sh -c "$t43_cmd"
+  echo "continued after status $ks_rc"
+) >"$t43/fail.out" 2>"$t43/fail.err"
+t43_r=$?
+[ "$t43_r" -eq 2 ] && ! grep -q continued "$t43/fail.out" &&
+  grep -q '^HARNESS ERROR: the raw output .*/ro/x\.out could not be written (tee status [1-9][0-9]*, command status 125)$' "$t43/fail.err"
+result "T-43 a raw output that cannot be written ends the suite with 2 (harness error), even when the command ends 125 as a case expects" $? \
+  "(rc $t43_r)"
+chmod 700 "$t43/ro"
+t43_sites=$(grep -cE '^ *keep_stream (both|out|err) "\$work/(t02\.out|t07\.out|t16\.out|t17\.out|t18-\$t18n\.err)" ' "$here/no-docker.test.sh")
+t43_tees=$(grep -vE '^[[:space:]]*#' "$here/no-docker.test.sh" | grep -cE '[|][[:space:]]*tee[[:space:]]')
+[ "$t43_sites" -eq 5 ] && [ "$t43_tees" -eq 3 ]
+result "T-43 the launches of T-02, T-07, T-16, T-17 and T-18 keep their streams through keep_stream; no other tee pipeline" $? \
+  "($t43_sites sites, $t43_tees tee pipelines)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a

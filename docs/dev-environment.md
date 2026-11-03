@@ -1244,6 +1244,12 @@ in the test's directories or send signal 0 or TERM to the test's own
   with the socket records `t16-sockets` and `t16-classes`, `t17.out`,
   `t17.err` and `t17c.out`, `t18-1.out` … `t18-7.err` and `t18.rc.out`, and
   `l16.out`. Without the variable nothing changes.
+- **T-43:** a pure check (both platforms) of `keep_stream`, through which
+  the launches of T-02, T-07, T-16, T-17 and T-18 keep the stream a case
+  reads (copied by `tee`, the launch still writing to a pipe): each mode
+  keeps exactly its stream and returns the command's own status, and a copy
+  that cannot be written ends the suite with 2 (a harness error) even after
+  the status the case expects; no other `tee` pipeline exists in the suite.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
