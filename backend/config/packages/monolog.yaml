@@ -1,0 +1,30 @@
+# Structured logs (FCRM-003 section Q, docs/architecture/observability.md):
+# one JSON object per line on stderr, collected by Docker. The formatter
+# redacts secrets and personal data and fills in the message placeholders
+# itself, after redaction (process_psr_3_messages: false).
+monolog:
+    channels: [deprecation, http, health]
+
+when@dev: &stderr
+    monolog:
+        handlers:
+            main:
+                type: stream
+                path: php://stderr
+                level: info
+                formatter: App\Shared\Infrastructure\Logging\JsonLineFormatter
+                process_psr_3_messages: false
+                channels: ['!event', '!doctrine', '!deprecation']
+
+when@prod: *stderr
+
+# Tests read the formatted records from the in-memory handler.
+when@test:
+    monolog:
+        handlers:
+            main:
+                type: test
+                level: debug
+                formatter: App\Shared\Infrastructure\Logging\JsonLineFormatter
+                process_psr_3_messages: false
+                channels: ['!event', '!doctrine']

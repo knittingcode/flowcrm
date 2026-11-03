@@ -1,0 +1,29 @@
+# Application cache in PostgreSQL (FCRM-003 section F and ADR-007, no
+# Redis), see docs/architecture/sessions-and-cache.md. cache.app and every
+# pool based on it store items in the cache_items table through Symfony's
+# DoctrineDbalAdapter, each pool under its own key namespace, on the
+# dedicated "cache" connection (config/packages/doctrine.yaml). cache.system
+# (compiled metadata) stays on the local filesystem.
+framework:
+    cache:
+        # Fixed, so pool namespaces do not change with the install path.
+        prefix_seed: flowcrm
+        app: cache.adapter.doctrine_dbal
+        default_doctrine_dbal_provider: doctrine.dbal.cache_connection
+        pools:
+            # Rate limiter state (login throttling, ADR-019); the keys are
+            # hashes, never an e-mail address or an IP address.
+            cache.rate_limits:
+                adapter: cache.app
+
+when@test:
+    framework:
+        cache:
+            pools:
+                # Two pools of the test suite, to prove namespace isolation.
+                test.cache.pool_a:
+                    adapter: cache.app
+                    public: true
+                test.cache.pool_b:
+                    adapter: cache.app
+                    public: true

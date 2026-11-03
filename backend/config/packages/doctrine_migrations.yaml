@@ -1,0 +1,9 @@
+doctrine_migrations:
+    migrations_paths:
+        # Migration classes are not autoloaded as services, so they use their
+        # own namespace outside App\.
+        'DoctrineMigrations': '%kernel.project_dir%/migrations'
+    enable_profiler: false
+    # Each migration runs in its own transaction; a failed migration leaves the
+    # schema at the last completed version.
+    transactional: true

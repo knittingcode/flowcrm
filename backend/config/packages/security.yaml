@@ -1,0 +1,71 @@
+# Authentication and authorization (ADR-019, docs/architecture/authentication.md).
+#
+# Stateful, lazy session authentication for the same-origin SPA: the
+# security token lives in the PostgreSQL session (config/packages/session.yaml),
+# nothing in the browser can read it, and a request that does not need the
+# user never reads the session. Organization roles are not Symfony roles:
+# every user has ROLE_USER only, and tenant permissions are decided per
+# request from the active membership (App\Organizations\Http\Tenant).
+security:
+    password_hashers:
+        # Argon2id (FCRM-002 NFR-001) with libsodium: 19 MiB and three passes,
+        # above both OWASP baselines (19 MiB with 2 passes, 12 MiB with 3);
+        # Symfony's libsodium hasher needs at least 3 passes. Hashes made with
+        # other parameters are upgraded at the next successful login. About
+        # 20 ms per hash on the development hardware: tune per deployment
+        # (ADR-019).
+        App\Identity\Infrastructure\Security\SecurityUser:
+            algorithm: argon2id
+            memory_cost: 19456
+            time_cost: 3
+
+    providers:
+        users:
+            id: App\Identity\Infrastructure\Security\UserProvider
+
+    # Failed logins never say why (unknown e-mail, wrong password, disabled
+    # account): the failure handler answers with one problem document.
+    expose_security_errors: none
+    # A login gets a new session ID; the data are kept and the old row is
+    # deleted (FCRM-002 NFR-005).
+    session_fixation_strategy: migrate
+
+    firewalls:
+        api:
+            pattern: ^/api(/|$)
+            lazy: true
+            stateless: false
+            provider: users
+            user_checker: App\Identity\Infrastructure\Security\UserChecker
+            entry_point: App\Identity\Http\Security\ProblemEntryPoint
+            json_login:
+                check_path: api_v1_auth_login
+                username_path: email
+                password_path: password
+                # No success handler: the request continues to the login
+                # controller, which answers with the session (after the
+                # session ID was migrated).
+                failure_handler: App\Identity\Http\Security\LoginFailureHandler
+            # Checked before the password is hashed; only failures count.
+            login_throttling:
+                limiter: App\Identity\Infrastructure\Security\LoginRateLimiter
+
+    # The first matching rule applies. Everything under /api needs a logged-in
+    # user except the routes listed before the last rule; an unknown /api
+    # route is a 404 from the router, which runs before the firewall.
+    access_control:
+        - { path: '^/api/v1/system/status$', roles: PUBLIC_ACCESS }
+        - { path: '^/api/v1/auth/(session|login|logout)$', roles: PUBLIC_ACCESS }
+        # Test-only session probes (the routes exist only in the test environment).
+        - { path: '^/api/_test/', roles: PUBLIC_ACCESS }
+        - { path: '^/api(/|$)', roles: IS_AUTHENTICATED }
+
+when@test:
+    security:
+        password_hashers:
+            # The lowest Argon2id cost, to keep the suites fast; the
+            # production parameters are asserted by SecurityConfigurationTest.
+            App\Identity\Infrastructure\Security\SecurityUser:
+                algorithm: argon2id
+                memory_cost: 10
+                time_cost: 3

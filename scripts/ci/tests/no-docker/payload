@@ -1,0 +1,37 @@
+qa_log=@LOG@ qa_canary=@CANARY@ qa_cfg=@CFG@ qa_marker=@MARKER@
+qa() { # case command...
+  qa_n=$1
+  shift
+  qa_out=$("$@" 2>&1)
+  printf '%s rc=%s out=%s\n' "$qa_n" "$?" "$(printf '%s' "$qa_out" | tr '\n' ' ' | cut -c1-200)" >>"$qa_log"
+}
+qa_fmt='{{.Server.Version}}'
+qa inherited-env docker version --format "$qa_fmt"
+qa path-lookup docker -H "unix://$qa_canary" version --format "$qa_fmt"
+for qa_p in /usr/local/bin/docker /usr/bin/docker /opt/homebrew/bin/docker /Applications/Docker.app/Contents/Resources/bin/docker; do
+  [ ! -x "$qa_p" ] || qa "absolute-path:$qa_p" "$qa_p" -H "unix://$qa_canary" version --format "$qa_fmt"
+done
+qa builtin-command command docker -H "unix://$qa_canary" version --format "$qa_fmt"
+qa env-wrapper env docker -H "unix://$qa_canary" version --format "$qa_fmt"
+qa env-docker-host env DOCKER_HOST="unix://$qa_canary" docker version --format "$qa_fmt"
+qa context env DOCKER_CONFIG="$qa_cfg" docker --context canary version --format "$qa_fmt"
+qa nested-bash bash -c 'docker -H "unix://$1" version --format "$2"' _ "$qa_canary" "$qa_fmt"
+qa nested-sh sh -c 'docker -H "unix://$1" version --format "$2"' _ "$qa_canary" "$qa_fmt"
+qa_x=$(docker -H "unix://$qa_canary" version --format "$qa_fmt" 2>&1)
+printf 'command-substitution rc=%s out=%s\n' "$?" "$(printf '%s' "$qa_x" | tr '\n' ' ')" >>"$qa_log"
+qa_x=`docker -H "unix://$qa_canary" version --format "$qa_fmt" 2>&1`
+printf 'backticks rc=%s out=%s\n' "$?" "$(printf '%s' "$qa_x" | tr '\n' ' ')" >>"$qa_log"
+qa_dk=docker
+qa variable "$qa_dk" -H "unix://$qa_canary" version --format "$qa_fmt"
+qa quoted "docker" -H "unix://$qa_canary" version --format "$qa_fmt"
+qa exec-subshell sh -c 'exec docker -H "unix://$1" version --format "$2"' _ "$qa_canary" "$qa_fmt"
+qa xargs sh -c 'echo version | xargs docker -H "unix://$1"' _ "$qa_canary"
+(docker -H "unix://$qa_canary" version --format "$qa_fmt" >"$qa_log.bg" 2>&1; echo "background rc=$? out=$(tr '\n' ' ' <"$qa_log.bg")" >>"$qa_log") &
+wait
+qa sudo sudo -n docker -H "unix://$qa_canary" version --format "$qa_fmt"
+qa curl-unix-socket curl -sS --max-time 5 --unix-socket "$qa_canary" http://docker/version
+qa python-raw-socket python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"GET /version HTTP/1.0\r\n\r\n"); print(s.recv(4096).decode())' "$qa_canary"
+qa real-socket-cli docker -H unix:///var/run/docker.sock version --format "$qa_fmt"
+qa real-socket-curl curl -sS --max-time 5 --unix-socket /var/run/docker.sock http://docker/_ping
+qa home-write touch "$qa_marker"
+exit 97

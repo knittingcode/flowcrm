@@ -1,0 +1,41 @@
+# Module boundaries of the modular monolith (FCRM-003 section E, ADR-001):
+# a module may depend on itself, on the public Api namespace of any module
+# and on Shared. An Api namespace may depend only on Shared; Shared depends
+# on no module. Layers inside a module: deptrac.layers.yaml.
+deptrac:
+  paths:
+    - ./src
+  exclude_files:
+    - '#/src/Kernel\.php$#'
+  layers:
+    - { name: Identity, collectors: [{ type: classLike, value: '^App\\Identity\\(?!Api\\)' }] }
+    - { name: IdentityApi, collectors: [{ type: classLike, value: '^App\\Identity\\Api\\' }] }
+    - { name: Organizations, collectors: [{ type: classLike, value: '^App\\Organizations\\(?!Api\\)' }] }
+    - { name: OrganizationsApi, collectors: [{ type: classLike, value: '^App\\Organizations\\Api\\' }] }
+    - { name: CRM, collectors: [{ type: classLike, value: '^App\\CRM\\(?!Api\\)' }] }
+    - { name: CRMApi, collectors: [{ type: classLike, value: '^App\\CRM\\Api\\' }] }
+    - { name: Sales, collectors: [{ type: classLike, value: '^App\\Sales\\(?!Api\\)' }] }
+    - { name: SalesApi, collectors: [{ type: classLike, value: '^App\\Sales\\Api\\' }] }
+    - { name: Activities, collectors: [{ type: classLike, value: '^App\\Activities\\(?!Api\\)' }] }
+    - { name: ActivitiesApi, collectors: [{ type: classLike, value: '^App\\Activities\\Api\\' }] }
+    - { name: Reporting, collectors: [{ type: classLike, value: '^App\\Reporting\\(?!Api\\)' }] }
+    - { name: ReportingApi, collectors: [{ type: classLike, value: '^App\\Reporting\\Api\\' }] }
+    - { name: Audit, collectors: [{ type: classLike, value: '^App\\Audit\\(?!Api\\)' }] }
+    - { name: AuditApi, collectors: [{ type: classLike, value: '^App\\Audit\\Api\\' }] }
+    - { name: Shared, collectors: [{ type: classLike, value: '^App\\Shared\\' }] }
+  ruleset:
+    Identity: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    Organizations: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    CRM: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    Sales: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    Activities: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    Reporting: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    Audit: [IdentityApi, OrganizationsApi, CRMApi, SalesApi, ActivitiesApi, ReportingApi, AuditApi, Shared]
+    IdentityApi: [Shared]
+    OrganizationsApi: [Shared]
+    CRMApi: [Shared]
+    SalesApi: [Shared]
+    ActivitiesApi: [Shared]
+    ReportingApi: [Shared]
+    AuditApi: [Shared]
+    Shared: []

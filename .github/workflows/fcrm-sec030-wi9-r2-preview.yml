@@ -1,0 +1,97 @@
+# FCRM-SEC-030 WI-9, route R2: the first Linux run of the kernel-enforced
+# test isolation (design FCRM-SEC-028 v8) on a GitHub-hosted ubuntu-24.04
+# runner. Prepared locally; it runs only after the owner authorizes and
+# pushes the orphan branch preview/fcrm-sec030-wi9-r2-v7, once. Its tree is the
+# tree of the implementation commit named in .github/wi9-r2/MANIFEST.md plus
+# six files: this workflow, that manifest and the tools .github/wi9-r2/run.sh,
+# payload.py (the raw evidence, exported into the job log), residual.py and
+# EXPECTED.md (the evidence a run must hold, derived from the source).
+#
+# No action (not even a checkout action), no secret and no token
+# permission. The public repository is fetched anonymously at the pushed
+# branch, its head must be GITHUB_SHA, and every file must match the
+# manifest (whose sha256 is pinned below) before anything of the tree
+# runs. The two jobs mirror the required checks of ci.yml, which a push to
+# this branch does not trigger, with the same names, runner and timeouts.
+name: FCRM-SEC-030 WI-9 R2 Linux isolation preview
+on:
+  push:
+    branches: [preview/fcrm-sec030-wi9-r2-v7]
+permissions: {}
+concurrency:
+  group: fcrm-sec030-wi9-r2-v7
+  cancel-in-progress: false
+jobs:
+  guard:
+    name: Repository guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch and verify the preview tree
+        timeout-minutes: 2
+        env:
+          MANIFEST_SHA256: "e3abacae638f2eb001f5c0a889a143528b12bced9e5d4df0670804e5aaa7eff0"
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = knittingcode/flowcrm
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/preview/fcrm-sec030-wi9-r2-v7
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          cd "$GITHUB_WORKSPACE"
+          test -z "$(ls -A)"
+          git init -q
+          git -c protocol.version=2 fetch -q --no-tags --depth 1 https://github.com/knittingcode/flowcrm.git \
+            "+refs/heads/preview/fcrm-sec030-wi9-r2-v7:refs/remotes/preview"
+          test "$(git rev-parse refs/remotes/preview)" = "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          echo "commit $GITHUB_SHA, tree $(git rev-parse 'HEAD^{tree}')"
+          m=.github/wi9-r2/MANIFEST.md
+          echo "$MANIFEST_SHA256  $m" | sha256sum -c --strict -
+          sed -n '/^<!-- sha256 begin -->$/,/^<!-- sha256 end -->$/p' "$m" | grep -E '^[0-9a-f]{64}  ' >"$RUNNER_TEMP/wi9-sha256.txt"
+          sed -n '/^<!-- tree begin -->$/,/^<!-- tree end -->$/p' "$m" | grep -E '^[0-7]{6} [a-z]+ ' >"$RUNNER_TEMP/wi9-tree.txt"
+          sha256sum -c --strict --quiet "$RUNNER_TEMP/wi9-sha256.txt"
+          git ls-tree -r --full-tree --format='%(objectmode) %(objecttype) %(path)' HEAD | diff - "$RUNNER_TEMP/wi9-tree.txt"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "$(wc -l <"$RUNNER_TEMP/wi9-sha256.txt") files match the manifest; the tree has exactly its $(wc -l <"$RUNNER_TEMP/wi9-tree.txt") entries"
+      - name: Run the guard suites and the isolation suite, check the evidence and that nothing is left
+        run: bash .github/wi9-r2/run.sh guard
+
+  devenv:
+    name: Dev environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch and verify the preview tree
+        timeout-minutes: 2
+        env:
+          MANIFEST_SHA256: "e3abacae638f2eb001f5c0a889a143528b12bced9e5d4df0670804e5aaa7eff0"
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = knittingcode/flowcrm
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/preview/fcrm-sec030-wi9-r2-v7
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          cd "$GITHUB_WORKSPACE"
+          test -z "$(ls -A)"
+          git init -q
+          git -c protocol.version=2 fetch -q --no-tags --depth 1 https://github.com/knittingcode/flowcrm.git \
+            "+refs/heads/preview/fcrm-sec030-wi9-r2-v7:refs/remotes/preview"
+          test "$(git rev-parse refs/remotes/preview)" = "$GITHUB_SHA"
+          git checkout -q --detach "$GITHUB_SHA"
+          echo "commit $GITHUB_SHA, tree $(git rev-parse 'HEAD^{tree}')"
+          m=.github/wi9-r2/MANIFEST.md
+          echo "$MANIFEST_SHA256  $m" | sha256sum -c --strict -
+          sed -n '/^<!-- sha256 begin -->$/,/^<!-- sha256 end -->$/p' "$m" | grep -E '^[0-9a-f]{64}  ' >"$RUNNER_TEMP/wi9-sha256.txt"
+          sed -n '/^<!-- tree begin -->$/,/^<!-- tree end -->$/p' "$m" | grep -E '^[0-7]{6} [a-z]+ ' >"$RUNNER_TEMP/wi9-tree.txt"
+          sha256sum -c --strict --quiet "$RUNNER_TEMP/wi9-sha256.txt"
+          git ls-tree -r --full-tree --format='%(objectmode) %(objecttype) %(path)' HEAD | diff - "$RUNNER_TEMP/wi9-tree.txt"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "$(wc -l <"$RUNNER_TEMP/wi9-sha256.txt") files match the manifest; the tree has exactly its $(wc -l <"$RUNNER_TEMP/wi9-tree.txt") entries"
+      - name: Run the allocator unit tests, check the evidence and that nothing is left
+        run: bash .github/wi9-r2/run.sh devenv

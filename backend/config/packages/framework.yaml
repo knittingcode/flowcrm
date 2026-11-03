@@ -1,0 +1,31 @@
+# see https://symfony.com/doc/current/reference/configuration/framework.html
+framework:
+    secret: '%env(trim:file:APP_SECRET_FILE)%'
+
+    # Sessions: config/packages/session.yaml.
+
+    # No proxy is trusted in dev and prod (compose.yaml sets no
+    # TRUSTED_PROXIES): over FastCGI the edge (Caddy) passes the client's
+    # address as REMOTE_ADDR and the scheme as HTTPS, so no forwarding header
+    # is read. If a proxy is ever trusted (the test harness, which plays the
+    # edge, compose.test.yaml), only the client address and the scheme are
+    # taken from it; the host is always the request's own Host header.
+    trusted_proxies: '%env(default::TRUSTED_PROXIES)%'
+    trusted_headers: ['x-forwarded-for', 'x-forwarded-proto']
+
+    # Session-bound CSRF tokens for unsafe API requests (ADR-019), checked by
+    # App\Shared\Http\Security\RequestOriginGuard.
+    csrf_protection: true
+
+    # Locks are used only by the rate limiters, which get a PostgreSQL
+    # advisory-lock factory of their own (config/services.yaml).
+    lock: false
+
+    # Client errors that need no attention are logged at info, not error.
+    exceptions:
+        Symfony\Component\HttpKernel\Exception\NotFoundHttpException: { log_level: info }
+        Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException: { log_level: info }
+
+when@test:
+    framework:
+        test: true

@@ -1,0 +1,113 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Tests\Unit\Shared\Http;
+
+use App\Shared\Http\Problem\ProblemDetailsListener;
+use App\Shared\Http\Problem\ProblemException;
+use App\Shared\Http\RequestId;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\TestCase;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpKernel\Event\ExceptionEvent;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+use Symfony\Component\HttpKernel\Exception\MethodNotAllowedHttpException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+use Symfony\Component\HttpKernel\HttpKernelInterface;
+
+final class ProblemDetailsListenerTest extends TestCase
+{
+    public function testNotFoundUnderApiIsAProblemDocument(): void
+    {
+        $event = $this->dispatch('/api/v1/unknown', new NotFoundHttpException('No route found for "GET /api/v1/unknown"'));
+        $response = $event->getResponse();
+
+        self::assertNotNull($response);
+        self::assertSame(404, $response->getStatusCode());
+        self::assertSame('application/problem+json', $response->headers->get('Content-Type'));
+        $body = json_decode((string) $response->getContent(), true, flags: \JSON_THROW_ON_ERROR);
+        self::assertIsArray($body);
+        self::assertSame('/problems/not-found', $body['type']);
+        self::assertSame('Not Found', $body['title']);
+        self::assertSame(404, $body['status']);
+        self::assertSame('/api/v1/unknown', $body['instance']);
+        self::assertSame('0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c', $body['requestId']);
+        self::assertStringNotContainsString('No route found', (string) $response->getContent());
+    }
+
+    public function testMethodNotAllowedKeepsTheAllowHeader(): void
+    {
+        $response = $this->dispatch('/api/v1/system/status', new MethodNotAllowedHttpException(['GET']))->getResponse();
+
+        self::assertNotNull($response);
+        self::assertSame(405, $response->getStatusCode());
+        self::assertSame('GET', $response->headers->get('Allow'));
+    }
+
+    public function testUnexpectedErrorsRevealNothing(): void
+    {
+        $response = $this->dispatch('/api/v1/system/status', new \RuntimeException('connection to db:5432 failed, password=secret'))->getResponse();
+
+        self::assertNotNull($response);
+        self::assertSame(500, $response->getStatusCode());
+        self::assertStringNotContainsString('db:5432', (string) $response->getContent());
+        self::assertStringNotContainsString('secret', (string) $response->getContent());
+    }
+
+    public function testAProblemExceptionKeepsItsTypeExtensionsAndHeaders(): void
+    {
+        $validation = $this->dispatch('/api/v1/me/password', ProblemException::validation([['pointer' => '/newPassword', 'code' => 'PASSWORD_TOO_SHORT']]))->getResponse();
+        self::assertNotNull($validation);
+        self::assertSame(422, $validation->getStatusCode());
+        self::assertSame([
+            'type' => '/problems/validation-error',
+            'title' => 'Unprocessable Content',
+            'status' => 422,
+            'instance' => '/api/v1/me/password',
+            'requestId' => '0192f0c4-7d1e-7b8a-9f3c-2b4d6e8f0a1c',
+            'errors' => [['pointer' => '/newPassword', 'code' => 'PASSWORD_TOO_SHORT']],
+        ], json_decode((string) $validation->getContent(), true, flags: \JSON_THROW_ON_ERROR));
+
+        $limited = $this->dispatch('/api/v1/auth/login', ProblemException::tooManyRequests(300))->getResponse();
+        self::assertNotNull($limited);
+        self::assertSame('300', $limited->headers->get('Retry-After'));
+        $unauthenticated = $this->dispatch('/api/v1/me', ProblemException::unauthenticated())->getResponse();
+        self::assertNotNull($unauthenticated);
+        self::assertSame('Session realm="flowcrm"', $unauthenticated->headers->get('WWW-Authenticate'));
+        self::assertStringContainsString('"type":"\/problems\/unauthenticated"', (string) $unauthenticated->getContent());
+    }
+
+    public function testFrameworkErrorsGetTheirProblemType(): void
+    {
+        $response = $this->dispatch('/api/v1/me', new AccessDeniedHttpException('Access Denied.'))->getResponse();
+
+        self::assertNotNull($response);
+        self::assertStringContainsString('"type":"\/problems\/forbidden"', (string) $response->getContent());
+        self::assertStringNotContainsString('Access Denied', (string) $response->getContent());
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function nonApiPaths(): iterable
+    {
+        yield 'health' => ['/health/ready'];
+        yield 'prefix lookalike' => ['/apix/v1'];
+        yield 'root' => ['/'];
+    }
+
+    #[DataProvider('nonApiPaths')]
+    public function testOtherPathsAreLeftToTheFramework(string $path): void
+    {
+        self::assertNull($this->dispatch($path, new NotFoundHttpException())->getResponse());
+    }
+
+    private function dispatch(string $path, \Throwable $exception): ExceptionEvent
+    {
+        $request = Request::create($path);
+        $request->headers->set(RequestId::HEADER, '0192F0C4-7D1E-7B8A-9F3C-2B4D6E8F0A1C');
+        $event = new ExceptionEvent($this->createStub(HttpKernelInterface::class), $request, HttpKernelInterface::MAIN_REQUEST, $exception);
+        new ProblemDetailsListener()($event);
+
+        return $event;
+    }
+}
