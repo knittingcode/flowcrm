@@ -1256,6 +1256,14 @@ in the test's directories or send signal 0 or TERM to the test's own
   command substitution that set the status the result line took (every
   moment but 300 ms reported failed and 300 ms passed, whatever the launch
   did), is caught.
+- **T-45:** a pure check (both platforms) of L-07's caller, with a stub in
+  place of `no-docker.sh`: the pty case gives it a live terminal on fd 1
+  (the pseudo-terminal's master stays open in the caller, which drains it
+  and returns the launcher's status), the socketpair case a socket, and
+  neither any descriptor above 2. The earlier caller, whose exec closed the
+  master, gave a hung-up terminal, which Linux does not report as a
+  terminal: the launcher then refused only when it could not write its
+  output, after it had made its resources. It is caught.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.

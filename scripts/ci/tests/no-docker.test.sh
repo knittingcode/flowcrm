@@ -60,7 +60,8 @@
 #     replaced by a link to another of its directories at a chosen moment;
 #     T-43 runs keep_stream on /bin/sh commands, into a directory of this
 #     suite it can and one it cannot write; T-44 runs L-15c's reporting
-#     with fixed verdicts.
+#     with fixed verdicts; T-45 runs L-07's caller with a stub in place of
+#     no-docker.sh (a pseudo-terminal and a socket pair of its own).
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -80,7 +81,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43 and T-44 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43, T-44 and T-45 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -455,6 +456,54 @@ l15c_result() {
   [ "$1" != 300 ] || name="$name; no profile of these launches is left"
   result "$name" "$ok" "(rc $3)"
 }
+
+# l07_py: L-07's caller. It runs the launcher ($2) with /usr/bin/true and,
+# as its stdout, one end of a socket pair or the slave of a new
+# pseudo-terminal ($1), and no descriptor above 2. The pty's master stays
+# open in this process, which drains it until the launcher has ended and
+# then exits with its status (128 + the signal if it was killed): a slave
+# whose master is closed is hung up, and isatty() does not report a hung-up
+# terminal on Linux. (Up to 5bcdd1b the master was closed by the exec, so
+# the launcher saw no terminal and refused only when its first write
+# failed, after it had made its resources.) Bounded: after 150 s the
+# launcher is killed and the status is 1. T-45.
+l07_py='
+import errno, os, pty, select, signal, socket, sys, time
+kind, launcher = sys.argv[1], sys.argv[2]
+fddir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+def run(out):
+    os.dup2(out, 1, inheritable=True)
+    for fd in sorted(int(n) for n in os.listdir(fddir)):
+        if fd > 2:
+            try:
+                os.close(fd)
+            except OSError as e:
+                if e.errno != errno.EBADF:
+                    os._exit(2)
+    os.execv(launcher, [launcher, "/usr/bin/true"])
+if kind == "socketpair":
+    a, b = socket.socketpair()
+    run(a.fileno())
+master, slave = pty.openpty()
+pid = os.fork()
+if pid == 0:
+    run(slave)
+os.close(slave)
+end = time.monotonic() + 150
+while True:
+    done, status = os.waitpid(pid, os.WNOHANG)
+    if done:
+        sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+    if time.monotonic() > end:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        sys.exit(1)
+    if select.select([master], [], [], 0.1)[0]:
+        try:
+            os.read(master, 65536)
+        except OSError:
+            pass
+'
 
 # --- the helpers -------------------------------------------------------------
 # Tracked files of this suite (scripts/ci/tests/no-docker/), copied to
@@ -2334,16 +2383,7 @@ while [ ! -e "$1/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; echo
   for kind in socketpair pty; do
     c0=$(ctl_dirs)
     p0=$(listed flowcrm-nd-)
-    python3 -I -c '
-import os, pty, socket, sys
-if sys.argv[1] == "socketpair":
-    a, b = socket.socketpair()
-    os.dup2(a.fileno(), 1, inheritable=True)
-else:
-    m, s = pty.openpty()
-    os.dup2(s, 1, inheritable=True)
-os.execv(sys.argv[2], [sys.argv[2], "/usr/bin/true"])
-' "$kind" "$nd" 2>"$work/l07-$kind.err"
+    python3 -I -c "$l07_py" "$kind" "$nd" 2>"$work/l07-$kind.err"
     r=$?
     [ "$r" -eq 125 ] && grep -q "the caller's fd 1 is a socket or a terminal" "$work/l07-$kind.err" &&
       [ "$(ctl_dirs)" = "$c0" ] && [ "$(listed flowcrm-nd-)" = "$p0" ]
@@ -2963,6 +3003,62 @@ t44_was=$(t44_all t44_old)
   [ "$(grep -c '^    l15c_result "\$ms" "\$l15c_ok" "\$r"$' "$here/no-docker.test.sh")" -eq 1 ]
 result "T-44 L-15c reports each launch's own verdict: at all six moments a true one passes and a false one fails, under its exact name; the form whose name set the status is caught" $? \
   "($(printf '%s\n' "$t44_got" | grep -c '^PASS') of 12 passed, $(printf '%s\n' "$t44_was" | grep -c '^PASS') with the earlier form)"
+
+# --- T-45 L-07's caller (pure, both platforms): with a stub in place of
+# no-docker.sh, l07_py gives it, in the pty case, a terminal on fd 1 that
+# it can write (the master open and drained) and, in the socketpair case,
+# a socket; in both no descriptor above 2, and the stub's status (125)
+# comes back. The stub (a /bin/sh script that execs python3) lists its own
+# descriptors, so a descriptor closed before or by its exec is not counted
+# as one it had. The fixture of 88b9085 to 5bcdd1b, held here, is caught:
+# its terminal was hung up, so the stub cannot write it. L-07 uses l07_py.
+t45=$work/t45
+mkdir -p "$t45" || exit 2
+printf '%s\n' '
+import errno, os, stat, sys
+fddir = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+fds = []
+for n in sorted(int(x) for x in os.listdir(fddir)):
+    try:
+        os.fstat(n)
+    except OSError as e:
+        if e.errno != errno.EBADF:
+            raise
+        continue
+    fds.append(str(n))
+kind = "tty" if os.isatty(1) else "socket" if stat.S_ISSOCK(os.fstat(1).st_mode) else "other"
+try:
+    os.write(1, b"t45\n")
+    wrote = "ok"
+except OSError as e:
+    wrote = errno.errorcode.get(e.errno, str(e.errno))
+sys.stderr.write("t45: fd 1 %s, write %s, fds %s\n" % (kind, wrote, " ".join(fds)))
+sys.exit(125)' >"$t45/stub.py" &&
+  printf '#!/bin/sh\nexec python3 -I "$0.py"\n' >"$t45/stub" && chmod 700 "$t45/stub" || exit 2
+t45_old='
+import os, pty, socket, sys
+if sys.argv[1] == "socketpair":
+    a, b = socket.socketpair()
+    os.dup2(a.fileno(), 1, inheritable=True)
+else:
+    m, s = pty.openpty()
+    os.dup2(s, 1, inheritable=True)
+os.execv(sys.argv[2], [sys.argv[2], "/usr/bin/true"])
+'
+t45_run() { # FIXTURE KIND NAME: "<status> <the stub's report>"; streams in NAME.out, NAME.err
+  local r
+  python3 -I -c "$1" "$2" "$t45/stub" </dev/null >"$t45/$3.out" 2>"$t45/$3.err"
+  r=$?
+  echo "$r $(grep '^t45: ' "$t45/$3.err")"
+}
+t45_p=$(t45_run "$l07_py" pty pty)
+t45_s=$(t45_run "$l07_py" socketpair socketpair)
+t45_o=$(t45_run "$t45_old" pty pty-earlier)
+[ "$t45_p" = "125 t45: fd 1 tty, write ok, fds 0 1 2" ] &&
+  case $t45_s in "125 t45: fd 1 socket, write "*", fds 0 1 2") true ;; *) false ;; esac &&
+  [ "$t45_o" != "$t45_p" ] && [ "$(grep -c '^    python3 -I -c "\$l07_py" "\$kind" "\$nd" ' "$here/no-docker.test.sh")" -eq 1 ]
+result "T-45 L-07's caller gives the launcher a live terminal or a socket on fd 1 and no descriptor above 2; the fixture whose terminal was hung up is caught" $? \
+  "(pty: $t45_p; socketpair: $t45_s; earlier pty: $t45_o)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
