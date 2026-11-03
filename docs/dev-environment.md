@@ -1264,6 +1264,13 @@ in the test's directories or send signal 0 or TERM to the test's own
   master, gave a hung-up terminal, which Linux does not report as a
   terminal: the launcher then refused only when it could not write its
   output, after it had made its resources. It is caught.
+- **T-46:** a pure check (both platforms) of how L-18 counts its 64 KiB
+  stderr line: byte for byte, with no pattern, so exactly one line of
+  65535 `e` counts and lines one byte shorter, longer or altered do not.
+  The earlier count used `grep -c '^e\{65535\}$'`, whose repetition bound
+  GNU grep refuses ("Regular expression too big"): on Linux it gave no
+  number and L-18 could not pass. The case prints, as information, what
+  the platform's grep makes of that pattern.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.

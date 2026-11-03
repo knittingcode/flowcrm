@@ -61,7 +61,8 @@
 #     T-43 runs keep_stream on /bin/sh commands, into a directory of this
 #     suite it can and one it cannot write; T-44 runs L-15c's reporting
 #     with fixed verdicts; T-45 runs L-07's caller with a stub in place of
-#     no-docker.sh (a pseudo-terminal and a socket pair of its own).
+#     no-docker.sh (a pseudo-terminal and a socket pair of its own);
+#     T-46 counts lines of fixture files of its own.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -81,7 +82,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43, T-44 and T-45 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43, T-44, T-45 and T-46 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -504,6 +505,18 @@ while True:
         except OSError:
             pass
 '
+
+# l18_lines FILE: the number of lines of FILE that are exactly 65535 times
+# "e" (L-18's 64 KiB of stderr), compared byte for byte; "-" if FILE cannot
+# be read. No pattern: GNU grep refuses the repetition bound of
+# '^e\{65535\}$' ("Regular expression too big"), so the earlier count was
+# empty on Linux. T-46.
+l18_lines() {
+  python3 -I -c '
+import sys
+print(open(sys.argv[1], "rb").read().split(b"\n").count(b"e" * 65535))
+' "$1" 2>/dev/null || echo -
+}
 
 # --- the helpers -------------------------------------------------------------
 # Tracked files of this suite (scripts/ci/tests/no-docker/), copied to
@@ -2311,8 +2324,8 @@ sys.exit(0 if hashlib.sha256(body).hexdigest() == sys.argv[3] else 1)
   l18_body=$?
   [ "$l18_rc" -eq 0 ] && [ "$l18_body" -eq 0 ]
   result "L-18 the command's 1 MiB of stdout arrives complete through a pipe" $? "(rc $l18_rc)"
-  l18_e=$(grep -ac '^e\{65535\}$' "$work/l18.err")
-  [ "$l18_e" -eq 1 ]
+  l18_e=$(l18_lines "$work/l18.err")
+  [ "$l18_e" = 1 ]
   result "L-18 the command's 64 KiB of stderr arrives complete" $?
   [ -n "$l18_token" ] && [ "$(tail -n 1 "$work/l18.out")" = "::$l18_token::" ]
   result "L-18 the resume token is the last stdout line" $? "($(tail -n 1 "$work/l18.out" | cut -c1-40))"
@@ -3059,6 +3072,33 @@ t45_o=$(t45_run "$t45_old" pty pty-earlier)
   [ "$t45_o" != "$t45_p" ] && [ "$(grep -c '^    python3 -I -c "\$l07_py" "\$kind" "\$nd" ' "$here/no-docker.test.sh")" -eq 1 ]
 result "T-45 L-07's caller gives the launcher a live terminal or a socket on fd 1 and no descriptor above 2; the fixture whose terminal was hung up is caught" $? \
   "(pty: $t45_p; socketpair: $t45_s; earlier pty: $t45_o)"
+
+# --- T-46 L-18's count of its 64 KiB stderr line (pure, both platforms):
+# l18_lines counts the lines that are exactly 65535 times "e", byte for
+# byte: one among other lines, and one at the end without a newline, count
+# 1; one of 65534 or 65536, or with one other byte, 0; two, 2; a missing
+# file gives "-". L-18 uses it. What this platform's grep makes of the
+# earlier pattern '^e\{65535\}$' on the first fixture is printed as
+# information (GNU grep refuses that bound, so on Linux the count was
+# empty and L-18 could not pass).
+t46=$work/t46
+mkdir -p "$t46" || exit 2
+python3 -I -c '
+import sys
+d, e = sys.argv[1], b"e" * 65535
+for name, data in (("one", b"x\n" + e + b"\ny\n"), ("short", e[1:] + b"\n"), ("long", e + b"e\n"),
+                   ("altered", e[:30000] + b"f" + e[30001:] + b"\n"), ("two", e + b"\n" + e + b"\n"),
+                   ("last", b"x\n" + e)):
+    with open(d + "/" + name, "wb") as f:
+        f.write(data)
+' "$t46" || exit 2
+t46_got=""
+for f in one short long altered two last missing; do t46_got="$t46_got $f=$(l18_lines "$t46/$f")"; done
+echo "INFO  T-46 the earlier count on the first fixture here: $(grep -ac '^e\{65535\}$' "$t46/one" 2>&1 | head -n 1) ($(grep --version 2>&1 | head -n 1))"
+[ "$t46_got" = " one=1 short=0 long=0 altered=0 two=2 last=1 missing=-" ] &&
+  [ "$(grep -c '^  l18_e=$(l18_lines "$work/l18.err")$' "$here/no-docker.test.sh")" -eq 1 ]
+result "T-46 L-18's 64 KiB stderr line is counted byte for byte with no pattern bound: exact lines count, shorter, longer and altered ones do not" $? \
+  "($t46_got)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
