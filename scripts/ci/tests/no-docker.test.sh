@@ -62,7 +62,8 @@
 #     suite it can and one it cannot write; T-44 runs L-15c's reporting
 #     with fixed verdicts; T-45 runs L-07's caller with a stub in place of
 #     no-docker.sh (a pseudo-terminal and a socket pair of its own);
-#     T-46 counts lines of fixture files of its own.
+#     T-46 counts lines of fixture files of its own; T-47 gives T-07's
+#     verdict fixed statuses and outputs of its own.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -82,7 +83,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43, T-44, T-45 and T-46 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40, T-41, T-42, T-43, T-44, T-45, T-46 and T-47 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -456,6 +457,16 @@ l15c_result() {
   name="L-15c TERM at $1 ms: an allowed outcome"
   [ "$1" != 300 ] || name="$name; no profile of these launches is left"
   result "$name" "$ok" "(rc $3)"
+}
+
+# t07_verdict STATUS FILE: T-07's verdict on its launch: the launch ended 0
+# and its kept stdout, without the workflow command lines, is exactly
+# "refused reached" (left in t07). STATUS is the launch's own (ks_rc):
+# up to 5bcdd1b T-07 took grep's status for it, so a launch that printed
+# the text and then ended 125 passed. T-47.
+t07_verdict() {
+  t07=$(grep -v '^::' "$2")
+  [ "$1" -eq 0 ] && [ "$t07" = "refused reached" ]
 }
 
 # l07_py: L-07's caller. It runs the launcher ($2) with /usr/bin/true and,
@@ -1621,12 +1632,11 @@ own.bind(("127.0.0.1", 0))
 own.listen(1)
 print(reach(int(sys.argv[1])), reach(own.getsockname()[1]))
 ' "$(cat "$work/t07.port" 2>/dev/null || echo 0)"
-t07=$(grep -v '^::' "$work/t07.out")
-r=$?
+t07_rc=$ks_rc
 kill "$t07pid" 2>/dev/null
 wait "$t07pid" 2>/dev/null
-[ "$r" -eq 0 ] && [ -s "$work/t07.port" ] && [ "$t07" = "refused reached" ]
-result "T-07 a loopback port listening before the isolation is unreachable, one opened inside it is reachable" $? "(rc $r: $t07)"
+t07_verdict "$t07_rc" "$work/t07.out" && [ -s "$work/t07.port" ]
+result "T-07 a loopback port listening before the isolation is unreachable, one opened inside it is reachable" $? "(rc $t07_rc: $t07)"
 
 if [ "$os" = Linux ]; then
   echo "INFO  mount: $(mount --version 2>&1 | head -n 1)"
@@ -3099,6 +3109,33 @@ echo "INFO  T-46 the earlier count on the first fixture here: $(grep -ac '^e\{65
   [ "$(grep -c '^  l18_e=$(l18_lines "$work/l18.err")$' "$here/no-docker.test.sh")" -eq 1 ]
 result "T-46 L-18's 64 KiB stderr line is counted byte for byte with no pattern bound: exact lines count, shorter, longer and altered ones do not" $? \
   "($t46_got)"
+
+# --- T-47 T-07's verdict (pure, both platforms): t07_verdict passes a
+# launch that ended 0 and printed exactly "refused reached" between its
+# workflow command lines; the same output with status 125, another output
+# with status 0, or no output fails. T-07 takes the status from
+# keep_stream (ks_rc) right after its launch and gives it to t07_verdict.
+# The earlier form, which took grep's status for the launch's, passes the
+# status-125 case and is caught.
+t47=$work/t47
+mkdir -p "$t47" || exit 2
+printf '::stop-commands::0123\nrefused reached\n\n::0123::\n' >"$t47/right" &&
+  printf '::stop-commands::0123\nreached reached\n\n::0123::\n' >"$t47/wrong" || exit 2
+t47_v() { if t07_verdict "$@" 2>/dev/null; then echo pass; else echo fail; fi; }
+t47_old() { # STATUS FILE: the form of a10c6ea to 5bcdd1b
+  local r
+  t07=$(grep -v '^::' "$2")
+  r=$?
+  if [ "$r" -eq 0 ] && [ "$t07" = "refused reached" ]; then echo pass; else echo fail; fi
+}
+t47_got="$(t47_v 0 "$t47/right") $(t47_v 125 "$t47/right") $(t47_v 0 "$t47/wrong") $(t47_v 0 "$t47/none")"
+t47_was=$(t47_old 125 "$t47/right")
+[ "$t47_got" = "pass fail fail fail" ] && [ "$t47_was" = pass ] &&
+  [ "$(sed -n '/^t07_rc=\$ks_rc$/{x;p;q;};h' "$here/no-docker.test.sh")" = "' \"\$(cat \"\$work/t07.port\" 2>/dev/null || echo 0)\"" ] &&
+  [ "$(grep -c '^t07_rc=\$ks_rc$' "$here/no-docker.test.sh")" -eq 1 ] &&
+  [ "$(grep -c '^t07_verdict "\$t07_rc" "\$work/t07.out" && \[ -s "\$work/t07.port" \]$' "$here/no-docker.test.sh")" -eq 1 ]
+result "T-47 T-07 needs its launch's own status 0 and exactly its output: that output with status 125, another output or none fail; the form that took grep's status is caught" $? \
+  "($t47_got; earlier form with 125: $t47_was)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
