@@ -479,7 +479,10 @@ case $os in
       # while it is changed.
       if [ "$work_made" = yes ] && [ -z "$left" ]; then
         chmod -R u+rwx "$work" 2>/dev/null
-        rm -rf "$work" || printf 'no-docker: the run directory %s could not be removed\n' "$work" >&2
+        if ! rm -rf "$work"; then
+          fail="${fail:+$fail; }the run directory $work could not be removed"
+          printf 'no-docker: refused: cleanup failed (the run directory %s could not be removed)\n' "$work" >&2
+        fi
       elif [ "$work_made" = yes ]; then
         printf 'no-docker: the run directory %s is kept\n' "$work" >&2
       fi

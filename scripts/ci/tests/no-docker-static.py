@@ -35,9 +35,10 @@ check prints "ok   <rule> <text>" or "FAIL <rule> <text>"; the last line is
          and the unit and static tests;
   S-08   the sha256 values no-docker-aa.py pins for the two templates are
          those of the template files;
-  S-09   in no-docker.sh, cleanup records a failed removal of the fence
-         directory (C3) and of the control directory (C6) as a cleanup
-         failure, so the launch ends 125 and says so (C7).
+  S-09   in the cleanup function of no-docker.sh, a failed removal of the
+         fence directory (C3), the control directory or the run directory
+         (C6) is recorded as a cleanup failure, so the launch ends 125 and
+         says so (C7; T-40 runs that function against stubs).
 
 Code means every tracked file except Markdown; lines that are comments
 (#, //, /* or *) are not code either.
@@ -292,17 +293,23 @@ def s08(files):
 # --- S-09 ---------------------------------------------------------------------
 
 def s09(files):
-    """Each removal of the fence and control directories in no-docker.sh is
-    the condition of an `if` whose next line records a cleanup failure."""
+    """In the cleanup function of no-docker.sh, each removal of the fence,
+    control and run directories is the condition of an `if` whose next line
+    records a cleanup failure."""
     lines = files.get(LAUNCHER, "").splitlines()
+    start = next((n for n, line in enumerate(lines) if re.fullmatch(r"( *)cleanup\(\) \{", line)), None)
+    if start is None:
+        return [f"{LAUNCHER}: no cleanup function"]
+    end = next((n for n in range(start + 1, len(lines))
+                if lines[n] == lines[start][:len(lines[start]) - len(lines[start].lstrip())] + "}"), len(lines))
     found = []
-    for var in ("fencedir", "ctldir"):
-        removals = [n for n, line in enumerate(lines) if not comment(line) and f'rm -rf "${var}"' in line]
+    for var in ("fencedir", "ctldir", "work"):
+        removals = [n for n in range(start, end) if not comment(lines[n]) and f'rm -rf "${var}"' in lines[n]]
         if not removals:
-            found.append(f"{LAUNCHER}: no removal of ${var}")
+            found.append(f"{LAUNCHER}: cleanup does not remove ${var}")
         for n in removals:
-            guarded = re.fullmatch(r'\s*(el)?if \[ -n "\$' + var + r'" \] && ! rm -rf "\$' + var + r'"; then', lines[n])
-            if not (guarded and n + 1 < len(lines) and re.match(r'\s*fail="', lines[n + 1])):
+            guarded = re.fullmatch(r'\s*(el)?if (\[ -n "\$' + var + r'" \] && )?! rm -rf "\$' + var + r'"; then', lines[n])
+            if not (guarded and n + 1 < end and re.match(r'\s*fail="', lines[n + 1])):
                 found.append(f"{LAUNCHER}:{n + 1}")
     return found
 
@@ -341,7 +348,7 @@ RULE_LIST = [
      add(".github/workflows/ci.yml", "\n      - run: scripts/ci/no-docker.sh --negative-control true\n")),
     ("S-08", "the template hashes pinned in no-docker-aa.py are those of the files", s08,
      edit(NEGATIVE, "  deny network vsock,\n", "  deny network inet,\n")),
-    ("S-09", "a failed removal of the fence or control directory is a cleanup failure (125)", s09,
+    ("S-09", "a failed removal of the fence, control or run directory is a cleanup failure (125)", s09,
      edit(LAUNCHER, '      if [ -n "$fencedir" ] && ! rm -rf "$fencedir"; then\n'
                     '        fail="$fail; the fence directory $fencedir could not be removed"\n      fi\n',
           '      [ -z "$fencedir" ] || rm -rf "$fencedir"\n')),

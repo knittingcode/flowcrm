@@ -52,6 +52,9 @@
 #     descriptor made to raise.
 #   - T-39 reads the tracked files and checks static rules on them and on
 #     mutant fixtures held in memory.
+#   - T-40 runs the Linux cleanup function of no-docker.sh, taken from the
+#     script, in a shell of its own against stubs of rm, sudo and chmod,
+#     on directories of this suite only.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -71,7 +74,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38 and T-39 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39 and T-40 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -2395,6 +2398,76 @@ for want in S-02=2 S-02b=2 S-03=2 S-03b=2 S-04=2 S-05=4 S-06=2 S-07=2 S-08=2 S-0
     printf '%s\n' "$t39" | grep -qx 'SUMMARY 22 ok, 0 failed'
   result "T-39 $tag: $n of ${want#*=} checks pass" $? "(rc $t39_rc, $bad failed)"
 done
+
+# --- T-40 the Linux cleanup's failure propagation, as a pure harness, on
+# both platforms: the cleanup function of no-docker.sh and the functions it
+# calls, taken from the script unchanged, run in a subshell in the state of
+# a launch whose command exited 0, with rm, sudo and chmod replaced by shell
+# functions (only this suite's own directories are removed; nothing runs as
+# root; no namespace or profile exists). A failed removal of the fence, the
+# control or the run directory must end 125 with a refusal naming it (design
+# section 10, C3, C6, C7); without one the command's status stays 0. Three
+# mutants of the propagation must each change an outcome. The shell logic
+# only: on Linux, L-14 and L-13c show at run time that nothing is left.
+t40_src=$work/t40-cleanup.sh
+awk '
+  /^    (proc_stat|alive|wait_gone|wait_all|put_state|resolve_pending|sudo_may_run|close_relay_ends|secs|cleanup)\(\) \{$/ { f = 1 }
+  f { print }
+  f && /^    }$/ { f = 0 }
+' "$nd" >"$t40_src"
+# The harness, a shell of its own: $1 the functions, $2 the case's
+# directory, $3 the directory whose removal fails.
+t40_harness='
+set -u
+EX_REFUSED=125 aa=/nonexistent EPOCHREALTIME=1700000000.000000 bad=$3
+ctldir=$2/ctl fencedir=$2/fence work=$2/run work_made=yes profile=flowcrm-nd-00000000000000000000000000000000
+load_op=load state="entered spid=1" lpid=1 lstart=1 load_done=yes spid=1 sstart=1 sudo_reaped=yes
+o="" e="" opid="" ostart="" epid="" estart="" fspid="" fsstart="" fdpid="" fdstart=""
+pending="" kept="" token="" stopped="" signalled="" normal=yes cleaning="" rc=0 negative=""
+t_launch=0 t_preflight=0 t_load=0 t_fence=0 t_relays=0 t_run=0 t_release=0
+sudo() { :; }
+chmod() { :; }
+rm() {
+  for last; do :; done
+  [ "$last" != "$bad" ] || return 1
+  command rm "$@"
+}
+. "$1"
+cleanup
+'
+t40_case() { # SOURCE fence|ctl|run|none: "<status> <refusals naming a removal>"
+  local d r
+  d=$(mktemp -d "$work/t40.XXXXXX") || return 2
+  mkdir "$d/fence" "$d/ctl" "$d/run" && : >"$d/run/started" || return 2
+  "$BASH" -c "$t40_harness" t40 "$1" "$d" "$d/$2" >"$d/out" 2>"$d/err"
+  r=$?
+  echo "$r $(grep -c '^no-docker: refused: cleanup failed (.*could not be removed' "$d/err")"
+}
+t40_all() { # SOURCE: the outcomes of the four cases, space-separated
+  echo "none=$(t40_case "$1" none | tr ' ' :) fence=$(t40_case "$1" fence | tr ' ' :)" \
+    "ctl=$(t40_case "$1" ctl | tr ' ' :) run=$(t40_case "$1" run | tr ' ' :)"
+}
+t40_want="none=0:0 fence=125:1 ctl=125:1 run=125:1"
+t40_got=$(t40_all "$t40_src")
+[ "$(grep -c '() {$' "$t40_src")" -eq 10 ] && [ "$t40_got" = "$t40_want" ]
+result "T-40 cleanup against stubs: a failed removal of the fence, control or run directory ends 125 and says so; otherwise the command's status (0)" $? \
+  "($t40_got; $(grep -c '() {$' "$t40_src") of 10 functions)"
+# The mutants: the fence removal unchecked; the failure cleared before the
+# status; the status not raised by a cleanup failure.
+awk '/^      if \[ -n "\$fencedir" \] && ! rm -rf "\$fencedir"; then$/ { print "      [ -z \"$fencedir\" ] || rm -rf \"$fencedir\""; skip = 2; next }
+  skip > 0 { skip--; next } { print }' "$t40_src" >"$work/t40-m1.sh"
+awk '/^      # C7: the status\./ { print "      fail=\"\"" } { print }' "$t40_src" >"$work/t40-m2.sh"
+awk '/^      # C7: the status\./ { c7 = 1 } c7 && /^        status=\$EX_REFUSED$/ && !done { print "        status=$rc"; done = 1; next } { print }' \
+  "$t40_src" >"$work/t40-m3.sh"
+t40_caught=""
+for m in 1 2 3; do
+  if ! cmp -s "$t40_src" "$work/t40-m$m.sh" && [ "$(t40_all "$work/t40-m$m.sh")" != "$t40_want" ]; then
+    t40_caught="$t40_caught M$m"
+  fi
+done
+[ "$t40_caught" = " M1 M2 M3" ]
+result "T-40 mutants of the propagation are caught (fence removal unchecked, failure cleared, status not raised)" $? \
+  "(caught:${t40_caught:- none})"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
