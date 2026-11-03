@@ -1265,8 +1265,11 @@ in the test's directories or send signal 0 or TERM to the test's own
   terminal: the launcher then refused only when it could not write its
   output, after it had made its resources. It is caught.
 - **T-46:** a pure check (both platforms) of how L-18 counts its 64 KiB
-  stderr line: byte for byte, with no pattern, so exactly one line of
-  65535 `e` counts and lines one byte shorter, longer or altered do not.
+  stderr line: byte for byte, with no pattern, counting only complete
+  lines (65535 `e` and their newline, from the start of the file or a
+  newline), so exactly one such line counts, lines one byte shorter, longer
+  or altered do not, and a file whose last line has no newline gives no
+  count at all.
   The earlier count used `grep -c '^e\{65535\}$'`, whose repetition bound
   GNU grep refuses ("Regular expression too big"): on Linux it gave no
   number and L-18 could not pass. The case prints, as information, what

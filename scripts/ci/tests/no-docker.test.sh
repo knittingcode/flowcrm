@@ -517,15 +517,20 @@ while True:
             pass
 '
 
-# l18_lines FILE: the number of lines of FILE that are exactly 65535 times
-# "e" (L-18's 64 KiB of stderr), compared byte for byte; "-" if FILE cannot
-# be read. No pattern: GNU grep refuses the repetition bound of
-# '^e\{65535\}$' ("Regular expression too big"), so the earlier count was
-# empty on Linux. T-46.
+# l18_lines FILE: the number of complete lines of FILE that are exactly
+# 65535 times "e" and their newline (L-18's 64 KiB of stderr), compared
+# byte for byte, each line running from the start of FILE or a newline to
+# the next newline; "unterminated" if FILE does not end with a newline (its
+# last line is incomplete: no count is given); "-" if FILE cannot be read
+# (missing, a directory). No pattern: GNU grep refuses the repetition bound
+# of '^e\{65535\}$' ("Regular expression too big"), so the earlier count
+# was empty on Linux; it also counted a last line without its newline.
+# T-46.
 l18_lines() {
   python3 -I -c '
 import sys
-print(open(sys.argv[1], "rb").read().split(b"\n").count(b"e" * 65535))
+*lines, rest = open(sys.argv[1], "rb").read().split(b"\n")
+print("unterminated" if rest else sum(1 for line in lines if line == b"e" * 65535))
 ' "$1" 2>/dev/null || echo -
 }
 
@@ -3084,28 +3089,30 @@ result "T-45 L-07's caller gives the launcher a live terminal or a socket on fd 
   "(pty: $t45_p; socketpair: $t45_s; earlier pty: $t45_o)"
 
 # --- T-46 L-18's count of its 64 KiB stderr line (pure, both platforms):
-# l18_lines counts the lines that are exactly 65535 times "e", byte for
-# byte: one among other lines, and one at the end without a newline, count
-# 1; one of 65534 or 65536, or with one other byte, 0; two, 2; a missing
-# file gives "-". L-18 uses it. What this platform's grep makes of the
-# earlier pattern '^e\{65535\}$' on the first fixture is printed as
-# information (GNU grep refuses that bound, so on Linux the count was
-# empty and L-18 could not pass).
+# l18_lines counts the complete lines that are exactly 65535 times "e" and
+# a newline, byte for byte: one among other lines, and one as the last
+# line, count 1; one of 65534 or 65536, or with one other byte, 0; two, 2.
+# A file whose last line has no newline gives no count ("unterminated"),
+# also when a complete line came before it; a missing file and a directory
+# give "-". L-18 uses it. What this platform's grep makes of the earlier
+# pattern '^e\{65535\}$' on the first fixture is printed as information
+# (GNU grep refuses that bound, so on Linux the count was empty and L-18
+# could not pass).
 t46=$work/t46
-mkdir -p "$t46" || exit 2
+mkdir -p "$t46/dir" || exit 2
 python3 -I -c '
 import sys
 d, e = sys.argv[1], b"e" * 65535
-for name, data in (("one", b"x\n" + e + b"\ny\n"), ("short", e[1:] + b"\n"), ("long", e + b"e\n"),
-                   ("altered", e[:30000] + b"f" + e[30001:] + b"\n"), ("two", e + b"\n" + e + b"\n"),
-                   ("last", b"x\n" + e)):
+for name, data in (("one", b"x\n" + e + b"\ny\n"), ("end", b"x\n" + e + b"\n"), ("short", e[1:] + b"\n"),
+                   ("long", e + b"e\n"), ("altered", e[:30000] + b"f" + e[30001:] + b"\n"),
+                   ("two", e + b"\n" + e + b"\n"), ("last", b"x\n" + e), ("partial", e + b"\n" + e)):
     with open(d + "/" + name, "wb") as f:
         f.write(data)
 ' "$t46" || exit 2
 t46_got=""
-for f in one short long altered two last missing; do t46_got="$t46_got $f=$(l18_lines "$t46/$f")"; done
+for f in one end short long altered two last partial missing dir; do t46_got="$t46_got $f=$(l18_lines "$t46/$f")"; done
 echo "INFO  T-46 the earlier count on the first fixture here: $(grep -ac '^e\{65535\}$' "$t46/one" 2>&1 | head -n 1) ($(grep --version 2>&1 | head -n 1))"
-[ "$t46_got" = " one=1 short=0 long=0 altered=0 two=2 last=1 missing=-" ] &&
+[ "$t46_got" = " one=1 end=1 short=0 long=0 altered=0 two=2 last=unterminated partial=unterminated missing=- dir=-" ] &&
   [ "$(grep -c '^  l18_e=$(l18_lines "$work/l18.err")$' "$here/no-docker.test.sh")" -eq 1 ]
 result "T-46 L-18's 64 KiB stderr line is counted byte for byte with no pattern bound: exact lines count, shorter, longer and altered ones do not" $? \
   "($t46_got)"
