@@ -87,6 +87,11 @@ UNSHARE_ARGV = ["unshare", "--net", "--mount", "--pid", "--fork", "--kill-child"
 SUDO_ARGV = ["sudo", "-n"] + UNSHARE_ARGV
 KILL_INIT_DEADLINE = 8.0
 SWEEPS = 2
+# A task's label is read in one read of LABEL_MAX bytes (a read that fills it
+# may have cut the label); the profile list is read to its end, at most
+# LIST_MAX bytes.
+LABEL_MAX = 1 << 16
+LIST_MAX = 1 << 24
 
 
 class Refused(Exception):
@@ -304,6 +309,32 @@ def sweeps_clear(sweep, name, count=SWEEPS):
     return None
 
 
+def read_all(read, limit):
+    """The bytes of a file read with read(n) until it returns none (its
+    end): the kernel hands the profile list out about a page per read (a
+    seq_file), so one read may hold only its first part. OSError if there
+    are more than limit bytes."""
+    data = b""
+    while True:
+        chunk = read(1 << 16)
+        if not chunk:
+            return data
+        data += chunk
+        if len(data) > limit:
+            raise OSError(errno.EFBIG, f"more than {limit} bytes")
+
+
+def label_from(data, limit):
+    """The text of a task's label from one read of attr/apparmor/current
+    with a buffer of limit bytes (the kernel gives the whole label in one
+    read, cut to the buffer). OSError if the read filled the buffer: the
+    label may have been cut, and a profile named after the cut would not be
+    seen."""
+    if len(data) >= limit:
+        raise OSError(errno.EOVERFLOW, f"a label of {limit} bytes or more may have been cut")
+    return data.decode("utf-8", "replace")
+
+
 def parse_stat(text):
     """{"comm", "state", "ppid", "start"} of a /proc/<pid>/stat line."""
     head, _, rest = text.rpartition(")")
@@ -478,11 +509,20 @@ def pidns_tasks():
     return tasks
 
 
+def read_label(path):
+    """A task's label, read whole in one read (label_from)."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        return label_from(os.read(fd, LABEL_MAX), LABEL_MAX)
+    finally:
+        os.close(fd)
+
+
 def label_sweep():
     """(path, label or OSError) of every task's attr/apparmor/current. A
     kernel without that file would make every task look ended: the sweep
     refuses unless it can read its own."""
-    read_text("/proc/self/attr/apparmor/current", 4096)
+    read_label("/proc/self/attr/apparmor/current")
     entries = []
     for pid in proc_pids():
         try:
@@ -493,14 +533,19 @@ def label_sweep():
         for tid in tids:
             path = f"/proc/{pid}/task/{tid}/attr/apparmor/current"
             try:
-                entries.append((path, read_text(path, 4096)))
+                entries.append((path, read_label(path)))
             except OSError as e:
                 entries.append((path, still_there(e, f"/proc/{pid}/task/{tid}")))
     return entries
 
 
 def profile_list():
-    return read_text(PROFILES, 1 << 24)
+    """The kernel's list of loaded profiles, read to its end (read_all)."""
+    fd = os.open(PROFILES, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        return read_all(lambda n: os.read(fd, n), LIST_MAX).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
 
 
 def kernel_hash(name):

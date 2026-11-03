@@ -1175,9 +1175,12 @@ in the test's directories or send signal 0 or TERM to the test's own
   labels, the preflight, the profile list, the sweeps, P0, P1 and the
   state rules (with the namespace record's exact format), the template,
   the negative template's reach, P2, `kill-init`'s order and the argument
-  validation, run against a fake system (107 assertions). Seventeen
-  mutated copies (a single sweep, P1 or P2 skipped, `kill-init` signalling
-  before recording, and so on) must each be rejected.
+  validation, run against a fake system (114 assertions). The profile list
+  is read to its end (the kernel hands it out about a page per read), and
+  a task's label read that fills its buffer, which may have cut the label,
+  counts as unknown. Nineteen mutated copies (a single sweep, P1 or P2
+  skipped, `kill-init` signalling before recording, the list read once, a
+  full label buffer accepted, and so on) must each be rejected.
 - **T-39:** static rules (both platforms), each passing on the tracked
   files and failing on a mutant fixture held in memory: no AppArmor reload,
   replacement, removal or configuration write; `attach_disconnected` only

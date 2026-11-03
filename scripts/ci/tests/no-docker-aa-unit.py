@@ -8,7 +8,7 @@ program, open a pidfd or send a signal is replaced by one that raises: the
 operations run against a fake System and a fake control directory only,
 never against this machine. Each assertion prints "ok   <case> <text>" or
 "FAIL <case> <text>"; the cases are P-01 to P-11, W (the helper calls the
-tested functions) and M1 to M17 (mutated copies of the helper, each of
+tested functions) and M1 to M19 (mutated copies of the helper, each of
 which must fail at least one assertion of its case). The last line is
 "SUMMARY <ok> ok, <failed> failed". Exit 0 only if nothing failed; 2 if a
 mutant cannot be made exactly.
@@ -277,6 +277,27 @@ def p04(P, emit):
         r = "error"
     emit("P-04", r == "error" and not fs.removed, "an unreadable list is an error, nothing is removed")
     emit("P-04", lm(f"{NAME}0 (enforce)\nx{NAME} (enforce)\n", NAME) == [], "similar foreign names are not the profile")
+    # The kernel hands the list out about a page per read (a seq_file).
+    listing = "".join(f"profile-{i:04d} (enforce)\n" for i in range(400)) + f"{NAME} (enforce)\n"
+    whole = P["read_all"](chunks(listing.encode(), 4096), P["LIST_MAX"]).decode()
+    try:
+        P["read_all"](chunks(b"x (enforce)\n" * 1000, 4096), 8192)
+        over = False
+    except OSError as e:
+        over = not P["gone"](e)
+    emit("P-04", NAME not in listing[:4096] and lm(whole, NAME) == ["enforce"] and over,
+         "the list is read to its end: NAME after its first 4096 bytes is found; a list over the limit is an error")
+
+
+def chunks(data, size):
+    """A read(n) of data that gives at most size bytes a call, then b""."""
+    pos = [0]
+
+    def read(n):
+        part = data[pos[0]:pos[0] + min(n, size)]
+        pos[0] += len(part)
+        return part
+    return read
 
 
 def p05(P, emit):
@@ -293,6 +314,17 @@ def p05(P, emit):
     seq = [[(lab, "unconfined\n")], [(lab, f"{NAME} (enforce)\n")]]
     emit("P-05", P["sweeps_clear"](lambda: seq.pop(0), NAME) is not None, "two sweeps are required: a carrier in the second keeps it")
     emit("P-05", P["sweeps_clear"](lambda: [(lab, "unconfined\n")], NAME) is None, "two clear sweeps pass")
+    # A stacked label longer than 4096 bytes, NAME after its first 4096.
+    long_label = "/".join(["x" * 200] * 24) + f"//&{NAME} (enforce)\n"
+    whole = P["label_from"](long_label.encode(), P["LABEL_MAX"])
+    try:
+        P["label_from"](long_label[:4096].encode(), 4096)
+        cut = None
+    except OSError as e:
+        cut = e
+    emit("P-05", len(long_label) > 4096 and sr([(lab, whole)], NAME)[0] == [lab] and isinstance(cut, OSError)
+         and sr([(lab, cut)], NAME)[1] != [],
+         "a long stacked label read whole is counted; a read that fills its buffer (maybe cut) is unknown")
 
 
 def p06(P, emit):
@@ -564,6 +596,9 @@ def wiring():
         "kill_init_once": {"find_init", "p0", "parse_ns", "ns_record"},
         "preflight": {"preflight_findings"},
         "sweeps_clear": {"sweep_result"},
+        "profile_list": {"read_all"},
+        "label_sweep": {"read_label"},
+        "read_label": {"label_from"},
     }
     for fname, names in need.items():
         missing = names - calls_in(tree, fname)
@@ -613,6 +648,10 @@ MUTANTS = [
     ("M17", "P-10", "pid 1 signalled before its namespace is recorded",
      "        sys_.pidfd_signal(pidfd, 0)\n        if pid_ino == host:",
      "        sys_.pidfd_signal(pidfd, 0)\n        sys_.pidfd_signal(pidfd, signal.SIGKILL)\n        if pid_ino == host:"),
+    ("M18", "P-04", "the profile list read once",
+     "        chunk = read(1 << 16)\n        if not chunk:\n            return data", "        return read(1 << 16)"),
+    ("M19", "P-05", "a label read that filled its buffer accepted",
+     "    if len(data) >= limit:\n        raise OSError(errno.EOVERFLOW", "    if False:\n        raise OSError(errno.EOVERFLOW"),
 ]
 
 

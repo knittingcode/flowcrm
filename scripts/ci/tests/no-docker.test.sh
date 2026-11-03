@@ -2398,16 +2398,16 @@ done
 # file, read a link, run a program, open a pidfd or send a signal raises),
 # its operations against a fake system (P-01 to P-11), the helper's
 # functions called by what runs (W) and mutated copies of the helper
-# rejected (M1 to M17). The numbers of assertions are fixed here.
+# rejected (M1 to M19). The numbers of assertions are fixed here.
 t38=$(python3 -I -B "$here/no-docker-aa-unit.py" "$root/scripts/ci/no-docker-aa.py" 2>&1)
 t38_rc=$?
 printf '%s\n' "$t38" | grep -vE '^ok   ' | sed 's/^/INFO    /'
-for want in P-01=8 P-02=7 P-03=13 P-04=6 P-05=9 P-06=15 P-07=6 P-08=4 P-09=6 P-10=4 P-11=6 W=6 M=17; do
+for want in P-01=8 P-02=7 P-03=13 P-04=7 P-05=10 P-06=15 P-07=6 P-08=4 P-09=6 P-10=4 P-11=6 W=9 M=19; do
   tag=${want%=*}
   n=$(printf '%s\n' "$t38" | grep -cE "^ok   ${tag}[0-9]* ")
   bad=$(printf '%s\n' "$t38" | grep -cE "^FAIL ${tag}[0-9]* ")
   [ "$t38_rc" -eq 0 ] && [ "$n" -eq "${want#*=}" ] && [ "$bad" -eq 0 ] &&
-    printf '%s\n' "$t38" | grep -qx 'SUMMARY 107 ok, 0 failed'
+    printf '%s\n' "$t38" | grep -qx 'SUMMARY 114 ok, 0 failed'
   result "T-38 $tag: $n of ${want#*=} assertions pass" $? "(rc $t38_rc, $bad failed)"
 done
 
