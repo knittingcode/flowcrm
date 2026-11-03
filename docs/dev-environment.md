@@ -675,10 +675,11 @@ the launch's control directory.
 2. The fence: two sockets bound outside by listeners of `no-docker.sh` (a
    stream and a datagram socket, children of its shell with
    `PR_SET_PDEATHSIG`), shown reachable from outside.
-3. The profile is loaded (20 s limit). Whether `sudo` still runs is read
-   from `/proc` (pid and start time), never with `kill -0`.
-4. `::stop-commands::<random token>` is printed on stdout and stderr; the
-   token is never passed inside. Two relays, `cat` processes of
+3. The profile is loaded (the helper is limited to 20 s; `no-docker.sh`
+   waits for it up to 25 s). Whether `sudo` still runs is read from
+   `/proc` (pid and start time), never with `kill -0`.
+4. `::stop-commands::<random token>` is printed on stdout and stderr; no
+   argument or variable passes the token inside (see RR-10). Two relays, `cat` processes of
    `no-docker.sh`, will copy the command's stdout and stderr to the
    caller's. The shell's own descriptors are then listed (by a child, into
    the control directory): besides 0 to 2, the relays' write ends and the
@@ -946,10 +947,10 @@ them.
 - **Annotation order and the stop token (Linux, RR-10).** Output the
   command wrote earlier on stderr may reach the runner after the resume
   token on stdout (as before); it can only add annotations. The token is
-  not passed inside, but when the caller sends stdout to a file the command
-  can read (in `$HOME`, the workspace or `$RUNNER_TEMP`), the command can
-  read it there and resume workflow commands itself: give it a pipe, or a
-  file elsewhere. No step of this repository's workflow uses step outputs
+  not passed inside, but when the caller sends stdout or stderr to a file
+  the command can read (in `$HOME`, the workspace or `$RUNNER_TEMP`), the
+  command can read it there and resume workflow commands itself: give it a
+  pipe, or a file elsewhere. No step of this repository's workflow uses step outputs
   or unsecure commands, and `$GITHUB_ENV` and `$GITHUB_OUTPUT` are
   read-only inside.
 - **Untrapped signals (Linux, RR-11).** A signal `no-docker.sh` does not
@@ -1049,7 +1050,7 @@ in the test's directories or send signal 0 or TERM to the test's own
 - **T-01 and T-02:** `--check`, and a claimed but unproven isolation.
 - **T-07:** loopback ports that were already listening are unreachable,
   while ports opened inside are reachable.
-- **T-06, T-08 to T-15, T-21, T-22 and T-24 to T-34, macOS only:**
+- **T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35, macOS only:**
   - **T-06 and T-11:** the write limits, including that a bash 3.2
     here-document fails;
   - **T-08:** the complete port list;
@@ -1089,6 +1090,8 @@ in the test's directories or send signal 0 or TERM to the test's own
     supervisor's own child and keeps the marker directory;
   - **T-34:** SIGTERM at several moments while the command starts processes:
     every run ends in time and none of its processes survives;
+  - **T-35:** a zombie outside the sandbox (a child of this suite that has
+    ended) does not make the ending of a run unprovable;
   - **T-29:** another terminal's device cannot be read from inside, while
     it can from outside.
 - **T-16 to T-18, Linux only:**

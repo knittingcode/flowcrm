@@ -186,8 +186,11 @@ new_work() { # a fresh, empty directory for --work
   mktemp -d "$vt/w.XXXXXX"
 }
 
-# The Linux launches of this suite that reach the profile, counted for
-# L-16's projection of the guard job (a file: some run in subshells).
+# The Linux launches of this suite, counted for L-16's projection of the
+# guard job (a file: some run in subshells). A launch is counted when it is
+# started, so one of L-15c that TERM ends before it made anything counts
+# too: the projection can only come out higher, never lower. Refusals
+# before any resource (T-18, L-07) are not counted.
 count_launch() { printf x >>"$work/launch-count"; }
 ndl() { # no-docker.sh, counted on Linux
   [ "$os" != Linux ] || count_launch
