@@ -2486,9 +2486,11 @@ result "T-40 mutants of the propagation are caught (fence removal unchecked, fai
 # platforms): l16_project, which L-16 uses, sums the launch timings (two
 # decimals, as the launch notices print them) in integer hundredths, so a
 # projection of 540.04 s is over the limit although it would print as 540.
-# Cases: exactly 540 s passes; 540.004 s fails; nine launches of 7.91 s and
-# one of 7.93 s with N = 45 (540.04 s) fail; 539.95 s passes; a malformed
-# timing is refused. The printed c and projection are rounded up.
+# Cases: exactly 540 s passes (N = 40, ten launches of 8.90 s); 540.004 s
+# fails (N = 4, nine of 89.00 s and one of 89.01 s); 540.04 s fails (N = 45,
+# nine of 7.91 s and one of 7.93 s); 539.95 s passes (N = 45, ten of 7.91 s);
+# a malformed timing is refused. The printed c and projection are rounded
+# up.
 # l16_project N TIMING...: "<c in s, 3 decimals, rounded up> <projection in
 # whole s, rounded up> <ok|over>", or "- - bad"; the projection is 184 s
 # plus N times c, c the mean of the timings.
@@ -2510,8 +2512,8 @@ l16_project() {
   if [ $((18400 * k + n * s)) -le $((54000 * k)) ]; then t=ok; else t=over; fi
   printf '%d.%03d %d %s\n' $((c / 1000)) $((c % 1000)) "$p" "$t"
 }
-t41_got="$(l16_project 40 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90)|$(l16_project 40 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.91)|$(l16_project 45 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.93)|$(l16_project 45 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91)|$(l16_project 45 7.9 8.00)"
-[ "$t41_got" = "8.900 540 ok|8.901 541 over|7.912 541 over|7.910 540 ok|- - bad" ] &&
+t41_got="$(l16_project 40 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90)|$(l16_project 4 89.00 89.00 89.00 89.00 89.00 89.00 89.00 89.00 89.00 89.01)|$(l16_project 45 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.93)|$(l16_project 45 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91)|$(l16_project 45 7.9 8.00)"
+[ "$t41_got" = "8.900 540 ok|89.001 541 over|7.912 541 over|7.910 540 ok|- - bad" ] &&
   grep -q '^  l16=$(l16_project "$l16_launches" $l16_t)$' "$here/no-docker.test.sh"
 result "T-41 L-16's projection is compared with 540 s exactly: 540 s passes, 540.004 s and 540.04 s fail, 539.95 s passes" $? \
   "($t41_got)"
