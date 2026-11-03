@@ -1170,7 +1170,9 @@ in the test's directories or send signal 0 or TERM to the test's own
     before the resume token, which is the last stdout line;
   - **L-16, last of all the cases that launch:** 10 launches are timed and
     the guard job projected (184 s plus the suite's launches times the mean
-    launch time): above 540 s fails, above 360 s is a warning.
+    launch time): above 540 s fails, compared exactly before any rounding
+    (the printed mean and projection are rounded up); above 360 s is a
+    warning.
 - **T-02** also requires that the refusal comes from the probe's mechanism
   check and that its writes and connects never ran.
 - **T-36:** pure tests of the Linux rules (both platforms): the credential,
@@ -1212,6 +1214,10 @@ in the test's directories or send signal 0 or TERM to the test's own
   leaves none. Four mutants of that propagation must each be caught. It
   tests the shell logic only; L-14 and L-13c show on Linux that nothing is
   left.
+- **T-41:** a pure check (both platforms) of L-16's projection: from fixed
+  timings, exactly 540 s passes and 540.004 s or 540.04 s (which would
+  print as 540) fail, so no rounding can turn a projection above 540 s
+  into a pass; L-16 must use that computation.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.

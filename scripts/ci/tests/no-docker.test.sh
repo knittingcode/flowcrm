@@ -54,7 +54,8 @@
 #     mutant fixtures held in memory.
 #   - T-40 runs the Linux cleanup function of no-docker.sh, taken from the
 #     script, in a shell of its own against stubs of rm, sudo and chmod,
-#     on directories of this suite only.
+#     on directories of this suite only; T-41 computes L-16's projection
+#     from fixed timings.
 #   - the L-tests (Linux CI only) check the kernel-enforced isolation from
 #     outside: sockets of this suite (stream, datagram, abstract, behind a
 #     bind-mounted alias, in a directory that cannot be listed, bound late,
@@ -74,7 +75,7 @@
 # T-06, T-08 to T-15, T-21, T-22 and T-24 to T-35 are macOS only, T-16 to
 # T-18 and L-01 to L-18 Linux only (INFO or SKIP on the other platform; on
 # Linux CI a missing prerequisite is a failure); T-19,
-# T-20, T-23, T-36, T-38, T-39 and T-40 are static or pure and run on both. Each case says
+# T-20, T-23, T-36, T-38, T-39, T-40 and T-41 are static or pure and run on both. Each case says
 # how it fails against the no-docker.sh of 38b5ebd, dfb6ee4, e8ed7ed or
 # 85cfb37, which these cases were written to catch.
 #
@@ -2481,6 +2482,40 @@ done
 result "T-40 mutants of the propagation are caught (fence removal unchecked, failure cleared, status not raised, another directory named)" $? \
   "(caught:${t40_caught:- none})"
 
+# --- T-41 L-16's projection is compared with 540 s exactly (pure, both
+# platforms): l16_project, which L-16 uses, sums the launch timings (two
+# decimals, as the launch notices print them) in integer hundredths, so a
+# projection of 540.04 s is over the limit although it would print as 540.
+# Cases: exactly 540 s passes; 540.004 s fails; nine launches of 7.91 s and
+# one of 7.93 s with N = 45 (540.04 s) fail; 539.95 s passes; a malformed
+# timing is refused. The printed c and projection are rounded up.
+# l16_project N TIMING...: "<c in s, 3 decimals, rounded up> <projection in
+# whole s, rounded up> <ok|over>", or "- - bad"; the projection is 184 s
+# plus N times c, c the mean of the timings.
+l16_project() {
+  local n=$1 k=0 s=0 t c p
+  shift
+  for t in "$@"; do
+    case $t in
+      "" | *[!0-9.]* | *.*.*) echo "- - bad"; return 1 ;;
+      [0-9]*.[0-9][0-9]) s=$((s + 10#${t%.*} * 100 + 10#${t#*.})) k=$((k + 1)) ;;
+      *) echo "- - bad"; return 1 ;;
+    esac
+  done
+  case $n in "" | *[!0-9]*) echo "- - bad"; return 1 ;; esac
+  [ "$k" -gt 0 ] || { echo "- - bad"; return 1; }
+  # c = s / (100 k) s; 100 k times the projection = 18400 k + n s.
+  c=$(((10 * s + k - 1) / k))
+  p=$(((18400 * k + n * s + 100 * k - 1) / (100 * k)))
+  if [ $((18400 * k + n * s)) -le $((54000 * k)) ]; then t=ok; else t=over; fi
+  printf '%d.%03d %d %s\n' $((c / 1000)) $((c % 1000)) "$p" "$t"
+}
+t41_got="$(l16_project 40 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90)|$(l16_project 40 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.90 8.91)|$(l16_project 45 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.93)|$(l16_project 45 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91 7.91)|$(l16_project 45 7.9 8.00)"
+[ "$t41_got" = "8.900 540 ok|8.901 541 over|7.912 541 over|7.910 540 ok|- - bad" ] &&
+  grep -q '^  l16=$(l16_project "$l16_launches" $l16_t)$' "$here/no-docker.test.sh"
+result "T-41 L-16's projection is compared with 540 s exactly: 540 s passes, 540.004 s and 540.04 s fail, 539.95 s passes" $? \
+  "($t41_got)"
+
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
 # file, read a link, run a program, open a pidfd or send a signal raises),
@@ -2554,8 +2589,9 @@ result "T-05 control: without the containment the mutant's commands reach the ca
 # (after T-03 to T-05), so the count of launches is complete: 10 launches
 # of true; c, the mean of their timing notices; the guard job projected as
 # 184 s (its work besides launches, measured) + N * c, N = the 4 launches
-# of the guard suites + this suite's. Above 540 s fails; above 360 s (the
-# 6-minute target) is a warning only.
+# of the guard suites + this suite's. Above 540 s fails, compared exactly
+# (l16_project, T-41; c and the projection are printed rounded up); above
+# 360 s (the 6-minute target) is a warning only.
 if [ "$os" = Linux ]; then
   : >"$work/l16.err"
   l16_bad=0
@@ -2567,15 +2603,16 @@ if [ "$os" = Linux ]; then
   [ "$l16_bad" -eq 0 ] && [ "$l16_n" -eq 10 ]
   result "L-16 10 launches ran and timed themselves" $? "($l16_bad failed, $l16_n timings)"
   l16_launches=$(($(wc -c <"$work/launch-count") + 4))
-  l16=$(printf '%s\n' "$l16_t" | awk -v n="$l16_launches" '{ s += $1 } END { if (NR) { c = s / NR; printf "%.2f %.0f", c, 184 + n * c } }')
-  l16_c=${l16% *}
-  l16_proj=${l16#* }
+  # shellcheck disable=SC2086 # one word per timing
+  l16=$(l16_project "$l16_launches" $l16_t)
+  read -r l16_c l16_proj l16_verdict <<<"$l16"
   echo "INFO  L-16 c = ${l16_c:-?} s per launch, N = $l16_launches launches, projected guard job ${l16_proj:-?} s"
-  [ -n "$l16_proj" ] && [ "$l16_proj" -le 540 ]
-  result "L-16 the projected guard job is at most 540 s" $? "(${l16_proj:-?} s)"
-  if [ -n "$l16_proj" ] && [ "$l16_proj" -gt 360 ]; then
-    echo "::warning title=no-docker::the projected guard job ($l16_proj s) is above the 6-minute target"
-  fi
+  [ "$l16_verdict" = ok ]
+  result "L-16 the projected guard job is at most 540 s" $? "(${l16_proj:-?} s rounded up, $l16_verdict)"
+  case $l16_proj in
+    "" | *[!0-9]*) ;;
+    *) [ "$l16_proj" -le 360 ] || echo "::warning title=no-docker::the projected guard job ($l16_proj s) is above the 6-minute target" ;;
+  esac
   [ "$(listed flowcrm-nd-)" = "$nd_listed_before" ]
   result "L-16 no profile is left" $?
 else
