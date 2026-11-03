@@ -114,7 +114,10 @@ os=$(uname -s)
 # too ($work and $vt are made physical when they are created); a source
 # path is never resolved, and one with a link in it is refused (2) before
 # anything is written. A copy that cannot be completed makes the suite
-# fail (2). T-42 checks the copy.
+# fail (2). T-42 checks the copy. The cases keep what they would otherwise
+# only filter or discard there: the checker outputs of T-19, T-36, T-38
+# and T-39 and the streams of the launches of T-01, T-02, T-07, T-16 (with
+# its socket records), T-17, T-18 and L-16.
 # shellcheck disable=SC2016 # Python, not shell
 keep_py='
 import errno, hashlib, os, re, stat, sys
@@ -611,13 +614,13 @@ done
 result "T-00 the read-only lint rejects a payload with a non-read-only command (9 variants)" $?
 
 # --- T-01/T-02 no-docker.sh itself
-"$nd" --check >/dev/null 2>&1
+"$nd" --check >"$work/t01.out" 2>&1
 r=$?
 [ "$r" -ne 0 ]
 result "T-01 --check fails outside the isolation" $? "(rc $r)"
 # Refused for the right reason: the probe's mechanism check failed, and
 # its part that writes and connects never ran.
-t02=$(NO_DOCKER_ACTIVE=1 "$nd" touch "$work/t02" 2>&1)
+t02=$(NO_DOCKER_ACTIVE=1 "$nd" touch "$work/t02" 2>&1 | tee "$work/t02.out"; exit "${PIPESTATUS[0]}")
 r=$?
 t02_after=$(printf '%s\n' "$t02" | grep -cE 'container engine answers|accepts a connection|writes to .* fail')
 [ "$r" -eq 125 ] && [ ! -e "$work/t02" ] &&
@@ -1498,7 +1501,7 @@ own = socket.socket()
 own.bind(("127.0.0.1", 0))
 own.listen(1)
 print(reach(int(sys.argv[1])), reach(own.getsockname()[1]))
-' "$(cat "$work/t07.port" 2>/dev/null || echo 0)" 2>/dev/null | grep -v '^::')
+' "$(cat "$work/t07.port" 2>/dev/null || echo 0)" 2>"$work/t07.err" | tee "$work/t07.out" | grep -v '^::')
 r=$?
 kill "$t07pid" 2>/dev/null
 wait "$t07pid" 2>/dev/null
@@ -1881,8 +1884,9 @@ for raw in open(sys.argv[1], "rb").read().split(b"\0"):
   t16_targets=("$home")
   for v in GITHUB_WORKSPACE RUNNER_TEMP; do [ -z "${!v-}" ] || t16_targets+=("${!v}"); done
   [ ! -d /opt/hostedtoolcache ] || t16_targets+=(/opt/hostedtoolcache)
+  cp "$ro/t16-sockets" "$ro/t16-classes" "$work/" || exit 2
   t16=$(ndl python3 -I "$ro/t16.py" "$(readlink /proc/self/ns/ipc)" "$(readlink /proc/self/ns/pid)" "$t16_tmp" "$t16_shm" "$t16_in" \
-    "$ro/t16-classes" "$nonce" "${t16_targets[@]}" 2>&1)
+    "$ro/t16-classes" "$nonce" "${t16_targets[@]}" 2>&1 | tee "$work/t16.out"; exit "${PIPESTATUS[0]}")
   r=$?
   lstop "$work/t16own.ready"
   printf '%s\n' "$t16" | grep '^t16 ' | sed 's/^/INFO    /'
@@ -1923,7 +1927,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   if pgrep -f -- "$1-in" >/dev/null; then echo canary-started; exit 0; fi
   sleep 0.1
 done
-echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
+echo canary-missing' _ "$t17m" 2>"$work/t17.err" | tee "$work/t17.out" | grep -v '^::')
   for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f -- "$t17m-in" >/dev/null || break; sleep 0.5; done
   pgrep -f -- "$t17m-in" >/dev/null
   left=$?
@@ -1934,7 +1938,7 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
 
   t17c=t17c-$nonce
   count_launch
-  "$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1; sleep 60; :' _ "$t17c" >/dev/null 2>&1 &
+  "$nd" /bin/sh -c 'setsid -f /bin/sh -c "sleep 60; :" "$1-in" </dev/null >/dev/null 2>&1; sleep 60; :' _ "$t17c" >"$work/t17c.out" 2>&1 &
   t17pid=$!
   # Up to 150 s: longer than the bound of the cleanup (112 s).
   for _ in $(seq 1 300); do pgrep -f -- "$t17c-in" >/dev/null && break; sleep 0.5; done
@@ -1954,10 +1958,14 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   # --- T-18 unsupported use is refused: uid 0 (a real sudo run) and a Linux
   # that is not a GitHub-hosted runner. The command is `true`.
   # On 38b5ebd: neither was checked, so every case ran `true` (rc 0).
+  # The command's stdout is kept in $work/t18-N.out and its stderr in
+  # $work/t18-N.err (N counts the calls).
+  t18n=0
   t18() { # name expected-message command...
     local name=$1 msg=$2 err
     shift 2
-    err=$("$@" 2>&1 >/dev/null)
+    t18n=$((t18n + 1))
+    err=$("$@" 2>&1 >"$work/t18-$t18n.out" | tee "$work/t18-$t18n.err"; exit "${PIPESTATUS[0]}")
     r=$?
     [ "$r" -eq 125 ] && printf '%s' "$err" | grep -q -- "$msg"
     result "T-18 $name: refused" $? "(rc $r)"
@@ -1970,7 +1978,7 @@ echo canary-missing' _ "$t17m" 2>/dev/null | grep -v '^::')
   # Without a Runner.Worker ancestor: started through setsid -f, so it is
   # reparented away from this job's process tree; its status comes back in
   # a file.
-  setsid -f /bin/sh -c '"$1" /usr/bin/true >/dev/null 2>"$2.err"; echo $? >"$2.tmp"; mv "$2.tmp" "$2"' _ "$nd" "$work/t18.rc"
+  setsid -f /bin/sh -c '"$1" /usr/bin/true >"$2.out" 2>"$2.err"; echo $? >"$2.tmp"; mv "$2.tmp" "$2"' _ "$nd" "$work/t18.rc"
   for _ in $(seq 1 240); do [ -s "$work/t18.rc" ] && break; sleep 0.5; done
   r=$(cat "$work/t18.rc" 2>/dev/null)
   [ "$r" = 125 ] && grep -q "no Runner.Worker ancestor" "$work/t18.rc.err" 2>/dev/null
@@ -2907,10 +2915,11 @@ result "T-05 control: without the containment the mutant's commands reach the ca
 # (l16_project, T-41; c and the projection are printed rounded up); above
 # 360 s (the 6-minute target) is a warning only.
 if [ "$os" = Linux ]; then
+  : >"$work/l16.out"
   : >"$work/l16.err"
   l16_bad=0
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    ndl /usr/bin/true >/dev/null 2>>"$work/l16.err" || l16_bad=$((l16_bad + 1))
+    ndl /usr/bin/true >>"$work/l16.out" 2>>"$work/l16.err" || l16_bad=$((l16_bad + 1))
   done
   l16_t=$(sed -n 's/^::notice title=no-docker::launch \([0-9]*\.[0-9]*\)s: .*/\1/p' "$work/l16.err")
   l16_n=$(printf '%s\n' "$l16_t" | grep -c .)

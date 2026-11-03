@@ -1238,8 +1238,12 @@ in the test's directories or send signal 0 or TERM to the test's own
   or a source with a link among its ancestors, or a source that is a link,
   is refused. The full outputs of T-19, T-36, T-38 and T-39 are
   written to `T-19.out`, `T-36.out`, `T-38.out` and `T-39.out` in the
-  suite's own directory before they are checked, so the copy keeps them.
-  Without the variable nothing changes.
+  suite's own directory before they are checked, so the copy keeps them,
+  and so are the streams of the launches whose output a case only filters
+  or discards: `t01.out`, `t02.out`, `t07.out` and `t07.err`, `t16.out`
+  with the socket records `t16-sockets` and `t16-classes`, `t17.out`,
+  `t17.err` and `t17c.out`, `t18-1.out` … `t18-7.err` and `t18.rc.out`, and
+  `l16.out`. Without the variable nothing changes.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
