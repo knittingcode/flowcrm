@@ -2559,8 +2559,9 @@ result "T-23 the helpers run outside any isolation are pinned to reviewed sha256
 # numbers of assertions are fixed here: a case that loses one fails.
 # On 85cfb37: the NSpid rule accepted only a /proc of an ancestor namespace
 # (M1).
-t36=$(python3 -I -B "$here/no-docker-probe-unit.py" "$root/scripts/ci/no-docker-probe.py" 2>&1)
+python3 -I -B "$here/no-docker-probe-unit.py" "$root/scripts/ci/no-docker-probe.py" >"$work/T-36.out" 2>&1
 t36_rc=$?
+t36=$(cat "$work/T-36.out")
 printf '%s\n' "$t36" | grep -vE '^ok   ' | sed 's/^/INFO    /'
 for want in C01=2 C02=13 C03=12 C04=14 C05=9 C06=15 C07=7 C10=8 C11=7 C12=9 C13=9 C14=4 W=12 M=14; do
   tag=${want%=*}
@@ -2575,8 +2576,9 @@ done
 # both platforms: each rule passes on the tracked files and fails on its
 # mutant fixture; the AppArmor templates are the reviewed rule set. The
 # numbers of checks are fixed here: a rule that loses one fails.
-t39=$(python3 -I -B "$here/no-docker-static.py" "$root" 2>&1)
+python3 -I -B "$here/no-docker-static.py" "$root" >"$work/T-39.out" 2>&1
 t39_rc=$?
+t39=$(cat "$work/T-39.out")
 printf '%s\n' "$t39" | grep -vE '^ok   ' | sed 's/^/INFO    /'
 for want in S-02=2 S-02b=2 S-03=2 S-03b=2 S-04=2 S-05=4 S-06=2 S-07=2 S-08=2 S-09=2; do
   tag=${want%=*}
@@ -2807,8 +2809,9 @@ result "T-42 a file with a second hard link is not copied (skipped and recorded)
 # its operations against a fake system (P-01 to P-11), the helper's
 # functions called by what runs (W) and mutated copies of the helper
 # rejected (M1 to M19). The numbers of assertions are fixed here.
-t38=$(python3 -I -B "$here/no-docker-aa-unit.py" "$root/scripts/ci/no-docker-aa.py" 2>&1)
+python3 -I -B "$here/no-docker-aa-unit.py" "$root/scripts/ci/no-docker-aa.py" >"$work/T-38.out" 2>&1
 t38_rc=$?
+t38=$(cat "$work/T-38.out")
 printf '%s\n' "$t38" | grep -vE '^ok   ' | sed 's/^/INFO    /'
 for want in P-01=8 P-02=7 P-03=13 P-04=7 P-05=10 P-06=15 P-07=6 P-08=4 P-09=6 P-10=4 P-11=6 W=9 M=19; do
   tag=${want%=*}
@@ -2823,8 +2826,9 @@ done
 # isolated one in a job; the required jobs exist; no if: conditions.
 # On 38b5ebd: "Allocator unit tests" came before the real-Docker steps and
 # the guard suites before ShellCheck and actionlint.
-t19=$(python3 -I "$here/ci-isolation-order.py" "$root" 2>&1)
+python3 -I "$here/ci-isolation-order.py" "$root" >"$work/T-19.out" 2>&1
 r=$?
+t19=$(cat "$work/T-19.out")
 printf '%s\n' "$t19" | grep -v '^ci-isolation-order: ok' | sed 's/^/INFO    /'
 [ "$r" -eq 0 ]
 result "T-19 isolated steps are the last steps of their CI jobs; required jobs exist; no if: conditions" $? "(rc $r)"

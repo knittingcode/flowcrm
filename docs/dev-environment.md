@@ -1232,7 +1232,10 @@ in the test's directories or send signal 0 or TERM to the test's own
   while the copy runs is skipped, not read through. T-42 replaces fixture
   directories by links to outside at the moments that matter and checks
   that no byte from outside is kept; a destination with a link among its
-  ancestors is refused. Without the variable nothing changes.
+  ancestors is refused. The full outputs of T-19, T-36, T-38 and T-39 are
+  written to `T-19.out`, `T-36.out`, `T-38.out` and `T-39.out` in the
+  suite's own directory before they are checked, so the copy keeps them.
+  Without the variable nothing changes.
 - **T-19:** the static CI order check, on both platforms.
 - **T-20:** a static check that the code run inside the isolation has no
   here-document or here-string, on both platforms.
