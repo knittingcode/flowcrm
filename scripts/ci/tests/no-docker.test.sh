@@ -460,13 +460,16 @@ l15c_result() {
 }
 
 # t07_verdict STATUS FILE: T-07's verdict on its launch: the launch ended 0
-# and its kept stdout, without the workflow command lines, is exactly
-# "refused reached" (left in t07). STATUS is the launch's own (ks_rc):
-# up to 5bcdd1b T-07 took grep's status for it, so a launch that printed
-# the text and then ended 125 passed. T-47.
+# (STATUS, the launch's own: ks_rc), the filter of its kept stdout ended 0,
+# and that stdout without the workflow command lines is exactly "refused
+# reached" (left in t07). Up to 5bcdd1b T-07 took grep's status for the
+# launch's, so a launch that printed the text and then ended 125 passed.
+# T-47.
 t07_verdict() {
+  local filtered
   t07=$(grep -v '^::' "$2")
-  [ "$1" -eq 0 ] && [ "$t07" = "refused reached" ]
+  filtered=$?
+  [ "$1" -eq 0 ] && [ "$filtered" -eq 0 ] && [ "$t07" = "refused reached" ]
 }
 
 # l07_py: L-07's caller. It runs the launcher ($2) with /usr/bin/true and,
@@ -3120,10 +3123,12 @@ result "T-46 L-18's 64 KiB stderr line is counted byte for byte with no pattern 
 # --- T-47 T-07's verdict (pure, both platforms): t07_verdict passes a
 # launch that ended 0 and printed exactly "refused reached" between its
 # workflow command lines; the same output with status 125, another output
-# with status 0, or no output fails. T-07 takes the status from
-# keep_stream (ks_rc) right after its launch and gives it to t07_verdict.
-# The earlier form, which took grep's status for the launch's, passes the
-# status-125 case and is caught.
+# with status 0, or no output fails, and so does the right text from a
+# filter that ended 2 (a grep shell function of a subshell of this case
+# prints it and returns 2). T-07 takes the status from keep_stream (ks_rc)
+# right after its launch and gives it to t07_verdict. The earlier form,
+# which took grep's status for the launch's, passes the status-125 case
+# and is caught.
 t47=$work/t47
 mkdir -p "$t47" || exit 2
 printf '::stop-commands::0123\nrefused reached\n\n::0123::\n' >"$t47/right" &&
@@ -3136,8 +3141,13 @@ t47_old() { # STATUS FILE: the form of a10c6ea to 5bcdd1b
   if [ "$r" -eq 0 ] && [ "$t07" = "refused reached" ]; then echo pass; else echo fail; fi
 }
 t47_got="$(t47_v 0 "$t47/right") $(t47_v 125 "$t47/right") $(t47_v 0 "$t47/wrong") $(t47_v 0 "$t47/none")"
+t47_got="$t47_got $(
+  # shellcheck disable=SC2329 # called by t07_verdict, through t47_v
+  grep() { printf 'refused reached\n'; return 2; }
+  t47_v 0 "$t47/right"
+)"
 t47_was=$(t47_old 125 "$t47/right")
-[ "$t47_got" = "pass fail fail fail" ] && [ "$t47_was" = pass ] &&
+[ "$t47_got" = "pass fail fail fail fail" ] && [ "$t47_was" = pass ] &&
   [ "$(sed -n '/^t07_rc=\$ks_rc$/{x;p;q;};h' "$here/no-docker.test.sh")" = "' \"\$(cat \"\$work/t07.port\" 2>/dev/null || echo 0)\"" ] &&
   [ "$(grep -c '^t07_rc=\$ks_rc$' "$here/no-docker.test.sh")" -eq 1 ] &&
   [ "$(grep -c '^t07_verdict "\$t07_rc" "\$work/t07.out" && \[ -s "\$work/t07.port" \]$' "$here/no-docker.test.sh")" -eq 1 ]

@@ -1275,9 +1275,10 @@ in the test's directories or send signal 0 or TERM to the test's own
   number and L-18 could not pass. The case prints, as information, what
   the platform's grep makes of that pattern.
 - **T-47:** a pure check (both platforms) of T-07's verdict: the launch must
-  end 0 and its kept stdout, without the workflow command lines, must be
-  exactly `refused reached`; the same output with status 125, another
-  output or none fail. T-07 takes the status of its launch from
+  end 0, the filter of its kept stdout must end 0, and that stdout, without
+  the workflow command lines, must be exactly `refused reached`; the same
+  output with status 125, another output, none, or the right text from a
+  filter that ended 2 fail. T-07 takes the status of its launch from
   `keep_stream` right after it; the earlier T-07 took `grep`'s status for
   it (no `pipefail`), so a launch that printed the right text and then
   ended 125 passed. That form is caught.
