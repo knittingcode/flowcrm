@@ -1229,10 +1229,14 @@ in the test's directories or send signal 0 or TERM to the test's own
   walked by directory descriptors, each directory opened from its opened
   parent without following a link, and files are read and written
   relative to their opened directory, so a directory replaced by a link
-  while the copy runs is skipped, not read through. T-42 replaces fixture
-  directories by links to outside at the moments that matter and checks
-  that no byte from outside is kept; a destination with a link among its
-  ancestors is refused. The full outputs of T-19, T-36, T-38 and T-39 are
+  while the copy runs is skipped, not read through. The sources are given
+  by their canonical physical paths as well (the suite makes its
+  directories physical when it creates them) and are never resolved: a
+  source with a link in its path is refused before anything is written.
+  T-42 replaces fixture directories by links to outside at the moments
+  that matter and checks that no byte from outside is kept; a destination
+  or a source with a link among its ancestors, or a source that is a link,
+  is refused. The full outputs of T-19, T-36, T-38 and T-39 are
   written to `T-19.out`, `T-36.out`, `T-38.out` and `T-39.out` in the
   suite's own directory before they are checked, so the copy keeps them.
   Without the variable nothing changes.

@@ -110,8 +110,11 @@ os=$(uname -s)
 # opened parent with O_NOFOLLOW (the destination and each source from /
 # down), so no link is followed and a directory replaced meanwhile is
 # skipped, not read through; files are read and written relative to their
-# opened directory. A copy that cannot be completed makes the suite fail
-# (2). T-42 checks the copy.
+# opened directory. The sources are given by their canonical physical paths
+# too ($work and $vt are made physical when they are created); a source
+# path is never resolved, and one with a link in it is refused (2) before
+# anything is written. A copy that cannot be completed makes the suite
+# fail (2). T-42 checks the copy.
 # shellcheck disable=SC2016 # Python, not shell
 keep_py='
 import errno, hashlib, os, re, stat, sys
@@ -247,19 +250,25 @@ def copy(dest, pairs):
             else:
                 what = "symbolic link, not followed" if stat.S_ISLNK(st.st_mode) else "not a regular file"
                 skipped.append(f"{relp}: {what}")
+    # Every source by its canonical physical path, opened like the
+    # destination before anything is written; one inside an earlier one is
+    # copied with it.
+    opened = []
     for pair in pairs:
         name, _, src = pair.partition("=")
-        src = os.path.realpath(src)
-        if (not SAFE.fullmatch(name) or name in names or name in ("MANIFEST.sha256", "SKIPPED.txt")
-                or any(src == r or src.startswith(r + os.sep) for r in roots)):
+        if not SAFE.fullmatch(name) or name in names or name in ("MANIFEST.sha256", "SKIPPED.txt"):
             continue
-        names.append(name)
-        roots.append(src)
         try:
             sfd = opendir(src)
         except OSError as e:
-            failed.append(f"{name} ({src}): {e.strerror}")
+            refuse(f"source {name} {src!r} is not the canonical physical path of a directory ({e.strerror})")
+        if any(src == r or src.startswith(r + "/") for r in roots):
+            os.close(sfd)
             continue
+        names.append(name)
+        roots.append(src)
+        opened.append((name, sfd))
+    for name, sfd in opened:
         out = Out(top, name)
         try:
             walk(sfd, name, out, 0)
@@ -2714,9 +2723,11 @@ result "T-41 L-16's projection is compared with 540 s exactly: 540 s passes, 540
 # empty or not mode 0700 is refused (2). Then no byte from outside the
 # copied tree is kept: a directory replaced by a link to outside between
 # its listing and the descent, or after it was opened, a link to a
-# directory, a destination with a link among its ancestors (refused) and a
-# file with a second hard link. On 51013e5 the four last cases fail: the
-# copy walked by path and kept the outside files.
+# directory, a destination with a link among its ancestors (refused), a
+# file with a second hard link, and a source given by a link or with a
+# link among its ancestors (refused). On 51013e5 the four cases after the
+# first fail: the copy walked by path and kept the outside files; on
+# 9ac29bb the two last fail: the copy resolved the source path first.
 t42=$work/t42
 mkdir -p "$t42/src/sub" "$t42/dest" "$t42/full" "$t42/open" && chmod 700 "$t42/dest" "$t42/full" && chmod 755 "$t42/open" &&
   printf 'a\n' >"$t42/src/a.log" && printf 'b\n' >"$t42/src/sub/b.log" && ln -s /etc/hosts "$t42/src/link" &&
@@ -2802,6 +2813,20 @@ t42_r4=$?
   cmp -s "$t42/r4/src/a.log" "$t42/r4/dest/work/a.log" && grep -q '^work/hard.log: 2 hard links$' "$t42/r4/dest/SKIPPED.txt"
 result "T-42 a file with a second hard link is not copied (skipped and recorded)" $? \
   "(rc $t42_r4)"
+# Sources given through a symbolic link to outside: the root itself, and an
+# ancestor of it.
+mkdir -p "$t42/r5/out/src" "$t42/r5/dest1" "$t42/r5/dest2" && chmod 700 "$t42/r5/dest1" "$t42/r5/dest2" &&
+  printf 'OUTSIDE-42\n' >"$t42/r5/out/src/f42.log" && ln -s out/src "$t42/r5/rootlink" && ln -s out "$t42/r5/alink" || exit 2
+python3 -I -c "$keep_py" copy "$t42/r5/dest1" "work=$t42/r5/rootlink" >/dev/null 2>&1
+t42_r5=$?
+[ "$t42_r5" -eq 2 ] && [ -z "$(ls -A "$t42/r5/dest1")" ]
+result "T-42 a source given by a symbolic link to outside is refused (2) and nothing is copied" $? \
+  "(rc $t42_r5)"
+python3 -I -c "$keep_py" copy "$t42/r5/dest2" "work=$t42/r5/alink/src" >/dev/null 2>&1
+t42_r6=$?
+[ "$t42_r6" -eq 2 ] && [ -z "$(ls -A "$t42/r5/dest2")" ]
+result "T-42 a source with a symbolic link to outside among its ancestors is refused (2) and nothing is copied" $? \
+  "(rc $t42_r6)"
 
 # --- T-38 the AppArmor lifecycle helper no-docker-aa.py as pure functions, on
 # both platforms: fixtures only (every call that would open, list or write a
