@@ -20,8 +20,10 @@ after the first isolated step of a job, only isolated steps may follow.
 Also checked:
   - the required jobs "Repository guard" and "Dev environment" exist and
     each has an isolated step;
-  - every isolated step of those jobs starts through the wrapper, and the
+  - every isolated step of those jobs is exactly one wrapped command, and the
     wrapper exists;
+  - no isolated step has a key other than name, run and timeout-minutes, and
+    no env or defaults apply to it from its job or the workflow;
   - no job or step has an `if:` condition (one could run a non-isolated
     step after a failed isolated one, or skip a required check) or a
     `continue-on-error:` key (a failed step, a security gate included,
@@ -45,9 +47,16 @@ OWN = {"scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py", "scripts/ci/t
        "scripts/ci/tests/ci-isolation-order-unit.py"}
 WRAPPER = "scripts/ci/fdnorm.py"
 # The only recognised use of the wrapper. No component starts with a dot, so
-# neither ./ nor ../ can reach a script outside the checkout's own paths.
-WRAPPED = re.compile(r"python3 -I scripts/ci/fdnorm\.py -- ((?:[\w-][\w.-]*/)*[\w-][\w.-]*\.(?:sh|py))")
+# neither ./ nor ../ can reach a script outside the checkout's own paths. A
+# directory is required: execvp searches PATH for a bare name, which need not be
+# the file classified here.
+WRAPPED = re.compile(r"python3 -I scripts/ci/fdnorm\.py -- ((?:[\w-][\w.-]*/)+[\w-][\w.-]*\.(?:sh|py))")
 SEPARATORS = r"\n|;|&&|\|\||\|"
+# Keys an isolated step may have. Others, such as shell, env or
+# working-directory, change how its exact run: line behaves.
+STEP_KEYS = {"name", "run", "timeout-minutes"}
+# Workflow and job keys that do the same for every step below them.
+INHERITED = ("env", "defaults")
 SCRIPT =re.compile(r"(?<![\w./$-])((?:\./)?(?:[\w.-]+/)*[\w.-]+\.(?:sh|py))(?![\w.-])")
 REQUIRED = ("Repository guard", "Dev environment")
 # Runs code under test only through no-docker.sh (it has no stanza of its
@@ -76,6 +85,7 @@ def parse(path):
     in_jobs = False
     job = None
     step = None
+    inherited = []
     for line in lines:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -83,16 +93,20 @@ def parse(path):
         if n == 0:
             in_jobs = line.rstrip() == "jobs:"
             job = step = None
+            if line.split(":")[0] in INHERITED:
+                inherited.append("workflow " + line.split(":")[0])
             continue
         if not in_jobs:
             continue
         if n == 2:
-            job = {"name": "", "steps": [], "if": False, "coe": False}
+            job = {"name": "", "steps": [], "if": False, "coe": False, "inherited": inherited}
             jobs[line.strip().rstrip(":")] = job
             step = None
         elif n == 4 and job is not None:
             step = None
             key = line.strip()
+            if key.split(":")[0] in INHERITED:
+                job["inherited"] = job["inherited"] + ["job " + key.split(":")[0]]
             if key.startswith("name:"):
                 job["name"] = key[len("name:"):].strip().strip("'\"")
             if key.startswith("if:"):
@@ -102,7 +116,7 @@ def parse(path):
         elif n >= 6 and job is not None:
             stripped = line.strip()
             if n == 6 and stripped.startswith("- "):
-                step = {"name": "", "text": "", "if": False, "coe": False, "run": [], "in_run": False}
+                step = {"name": "", "text": "", "if": False, "coe": False, "run": [], "in_run": False, "keys": set()}
                 job["steps"].append(step)
                 stripped = stripped[2:]
                 n = 8
@@ -110,6 +124,7 @@ def parse(path):
                 continue
             if n == 8:
                 step["in_run"] = False
+                step["keys"].add(stripped.split(":")[0])
                 if stripped.startswith("name:"):
                     step["name"] = stripped[len("name:"):].strip().strip("'\"")
                 elif stripped.startswith("if:"):
@@ -179,14 +194,20 @@ def commands(text):
 
 def step_commands(root, text):
     """Every program a step runs: its own commands and those of the
-    recipes of the make targets it runs."""
+    recipes of the make targets it runs. A make command that is not plainly
+    "make TARGET..." with a recipe for each target stays the command make,
+    which is not isolated."""
     words = []
-    for w in commands(text):
-        words.append(w)
-    for targets in re.findall(r"(?:^|[\n;&|]\s*)make((?:\s+[A-Za-z][\w-]*)+)", text):
-        for t in targets.split():
-            words += commands(make_recipe(root, t).replace("\t", " "))
-    return [w[2:] if w.startswith("./") else w for w in words if w != "make"]
+    for part in re.split(SEPARATORS, text):
+        found = commands(part)
+        plain = re.fullmatch(r"make((?:\s+[A-Za-z][\w-]*)+)", part.strip())
+        recipes = [make_recipe(root, t) for t in plain.group(1).split()] if plain and found == ["make"] else []
+        if recipes and all(recipes):
+            for recipe in recipes:
+                words += commands(recipe.replace("\t", " "))
+        else:
+            words += found
+    return [w[2:] if w.startswith("./") else w for w in words]
 
 
 def isolated(root, step):
@@ -213,9 +234,9 @@ def isolated(root, step):
 
 
 def starts_through_wrapper(text):
-    """Every command of the step text is in the exact form of WRAPPED."""
-    parts = [p.strip() for p in re.split(SEPARATORS, text) if p.strip()]
-    return bool(parts) and all(WRAPPED.fullmatch(p) for p in parts)
+    """The whole step is one command in the exact form of WRAPPED. One suite per
+    step: a second one joined by || or | could hide the first one's failure."""
+    return bool(WRAPPED.fullmatch(text.strip()))
 
 
 def tracked(root):
@@ -255,6 +276,10 @@ def main():
                 through = starts_through_wrapper(step["text"])
                 report(through, f"{job['name'] or jid} / {step['name']}: "
                        + ("starts through the descriptor wrapper" if through else "does not start through the descriptor wrapper"))
+            if iso:
+                changes = sorted(step["keys"] - STEP_KEYS) + job["inherited"]
+                report(not changes, f"{job['name'] or jid} / {step['name']}: nothing changes how the step runs"
+                       + (f" (changes how it runs: {', '.join(changes)})" if changes else ""))
             if iso and first is None:
                 first = step["name"]
             elif not iso and first is not None:

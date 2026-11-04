@@ -126,6 +126,17 @@ for text in (f"{W} {ISO}\ndocker ps", f"{W} {ISO}; docker ps", f"docker ps && {W
     iso, mixed, _ = classify(text)
     check(not iso and mixed, f"mixed: {text!r}")
 
+# --- a make that cannot be resolved to a recipe is another command, not nothing
+write("Makefile", f"iso:\n\t{ISO}\nother:\n\tdocker ps\n")
+check(classify("make iso")[0], "isolated: a make target whose recipe is isolated")
+for text in (f"{W} {ISO}; make nosuchtarget", f"{W} {ISO}; make -C x y", f"{W} {ISO}; make other", f"{W} {ISO}; FOO=1 make iso"):
+    iso, mixed, _ = classify(text)
+    check(not iso and mixed, f"mixed: {text!r}")
+
+# --- the wrapper needs a path with a directory: execvp searches PATH for a bare name
+write("bare.test.sh", "#!/bin/bash\n" + STANZA)
+check(not classify(f"{W} bare.test.sh")[0], "not isolated: a bare script name in the wrapper")
+
 # --- the whole workflow
 
 
@@ -146,6 +157,35 @@ def run_order(*steps):
     return subprocess.run([sys.executable, "-I", path, root, wf], capture_output=True, text=True)
 
 
+def run_text(text):
+    wf = os.path.join(root, "wf.yml")
+    with open(wf, "w") as f:
+        f.write(text)
+    return subprocess.run([sys.executable, "-I", path, root, wf], capture_output=True, text=True)
+
+
+# Settings that change how an isolated step runs, though its run: line is exact.
+GOOD_STEP = f"      - name: Suite\n        run: {W} {ISO}\n"
+JOBS = ("  guard:\n    name: Repository guard\n{job}    runs-on: ubuntu-24.04\n    steps:\n" + "{step}"
+        + "  devenv:\n    name: Dev environment\n    runs-on: ubuntu-24.04\n    steps:\n" + GOOD_STEP)
+BASE = "name: CI\non:\n  push:\n{top}jobs:\n" + JOBS
+p = run_text(BASE.format(top="", job="", step=GOOD_STEP))
+check(p.returncode == 0, f"the exact step with no extra keys passes (rc {p.returncode})")
+p = run_text(BASE.format(top="", job="", step=GOOD_STEP + "        timeout-minutes: 5\n"))
+check(p.returncode == 0, "timeout-minutes on an isolated step passes")
+for label, kw in (
+    ("step shell", {"step": GOOD_STEP + "        shell: bash -c 'docker ps; bash {0}'\n"}),
+    ("step env", {"step": GOOD_STEP + "        env:\n          LD_PRELOAD: x\n"}),
+    ("step working-directory", {"step": GOOD_STEP + "        working-directory: other\n"}),
+    ("job env", {"job": "    env:\n      BASH_ENV: x\n", "step": GOOD_STEP}),
+    ("job defaults", {"job": "    defaults:\n      run:\n        shell: bash -c 'docker ps; bash {0}'\n", "step": GOOD_STEP}),
+    ("workflow env", {"top": "env:\n  BASH_ENV: x\n", "step": GOOD_STEP}),
+    ("workflow defaults", {"top": "defaults:\n  run:\n    shell: sh\n", "step": GOOD_STEP}),
+):
+    p = run_text(BASE.format(**{"top": "", "job": "", **kw}))
+    check(p.returncode != 0 and "changes how" in p.stdout, f"refused: {label} on an isolated step (rc {p.returncode})")
+
+
 p = run_order("scripts/guard.sh", f"{W} {ISO}")
 check(p.returncode == 0, f"a workflow with wrapped suites last passes (rc {p.returncode}): {p.stdout[-200:] if p.returncode else ''}")
 
@@ -163,6 +203,11 @@ check(p.returncode != 0, "a job whose only wrapped command is docker has no isol
 
 p = run_order("scripts/guard.sh", f"{W} {ISO}; docker ps")
 check(p.returncode != 0, "a wrapped suite mixed with docker fails")
+
+# A failing first suite must fail the step, so a step runs exactly one suite.
+for sep in ("||", "|", ";", "&&"):
+    p = run_order("scripts/guard.sh", f"{W} {ISO} {sep} {W} {ISO}")
+    check(p.returncode != 0 and "does not start through" in p.stdout, f"two wrapped suites joined by {sep} fail")
 
 os.rename(os.path.join(root, "scripts/ci/fdnorm.py"), os.path.join(root, "scripts/ci/fdnorm.gone"))
 p = run_order("scripts/guard.sh", f"{W} {ISO}")

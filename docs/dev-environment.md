@@ -1013,8 +1013,11 @@ private.
   mixes such commands with others fails;
 - the required jobs exist;
 - no job or step has an `if:` condition or a `continue-on-error:` key;
-- every isolated step of the required jobs starts through
+- every isolated step of the required jobs is exactly one command through
   `scripts/ci/fdnorm.py`, and that file exists;
+- no isolated step has a key other than `name`, `run` and `timeout-minutes`,
+  and no `env` or `defaults` reach it from its job or the workflow, because
+  `shell`, `env` and `working-directory` change how an exact `run:` line behaves;
 - every other file that mentions `no-docker.sh` has the recognised re-exec
   stanza.
 
@@ -1027,8 +1030,9 @@ to fd 2 as `ci-fd:` lines, and then becomes `PATH` in the same process. If it
 cannot prove that state it exits 2 and `PATH` does not run. It does not change
 the launcher or what the launcher checks, and it does not isolate anything: the
 order check treats the wrapper as transparent only in that exact form, so
-`PATH` must already be isolated. Arguments, redirections, other interpreters,
-variables and wrapped commands such as `docker` are not isolated.
+`PATH` must already be isolated and must name a directory. Arguments,
+redirections, other interpreters, variables and wrapped commands such as
+`docker` are not isolated.
 
 #### Regression tests
 
