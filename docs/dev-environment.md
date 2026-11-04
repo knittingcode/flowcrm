@@ -1013,8 +1013,22 @@ private.
   mixes such commands with others fails;
 - the required jobs exist;
 - no job or step has an `if:` condition or a `continue-on-error:` key;
+- every isolated step of the required jobs starts through
+  `scripts/ci/fdnorm.py`, and that file exists;
 - every other file that mentions `no-docker.sh` has the recognised re-exec
   stanza.
+
+GitHub-hosted steps were seen to inherit open pipes above fd 2 (fds 142 and
+145 in run 41636839721; which process opened them is not known). The launcher
+refuses any descriptor it did not open itself, so all six isolated steps run
+`python3 -I scripts/ci/fdnorm.py -- PATH`. The wrapper closes every descriptor
+above 2, checks that only 0, 1 and 2 remain unchanged, reports what it closed
+to fd 2 as `ci-fd:` lines, and then becomes `PATH` in the same process. If it
+cannot prove that state it exits 2 and `PATH` does not run. It does not change
+the launcher or what the launcher checks, and it does not isolate anything: the
+order check treats the wrapper as transparent only in that exact form, so
+`PATH` must already be isolated. Arguments, redirections, other interpreters,
+variables and wrapped commands such as `docker` are not isolated.
 
 #### Regression tests
 

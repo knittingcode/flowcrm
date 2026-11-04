@@ -56,20 +56,22 @@ jobs:
       # Code under test runs only in the steps from here to the end of the
       # job, each isolated by scripts/ci/no-docker.sh; no step that is not
       # isolated may follow them (checked by scripts/ci/tests/ci-isolation-order.py).
+      # Each starts through scripts/ci/fdnorm.py: runner steps can inherit
+      # descriptors above 2, which the isolation launcher refuses.
       - name: Run guard regression tests
-        run: scripts/ci/tests/guard-tracked-files.test.sh
+        run: python3 -I scripts/ci/fdnorm.py -- scripts/ci/tests/guard-tracked-files.test.sh
 
       - name: Run Dockerfile frontend guard regression tests
-        run: scripts/ci/tests/guard-dockerfile-frontend.test.sh
+        run: python3 -I scripts/ci/fdnorm.py -- scripts/ci/tests/guard-dockerfile-frontend.test.sh
 
       - name: Run container scan exception guard regression tests
-        run: scripts/ci/tests/guard-trivyignore.test.sh
+        run: python3 -I scripts/ci/fdnorm.py -- scripts/ci/tests/guard-trivyignore.test.sh
 
       - name: Run edge configuration guard regression tests
-        run: scripts/ci/tests/guard-edge-config.test.sh
+        run: python3 -I scripts/ci/fdnorm.py -- scripts/ci/tests/guard-edge-config.test.sh
 
       - name: Run test isolation regression tests
-        run: scripts/ci/tests/no-docker.test.sh
+        run: python3 -I scripts/ci/fdnorm.py -- scripts/ci/tests/no-docker.test.sh
 
   # The application checks run in this required job on purpose: a separate
   # job that is not a required check could fail (or be skipped) without
@@ -134,5 +136,6 @@ jobs:
 
       # Code under test runs only from here to the end of the job, isolated by
       # scripts/ci/no-docker.sh (order checked by scripts/ci/tests/ci-isolation-order.py).
+      # It starts through scripts/ci/fdnorm.py, as in the Repository guard job.
       - name: Allocator unit tests
-        run: tests/devenv/unit.sh
+        run: python3 -I scripts/ci/fdnorm.py -- tests/devenv/unit.sh

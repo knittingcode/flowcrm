@@ -3184,6 +3184,18 @@ printf '%s\n' "$t19" | grep -v '^ci-isolation-order: ok' | sed 's/^/INFO    /'
 [ "$r" -eq 0 ]
 result "T-19 isolated steps are the last steps of their CI jobs; required jobs exist; no if: conditions" $? "(rc $r)"
 
+# --- T-19b the wrapper rule of that check, and T-19c the wrapper itself.
+python3 -I -B "$here/ci-isolation-order-unit.py" "$here/ci-isolation-order.py" >"$work/T-19b.out" 2>&1
+r=$?
+grep '^FAIL ' "$work/T-19b.out" | sed 's/^/INFO    /'
+[ "$r" -eq 0 ]
+result "T-19b only the exact wrapper around an already isolated command counts as isolated" $? "(rc $r)"
+python3 -I -B "$here/fdnorm-unit.py" "$root/scripts/ci/fdnorm.py" >"$work/T-19c.out" 2>&1
+r=$?
+grep '^FAIL ' "$work/T-19c.out" | sed 's/^/INFO    /'
+[ "$r" -eq 0 ]
+result "T-19c fdnorm.py leaves only fds 0 to 2 or refuses, and runs the command in its own process" $? "(rc $r)"
+
 # --- T-03/T-04 the harness against the mutant
 check_safe() { # name
   # Refused (125, the mutant never ran) or run isolated (97, every case ran

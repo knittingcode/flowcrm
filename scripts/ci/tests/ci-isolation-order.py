@@ -8,6 +8,11 @@ test harness scripts/ci/tests/no-docker.test.sh, or a script with the
 recognised re-exec stanza: it runs code under test, which may leave files
 or processes for later steps. A step that mixes such commands with others
 fails.
+The descriptor wrapper scripts/ci/fdnorm.py is transparent to this rule only
+in the exact form "python3 -I scripts/ci/fdnorm.py -- PATH", with nothing
+else on the command: the classification is then that of PATH. Any other
+command that names the wrapper is not isolated, and the wrapper never makes
+a command isolated by itself.
 Code under test cannot write anything on the Linux runner's file systems
 except private temporary directories, but the order is the second line:
 after the first isolated step of a job, only isolated steps may follow.
@@ -15,6 +20,8 @@ after the first isolated step of a job, only isolated steps may follow.
 Also checked:
   - the required jobs "Repository guard" and "Dev environment" exist and
     each has an isolated step;
+  - every isolated step of those jobs starts through the wrapper, and the
+    wrapper exists;
   - no job or step has an `if:` condition (one could run a non-isolated
     step after a failed isolated one, or skip a required check) or a
     `continue-on-error:` key (a failed step, a security gate included,
@@ -34,8 +41,14 @@ import sys
 STANZA = re.compile(r'no-docker\.sh" --check >/dev/null 2>&1 \|\|\n\s+exec "[^"\n]*/no-docker\.sh" ')
 OWN = {"scripts/ci/no-docker.sh", "scripts/ci/no-docker-probe.py", "scripts/ci/tests/no-docker.test.sh",
        "scripts/ci/tests/ci-isolation-order.py", ".github/workflows/ci.yml",
-       "scripts/ci/tests/no-docker-static.py", "scripts/ci/no-docker-aa.py"}
-SCRIPT = re.compile(r"(?<![\w./$-])((?:\./)?(?:[\w.-]+/)*[\w.-]+\.(?:sh|py))(?![\w.-])")
+       "scripts/ci/tests/no-docker-static.py", "scripts/ci/no-docker-aa.py",
+       "scripts/ci/tests/ci-isolation-order-unit.py"}
+WRAPPER = "scripts/ci/fdnorm.py"
+# The only recognised use of the wrapper. No component starts with a dot, so
+# neither ./ nor ../ can reach a script outside the checkout's own paths.
+WRAPPED = re.compile(r"python3 -I scripts/ci/fdnorm\.py -- ((?:[\w-][\w.-]*/)*[\w-][\w.-]*\.(?:sh|py))")
+SEPARATORS = r"\n|;|&&|\|\||\|"
+SCRIPT =re.compile(r"(?<![\w./$-])((?:\./)?(?:[\w.-]+/)*[\w.-]+\.(?:sh|py))(?![\w.-])")
 REQUIRED = ("Repository guard", "Dev environment")
 # Runs code under test only through no-docker.sh (it has no stanza of its
 # own: it tests the isolation from outside).
@@ -141,9 +154,18 @@ def make_recipe(root, target):
 def commands(text):
     """The program each simple command of a shell text runs: the first word
     after variable assignments and an interpreter (bash, sh, python3, exec,
-    env) of every command separated by a newline, ;, &&, || or |."""
+    env) of every command separated by a newline, ;, &&, || or |. A command
+    in the exact form of WRAPPED counts as PATH; any other command that names
+    the wrapper counts as the wrapper, which has no stanza and is not isolated."""
     words = []
-    for part in re.split(r"\n|;|&&|\|\||\|", text):
+    for part in re.split(SEPARATORS, text):
+        wrapped = WRAPPED.fullmatch(part.strip())
+        if wrapped:
+            words.append(wrapped.group(1))
+            continue
+        if "fdnorm" in part or "fd*" in part:
+            words.append(WRAPPER)
+            continue
         toks = part.split()
         while toks and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]) or toks[0] in ("exec", "env", "then", "do", "!")
                         or toks[0].lstrip("@") in ("bash", "sh", "python3", "/bin/bash", "/bin/sh")):
@@ -190,6 +212,12 @@ def isolated(root, step):
     return bool(iso) and not other, bool(iso) and bool(other), missing
 
 
+def starts_through_wrapper(text):
+    """Every command of the step text is in the exact form of WRAPPED."""
+    parts = [p.strip() for p in re.split(SEPARATORS, text) if p.strip()]
+    return bool(parts) and all(WRAPPED.fullmatch(p) for p in parts)
+
+
 def tracked(root):
     try:
         out = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True).stdout
@@ -214,6 +242,7 @@ def main():
     coe = [s["name"] or job["name"] for job in jobs.values() for s in [{"name": ""}] * job["coe"] + job["steps"]
            if s.get("coe", job["coe"] and not s["name"])]
     report(not coe, "no job or step has continue-on-error" + (f" ({', '.join(repr(c) for c in coe)})" if coe else ""))
+    report(os.path.isfile(os.path.join(root, WRAPPER)), f"the descriptor wrapper {WRAPPER} exists")
     for jid, job in jobs.items():
         first = None
         late = []
@@ -222,6 +251,10 @@ def main():
             report(not missing, f"{job['name'] or jid} / {step['name']}: the scripts it runs exist"
                    + (f" (missing {' '.join(missing)})" if missing else ""))
             report(not mixed, f"{job['name'] or jid} / {step['name']}: does not mix isolated and other commands")
+            if iso and job["name"] in REQUIRED:
+                through = starts_through_wrapper(step["text"])
+                report(through, f"{job['name'] or jid} / {step['name']}: "
+                       + ("starts through the descriptor wrapper" if through else "does not start through the descriptor wrapper"))
             if iso and first is None:
                 first = step["name"]
             elif not iso and first is not None:
