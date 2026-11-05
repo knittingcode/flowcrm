@@ -1011,7 +1011,17 @@ private.
   through a `make` target) is `no-docker.sh`, its test harness
   `no-docker.test.sh`, or a script with the re-exec stanza. A step that
   mixes such commands with others fails;
-- the required jobs exist;
+- the workflow is in a strict subset of YAML, read without PyYAML, which the
+  check cannot assume on the runner. Any other spelling (`env :`, a bare `-`, an
+  anchor, a merge key) fails, because GitHub may read it differently;
+- the workflow, its jobs and its steps have only known keys, so `needs:` and
+  `strategy:` fail, and the workflow runs for every pull request with no path
+  filter;
+- the required jobs exist once and run exactly their six suites, in order;
+- no step writes to `$GITHUB_ENV` or `$GITHUB_PATH`, in its text or in a script it
+  runs. A computed name is not seen;
+- nothing but comments, `set` options and the assignment of `$here` comes before
+  the re-exec stanza of a script that counts as isolated;
 - no job or step has an `if:` condition or a `continue-on-error:` key;
 - every isolated step of the required jobs is exactly one command through
   `scripts/ci/fdnorm.py`, and that file exists;

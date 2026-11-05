@@ -146,7 +146,7 @@ def workflow(*guard_steps):
         for i, run in enumerate(steps):
             body += [f"      - name: Step {i}", f"        run: {run}"]
         return "\n".join(body)
-    return ("name: CI\non:\n  push:\njobs:\n" + job("guard", "Repository guard", guard_steps) + "\n"
+    return ("name: CI\non:\n  pull_request:\njobs:\n" + job("guard", "Repository guard", guard_steps) + "\n"
             + job("devenv", "Dev environment", [f"{W} {ISO}"]) + "\n")
 
 
@@ -168,7 +168,7 @@ def run_text(text):
 GOOD_STEP = f"      - name: Suite\n        run: {W} {ISO}\n"
 JOBS = ("  guard:\n    name: Repository guard\n{job}    runs-on: ubuntu-24.04\n    steps:\n" + "{step}"
         + "  devenv:\n    name: Dev environment\n    runs-on: ubuntu-24.04\n    steps:\n" + GOOD_STEP)
-BASE = "name: CI\non:\n  push:\n{top}jobs:\n" + JOBS
+BASE = "name: CI\non:\n  pull_request:\n{top}jobs:\n" + JOBS
 p = run_text(BASE.format(top="", job="", step=GOOD_STEP))
 check(p.returncode == 0, f"the exact step with no extra keys passes (rc {p.returncode})")
 p = run_text(BASE.format(top="", job="", step=GOOD_STEP + "        timeout-minutes: 5\n"))
@@ -213,6 +213,188 @@ os.rename(os.path.join(root, "scripts/ci/fdnorm.py"), os.path.join(root, "script
 p = run_order("scripts/guard.sh", f"{W} {ISO}")
 check(p.returncode != 0 and "wrapper" in p.stdout, "a wrapper that does not exist fails")
 os.rename(os.path.join(root, "scripts/ci/fdnorm.gone"), os.path.join(root, "scripts/ci/fdnorm.py"))
+
+# --- spellings GitHub reads and a line reader may not (FCRM-PARADEV-005)
+GATE = "      - name: Gate\n        run: scripts/guard.sh\n"
+SAFE = BASE.format(top="", job="", step=GATE + GOOD_STEP)
+p = run_text(SAFE)
+check(p.returncode == 0, f"a gate before the suites passes (rc {p.returncode})")
+
+
+def refused(label, text):
+    p = run_text(text)
+    check(p.returncode == 1 and "FAIL" in p.stdout and "Traceback" not in p.stderr, f"refused: {label} (rc {p.returncode})")
+
+
+def good(top="", job="", step=None, tail=""):
+    return BASE.format(top=top, job=job, step=GATE + GOOD_STEP if step is None else step) + tail
+
+
+# Hidden or malformed steps.
+refused("a bare dash hides a later step", good(tail="        timeout-minutes: 5\n      -\n          run: docker ps\n"))
+refused("a bare dash with a later key", good(tail="      -\n        run: docker ps\n"))
+refused("two spaces after the dash", good(tail="      -  run: docker ps\n"))
+refused("a step at another indent", good(tail="       - run: docker ps\n"))
+refused("a list item that is not a mapping", good(tail="      - docker ps\n"))
+refused("a nested list in a step", good(tail="        - run: docker ps\n"))
+refused("steps in a flow list", SAFE.replace("    steps:\n", "    steps: [{run: docker ps}]\n    x:\n", 1))
+refused("a job in a flow mapping", good(tail="  hidden: {runs-on: ubuntu-24.04, steps: [{run: docker ps}]}\n"))
+refused("a job with steps at the indent of the key", good(tail="  other:\n    runs-on: ubuntu-24.04\n    steps:\n    - run: docker ps\n"))
+refused("a decoy step in a multi-line concurrency", good(tail="  other:\n    runs-on: ubuntu-24.04\n    concurrency: |\n      - run: " + f"{W} {ISO}\n    steps:\n    - run: docker ps\n"))
+refused("a tab in the indent", good(tail="\t- run: docker ps\n"))
+refused("a job without steps", good(tail="  other:\n    runs-on: ubuntu-24.04\n"))
+# Run blocks read differently.
+for label, run in (
+    ("a comment line first in a folded run", f">-\n          #\n          {W} {ISO}"),
+    ("a comment line first in a literal run", f"|\n          # {W} {ISO}\n          {W} {ISO}"),
+    ("a comment line after a folded run", f">-\n          {W} {ISO}\n          #"),
+    ("a keep block indicator", f"|+\n          {W} {ISO}"),
+    ("an indent indicator", f">2\n          {W} {ISO}"),
+    ("an alias", "*suite"),
+    ("an anchor", f"&suite {W} {ISO}"),
+    ("a tag", f"!!str {W} {ISO}"),
+    ("a double-quoted value with an escape", f'"{W} {ISO}\\n"'),
+    ("a multi-line plain value", f"{W} {ISO}\n          docker ps"),
+    ("a null run", "~"),
+    ("a mapping run", f"{{a: b}}"),
+):
+    refused(label, good(step=f"      - name: Suite\n        run: {run}\n"))
+refused("a run that is only a comment", good(step=f"      - name: Gate\n        run: '# nothing'\n      - name: Suite\n        run: >-\n          #\n          {W} {ISO}\n"))
+# Other ways to write a key.
+for key in ("env :", '"env":', "'env':", "env\t:", "? env", "<<: *x", "&a env:", "!!str env:"):
+    refused(f"workflow key {key!r}", good(top=key + "\n  BASH_ENV: x\n"))
+    refused(f"job key {key!r}", good(job="    " + key + "\n      BASH_ENV: x\n"))
+for key in ("defaults :", '"defaults":'):
+    refused(f"workflow key {key!r}", good(top=key + "\n  run:\n    shell: sh\n"))
+refused("step key 'shell :'", good(step=GOOD_STEP + "        shell : sh\n"))
+refused('step key "run":', good(step=f'      - name: Suite\n        "run": {W} {ISO}\n'))
+refused("a duplicate run key", good(step=GOOD_STEP + "        run: docker ps\n"))
+refused("a duplicate job key", good(tail="  guard:\n    runs-on: ubuntu-24.04\n    steps:\n" + GOOD_STEP))
+refused("a duplicate workflow key", good(top="name: other\n"))
+refused("a document marker", "---\n" + good())
+refused("a second document", good() + "---\nname: x\n")
+refused("a directive", "%YAML 1.1\n" + good())
+for ch, label in (("\x85", "NEL"), ("\u2028", "LINE SEPARATOR"), ("\r", "CR"), ("\x0c", "FF")):
+    refused(f"a {label} character", good().replace("name: CI", f"name: CI{ch}jobs:", 1))
+# The gates and required jobs cannot be switched off.
+for key in ("continue-on-error : true", '"continue-on-error": true', "continue-on-error: true", "if : false", '"if": false', "if: false"):
+    refused(f"gate step {key!r}", good(step=f"      - name: Gate\n        {key}\n        run: scripts/guard.sh\n" + GOOD_STEP))
+    refused(f"required job {key!r}", good(job=f"    {key}\n"))
+refused("a required job with needs", good(job="    needs: other\n"))
+refused("a required job that is a reusable workflow", good(job="    uses: x/y/.github/workflows/z.yml@main\n"))
+refused("a required job with a matrix", good(job="    strategy:\n      matrix:\n        a: [b]\n"))
+refused("a required job in a container", good(job="    container: img\n"))
+refused("a required job on a computed runner", good().replace("runs-on: ubuntu-24.04", "runs-on: ${{ vars.x }}", 1))
+refused("a required job twice", good(tail="  again:\n    name: Dev environment\n    runs-on: ubuntu-24.04\n    steps:\n" + GOOD_STEP))
+refused("a workflow not run for pull requests", good().replace("  pull_request:\n", "  push:\n", 1))
+refused("a path filter", good().replace("  pull_request:\n", "  pull_request:\n    paths:\n      - docs/x\n", 1))
+refused("branches-ignore", good().replace("  pull_request:\n", "  pull_request:\n    branches-ignore: [main]\n", 1))
+refused("branches without main", good().replace("  pull_request:\n", "  pull_request:\n    branches: [other]\n", 1))
+refused("another trigger", good().replace("  pull_request:\n", "  pull_request:\n  workflow_dispatch:\n", 1))
+refused("an unknown workflow key", good(top="x-note: y\n"))
+refused("a step with neither run nor uses", good(step="      - name: Nothing\n" + GOOD_STEP))
+refused("a step with both run and uses", good(step="      - name: Both\n        uses: a/b@" + "0" * 40 + "\n        run: scripts/guard.sh\n" + GOOD_STEP))
+refused("an action that is not pinned", good(step="      - name: Mutable\n        uses: a/b@main\n" + GOOD_STEP))
+refused("a gate step with env", good(step="      - name: Gate\n        env:\n          X: y\n        run: scripts/guard.sh\n" + GOOD_STEP))
+# Settings written for later steps.
+for text in ('echo "BASH_ENV=$PWD/x" >> "$GITHUB_ENV"', 'echo x >> "$GITHUB_PATH"', "echo x >> ${GITHUB_ENV}", 'echo x >> "$GITHUB_"ENV',
+             "echo x >> $GITHUB_\\ENV", "echo ::add-path::x", "echo ::set-env name=a::b", "tee -a $GITHUB_PATH"):
+    refused(f"a step that runs {text!r}", good(step=f"      - name: Seed\n        run: {text}\n" + GOOD_STEP))
+refused("GITHUB_ENV in a folded step", good(step="      - name: Seed\n        run: >-\n          echo x\n          >> $GITHUB_ENV\n" + GOOD_STEP))
+write("scripts/seed.sh", '#!/bin/bash\necho "BASH_ENV=x" >>"$GITHUB_ENV"\n')
+refused("a script that writes GITHUB_ENV", good(step="      - name: Seed\n        run: scripts/seed.sh\n" + GOOD_STEP))
+write("Makefile", "iso:\n\tscripts/iso.test.sh\nother:\n\tdocker ps\nseed:\n\tscripts/seed.sh\n")
+refused("a make target that writes GITHUB_ENV", good(step="      - name: Seed\n        run: make seed\n" + GOOD_STEP))
+
+# A script is isolated only if nothing runs before its stanza.
+write("scripts/late.test.sh", "#!/bin/bash\ndocker ps\n" + STANZA)
+check(not classify(f"{W} scripts/late.test.sh")[0], "not isolated: a command before the stanza")
+write("scripts/first.test.sh", '#!/bin/bash\n# Comment.\nset -u\n\nhere=$(cd "$(dirname "$0")" && pwd)\n# Comment.\n' + STANZA)
+check(classify(f"{W} scripts/first.test.sh")[0], "isolated: only set, here and comments before the stanza")
+write("scripts/first-p.test.sh", '#!/bin/bash\nhere=$(cd -P "$(dirname "$0")" && pwd -P)\n' + STANZA)
+check(classify(f"{W} scripts/first-p.test.sh")[0], "isolated: the -P form of here")
+write("scripts/assign.test.sh", '#!/bin/bash\nhere=$(docker ps)\n' + STANZA)
+check(not classify(f"{W} scripts/assign.test.sh")[0], "not isolated: another assignment of here")
+
+# Harmless spellings of this subset still read.
+p = run_text(good(top="# A comment.\n\n", job="    # A comment.\n    timeout-minutes: 10\n",
+                  step="      # A comment.\n      - name: Checkout\n        uses: a/b@" + "0" * 40 + " # v1\n        with:\n          persist-credentials: false\n"
+                       + "      - name: Folded\n        run: >-\n          scripts/guard.sh\n          --flag\n"
+                       + "      - name: Literal\n        run: |\n          scripts/guard.sh\n\n          # Not a suite.\n          scripts/guard.sh\n"
+                       + "      - name: 'Quoted name'\n        run: scripts/guard.sh\n" + GOOD_STEP))
+check(p.returncode == 0, f"comments, folded and literal runs, and quoted names read (rc {p.returncode}) {p.stdout[-300:] if p.returncode else ''}")
+tree = order.load_workflow("a:\n  b: 'c'\n  d: \"e\"\n  f: [g, h]\n  i: j # k\n  l: |\n    m\n      n\n\n    # o\n  p: >-\n    q\n    r\n  s:\n    - t: u\n      v: w\n    - x: y\n  z:\n")
+check(tree == {"a": {"b": "c", "d": "e", "f": ["g", "h"], "i": "j", "l": "m\n  n\n\n# o", "p": "q r", "s": [{"t": "u", "v": "w"}, {"x": "y"}], "z": None}},
+      "the subset reads to the tree YAML gives")
+
+# --- the six suites of the real workflow
+real = tempfile.mkdtemp(prefix="order-real.")
+for rel in sum(order.SUITES.values(), []) + ["scripts/ci/no-docker.sh", "scripts/ci/fdnorm.py"]:
+    full = os.path.join(real, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w") as f:
+        f.write("#!/bin/bash\n" + STANZA)
+wfdir = os.path.join(real, ".github/workflows")
+os.makedirs(wfdir)
+
+
+def real_workflow(guard, devenv):
+    def steps(paths):
+        return "".join(f"      - name: Step {i}\n        run: {W} {path}\n" for i, path in enumerate(paths))
+    return ("name: CI\non:\n  pull_request:\njobs:\n  guard:\n    name: Repository guard\n    runs-on: ubuntu-24.04\n    steps:\n" + steps(guard)
+            + "  devenv:\n    name: Dev environment\n    runs-on: ubuntu-24.04\n    steps:\n" + steps(devenv))
+
+
+def run_real(guard, devenv):
+    with open(os.path.join(wfdir, "ci.yml"), "w") as f:
+        f.write(real_workflow(guard, devenv))
+    return subprocess.run([sys.executable, "-I", path, real], capture_output=True, text=True)
+
+
+G, U = order.SUITES["Repository guard"], order.SUITES["Dev environment"]
+check(len(G) + len(U) == 6, "six suites are listed")
+p = run_real(G, U)
+check(p.returncode == 0, f"the six suites in order pass (rc {p.returncode}) {p.stdout[-200:] if p.returncode else ''}")
+for label, guard, devenv in (
+    ("a suite left out", G[:-1], U),
+    ("the last suite left out", G, []),
+    ("suites in another order", G[::-1], U),
+    ("a suite twice", G + G[-1:], U),
+    ("a suite in the other job", G[1:], U + G[:1]),
+):
+    p = run_real(guard, devenv)
+    check(p.returncode == 1, f"refused: {label} (rc {p.returncode})")
+
+# --- the real workflow reads the same here and in PyYAML, where that exists
+repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+real_ci = os.path.join(repo, ".github/workflows/ci.yml")
+try:
+    import yaml
+except ImportError:
+    yaml = None
+if yaml is None or not os.path.isfile(real_ci):
+    print("skip the comparison with PyYAML: PyYAML or the real workflow is not available")
+else:
+    def text_tree(node):
+        if isinstance(node, dict):
+            return {("on" if k is True else str(k)): text_tree(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [text_tree(v) for v in node]
+        if node is None:
+            return None
+        return str(node).lower() if isinstance(node, bool) else str(node)
+    with open(real_ci) as f:
+        text = f.read()
+    mine = order.load_workflow(text)
+    theirs = text_tree(yaml.safe_load(text))
+    # YAML keeps the trailing line break of a literal block; the shell does not care.
+    def trimmed(node):
+        if isinstance(node, dict):
+            return {k: trimmed(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [trimmed(v) for v in node]
+        return node.rstrip("\n") if isinstance(node, str) else node
+    check(trimmed(mine) == trimmed(theirs), "the real ci.yml reads the same as in PyYAML")
 
 print(f"SUMMARY {passed} ok, {failed} failed")
 sys.exit(0 if failed == 0 else 1)
