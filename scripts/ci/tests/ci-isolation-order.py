@@ -110,7 +110,8 @@ KEY = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?: +(.*))?")
 FLOW_LIST = re.compile(r"\[ *[\w.-]+(?: *, *[\w.-]+)* *\]")
 BLOCK_HEADERS = ("|", "|-", ">", ">-")
 # A line break or control character that a line-by-line reader and YAML see differently.
-BAD_CHAR = re.compile("[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u2028\\u2029\\ufeff]")
+# Unicode spaces too: Python's strip removes them, and YAML and the shell keep them.
+BAD_CHAR = re.compile("[\\x00-\\x09\\x0b-\\x1f\\x7f-\\xa0\\u1680\\u180e\\u2000-\\u200f\\u2028-\\u202f\\u205f-\\u2064\\u3000\\ufeff]")
 
 
 def line_indent(line):
@@ -124,7 +125,7 @@ def is_blank(line):
 
 def scalar(value, no):
     """A one-line value. Always a string, or a list for a flow list of plain words."""
-    value = value.strip()
+    value = value.strip(" ")
     quoted = re.fullmatch(r"(?:'([^']*)'|\"([^\"\\\\]*)\")(?: +#.*)?", value)
     if quoted:
         return quoted.group(1) if quoted.group(1) is not None else quoted.group(2)
@@ -190,7 +191,7 @@ class Reader:
             if key in result:
                 raise Unreadable(f"line {no}: duplicate key {key}")
             self.i += 1
-            value = (value or "").strip()
+            value = (value or "").strip(" ")
             if value in BLOCK_HEADERS:
                 result[key] = self.block_scalar(indent, value, no)
             elif not value or value.startswith("#"):
@@ -355,7 +356,23 @@ def propagates(root, step):
                     texts.append(f.read())
             except OSError:
                 pass
-    return any(PROPAGATES.search(re.sub(r"[\"'\\\\]", "", t)) for t in texts)
+    return any(PROPAGATES.search(re.sub(r"[\"'\\\\\n]", "", t)) for t in texts)
+
+
+def late_stanzas(root, step):
+    """Scripts a step runs that have the stanza after other code: such a script is
+    neither isolated nor ordinary, so it is refused rather than reclassified."""
+    found = []
+    for w in step_commands(root, step["text"]):
+        if SCRIPT.fullmatch(w):
+            try:
+                with open(os.path.join(root, w), encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            if STANZA.search(content) and not stanza_first(content):
+                found.append(w)
+    return found
 
 
 def check_trigger(tree):
@@ -367,7 +384,8 @@ def check_trigger(tree):
     for event, spec in on.items():
         if event not in ("pull_request", "push"):
             problems.append(f"event {event}")
-        elif spec is not None and (not isinstance(spec, dict) or set(spec) != {"branches"} or "main" not in (spec["branches"] or [])):
+        elif spec is not None and (not isinstance(spec, dict) or set(spec) != {"branches"} or not isinstance(spec["branches"], list)
+                                   or "main" not in spec["branches"]):
             problems.append(f"{event} has filters other than branches including main")
     return problems
 
@@ -422,7 +440,7 @@ def isolated(root, step):
 def starts_through_wrapper(text):
     """The whole step is one command in the exact form of WRAPPED. One suite per
     step: a second one joined by || or | could hide the first one's failure."""
-    return bool(WRAPPED.fullmatch(text.strip()))
+    return bool(WRAPPED.fullmatch(text))
 
 
 def tracked(root):
@@ -468,6 +486,9 @@ def main():
                    + (f" (missing {' '.join(missing)})" if missing else ""))
             report(not mixed, f"{job['name'] or jid} / {step['name']}: does not mix isolated and other commands")
             report(not propagates(root, step), f"{job['name'] or jid} / {step['name']}: writes nothing to GITHUB_ENV or GITHUB_PATH")
+            late_scripts = late_stanzas(root, step)
+            report(not late_scripts, f"{job['name'] or jid} / {step['name']}: no script runs code before its stanza"
+                   + (f" ({' '.join(late_scripts)})" if late_scripts else ""))
             if iso and job["name"] in REQUIRED:
                 through = starts_through_wrapper(step["text"])
                 report(through, f"{job['name'] or jid} / {step['name']}: "
@@ -485,7 +506,7 @@ def main():
         if job["name"] in REQUIRED:
             report(first is not None, f"{job['name']}: has isolated steps (first: {first})")
         if real and job["name"] in SUITES:
-            ran = [m.group(1) for m in (WRAPPED.fullmatch(s["text"].strip()) for s in job["steps"]) if m]
+            ran = [m.group(1) for m in (WRAPPED.fullmatch(s["text"]) for s in job["steps"]) if m]
             report(ran == SUITES[job["name"]], f"{job['name']}: runs exactly its wrapped suites, in order"
                    + (f" (found {' '.join(ran)})" if ran != SUITES[job["name"]] else ""))
     unknown = []

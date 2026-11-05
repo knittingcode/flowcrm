@@ -292,6 +292,11 @@ refused("branches-ignore", good().replace("  pull_request:\n", "  pull_request:\
 refused("branches without main", good().replace("  pull_request:\n", "  pull_request:\n    branches: [other]\n", 1))
 refused("another trigger", good().replace("  pull_request:\n", "  pull_request:\n  workflow_dispatch:\n", 1))
 refused("an unknown workflow key", good(top="x-note: y\n"))
+refused("branches as a word that contains main", good().replace("  pull_request:\n", "  pull_request:\n    branches: domain\n", 1))
+refused("branches as the word main", good().replace("  pull_request:\n", "  pull_request:\n    branches: main\n", 1))
+for ch, label in (("\xa0", "NO-BREAK SPACE"), ("\u2003", "EM SPACE"), ("\u200b", "ZERO WIDTH SPACE"), ("\u3000", "IDEOGRAPHIC SPACE"), ("\u205f", "MATHEMATICAL SPACE")):
+    refused(f"a {label} at the end of a quoted run", good(step=f'      - name: Suite\n        run: "{W} {ISO}{ch}"\n'))
+    refused(f"a {label} at the end of a plain run", good(step=f"      - name: Suite\n        run: {W} {ISO}{ch}\n"))
 refused("a step with neither run nor uses", good(step="      - name: Nothing\n" + GOOD_STEP))
 refused("a step with both run and uses", good(step="      - name: Both\n        uses: a/b@" + "0" * 40 + "\n        run: scripts/guard.sh\n" + GOOD_STEP))
 refused("an action that is not pinned", good(step="      - name: Mutable\n        uses: a/b@main\n" + GOOD_STEP))
@@ -300,6 +305,7 @@ refused("a gate step with env", good(step="      - name: Gate\n        env:\n   
 for text in ('echo "BASH_ENV=$PWD/x" >> "$GITHUB_ENV"', 'echo x >> "$GITHUB_PATH"', "echo x >> ${GITHUB_ENV}", 'echo x >> "$GITHUB_"ENV',
              "echo x >> $GITHUB_\\ENV", "echo ::add-path::x", "echo ::set-env name=a::b", "tee -a $GITHUB_PATH"):
     refused(f"a step that runs {text!r}", good(step=f"      - name: Seed\n        run: {text}\n" + GOOD_STEP))
+refused("a line continuation in the name", good(step='      - name: Seed\n        run: |\n          printf x >> "$GITHUB_EN\\\n          V"\n' + GOOD_STEP))
 refused("GITHUB_ENV in a folded step", good(step="      - name: Seed\n        run: >-\n          echo x\n          >> $GITHUB_ENV\n" + GOOD_STEP))
 write("scripts/seed.sh", '#!/bin/bash\necho "BASH_ENV=x" >>"$GITHUB_ENV"\n')
 refused("a script that writes GITHUB_ENV", good(step="      - name: Seed\n        run: scripts/seed.sh\n" + GOOD_STEP))
@@ -309,6 +315,7 @@ refused("a make target that writes GITHUB_ENV", good(step="      - name: Seed\n 
 # A script is isolated only if nothing runs before its stanza.
 write("scripts/late.test.sh", "#!/bin/bash\ndocker ps\n" + STANZA)
 check(not classify(f"{W} scripts/late.test.sh")[0], "not isolated: a command before the stanza")
+refused("a script with code before its stanza, as an ordinary step", good(step="      - name: Late\n        run: scripts/late.test.sh\n" + GOOD_STEP))
 write("scripts/first.test.sh", '#!/bin/bash\n# Comment.\nset -u\n\nhere=$(cd "$(dirname "$0")" && pwd)\n# Comment.\n' + STANZA)
 check(classify(f"{W} scripts/first.test.sh")[0], "isolated: only set, here and comments before the stanza")
 write("scripts/first-p.test.sh", '#!/bin/bash\nhere=$(cd -P "$(dirname "$0")" && pwd -P)\n' + STANZA)
