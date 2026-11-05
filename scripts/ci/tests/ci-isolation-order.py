@@ -33,7 +33,8 @@ Also checked:
   - no isolated step has a key other than name, run and timeout-minutes, and
     no env or defaults apply to it from its job or the workflow;
   - no step writes to $GITHUB_ENV or $GITHUB_PATH, in its text or in a script it
-    runs: that would reach later isolated steps as settings;
+    runs: that would reach later isolated steps as settings. The only action
+    allowed is actions/checkout, pinned to a commit, with persist-credentials: false;
   - a script counts as isolated only if its re-exec stanza comes before anything
     but comments, set options and the assignment of $here;
   - no job or step has an `if:` condition (one could run a non-isolated
@@ -83,7 +84,9 @@ SUITES = {
 WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 JOB_KEYS = {"name", "runs-on", "timeout-minutes", "permissions", "steps"}
 ANY_STEP_KEYS = {"name", "run", "uses", "with", "timeout-minutes"}
-PINNED = re.compile(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}")
+# The one action allowed. Any other, even pinned, could export settings for later
+# steps (core.exportVariable) in text this check does not read.
+CHECKOUT = re.compile(r"actions/checkout@[0-9a-f]{40}")
 RUNNER = re.compile(r"ubuntu-\d\d\.\d\d")
 PROPAGATES = re.compile(r"GITHUB_(ENV|PATH)|::(set-env|add-path)")
 # What may run before the re-exec stanza of a script.
@@ -409,9 +412,10 @@ def check_structure(tree, jobs):
             kinds = ("run" in raw) + ("uses" in raw)
             report(kinds == 1 and isinstance(raw.get("run", ""), str), f"{name}: has one run text or one action")
             if "uses" in raw:
-                report(isinstance(raw["uses"], str) and bool(PINNED.fullmatch(raw["uses"])), f"{name}: the action is pinned to a commit")
-            if "with" in raw:
-                report("uses" in raw, f"{name}: has with only for an action")
+                report(isinstance(raw["uses"], str) and bool(CHECKOUT.fullmatch(raw["uses"])), f"{name}: the action is actions/checkout, pinned to a commit")
+                report(raw.get("with") == {"persist-credentials": "false"}, f"{name}: the action has exactly persist-credentials: false")
+            elif "with" in raw:
+                report(False, f"{name}: has with only for an action")
 
 
 def isolated(root, step):

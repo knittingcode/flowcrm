@@ -299,7 +299,16 @@ for ch, label in (("\xa0", "NO-BREAK SPACE"), ("\u2003", "EM SPACE"), ("\u200b",
     refused(f"a {label} at the end of a plain run", good(step=f"      - name: Suite\n        run: {W} {ISO}{ch}\n"))
 refused("a step with neither run nor uses", good(step="      - name: Nothing\n" + GOOD_STEP))
 refused("a step with both run and uses", good(step="      - name: Both\n        uses: a/b@" + "0" * 40 + "\n        run: scripts/guard.sh\n" + GOOD_STEP))
-refused("an action that is not pinned", good(step="      - name: Mutable\n        uses: a/b@main\n" + GOOD_STEP))
+CHECKOUT_STEP = "      - name: Checkout\n        uses: actions/checkout@" + "0" * 40 + "\n        with:\n          persist-credentials: false\n"
+p = run_text(good(step=CHECKOUT_STEP + GOOD_STEP))
+check(p.returncode == 0, f"the pinned checkout passes (rc {p.returncode})")
+refused("an action that is not pinned", good(step="      - name: Mutable\n        uses: actions/checkout@main\n        with:\n          persist-credentials: false\n" + GOOD_STEP))
+refused("another action, though pinned", good(step="      - name: Other\n        uses: actions/github-script@" + "0" * 40 + "\n        with:\n          persist-credentials: false\n" + GOOD_STEP))
+refused("an action that exports BASH_ENV", good(step="      - name: Seed\n        uses: actions/github-script@" + "0" * 40 + "\n        with:\n          script: |\n            core.exportVariable('BASH_ENV', '/tmp/x');\n" + GOOD_STEP))
+refused("a checkout that keeps credentials", good(step=CHECKOUT_STEP.replace("false", "true") + GOOD_STEP))
+refused("a checkout of another ref", good(step=CHECKOUT_STEP + "          ref: other\n" + GOOD_STEP))
+refused("a checkout without with", good(step="      - name: Checkout\n        uses: actions/checkout@" + "0" * 40 + "\n" + GOOD_STEP))
+refused("with on a run step", good(step="      - name: Run\n        run: scripts/guard.sh\n        with:\n          a: b\n" + GOOD_STEP))
 refused("a gate step with env", good(step="      - name: Gate\n        env:\n          X: y\n        run: scripts/guard.sh\n" + GOOD_STEP))
 # Settings written for later steps.
 for text in ('echo "BASH_ENV=$PWD/x" >> "$GITHUB_ENV"', 'echo x >> "$GITHUB_PATH"', "echo x >> ${GITHUB_ENV}", 'echo x >> "$GITHUB_"ENV',
@@ -325,7 +334,7 @@ check(not classify(f"{W} scripts/assign.test.sh")[0], "not isolated: another ass
 
 # Harmless spellings of this subset still read.
 p = run_text(good(top="# A comment.\n\n", job="    # A comment.\n    timeout-minutes: 10\n",
-                  step="      # A comment.\n      - name: Checkout\n        uses: a/b@" + "0" * 40 + " # v1\n        with:\n          persist-credentials: false\n"
+                  step="      # A comment.\n      - name: Checkout\n        uses: actions/checkout@" + "0" * 40 + " # v1\n        with:\n          persist-credentials: false\n"
                        + "      - name: Folded\n        run: >-\n          scripts/guard.sh\n          --flag\n"
                        + "      - name: Literal\n        run: |\n          scripts/guard.sh\n\n          # Not a suite.\n          scripts/guard.sh\n"
                        + "      - name: 'Quoted name'\n        run: scripts/guard.sh\n" + GOOD_STEP))

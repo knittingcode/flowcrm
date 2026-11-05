@@ -1019,7 +1019,9 @@ private.
   filter;
 - the required jobs exist once and run exactly their six suites, in order;
 - no step writes to `$GITHUB_ENV` or `$GITHUB_PATH`, in its text or in a script it
-  runs. A computed name is not seen;
+  runs. A computed name is not seen. The only action allowed is `actions/checkout`,
+  pinned to a commit, with `persist-credentials: false`, because another could export
+  settings from text the check does not read;
 - nothing but comments, `set` options and the assignment of `$here` comes before
   the re-exec stanza of a script that counts as isolated;
 - no job or step has an `if:` condition or a `continue-on-error:` key;
