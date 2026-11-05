@@ -35,6 +35,7 @@ Also checked:
   - no step writes to $GITHUB_ENV or $GITHUB_PATH, in its text or in a script it
     runs: that would reach later isolated steps as settings. The only action
     allowed is actions/checkout, pinned to a commit, with persist-credentials: false;
+  - no run text has a ${{ }} expression, which GitHub expands before the shell;
   - a script counts as isolated only if its re-exec stanza comes before anything
     but comments, set options and the assignment of $here;
   - no job or step has an `if:` condition (one could run a non-isolated
@@ -409,6 +410,9 @@ def check_structure(tree, jobs):
             raw = step["raw"]
             extra = sorted(step["keys"] - ANY_STEP_KEYS - {"if", "continue-on-error"})
             report(not extra, f"{name}: the step has only known keys" + (f" (also: {', '.join(extra)})" if extra else ""))
+            # GitHub expands an expression before the shell sees the text, so nothing
+            # read here is what would run.
+            report("${{" not in step["text"], f"{name}: has no expression in its run text")
             kinds = ("run" in raw) + ("uses" in raw)
             report(kinds == 1 and isinstance(raw.get("run", ""), str), f"{name}: has one run text or one action")
             if "uses" in raw:
