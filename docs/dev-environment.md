@@ -852,10 +852,24 @@ the caller's primary group with its name and the group of
 `/var/run/docker.sock`. The command keeps the caller's primary group,
 which must not be a system group (above).
 
-**Status of the evidence.** This Linux path has not yet run in CI. The
-spike runs 41200868832 (inconclusive) and 41209833578 (GO) showed the
-kernel mechanism only, not this launcher. The first green run of the L-tests
-on a GitHub-hosted runner will be its first evidence.
+**Status of the evidence.** This Linux path has run on a GitHub-hosted
+runner. CI run
+[42049053505](https://github.com/knittingcode/flowcrm/actions/runs/42049053505)
+of 2026-11-05, a push of preview commit
+`7e7d4d38d054caeb5756bc785a6e73cab42548ea`, succeeded and executed all six
+protected suites, among them `scripts/ci/tests/no-docker.test.sh` (182 of
+182) and `tests/devenv/unit.sh` (341 of 341). The earlier spike runs
+41200868832 (inconclusive) and 41209833578 (GO) showed the kernel mechanism
+only, not this launcher.
+
+That run is evidence from a push of a preview branch. It does not replace
+the required `pull_request` checks of the final integration revision, which
+must pass on that revision. It is not a release approval. It does not show
+that the images have no vulnerabilities: the container scan passed under its
+exception policy. It does not show that nothing was left behind: the
+workflow takes no final inventory of the runner, and the removal of the scan
+cache reported permission errors in that run. The accepted residual risks
+below still apply.
 
 #### Run directory (`--work DIR`)
 
