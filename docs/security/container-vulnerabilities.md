@@ -237,10 +237,12 @@ was added.
 
 ## Runtime image packages (2026-11-16)
 
-Published after the last green scan of the code now on `main` (PR #43, run
-42065181780, 2026-11-05); found by the scan of `main` after that merge (run
-43888920527, 2026-11-16), not by a change of the project. The scan reported
-23 HIGH findings in the three runtime images, all with a fixed version:
+Reported by the scan of `main` in run 43888920527 (2026-11-16, 17 of 20
+checks passed). The scan of the same tree and the same pinned base images
+had passed with 20 of 20 in the pull request run 42065181780 (2026-11-05),
+so the findings come from vulnerability data that the scanner received in
+between, not from a change of the project. The scan reported 23 HIGH
+findings in the three runtime images, all with a fixed version:
 
 | Image | Base (Alpine) | Finding | Installed | Fixed in |
 |---|---|---|---|---|
