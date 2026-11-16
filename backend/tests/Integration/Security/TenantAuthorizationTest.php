@@ -94,7 +94,7 @@ final class TenantAuthorizationTest extends FpmApiTestCase
         self::assertIsString($membershipId);
         self::assertTrue(Uuid::isValid($membershipId));
         self::assertSame('REP', $response->value('membership', 'role'));
-        self::assertSame(['organization.view', 'membership.list'], $response->value('membership', 'permissions'));
+        self::assertSame(['organization.view', 'membership.list', 'account.view', 'account.manage'], $response->value('membership', 'permissions'));
     }
 
     /** The provisional matrix: the directory for every role, e-mail addresses for ADMIN and MANAGER only. */
@@ -198,7 +198,7 @@ final class TenantAuthorizationTest extends FpmApiTestCase
         self::assertArrayNotHasKey('email', (array) $client->get($path)->value('data', 0));
         $organization = $client->get('/api/v1/organizations/'.$this->a->toRfc4122());
         self::assertSame('REP', $organization->value('membership', 'role'));
-        self::assertSame(['organization.view', 'membership.list'], $organization->value('membership', 'permissions'));
+        self::assertSame(['organization.view', 'membership.list', 'account.view', 'account.manage'], $organization->value('membership', 'permissions'));
     }
 
     public function testPaginationIsValidated(): void

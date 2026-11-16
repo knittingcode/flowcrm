@@ -118,3 +118,45 @@ caption {
   align-items: center;
   margin-top: 1rem;
 }
+
+.record-form {
+  max-width: 28rem;
+  margin-top: 2rem;
+}
+
+.record-form fieldset {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 0.25rem;
+}
+
+.record-form legend {
+  font-weight: 700;
+  padding: 0 0.25rem;
+}
+
+.record-form .field {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.record-form input {
+  font: inherit;
+  padding: 0.4rem 0.5rem;
+}
+
+.record-form button {
+  justify-self: start;
+}
+
+.field-error {
+  margin: 0;
+  color: #c62828;
+  font-size: 0.875rem;
+}
+
+.danger {
+  margin-top: 2rem;
+}

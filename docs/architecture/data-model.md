@@ -12,7 +12,7 @@ the `Domain` layer of their module (`docs/architecture/backend-modules.md`).
 | Instants | `timestamptz` (DBAL `datetimetz_immutable`, second precision), stored in UTC |
 | Tenant tables | `organization_id uuid NOT NULL` plus `UNIQUE (organization_id, id)`, so child tables can reference `(organization_id, id)` |
 | References between modules | by ID only (no ORM associations); the foreign keys are declared by each module's `Infrastructure\Persistence\*Schema` listener so that `doctrine:schema:validate` compares them |
-| Removal | rows are not deleted: memberships get `status = 'REMOVED'` and `removed_at`, stages `archived_at` |
+| Removal | rows are not deleted: memberships get `status = 'REMOVED'` and `removed_at`, stages and accounts `archived_at` |
 
 ## Tables
 
@@ -23,6 +23,7 @@ the `Domain` layer of their module (`docs/architecture/backend-modules.md`).
 | `memberships` | Organizations | FK → `organizations`, FK → `users`; `UNIQUE (organization_id, user_id)`; `UNIQUE (organization_id, id)`; `CHECK (role IN ('ADMIN','MANAGER','REP'))`; `CHECK (status IN ('ACTIVE','REMOVED'))`; `CHECK ((status = 'REMOVED') = (removed_at IS NOT NULL))`; index `(user_id) WHERE status = 'ACTIVE'` |
 | `pipelines` | Sales | FK → `organizations`; `UNIQUE (organization_id)` (one pipeline per organization); `UNIQUE (organization_id, id)` |
 | `pipeline_stages` | Sales | composite FK `(organization_id, pipeline_id)` → `pipelines (organization_id, id)`; `UNIQUE (organization_id, id)`; active names unique per pipeline regardless of case (`pipeline_stages_active_name_key`, `WHERE archived_at IS NULL`); `UNIQUE (pipeline_id, position) DEFERRABLE INITIALLY DEFERRED` (stages can be reordered in one transaction) |
+| `accounts` | CRM | FK → `organizations`; `UNIQUE (organization_id, id)`; `CHECK (length(btrim(name)) BETWEEN 1 AND 200)`; length checks for `website` (2048), `email` (254) and `phone` (50); format rules are checked by `AccountDetails`; created by `Version20261116180000`; the runtime role has `SELECT, INSERT, UPDATE` and no `DELETE` (accounts are archived with `archived_at`) |
 | `audit_events` | Audit | FK → `organizations` (nullable for platform events); `CHECK (actor_type IN ('user','platform_operator','system'))`; `changes jsonb`; `ip inet`; indexes `(organization_id, occurred_at DESC, id DESC)` and `(organization_id, entity_type, entity_id, occurred_at DESC)`; **append-only**: the runtime role `flowcrm_app` holds only `SELECT, INSERT`, and triggers reject `UPDATE`, `DELETE` and `TRUNCATE` for every role (SQLSTATE 42501); the schema owner and the superuser can still disable the triggers and remain trusted ([ADR-018](adr/ADR-018-database-roles.md)) |
 
 `schema_baseline` (FND-004) remains.
@@ -77,6 +78,7 @@ the manifest. See [ADR-018](adr/ADR-018-database-roles.md).
 | `backend/tests/Integration/Database/CoreSchemaTest.php` | with raw SQL on PostgreSQL: case-insensitive unique e-mail, e-mail length, currency allow-list, one membership per user and organization, role, status and `removed_at` checks, foreign keys, one pipeline per organization, **a stage cannot reference another organization's pipeline**, active stage names unique regardless of case (archived duplicates allowed), deferred position uniqueness (swap passes, duplicate fails), audit `UPDATE`/`DELETE`/`TRUNCATE` rejected for the runtime role by privilege and for the owner by the trigger, audit checks |
 | `backend/tests/Integration/Database/RuntimePrivilegesTest.php`, `OwnerRoleTest.php`, `RuntimePrivilegesVerifierTest.php` | what the runtime and owner roles may and may not do, and that each weakening of the privileges is reported (ADR-018) |
 | `backend/tests/Integration/Database/CoreEntitiesTest.php` | every entity is written and read back through the ORM |
+| `backend/tests/Integration/Database/AccountSchemaTest.php` | with raw SQL as the runtime role: an account needs an existing organization, the name and length checks, the unique tenant key, no `DELETE` or `TRUNCATE` for the runtime role; the entity round trip |
 | `backend/tests/Unit/Domain/CoreEntityRulesTest.php` | e-mail format and length, IANA timezone, membership removal and stage archival once, IP address |
 | `tests/app/backend.sh` BE-06 to BE-08 | migration from empty, schema in sync with the mapping, full down/up round trip |
 

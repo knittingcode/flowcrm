@@ -1,7 +1,13 @@
 import { apiRequest, unexpected } from './client.ts';
 
 export type Role = 'ADMIN' | 'MANAGER' | 'REP';
-export type Permission = 'organization.view' | 'membership.list' | 'membership.view_email';
+export type Permission =
+  | 'organization.view'
+  | 'membership.list'
+  | 'membership.view_email'
+  | 'account.view'
+  | 'account.manage'
+  | 'account.archive';
 
 export interface User {
   id: string;

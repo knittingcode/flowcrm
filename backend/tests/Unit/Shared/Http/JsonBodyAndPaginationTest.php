@@ -45,6 +45,35 @@ final class JsonBodyAndPaginationTest extends TestCase
         }
     }
 
+    public function testOptionalMembersMayBeMissingOrNull(): void
+    {
+        self::assertSame(['a' => 'x', 'b' => null, 'c' => null, 'd' => 'z'], JsonBody::fields($this->body('{"a":"x","c":null,"d":"z"}'), ['a'], ['b', 'c', 'd']));
+    }
+
+    public function testOptionalMembersAreCheckedLikeRequiredOnes(): void
+    {
+        foreach (['', '[]', 'null'] as $content) {
+            try {
+                JsonBody::fields($this->body($content), ['a'], ['b']);
+                self::fail($content);
+            } catch (BadRequestHttpException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+        try {
+            JsonBody::fields($this->body('{"b":1,"organizationId":"x","c":null}'), ['a', 'c'], ['b']);
+            self::fail('accepted');
+        } catch (ProblemException $e) {
+            self::assertSame(422, $e->getStatusCode());
+            self::assertSame(['errors' => [
+                ['pointer' => '/organizationId', 'code' => 'UNKNOWN_FIELD'],
+                ['pointer' => '/a', 'code' => 'REQUIRED'],
+                ['pointer' => '/c', 'code' => 'INVALID_TYPE'],
+                ['pointer' => '/b', 'code' => 'INVALID_TYPE'],
+            ]], $e->extensions());
+        }
+    }
+
     public function testPaginationDefaultsAndLimits(): void
     {
         $default = Pagination::of(Request::create('/x'));

@@ -56,6 +56,22 @@ final class ApiClient
         return $this->send('POST', $uri, $params + $defaults, $raw ?? (null === $json ? null : json_encode($json, \JSON_THROW_ON_ERROR)));
     }
 
+    /**
+     * A JSON PUT request, with the CSRF token when known.
+     *
+     * @param array<string, mixed>       $json
+     * @param array<string, string|null> $params
+     */
+    public function put(string $uri, array $json, array $params = []): ApiResponse
+    {
+        $defaults = ['CONTENT_TYPE' => 'application/json'];
+        if (null !== $this->csrfToken) {
+            $defaults['HTTP_X_CSRF_TOKEN'] = $this->csrfToken;
+        }
+
+        return $this->send('PUT', $uri, $params + $defaults, json_encode($json, \JSON_THROW_ON_ERROR));
+    }
+
     public function login(string $email, string $password): ApiResponse
     {
         $response = $this->post('/api/v1/auth/login', ['email' => $email, 'password' => $password]);

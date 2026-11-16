@@ -102,6 +102,8 @@ another's permissions.
 | `organization.view` | yes | yes | yes | FCRM-002 section H [TASK] |
 | `membership.list` (name, role) | yes | yes | yes | FCRM-002 section H [PROP] |
 | `membership.view_email` | yes | yes | no | not specified in FCRM-002; provisional |
+| `account.view`, `account.manage` | yes | yes | yes | MVP (docs/product/MVP.md) |
+| `account.archive` | yes | yes | no | MVP |
 
 Tenant mutations and membership management are not part of FND-010B.
 
@@ -151,7 +153,7 @@ Tenant mutations and membership management are not part of FND-010B.
 - `backend/tests/Integration/Security/*` over the real PHP-FPM,
   PdoSessionHandler and PostgreSQL; every response checked against the
   OpenAPI file.
-- `tests/app/backend.sh` BE-18: 53 negative controls, each removing one
+- `tests/app/backend.sh` BE-18: 60 negative controls, each removing one
   protection, must make their tests fail.
 - `tests/app/stack.sh` ST-16 and ST-69 to ST-73 through the real edge,
   including spoofed `X-Forwarded-For`; `tests/app/prodlike.sh` PL-16 for the

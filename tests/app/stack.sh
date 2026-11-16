@@ -1504,6 +1504,9 @@ docker exec "$cdb" psql -U flowcrm -d flowcrm -tAq -c 'CREATE TRIGGER audit_even
   [ "$(rc_of c-upg-trgdrop)" = 6 ] && err_has c-upg-trgdrop 'the audit log is not intact \(audit_events_append_only:O;' && legacy_same
 v "ST-67 a disabled or a dropped audit trigger stops the upgrade in the backup check (exit 6); nothing changed" $? "$(tail -n 1 "$work/out/c-upg-trgoff.err") | $(tail -n 1 "$work/out/c-upg-trgdrop.err")"
 
+# The upgrade then applies every migration the legacy volume did not have:
+# the privileges of the role separation (Version20261023000000) and all
+# later ones. The legacy rows and versions are compared without them.
 dv c-upgrade "$C" upgrade-roles
 dump=$(find "$C/.runtime/backups" -name 'roles_upgrade_*.dump' -type f 2>/dev/null | head -n 1)
 psql_c() { docker exec "$(cid "$C" db)" psql -U flowcrm -d flowcrm -tAq -c "$1" 2>&1; }
@@ -1513,9 +1516,9 @@ psql_c() { docker exec "$(cid "$C" db)" psql -U flowcrm -d flowcrm -tAq -c "$1" 
   [ "$(docker exec "$(cid "$C" db)" flowcrm-db-roles state)" = complete ] &&
   [ "$(psql_c "SELECT string_agg(DISTINCT pg_get_userbyid(relowner), ',') FROM pg_class WHERE relnamespace = 'public'::regnamespace")" = flowcrm_owner ] &&
   [ "$(psql_c "SELECT string_agg(tgname || ':' || tgenabled::text, ' ' ORDER BY tgname) FROM pg_trigger WHERE tgrelid = 'audit_events'::regclass AND NOT tgisinternal")" = 'audit_events_append_only:O audit_events_no_truncate:O' ] &&
-  [ "$(psql_c "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions WHERE version <> 'DoctrineMigrations\Version20261023000000'")" = "$legacy_versions" ] &&
+  [ "$(psql_c "SELECT string_agg(version, ',' ORDER BY version) FROM doctrine_migration_versions WHERE version < 'DoctrineMigrations\Version20261023000000'")" = "$legacy_versions" ] &&
   [ "$(psql_c "SELECT count(*) FROM pg_database WHERE datname LIKE '%restore_check'")" = 0 ] &&
-  [ "$(psql_c "SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT u::text t FROM users u UNION ALL SELECT o::text FROM organizations o UNION ALL SELECT a::text FROM audit_events a UNION ALL SELECT s::text FROM sessions s UNION ALL SELECT c::text FROM cache_items c UNION ALL SELECT v.version::text FROM doctrine_migration_versions v WHERE v.version <> 'DoctrineMigrations\Version20261023000000') x")" = "$legacy_rows" ]
+  [ "$(psql_c "SELECT md5(string_agg(t, '|' ORDER BY t)) FROM (SELECT u::text t FROM users u UNION ALL SELECT o::text FROM organizations o UNION ALL SELECT a::text FROM audit_events a UNION ALL SELECT s::text FROM sessions s UNION ALL SELECT c::text FROM cache_items c UNION ALL SELECT v.version::text FROM doctrine_migration_versions v WHERE v.version < 'DoctrineMigrations\Version20261023000000') x")" = "$legacy_rows" ]
 v "ST-52 a volume from before role separation: make up refuses it; make db-upgrade-roles converts it after a verified backup, keeping every row" $? "$(tail -n 3 "$work/out/c-upgrade.err")"
 dv c-up2 "$C" up
 [ "$(rc_of c-up2)" = 0 ] && until_ready "$(saved_port "$C")" 200 30 && console_in "$C" app:database:verify-privileges --runtime

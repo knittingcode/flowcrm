@@ -39,6 +39,7 @@ services:
     App\Identity\Domain\UserRepository: '@App\Identity\Infrastructure\Persistence\DoctrineUserRepository'
     App\Organizations\Domain\OrganizationRepository: '@App\Organizations\Infrastructure\Persistence\DoctrineOrganizationRepository'
     App\Organizations\Domain\MembershipRepository: '@App\Organizations\Infrastructure\Persistence\DoctrineMembershipRepository'
+    App\CRM\Domain\AccountRepository: '@App\CRM\Infrastructure\Persistence\DoctrineAccountRepository'
 
     # The migrations bundle registers its dependency factory only by id.
     Doctrine\Migrations\DependencyFactory: '@doctrine.migrations.dependency_factory'

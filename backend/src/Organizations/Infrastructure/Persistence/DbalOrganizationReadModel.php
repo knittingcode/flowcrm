@@ -6,13 +6,13 @@ namespace App\Organizations\Infrastructure\Persistence;
 
 use App\Organizations\Api\MembershipDirectory;
 use App\Organizations\Api\MembershipSummary;
+use App\Organizations\Api\Permission;
 use App\Organizations\Api\TenantContext;
 use App\Organizations\Application\MemberRow;
 use App\Organizations\Application\OrganizationReadModel;
 use App\Organizations\Application\OrganizationView;
+use App\Organizations\Application\RolePolicy;
 use App\Organizations\Domain\MembershipRole;
-use App\Organizations\Domain\Permission;
-use App\Organizations\Domain\RolePolicy;
 use Doctrine\DBAL\Connection;
 use Symfony\Component\Uid\Uuid;
 

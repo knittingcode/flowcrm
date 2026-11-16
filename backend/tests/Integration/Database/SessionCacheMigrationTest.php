@@ -78,7 +78,8 @@ final class SessionCacheMigrationTest extends KernelTestCase
 
         $this->migrateTo(self::SESSIONS_AND_CACHE);
         self::assertSame($before, $this->coreRows());
-        self::assertSame(0, $this->console('doctrine:schema:validate')[0], 'schema in sync');
+        $this->assertTheMappingMatchesAfterTheLaterMigrations();
+        self::assertSame($before, $this->coreRows());
     }
 
     /**
@@ -105,7 +106,7 @@ final class SessionCacheMigrationTest extends KernelTestCase
 
         $this->migrateTo(self::SESSIONS_AND_CACHE);
         self::assertSame(['cache_items', 'sessions'], $this->tables(['sessions', 'cache_items']));
-        self::assertSame(0, $this->console('doctrine:schema:validate')[0]);
+        $this->assertTheMappingMatchesAfterTheLaterMigrations();
         $cache->close();
     }
 
@@ -243,6 +244,19 @@ final class SessionCacheMigrationTest extends KernelTestCase
         self::assertSame(0, $exit, $output);
         self::assertSame(['cache_items', 'sessions'], $this->tables(['sessions', 'cache_items']));
         self::assertSame(0, $this->console('doctrine:schema:validate')[0]);
+    }
+
+    /**
+     * The ORM mapping describes the schema after every migration, so the
+     * migrations after the one under test (privileges, later tables) run
+     * before the comparison.
+     */
+    private function assertTheMappingMatchesAfterTheLaterMigrations(): void
+    {
+        [$exit, $output] = $this->console('doctrine:migrations:migrate', '--no-interaction', '--all-or-nothing');
+        self::assertSame(0, $exit, $output);
+        [$exit, $output] = $this->console('doctrine:schema:validate');
+        self::assertSame(0, $exit, 'schema in sync: '.$output);
     }
 
     private function migrateTo(string $version): void

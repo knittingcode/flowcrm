@@ -6,7 +6,7 @@ FlowCRM is designed around practical sales workflows, with a focus on data owner
 
 ## Project Status
 
-**Foundation.** The development stack runs locally: a Symfony API under PHP-FPM, a React + TypeScript frontend with Vite, PostgreSQL, and Caddy as the single HTTP entry point. Users sign in with e-mail and password (server-side sessions), and each organization's data is visible only to its active members. There are no CRM features yet: after signing in you see your organization and its members. Users and organizations are created by the operator with console commands; there is no registration. Nothing is deployed.
+**Foundation.** The development stack runs locally: a Symfony API under PHP-FPM, a React + TypeScript frontend with Vite, PostgreSQL, and Caddy as the single HTTP entry point. Users sign in with e-mail and password (server-side sessions), and each organization's data is visible only to its active members. The first CRM feature is in place: after signing in you see your organization, its members and its accounts (customer companies), which members can add, edit and archive. Contacts, the sales pipeline with opportunities and the activity history follow; the frozen MVP scope and its backlog are in [docs/product/MVP.md](docs/product/MVP.md). Users and organizations are created by the operator with console commands; there is no registration. Nothing is deployed.
 
 ## Planned Features
 
@@ -133,6 +133,7 @@ All requests go through the URL printed by `make up`:
 | `GET /api/v1/auth/session`, `POST /api/v1/auth/login`, `POST /api/v1/auth/logout` | Symfony | the session, login and logout ([authentication](docs/architecture/authentication.md#endpoints)) |
 | `GET /api/v1/me`, `POST /api/v1/me/password` | Symfony | the logged-in user, own password change |
 | `GET /api/v1/organizations/{id}`, `…/members`, `…/members/{membershipId}` | Symfony | an organization and its member directory, for its active members |
+| `GET` and `POST …/organizations/{id}/accounts`, `GET` and `PUT …/accounts/{accountId}`, `POST …/accounts/{accountId}/archive` | Symfony | the organization's accounts (customer companies): list, create, open, edit, archive |
 | other `/api/…` paths | Symfony | RFC 9457 `application/problem+json` errors |
 | `GET /health/live` | Symfony | `200 {"status":"live"}` while PHP-FPM serves requests |
 | `GET /health/ready` | Symfony | `200 {"status":"ready"}`, or `503 {"status":"not-ready"}` when PostgreSQL is unreachable, its credential cannot be read or a migration is pending |
@@ -208,7 +209,7 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 
 ## Known limitations
 
-- No CRM features yet. The organization roles are a provisional, read-only matrix; membership management and tenant changes through the API and self-service password reset (there is no e-mail delivery) follow later ([authentication](docs/architecture/authentication.md#known-limitations)).
+- Of the CRM features only accounts exist ([MVP](docs/product/MVP.md)). The organization roles are a provisional matrix; membership management and tenant changes through the API and self-service password reset (there is no e-mail delivery) follow later ([authentication](docs/architecture/authentication.md#known-limitations)).
 - The production-like configuration is tested locally and in CI only; there is no deployment.
 - The API image is rebuilt when PHP dependencies change; there is no hot reload of Composer packages.
 
@@ -218,7 +219,7 @@ The application tests run in their own Compose projects (`<project>-test`, `<pro
 - [x] Set up Symfony and React applications
 - [x] Configure Docker, Makefile, and CI
 - [x] Implement authentication and authorization
-- [ ] Build customer and contact management
+- [ ] Build customer and contact management (accounts done, contacts next; scope and tasks in [docs/product/MVP.md](docs/product/MVP.md))
 - [ ] Implement sales pipelines
 - [ ] Add activities and notifications
 - [ ] Implement reporting and audit logs

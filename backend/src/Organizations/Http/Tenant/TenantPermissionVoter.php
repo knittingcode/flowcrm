@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace App\Organizations\Http\Tenant;
 
+use App\Organizations\Api\Permission;
 use App\Organizations\Api\TenantContext;
+use App\Organizations\Application\RolePolicy;
 use App\Organizations\Domain\MembershipRole;
-use App\Organizations\Domain\Permission;
-use App\Organizations\Domain\RolePolicy;
 use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
 use Symfony\Component\Security\Core\Authorization\Voter\Vote;
 use Symfony\Component\Security\Core\Authorization\Voter\Voter;

@@ -268,13 +268,17 @@ sessions of that user end then (the credentials fingerprint changes).
   current user's `ACTIVE` membership (`memberships_organization_user_key`).
   None, a removed one or an unknown organization: 404. Removal and role
   changes apply from the next request (TI-04).
-- **Policy:** each tenant route declares exactly one `#[TenantPermission]`;
+- **Policy:** each tenant route declares exactly one `#[TenantPermission]`
+  (`App\Organizations\Api`, so that the routes of every module can);
   otherwise it fails closed (500) and `RouteSecurityTest` fails.
-  `TenantPermissionVoter` decides with `App\Organizations\Domain\RolePolicy`
+  `TenantPermissionVoter` decides with `App\Organizations\Application\RolePolicy`
   and only for the user's own membership. Every user has `ROLE_USER` only.
 - **Queries:** every read is filtered by the organization in SQL
-  (`DbalOrganizationReadModel`); a membership ID of another organization is
-  a 404 like an unknown one.
+  (`DbalOrganizationReadModel`, `DbalAccountReadModel`), and a write loads
+  its row by organization and ID together, with a row lock
+  (`DoctrineAccountRepository`); a
+  membership or account ID of another organization is a 404 like an unknown
+  one.
 
 ### Provisional role matrix
 
@@ -283,6 +287,9 @@ sessions of that user end then (the credentials fingerprint changes).
 | `organization.view` | yes | yes | yes |
 | `membership.list` (name, role) | yes | yes | yes |
 | `membership.view_email` | yes | yes | no (provisional) |
+| `account.view` | yes | yes | yes |
+| `account.manage` | yes | yes | yes |
+| `account.archive` | yes | yes | no |
 
 Everything else is denied. The API returns each role's permissions with the
 memberships for showing controls; it decides every request itself.
@@ -380,7 +387,7 @@ time-based retention) before any real personal data is processed.
 | `RouteSecurityTest` | every tenant route has the UUID requirement and exactly one permission, pinned per route (a new tenant route or a changed permission must be added deliberately); every API route outside the public list needs a login; `/health` is outside the firewall; the specification matches the routes |
 | `AuditTrailTest`, `SecurityLoggingTest`, `ProvisioningCommandTest`, `SecurityConfigurationTest` | audit events without secrets or IP, none for failures; with the audit table failing (a test trigger): no login, no password or operator change (including enabling a user, creating a user or an organization and adding a membership), but the logout still ends the session; security log with pseudonyms (one per account, whatever the spelling of the e-mail address) and the request ID of the answer; console input rules (an address with a NUL byte or invalid UTF-8 names no user); production hasher, lifetime, limits and trusted headers |
 | Unit tests | `SecurityUser`, `PasswordPolicy`, `UserProvider` (one hash for unknown e-mails), `LoginRateLimiter`, `RolePolicy` (the matrix as data), `TenantPermissionVoter`, `TenantGuard`, `RequestOriginGuard`, `JsonBody`, `Pagination`, problem documents |
-| `tests/app/backend.sh` BE-18 | 53 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
+| `tests/app/backend.sh` BE-18 | 60 negative controls (`backend/tests/Mutation/controls.php`): each removes one protection in a copy of the backend and must make its tests fail |
 | `tests/app/stack.sh` ST-69 to ST-73, ST-16 | through the real edge: cookie attributes, logout with token and replay, cross-origin and form logins, spoofed `X-Forwarded-For` cannot evade the limit, no secrets in any log; Playwright journeys (login, logout, back button, roles, two organizations, foreign organization, CSRF) |
 | `tests/app/prodlike.sh` PL-16, PL-11 | the production cookie (`__Host-`, `Secure`) with curl; the login page under the production CSP |
 | `tests/app/prodlike.sh` PL-17 to PL-22, `frontend/e2e/https.spec.ts` | over HTTPS (see [HTTPS](#https-and-proxies)): the TLS site, spoofed forwarding headers, no CORS, an untrusted TLS proxy fails closed, the cookie and the logged-in journeys in Chromium, cross-site forgeries, the client IP behind the edge |

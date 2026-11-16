@@ -36,7 +36,7 @@ final class AuthenticationTest extends FpmApiTestCase
         self::assertIsArray($body['memberships'][0]);
         self::assertSame($organization->toRfc4122(), $body['memberships'][0]['organizationId']);
         self::assertSame('REP', $body['memberships'][0]['role']);
-        self::assertSame(['organization.view', 'membership.list'], $body['memberships'][0]['permissions']);
+        self::assertSame(['organization.view', 'membership.list', 'account.view', 'account.manage'], $body['memberships'][0]['permissions']);
         self::assertNotSame('', $response->string('csrfToken'));
         $expiresAt = new \DateTimeImmutable($response->string('expiresAt'));
         self::assertEqualsWithDelta(time() + 8 * 3600, $expiresAt->getTimestamp(), 30, 'absolute lifetime of 8 hours');

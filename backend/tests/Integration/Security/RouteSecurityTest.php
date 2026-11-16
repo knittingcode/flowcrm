@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace App\Tests\Integration\Security;
 
-use App\Organizations\Domain\Permission;
-use App\Organizations\Http\Tenant\TenantPermission;
+use App\Organizations\Api\Permission;
+use App\Organizations\Api\TenantPermission;
 use App\Tests\Support\Http\OpenApiContract;
 use Symfony\Bundle\FrameworkBundle\Test\KernelTestCase;
 use Symfony\Bundle\SecurityBundle\Security\FirewallMap;
@@ -35,6 +35,11 @@ final class RouteSecurityTest extends KernelTestCase
      * tenant route, or a changed permission, must be added here deliberately.
      */
     private const TENANT_PERMISSIONS = [
+        'api_v1_account' => Permission::AccountView,
+        'api_v1_account_archive' => Permission::AccountArchive,
+        'api_v1_account_create' => Permission::AccountManage,
+        'api_v1_account_update' => Permission::AccountManage,
+        'api_v1_accounts' => Permission::AccountView,
         'api_v1_organization' => Permission::OrganizationView,
         'api_v1_organization_member' => Permission::MembershipList,
         'api_v1_organization_members' => Permission::MembershipList,
@@ -55,7 +60,7 @@ final class RouteSecurityTest extends KernelTestCase
             self::assertSame(Requirement::UUID, $route->getRequirement('organizationId'), $name);
             self::assertCount(1, $this->permissions($route), "$name must declare exactly one TenantPermission");
         }
-        self::assertGreaterThanOrEqual(3, $tenantRoutes);
+        self::assertGreaterThanOrEqual(8, $tenantRoutes);
     }
 
     /**
