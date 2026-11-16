@@ -1,17 +1,19 @@
 import { useState } from 'react';
-import { NavLink, Outlet, useNavigate } from 'react-router';
+import { NavLink, Outlet, useMatch, useNavigate } from 'react-router';
 import { useAuth } from '../auth/context.ts';
 
-/** The layout of the logged-in application: user, organization switcher and logout. */
+/** The layout of the logged-in application: user, organization switcher, the sections of the current organization and logout. */
 export function AppShell() {
   const { state, logout } = useAuth();
   const navigate = useNavigate();
   const [pending, setPending] = useState(false);
   const [failed, setFailed] = useState(false);
+  const organizationId = useMatch('/o/:organizationId/*')?.params.organizationId;
   if (state.status !== 'authenticated') {
     return null;
   }
   const { user, memberships } = state.session;
+  const current = memberships.find((membership) => membership.organizationId === organizationId);
 
   /** Goes to the login only when the session has ended; otherwise says that it may not have. */
   async function signOut() {
@@ -37,9 +39,20 @@ export function AppShell() {
             <ul className="organization-switcher">
               {memberships.map((membership) => (
                 <li key={membership.organizationId}>
-                  <NavLink to={`/o/${membership.organizationId}`}>{membership.organizationName}</NavLink>
+                  <NavLink to={`/o/${membership.organizationId}`} end>
+                    {membership.organizationName}
+                  </NavLink>
                 </li>
               ))}
+            </ul>
+          </nav>
+        )}
+        {current !== undefined && current.permissions.includes('account.view') && (
+          <nav aria-label="Sections">
+            <ul className="organization-switcher">
+              <li>
+                <NavLink to={`/o/${current.organizationId}/accounts`}>Accounts</NavLink>
+              </li>
             </ul>
           </nav>
         )}
