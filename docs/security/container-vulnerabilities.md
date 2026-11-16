@@ -122,8 +122,9 @@ CVE-2026-97031, CVE-2026-111943).
 (`docker/edge/caddy/`, `go.mod` and `go.sum` committed, `go mod verify`
 clean) with
 `golang:1.26.10-alpine3.24@sha256:9ce231b28998b32e116927c61aa5c406183061d4f3f2d61b292c88e7f6bdf7ca`
-and `golang.org/x/net` 0.60.0; the official 2.11.7 image provides the base
-layer. `caddy version` reports `v2.11.7`. Result: **0 HIGH/CRITICAL** (was 24
+and `golang.org/x/net` 0.60.0 (0.62.0 since 2026-11-16, see
+[Runtime image packages (2026-11-16)](#runtime-image-packages-2026-11-16));
+the official 2.11.7 image provides the base layer. `caddy version` reports `v2.11.7`. Result: **0 HIGH/CRITICAL** (was 24
 with the 2.11.4 release binary, 5 with the 2.11.7 release binary). Since
 2026-10-27 the binary has a `go-jose` finding again; see
 [CVE-2026-116587](#cve-2026-116587--ghsa-mgcc-cww5-fp2q-go-jose-edge).
@@ -233,6 +234,43 @@ project's own health checks do not use `curl` (they use `cgi-fcgi` and
 `wget`), but the packages belong to the base images and are not removed.
 Remove the upgrade when the pinned base images include the fix. No exception
 was added.
+
+## Runtime image packages (2026-11-16)
+
+Published after the last green scan of the code now on `main` (PR #43, run
+42065181780, 2026-11-05); found by the scan of `main` after that merge (run
+43888920527, 2026-11-16), not by a change of the project. The scan reported
+23 HIGH findings in the three runtime images, all with a fixed version:
+
+| Image | Base (Alpine) | Finding | Installed | Fixed in |
+|---|---|---|---|---|
+| api (`prod`) | PHP 8.5.12 FPM (3.24.2) | CVE-2026-107891, `musl-utils` | 1.2.6-r2 | 1.2.6-r3 |
+| db | PostgreSQL 18.6 (3.24.2) | CVE-2026-107891, `musl-utils` | 1.2.6-r2 | 1.2.6-r3 |
+| db | PostgreSQL 18.6 (3.24.2) | 16 CVEs in `krb5-libs`: CVE-2026-40355, CVE-2026-40356, CVE-2026-71199, CVE-2026-71200, CVE-2026-107364, CVE-2026-112315 to CVE-2026-112323, CVE-2026-118380, CVE-2026-119079 | 1.22.2-r1 | 1.22.3-r0 |
+| db | PostgreSQL 18.6 (3.24.2) | CVE-2026-9947, CVE-2026-87636, CVE-2026-125350, `libxslt` | 1.1.43-r3 | 1.1.43-r4 |
+| edge (`prod`) | Caddy 2.11.7 (3.23.6) | CVE-2026-107891, `musl-utils` | 1.2.5-r23 | 1.2.5-r24 |
+| edge (`prod`) | Caddy binary | CVE-2026-78661, `golang.org/x/net` | 0.60.0 | 0.62.0 |
+
+The pinned base images still ship the affected packages, so the Dockerfiles
+upgrade them as for `brotli-libs` and `curl`: `docker/api/Dockerfile` and
+`docker/edge/Dockerfile` upgrade `musl` and `musl-utils` (both are built
+from the same source and are upgraded together), and `docker/db/Dockerfile`
+also `krb5-libs` and `libxslt`. No package is added to an image, and the
+build fails if a fixed version cannot be installed. The edge Caddy module
+(`docker/edge/caddy/go.mod`, `go.sum`) requires `golang.org/x/net` 0.62.0;
+that version requires `golang.org/x/crypto` 0.58.0, `x/sync` 0.24.0,
+`x/sys` 0.49.0, `x/term` 0.47.0 and `x/text` 0.43.0, which `go get` raised
+with it. The Go toolchain is unchanged, `go mod verify` is clean and
+`caddy version` still reports `v2.11.7`.
+The findings were not triaged for reachability, because each has a fix.
+Remove the upgrades when the pinned base images include the fixes. No
+exception was added, and the `go-jose` exception below is unchanged.
+
+The development images of api and edge share the upgraded stages. The web
+image (development and test only) keeps report-only findings of the same
+scan: `musl`, `musl-utils` and `zlib` from its Node base image, and
+CVE-2026-87018, CVE-2026-109383 and CVE-2026-109869 in the `undici` 6.29.0
+bundled with its npm.
 
 ## CVE-2026-116587 / GHSA-mgcc-cww5-fp2q: `go-jose` (edge)
 
