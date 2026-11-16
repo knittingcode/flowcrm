@@ -5,20 +5,20 @@
 # bin/devenv generated.
 #
 # This suite owns that check; tests/devenv/unit.sh cannot run it, because
-# setuid programs such as sudo do not work inside scripts/ci/no-docker.sh.
-# It is split in two parts so that no code under test runs with the
-# caller's privileges outside the isolation:
+# setuid programs such as sudo do not work inside the test isolation. It is
+# a trusted suite, like tests/devenv/integration.sh: it runs outside the
+# isolation, and only the committed code of this checkout. In CI it is a
+# step before the isolated suites, which come last in their job.
 #   1. The checkout's own bin/devenv (never a copy named by DEVENV or any
-#      other input) runs ensure_secrets under scripts/ci/no-docker.sh, with
-#      its runtime directory in a fresh directory below /var/tmp and a fake
-#      docker that reports no volume.
-#   2. Outside the isolation, this script checks the result as data (file
-#      type, owner, modes; never the contents) and then runs only fixed
-#      commands as nobody on fixed paths, with an empty environment:
-#      /usr/bin/env -i /bin/cat FILE and /usr/bin/env -i /bin/ls DIR. A
-#      denial counts only as "Permission denied" after a passed control.
-#      It never writes, creates or reads a file below the directory that
-#      the isolated code was given (which that code could have replaced).
+#      other input) runs ensure_secrets, with its runtime directory in a
+#      fresh directory below /var/tmp and a fake docker that reports no
+#      volume.
+#   2. This script checks the result as data (file type, owner, modes;
+#      never the contents) and then runs only fixed commands as nobody on
+#      fixed paths, with an empty environment: /usr/bin/env -i /bin/cat FILE
+#      and /usr/bin/env -i /bin/ls DIR. A denial counts only as "Permission
+#      denied" after a passed control. It never writes, creates or reads a
+#      file below the directory that the first part was given.
 # A control file that this script makes in a 0755 directory next to the
 # secrets directory, and that nobody must be able to read (and the
 # directory list), proves that the path is reachable for nobody and that
@@ -54,8 +54,8 @@ for var in DEVENV GUARD ADAPTED NO_DOCKER_ACTIVE; do
   [ -z "${!var+set}" ] || refuse "$var is set; this check runs only the checkout's own code, outside the isolation"
 done
 
-# The files this suite runs, outside or inside the isolation.
-involved='bin/devenv tests/devenv/cross-user.sh tests/devenv/tally.sh scripts/ci/no-docker.sh scripts/ci/no-docker-probe.py'
+# The files this suite runs.
+involved='bin/devenv tests/devenv/cross-user.sh tests/devenv/tally.sh'
 # shellcheck disable=SC2086 # the fixed list of paths is split into words
 {
   git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
@@ -87,11 +87,8 @@ fi
 
 # Below /var/tmp (1777 on Linux and macOS), not $TMPDIR: on macOS $TMPDIR is
 # a 0700 per-user directory, so nobody could not reach anything below it and
-# the check would pass for the wrong reason. Not /tmp either: the macOS
-# isolation denies writes there and refuses a TMPDIR below it. The parents
-# of the runtime directory are 0755 for the same reason; the control file
-# below proves it. The isolated step gets this directory as its TMPDIR, the
-# only place (with /dev) where the macOS sandbox lets it write.
+# the check would pass for the wrong reason. The parents of the runtime
+# directory are 0755 for the same reason; the control file below proves it.
 base=$(mktemp -d /var/tmp/flowcrm-cross-user.XXXXXX) || exit 2
 base=$(cd -P "$base" && pwd -P) || exit 2
 tally_dir=
@@ -111,16 +108,15 @@ printf '#!/bin/sh\nexit 1\n' >"$base/bin/docker" && chmod 0755 "$base/bin/docker
 { mkdir "$rt/control" && chmod 0755 "$rt/control" && printf 'control\n' >"$rt/control/file" &&
   chmod 0444 "$rt/control/file"; } || exit 2
 
-# --- part 1, isolated: the checkout's bin/devenv generates the secrets
-# The isolated code knows $base and runs as the caller, so it can replace
-# anything below it, for example with a symbolic link to a file under $HOME
-# (which the macOS sandbox would not let it write). The trusted part
-# therefore never writes, creates or reads a file below $base after this
-# step: error output is kept in variables (the last 4000 bytes) and the
-# tally is in a directory made after this step, outside $base, in the
-# caller's own TMPDIR (which the macOS sandbox does not let it write).
-# shellcheck disable=SC2016 # expanded by the isolated shell
-gen_err=$({ TMPDIR=$base "$root/scripts/ci/no-docker.sh" "$BASH" -c '
+# --- part 1: the checkout's bin/devenv generates the secrets
+# This is the committed bin/devenv (checked above), in a shell of its own so
+# that none of its functions or settings reach the checks below. What it
+# leaves below $base is still read as data only: the second part never
+# writes, creates or reads a file there. Error output is kept in variables
+# (the last 4000 bytes) and the tally is in a directory made after this
+# step, outside $base, in the caller's own TMPDIR.
+# shellcheck disable=SC2016 # expanded by the inner shell
+gen_err=$({ "$BASH" -c '
   set -u
   . "$1" || exit 2
   FLOWCRM_STACK=app
@@ -135,7 +131,7 @@ rc=$?
 tally_dir=$(mktemp -d "${TMPDIR:-/tmp}/flowcrm-cross-user-tally.XXXXXX") || exit 2
 tally_init "$tally_dir/tally"
 
-# --- part 2, outside the isolation: checks as data, then fixed reads as nobody
+# --- part 2: checks as data, then fixed reads as nobody
 mode_of() { # GNU stat first: its -f means file system status
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
@@ -146,7 +142,7 @@ for name in $names; do
   f=$secrets_dir/$name
   { [ ! -L "$f" ] && [ -f "$f" ] && [ -s "$f" ] && [ -O "$f" ] && [ "$(mode_of "$f")" = 444 ]; } || ok=1
 done
-result "CU-01 the checkout's bin/devenv created the secrets in the isolation (directory 0700, regular files 0444)" $ok \
+result "CU-01 the checkout's bin/devenv created the secrets (directory 0700, regular files 0444)" $ok \
   "(rc $rc: $(printf '%s' "$gen_err" | tail -c 2000 | clean))"
 generated=$ok
 
@@ -189,7 +185,7 @@ for name in $names; do
   denied "CU-04 nobody cannot read the secret $name" /bin/cat "$secrets_dir/$name"
 done
 # Nothing here writes, creates, follows into a write or executes a path that
-# the isolated code could have replaced (such as a symbolic link to a file
+# the first part could have replaced (such as a symbolic link to a file
 # of the caller): those paths are only tested and stat'ed, and read by
 # nobody. CU-04 is denied by the 0700 directory: the secret files are 0444
 # by design (the containers' unprivileged users read the bind mount).

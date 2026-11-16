@@ -593,8 +593,10 @@ owner lives) are left alone.
 
 Setuid programs cannot run in the sandbox, so `ps` is an ad-hoc signed copy
 and `sudo` is unavailable. The U-16 check that another local user cannot
-read a secret therefore prints INFO and is not counted; the U-16 mode checks
-still run. macOS applies a sandbox inside another only if the profiles are
+read a secret is therefore not part of `unit.sh` (which prints INFO and
+counts only the U-16 mode checks); it belongs to
+`tests/devenv/cross-user.sh` (see "Cross-user check of the secrets"). macOS
+applies a sandbox inside another only if the profiles are
 identical, so the suites cannot run inside a different sandbox: they are
 refused.
 
@@ -1012,7 +1014,8 @@ The isolated steps are the last steps of each required job:
   actionlint run first; then the guard regression suites and
   `scripts/ci/tests/no-docker.test.sh`.
 - **Dev environment:** `tests/devenv/unit.sh` runs after the container
-  scan.
+  scan. `tests/devenv/cross-user.sh` is not isolated (it needs `sudo`) and
+  runs among the trusted steps, before the allocator integration tests.
 
 After them, only the checkout action's post-job step runs. During the
 isolated steps on Linux it reads nothing that the code under test could
@@ -1356,21 +1359,20 @@ Cross-user check of the secrets:
 `tests/devenv/cross-user.sh` (CU-xx, its own CI step in the `Dev
 environment` job) checks that the user `nobody` can neither list the
 secrets directory nor read a secret that `bin/devenv` generated. It needs
-`sudo`, so it runs outside the isolation, and is built so that no code under
-test runs there:
+`sudo`, which does not work in the isolation, so it is a trusted suite like
+`tests/devenv/integration.sh`: it runs outside the isolation and only the
+committed code of the checkout. In CI its step comes before the isolated
+suites, which are the last steps of their job.
 
 - The checkout's own `bin/devenv`, never a copy named by an input, runs
-  `ensure_secrets` under `no-docker.sh`, with its runtime directory in a new
-  directory below `/var/tmp` and a fake `docker` that reports no volume.
-  That directory is the isolated step's `TMPDIR`: on macOS the sandbox lets
-  it write only there and in `/dev`. `/var/tmp` is used because it is
-  `1777` on Linux and macOS; the macOS `$TMPDIR` is `0700`, so `nobody`
-  could not reach anything below it, and the macOS isolation denies writes
-  to `/tmp` and refuses a `TMPDIR` below it.
-- Outside the isolation the script checks the result only as data (file
-  type, owner, modes `0700`/`0444`), then runs fixed commands as `nobody`
-  on fixed paths with an empty environment (`/usr/bin/env -i`): `/bin/ls`
-  of the directory and `/bin/cat` of each secret.
+  `ensure_secrets` in a shell of its own, with its runtime directory in a
+  new directory below `/var/tmp` and a fake `docker` that reports no
+  volume. `/var/tmp` is used because it is `1777` on Linux and macOS; the
+  macOS `$TMPDIR` is `0700`, so `nobody` could not reach anything below it.
+- The script then checks the result only as data (file type, owner, modes
+  `0700`/`0444`), and runs fixed commands as `nobody` on fixed paths with an
+  empty environment (`/usr/bin/env -i`): `/bin/ls` of the directory and
+  `/bin/cat` of each secret.
 - A control makes a pass meaningful: `nobody` must be able to read a
   `0444` file that the script puts in a `0755` directory next to the
   secrets directory, and to list that directory. This proves that the path is reachable (below a `0700`
@@ -1384,24 +1386,16 @@ test runs there:
   the secret files are `0444` by design, so that the containers'
   unprivileged users can read the bind-mounted copy. CU-01 checks both
   modes as data.
-- The isolated code runs as the caller and knows the temporary directory,
-  so it could replace anything in it, for example with a symbolic link to a
-  file under `$HOME`. After it returns, nothing outside the isolation
-  writes, creates, executes or reads a file there: those paths are only
-  tested and `stat`ed, and read by `nobody`. Error output is kept in
-  variables, and the result tally is in a new directory made after the
-  isolated step in the caller's own `$TMPDIR`, outside the temporary
-  directory.
-- Neither isolation ends processes that the isolated step leaves behind.
-  Such a process stays isolated, but it could still change a result or keep
-  the step waiting on its output until the CI job times out. On macOS it
-  cannot write the tally, which is outside its sandbox; on Linux the
-  isolation does not restrict file writes, but such a process has no more
-  file access than the caller.
+- After the secrets are generated, the script does not write, create,
+  execute or read a file in that directory: those paths are only tested
+  and `stat`ed, and read by `nobody`. Error output is kept in variables, and
+  the result tally is in a new directory made afterwards in the caller's
+  own `$TMPDIR`.
 - It certifies committed code and is not a mutation harness: it refuses
   (exit 64) arguments, `DEVENV`, `GUARD`, `ADAPTED`, a run inside
   `no-docker.sh`, a directory that is not a Git checkout, and local
-  changes to `bin/devenv`, itself, `tally.sh`, `no-docker.sh` or the probe.
+  changes to `bin/devenv`, itself or `tally.sh`. A modified or mutated
+  `bin/devenv` belongs in `unit.sh`, which is isolated.
 - Without passwordless sudo to `nobody` it prints INFO (CU-01 to CU-04 not
   run, no PASS) and exits 0; in CI (`CI=true`) that is a failure (CU-00).
 
