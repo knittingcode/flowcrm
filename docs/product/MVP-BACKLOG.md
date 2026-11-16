@@ -22,7 +22,7 @@ Status: `in review` (branch `feat/fcrm-mvp-s1-accounts`).
 | S1.1 | `accounts` table with tenant key and checks; runtime privileges without DELETE; `Account` entity in `CRM` | in review |
 | S1.2 | Permissions `account.view`, `account.manage` (all roles) and `account.archive` (ADMIN, MANAGER); `Permission` and `TenantPermission` in the public Api of `Organizations` so that other modules can declare routes | in review |
 | S1.3 | API: list, create, open, replace, archive under `/organizations/{organizationId}/accounts`; validation with a code per field; audit events without values; OpenAPI | in review |
-| S1.4 | Tests: domain rules, API over PHP-FPM (CRUD, another organization's accounts, forged organization, CSRF, permissions, paging, audit, persistence), schema, route pins, six negative controls | in review |
+| S1.4 | Tests: domain rules, API over PHP-FPM (CRUD, another organization's accounts, forged organization, CSRF, permissions, paging, audit, persistence), concurrent writes, schema, route pins, seven negative controls | in review |
 | S1.5 | Frontend: accounts list with empty state and form, account page with edit and archive, navigation; component tests; browser test | in review |
 
 ## S2 — Contacts (AC-03; AC-09 to AC-12 for contacts)

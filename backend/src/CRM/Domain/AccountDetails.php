@@ -94,6 +94,7 @@ final readonly class AccountDetails
         return \is_array($parts)
             && \in_array(strtolower($parts['scheme'] ?? ''), ['http', 'https'], true)
             && '' !== ($parts['host'] ?? '')
-            && !isset($parts['user'], $parts['pass']);
+            && !isset($parts['user'])
+            && !isset($parts['pass']);
     }
 }

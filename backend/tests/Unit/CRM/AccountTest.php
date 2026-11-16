@@ -45,6 +45,7 @@ final class AccountTest extends TestCase
         yield 'website with another scheme' => [['Acme', 'javascript:alert(1)', null, null], ['website' => 'INVALID_URL']];
         yield 'website with ftp' => [['Acme', 'ftp://example.test', null, null], ['website' => 'INVALID_URL']];
         yield 'website with credentials' => [['Acme', 'https://user:secret@example.test', null, null], ['website' => 'INVALID_URL']];
+        yield 'website with a user name' => [['Acme', 'https://user@example.test', null, null], ['website' => 'INVALID_URL']];
         yield 'website with a space' => [['Acme', 'https://exa mple.test', null, null], ['website' => 'INVALID_URL']];
         yield 'long website' => [['Acme', 'https://example.test/'.str_repeat('a', 2030), null, null], ['website' => 'TOO_LONG']];
         yield 'e-mail without a domain' => [['Acme', null, 'biuro@', null], ['email' => 'INVALID_EMAIL']];
