@@ -4,14 +4,14 @@ declare(strict_types=1);
 
 namespace App\Organizations\Http\Api;
 
+use App\Organizations\Api\Permission;
 use App\Organizations\Api\TenantContext;
+use App\Organizations\Api\TenantPermission;
 use App\Organizations\Application\MemberDirectory;
 use App\Organizations\Application\MemberView;
 use App\Organizations\Application\OrganizationReadModel;
+use App\Organizations\Application\RolePolicy;
 use App\Organizations\Domain\MembershipRole;
-use App\Organizations\Domain\Permission;
-use App\Organizations\Domain\RolePolicy;
-use App\Organizations\Http\Tenant\TenantPermission;
 use App\Shared\Http\Problem\ProblemException;
 use App\Shared\Http\Query\Pagination;
 use Symfony\Component\HttpFoundation\JsonResponse;

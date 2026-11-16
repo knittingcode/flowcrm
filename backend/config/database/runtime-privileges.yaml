@@ -11,6 +11,8 @@ tables:
   memberships: [SELECT, INSERT, UPDATE, DELETE]
   pipelines: [SELECT, INSERT, UPDATE, DELETE]
   pipeline_stages: [SELECT, INSERT, UPDATE, DELETE]
+  # Archived, never deleted: no DELETE.
+  accounts: [SELECT, INSERT, UPDATE]
   # Append-only: never UPDATE, DELETE or TRUNCATE (the trigger also refuses).
   audit_events: [SELECT, INSERT]
   # PdoSessionHandler: SELECT ... FOR UPDATE needs UPDATE; garbage collection DELETE.

@@ -6,6 +6,7 @@ namespace App\Organizations\Http\Tenant;
 
 use App\Identity\Api\CurrentUser;
 use App\Organizations\Api\TenantContext;
+use App\Organizations\Api\TenantPermission;
 use App\Organizations\Application\OrganizationReadModel;
 use App\Shared\Http\Problem\ProblemException;
 use Monolog\Attribute\WithMonologChannel;

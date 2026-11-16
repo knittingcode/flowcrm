@@ -41,6 +41,7 @@ tags:
   - name: auth
   - name: me
   - name: organizations
+  - name: accounts
 
 paths:
   /api/v1/system/status:
@@ -294,6 +295,177 @@ paths:
         '500':
           $ref: '#/components/responses/SessionUnavailable'
 
+  /api/v1/organizations/{organizationId}/accounts:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+    get:
+      tags: [accounts]
+      operationId: listAccounts
+      summary: The accounts of the organization (permission account.view)
+      description: Accounts that are not archived, by name regardless of case, then by ID.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+      responses:
+        '200':
+          description: One page of accounts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountPage'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/SessionUnavailable'
+    post:
+      tags: [accounts]
+      operationId: createAccount
+      summary: Create an account (permission account.manage)
+      description: The account belongs to the organization of the path. The body has no organization member.
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountDetails'
+      responses:
+        '201':
+          description: The new account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ForbiddenOrCsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/organizations/{organizationId}/accounts/{accountId}:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [accounts]
+      operationId: getAccount
+      summary: One account, archived or not (permission account.view)
+      description: An account of another organization is a 404, like an unknown one.
+      responses:
+        '200':
+          description: The account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/SessionUnavailable'
+    put:
+      tags: [accounts]
+      operationId: updateAccount
+      summary: Replace the details of an account (permission account.manage)
+      description: An optional member that is left out is cleared. An archived account cannot be changed (409).
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountDetails'
+      responses:
+        '200':
+          description: The account after the change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ForbiddenOrCsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /api/v1/organizations/{organizationId}/accounts/{accountId}/archive:
+    parameters:
+      - $ref: '#/components/parameters/OrganizationId'
+      - $ref: '#/components/parameters/AccountId'
+    post:
+      tags: [accounts]
+      operationId: archiveAccount
+      summary: Archive an account (permission account.archive)
+      description: |
+        The account leaves the list, stays readable and can no longer be
+        changed. Archiving an archived account changes nothing. Accounts are
+        never deleted.
+      parameters:
+        - $ref: '#/components/parameters/CsrfToken'
+      responses:
+        '204':
+          description: The account is archived.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/ForbiddenOrCsrfInvalid'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
 components:
   securitySchemes:
     session:
@@ -305,6 +477,13 @@ components:
   parameters:
     OrganizationId:
       name: organizationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    AccountId:
+      name: accountId
       in: path
       required: true
       schema:
@@ -360,6 +539,18 @@ components:
             $ref: '#/components/schemas/Problem'
     Forbidden:
       description: A member without the permission (type forbidden).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ForbiddenOrCsrfInvalid:
+      description: A member without the permission (type forbidden), or the origin check or the CSRF token failed (type csrf-invalid).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: The resource is in a state that does not allow the request, such as an archived account (type conflict).
       content:
         application/problem+json:
           schema:
@@ -520,7 +711,7 @@ components:
       additionalProperties: false
     Permission:
       type: string
-      enum: [organization.view, membership.list, membership.view_email]
+      enum: [organization.view, membership.list, membership.view_email, account.view, account.manage, account.archive]
     Role:
       type: string
       enum: [ADMIN, MANAGER, REP]
@@ -640,6 +831,75 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Member'
+        meta:
+          type: object
+          required: [page, pageSize, total]
+          properties:
+            page:
+              type: integer
+            pageSize:
+              type: integer
+            total:
+              type: integer
+          additionalProperties: false
+      additionalProperties: false
+    AccountDetails:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: 1 to 200 characters after trimming; no control characters.
+        website:
+          type: string
+          nullable: true
+          description: An absolute http or https URL without credentials, at most 2048 bytes. Empty or null for none.
+        email:
+          type: string
+          nullable: true
+          description: At most 254 bytes. Empty or null for none.
+        phone:
+          type: string
+          nullable: true
+          description: Digits, spaces and `+ ( ) . / -`, 3 to 50 characters. Empty or null for none.
+      additionalProperties: false
+    Account:
+      type: object
+      required: [id, name, website, email, phone, createdAt, updatedAt, archivedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        website:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        archivedAt:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+    AccountPage:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Account'
         meta:
           type: object
           required: [page, pageSize, total]

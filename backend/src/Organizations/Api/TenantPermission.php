@@ -2,9 +2,7 @@
 
 declare(strict_types=1);
 
-namespace App\Organizations\Http\Tenant;
-
-use App\Organizations\Domain\Permission;
+namespace App\Organizations\Api;
 
 /**
  * The permission a tenant route requires (FCRM-002 NFR-002: every endpoint

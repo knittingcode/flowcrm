@@ -56,6 +56,12 @@ final class ProblemException extends HttpException
         return new self(404, 'not-found');
     }
 
+    /** The resource is in a state that does not allow the request, such as an archived one. */
+    public static function conflict(): self
+    {
+        return new self(409, 'conflict');
+    }
+
     public static function unsupportedMediaType(): self
     {
         return new self(415, 'unsupported-media-type');
