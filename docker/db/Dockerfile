@@ -11,8 +11,12 @@ FROM ${POSTGRES_IMAGE}
 # brotli-libs >= 1.2.1-r0 fixes CVE-2026-111497 (HIGH) and libcurl
 # >= 8.23.0-r0 fixes CVE-2026-92392 (HIGH), which the pinned base image still
 # ships (docs/security/container-vulnerabilities.md). The base image has
-# libcurl but no curl tool, so only the library is upgraded.
+# libcurl but no curl tool, so only the library is upgraded. musl/musl-utils
+# >= 1.2.6-r3 fix CVE-2026-107891, krb5-libs >= 1.22.3-r0 and libxslt
+# >= 1.1.43-r4 the HIGH findings listed there under "Runtime image packages
+# (2026-11-16)".
 RUN apk add --no-cache --upgrade 'brotli-libs>=1.2.1-r0' 'libcurl>=8.23.0-r0' \
+        'musl>=1.2.6-r3' 'musl-utils>=1.2.6-r3' 'krb5-libs>=1.22.3-r0' 'libxslt>=1.1.43-r4' \
     && rm -f /usr/local/bin/gosu
 # Database roles (ADR-018): created on a new volume by the initdb hook, and
 # checked or upgraded by bin/devenv through flowcrm-db-roles.
