@@ -8,7 +8,10 @@
 #
 # Usage: tests/devenv/integration.sh
 #   DEVENV_TEST_PORT_BASE  first port of the 20-port test range (default 8080)
-#   DEVENV                 bin/devenv copy to test (default: this checkout's)
+#   DEVENV                 accepted only if identical to this checkout's
+#                          bin/devenv: this suite uses the real Docker daemon,
+#                          so a modified or mutated copy belongs in
+#                          tests/devenv/unit.sh, which runs without one
 #   DEVENV_TEST_SCENARIOS  space-separated subset, e.g. "pa16 pa21" (default:
 #                          all); the summary names the scenarios that ran
 # Needs: docker with Compose v2, python3 and curl (test tools only).
@@ -23,6 +26,10 @@ set -u
 
 here=$(cd -P "$(dirname "$0")" && pwd -P)
 repo=$(cd -P "$here/../.." && pwd -P)
+if [ -n "${DEVENV-}" ] && ! cmp -s "$DEVENV" "$repo/bin/devenv"; then
+  echo "REFUSED: DEVENV=$DEVENV differs from $repo/bin/devenv; this suite uses the real Docker daemon, run tests/devenv/unit.sh for a modified copy" >&2
+  exit 2
+fi
 BASE=${DEVENV_TEST_PORT_BASE:-8080}
 LO=$BASE
 HI=$((BASE + 19))
@@ -97,7 +104,7 @@ new_checkout() { # name -> sets CO
   CO=$work/$1
   mkdir -p "$CO/bin"
   cp "$repo/Makefile" "$repo/compose.fixture.yaml" "$CO/"
-  cp "${DEVENV:-$repo/bin/devenv}" "$CO/bin/devenv"
+  cp "$repo/bin/devenv" "$CO/bin/devenv"
   printf '%s\n' "$CO" >>"$work/checkouts"
 }
 
