@@ -409,6 +409,7 @@ Its regression suite is `scripts/ci/tests/guard-dockerfile-frontend.test.sh`.
 ```console
 $ make test-devenv                               # allocator: unit + integration (fixture)
 $ tests/devenv/unit.sh                           # no Docker needed
+$ tests/devenv/cross-user.sh                     # secrets vs. another local user (passwordless sudo)
 $ DEVENV_TEST_PORT_BASE=18080 tests/devenv/integration.sh
 $ make test-app                                  # application: the four suites below
 ```
@@ -592,8 +593,10 @@ owner lives) are left alone.
 
 Setuid programs cannot run in the sandbox, so `ps` is an ad-hoc signed copy
 and `sudo` is unavailable. The U-16 check that another local user cannot
-read a secret therefore prints INFO and is not counted; the U-16 mode checks
-still run. macOS applies a sandbox inside another only if the profiles are
+read a secret is therefore not part of `unit.sh` (which prints INFO and
+counts only the U-16 mode checks); it belongs to
+`tests/devenv/cross-user.sh` (see "Cross-user check of the secrets"). macOS
+applies a sandbox inside another only if the profiles are
 identical, so the suites cannot run inside a different sandbox: they are
 refused.
 
@@ -1011,7 +1014,8 @@ The isolated steps are the last steps of each required job:
   actionlint run first; then the guard regression suites and
   `scripts/ci/tests/no-docker.test.sh`.
 - **Dev environment:** `tests/devenv/unit.sh` runs after the container
-  scan.
+  scan. `tests/devenv/cross-user.sh` is not isolated (it needs `sudo`) and
+  runs among the trusted steps, before the allocator integration tests.
 
 After them, only the checkout action's post-job step runs. During the
 isolated steps on Linux it reads nothing that the code under test could
@@ -1350,6 +1354,51 @@ The macOS cases run only on a developer's Mac: there is no macOS CI job.
 - BE-18 mutates a copy of the backend inside the api test container, which
   has no Docker socket.
 
+Cross-user check of the secrets:
+
+`tests/devenv/cross-user.sh` (CU-xx, its own CI step in the `Dev
+environment` job) checks that the user `nobody` can neither list the
+secrets directory nor read a secret that `bin/devenv` generated. It needs
+`sudo`, which does not work in the isolation, so it is a trusted suite like
+`tests/devenv/integration.sh`: it runs outside the isolation and only the
+committed code of the checkout. In CI its step comes before the isolated
+suites, which are the last steps of their job.
+
+- The checkout's own `bin/devenv`, never a copy named by an input, runs
+  `ensure_secrets` in a shell of its own, with its runtime directory in a
+  new directory below `/var/tmp` and a fake `docker` that reports no
+  volume. `/var/tmp` is used because it is `1777` on Linux and macOS; the
+  macOS `$TMPDIR` is `0700`, so `nobody` could not reach anything below it.
+- The script then checks the result only as data (file type, owner, modes
+  `0700`/`0444`), and runs fixed commands as `nobody` on fixed paths with an
+  empty environment (`/usr/bin/env -i`): `/bin/ls` of the directory and
+  `/bin/cat` of each secret.
+- A control makes a pass meaningful: `nobody` must be able to read a
+  `0444` file that the script puts in a `0755` directory next to the
+  secrets directory, and to list that directory. This proves that the path is reachable (below a `0700`
+  directory such as the macOS `$TMPDIR` every read would fail) and that the
+  read check detects an exposed file. If the control fails, its result
+  shows the error and the mode of every parent directory.
+- A denial counts only if the secrets were generated (CU-01), the control
+  passed (CU-02) and the command failed with `Permission denied`; any other
+  failure, such as `sudo` itself failing, makes the result a failure.
+- CU-04 is denied by the `0700` secrets directory, not by the file mode:
+  the secret files are `0444` by design, so that the containers'
+  unprivileged users can read the bind-mounted copy. CU-01 checks both
+  modes as data.
+- After the secrets are generated, the script does not write, create,
+  execute or read a file in that directory: those paths are only tested
+  and `stat`ed, and read by `nobody`. Error output is kept in variables, and
+  the result tally is in a new directory made afterwards in the caller's
+  own `$TMPDIR`.
+- It certifies committed code and is not a mutation harness: it refuses
+  (exit 64) arguments, `DEVENV`, `GUARD`, `ADAPTED`, a run inside
+  `no-docker.sh`, a directory that is not a Git checkout, and local
+  changes to `bin/devenv`, itself or `tally.sh`. A modified or mutated
+  `bin/devenv` belongs in `unit.sh`, which is isolated.
+- Without passwordless sudo to `nobody` it prints INFO (CU-01 to CU-04 not
+  run, no PASS) and exits 0; in CI (`CI=true`) that is a failure (CU-00).
+
 Application suites (`tests/app/`), each in its own Compose projects:
 
 - `scan.sh` (SC-xx): Trivy scans of the runtime images (production-like api
@@ -1458,6 +1507,9 @@ run, so several runs from one checkout do not interfere.
   (targets and the commands they run), the test runners' image removal
   (by name only, see "Removing test images") and checks that the result tally
   detects failed and lost results.
+- `tests/devenv/cross-user.sh` checks that another local user cannot list
+  or read the generated secrets (CU-01 to CU-04, 7 results; see "Cross-user check of
+  the secrets" under "Isolation from Docker").
 - `tests/devenv/integration.sh` runs scenarios PA-01 to PA-23 and the
   Makefile targets against real Docker in temporary checkout copies. It uses
   the 20-port block starting at `DEVENV_TEST_PORT_BASE` (default 8080) and
@@ -1474,7 +1526,7 @@ run, so several runs from one checkout do not interfere.
   and verifies that the lock is held until they end. PA-23 checks that an
   invalid Compose file fails with exit 2, keeps the verified state and tries
   no other port.
-- Both suites compare the printed PASS/FAIL records with their counters and
+- The suites compare the printed PASS/FAIL records with their counters and
   exit 2 on a mismatch; a scenario without results or a failed setup step
   counts as a failure.
 
